@@ -29,7 +29,7 @@ export default async function Page(props: PageProps<'/interview/[[...slug]]'>) {
       <DocsDescription>{page.data.description}</DocsDescription>
       <NoteMeta type={page.data.type} status={page.data.status} tags={page.data.tags} />
       {page.data.placeholder ? (
-        <p className="not-prose mb-4 rounded-lg border border-[#53401a] bg-[#221a0b] px-3 py-2 text-sm text-amber-200">
+        <p className="not-prose mb-4 rounded-lg border border-[#3a3e78] bg-[#15172e] px-3 py-2 text-sm text-[#e0e4fc]">
           Placeholder. Personal interview stories are not published here. The page is only the outline.
         </p>
       ) : null}

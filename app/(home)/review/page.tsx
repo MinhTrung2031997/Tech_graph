@@ -23,7 +23,7 @@ export default function ReviewPage() {
           <Link key={page.url} href={page.url} className="block rounded-xl border border-fd-border bg-fd-card p-4 hover:border-indigo-500/70">
             <div className="flex flex-wrap items-center gap-2">
               <h2 className="text-base font-semibold">{page.data.title}</h2>
-              {page.data.type ? <Badge tone="indigo">{typeLabel(page.data.type)}</Badge> : null}
+              {page.data.type ? <Badge tone="neutral">{typeLabel(page.data.type)}</Badge> : null}
             </div>
             <p className="mt-2 text-sm text-fd-muted-foreground">{page.data.description}</p>
             <p className="mt-2 text-xs text-[#6b7285]">

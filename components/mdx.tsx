@@ -5,7 +5,7 @@ import type { ReactNode } from 'react';
 export function Tldr({ children }: { children: ReactNode }) {
   return (
     <div id="tldr" className="not-prose my-4 rounded-[10px] border border-[#2a2f6b] bg-[#12142a] px-3.5 py-3">
-      <p className="mb-1 text-xs font-bold tracking-wide text-indigo-300">TL;DR</p>
+      <p className="mb-1 text-xs font-bold tracking-wide text-[#a5b4fc]">TL;DR</p>
       <div className="text-sm leading-relaxed text-fd-foreground">{children}</div>
     </div>
   );
