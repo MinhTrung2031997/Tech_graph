@@ -1,0 +1,20 @@
+{
+  "title": "08 · Databases",
+  "description": "SQL and NoSQL, transactions, isolation, indexing, and choosing an engine.",
+  "icon": "Database",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "sql-vs-nosql",
+    "acid-vs-base",
+    "transaction-isolation-levels",
+    "normalization",
+    "sql-basics",
+    "query-optimization",
+    "postgresql-indexing",
+    "mongodb-indexes",
+    "sharding-vs-partitioning",
+    "mysql-vs-postgresql",
+    "orms"
+  ]
+}

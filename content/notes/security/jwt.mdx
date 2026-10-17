@@ -1,0 +1,39 @@
+---
+title: "JWT"
+description: "A JWT is a signed token (header, payload, signature), not an encrypted one. Anyone who has the token can read the payload. The signature only proves it was issued by someone who holds the secret or private key."
+domain: "security"
+type: "concept"
+tags: ["jwt", "auth"]
+status: "reviewed"
+appliesTo: "Any HTTP API"
+lastReviewed: "2026-10-06"
+interviewPriority: true
+related: ["security/oauth", "security/authentication-vs-authorization", "security/cookies-vs-sessions"]
+sources: ["https://datatracker.ietf.org/doc/html/rfc7519"]
+---
+<Tldr>
+A JWT is a signed token (header, payload, signature), not an encrypted one. Anyone who has the token can read the payload. The signature only proves it was issued by someone who holds the secret or private key.
+</Tldr>
+
+<Answer>
+I treat a JWT as a short-lived access token. I validate `alg`, `exp`, `iss`, and `aud`, I never accept `alg: none`, and I do not put secrets in the payload. If I need to revoke a session instantly, I use an opaque server-side session or a short expiry plus a refresh token I can revoke.
+</Answer>
+
+## What the three parts are
+
+The payload is base64url JSON. Typical claims are `sub`, `exp`, `iat`, `iss`, and `aud`. HS256 means a shared secret. RS256 or ES256 means the authorization server signs with a private key and resource servers verify with the public key.
+
+Signing is not encryption. A JWT in `localStorage` is readable by any script on the page, which is why XSS is fatal to bearer tokens. An `HttpOnly` `Secure` cookie avoids that particular leak, and then CSRF becomes the thing to design for.
+
+## Pitfalls
+
+<Pitfall>
+Do not decode a JWT and trust it. Verify the signature with an allow-list of algorithms. Libraries that pick the algorithm from the token header have been tricked into treating a public key as an HMAC secret.
+</Pitfall>
+
+## Interview questions
+
+<details>
+<summary>When is a JWT a bad session mechanism?</summary>
+When you need immediate revocation, or the token is large and sent on every request, or you are stuffing roles that change often into a token that lives for hours. A session id in a cookie plus a server-side store is simpler until you actually have many stateless resource servers.
+</details>

@@ -1,0 +1,32 @@
+---
+title: "React Hooks"
+description: "Hooks are functions that let function components keep state and subscribe to React features. Call them at the top level, never inside a condition. `useEffect` synchronizes with something outside React. It is not where de"
+domain: "frontend"
+type: "concept"
+tags: ["react"]
+status: "reviewed"
+appliesTo: "React 19"
+lastReviewed: "2026-10-07"
+related: ["frontend/react-fundamentals", "frontend/react-rendering"]
+sources: ["https://react.dev/reference/react/hooks"]
+---
+<Tldr>
+Hooks are functions that let function components keep state and subscribe to React features. Call them at the top level, never inside a condition. `useEffect` synchronizes with something outside React. It is not where derived data belongs.
+</Tldr>
+
+<Answer>
+`useState` stores state. `useRef` stores a mutable value that does not re-render. `useMemo` and `useCallback` cache a result or a function when identity matters. `useEffect` runs after paint to talk to the outside world. In React 19 I also reach for `use` to read a promise or context, and for actions (`useActionState`) when a form is the source of the update.
+</Answer>
+
+## Rules
+
+1. Call hooks from a component or another hook, in the same order every render.
+2. Do not copy props into state unless the copy is allowed to diverge.
+3. If a value is computed from props or state, compute it during render. An effect that does `setState` with that value is an extra render.
+4. `useCallback` does not make a function faster. It keeps the same function so a memoized child can skip rendering.
+
+## Pitfalls
+
+<Pitfall>
+A missing effect dependency is a stale closure, not a performance win. If the effect over-fires, restructure the code (derive during render, or move the value into the effect) instead of silencing the lint.
+</Pitfall>

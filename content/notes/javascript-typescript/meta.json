@@ -1,0 +1,16 @@
+{
+  "title": "03 · JavaScript & TypeScript",
+  "description": "Scope, types, and the parts of modern JavaScript that still surprise people.",
+  "icon": "FileCode",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "modern-javascript",
+    "strict-mode",
+    "var-let-const",
+    "this-bind-call-apply",
+    "data-types",
+    "type-vs-interface",
+    "abstract-class-vs-interface"
+  ]
+}

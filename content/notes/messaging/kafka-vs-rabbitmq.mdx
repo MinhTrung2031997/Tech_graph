@@ -1,0 +1,36 @@
+---
+title: "Kafka vs RabbitMQ"
+description: "Kafka is a retained log you read by offset. RabbitMQ is a broker that routes messages into queues and deletes them once they are acknowledged. Kafka replays. RabbitMQ pushes work to competing consumers and then forgets i"
+domain: "messaging"
+type: "comparison"
+tags: ["kafka", "rabbitmq"]
+status: "reviewed"
+appliesTo: "Kafka 4.x, RabbitMQ 4"
+lastReviewed: "2026-10-10"
+interviewPriority: true
+related: ["messaging/kafka-fundamentals", "messaging/rabbitmq-fundamentals", "messaging/bullmq"]
+---
+<Tldr>
+Kafka is a retained log you read by offset. RabbitMQ is a broker that routes messages into queues and deletes them once they are acknowledged. Kafka replays. RabbitMQ pushes work to competing consumers and then forgets it.
+</Tldr>
+
+<Answer>
+I use Kafka when several services need the same history, when order inside a key matters, or when I want to replay. I use RabbitMQ when I have a job, a routing key, and a worker pool that should take each message once. BullMQ sits closer to RabbitMQ: a Redis-backed job queue, not a log.
+</Answer>
+
+## Side by side
+
+| | Kafka | RabbitMQ |
+| --- | --- | --- |
+| Model | Append-only log | Queue (and exchanges) |
+| After consume | Record stays until retention | Ack removes it |
+| Replay | Start a group at an old offset | Not the default model |
+| Competing workers | One group member per partition | Many consumers on one queue |
+| Order | Per partition | Per queue, if a single consumer |
+| Routing | Key → partition | Exchange type and binding key |
+
+## Pitfalls
+
+<Pitfall>
+"Kafka is faster" is not a design. A single RabbitMQ queue with competing consumers is the simpler fix for a background job. Kafka pays off when the log itself is the product other teams subscribe to. See [Kafka Fundamentals](/notes/messaging/kafka-fundamentals).
+</Pitfall>

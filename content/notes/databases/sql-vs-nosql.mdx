@@ -1,0 +1,29 @@
+---
+title: "SQL vs NoSQL"
+description: "SQL databases give you a schema, joins, and strong transactions. Document and key-value stores give you flexible records and easy horizontal partitioning. Many systems now do both: PostgreSQL has JSONB, and MongoDB has m"
+domain: "databases"
+type: "comparison"
+tags: ["sql", "nosql"]
+status: "reviewed"
+appliesTo: "PostgreSQL 17, MongoDB 8"
+lastReviewed: "2026-10-04"
+related: ["databases/acid-vs-base", "databases/mysql-vs-postgresql"]
+---
+<Tldr>
+SQL databases give you a schema, joins, and strong transactions. Document and key-value stores give you flexible records and easy horizontal partitioning. Many systems now do both: PostgreSQL has JSONB, and MongoDB has multi-document transactions.
+</Tldr>
+
+<Answer>
+I start with PostgreSQL unless I have a concrete reason not to. I reach for a document store when the data is a self-contained aggregate, the shape changes often, and I do not need joins across those aggregates. I do not pick "NoSQL" as a performance strategy. Indexes and data modeling decide performance.
+</Answer>
+
+## How I choose
+
+| Need | Usually |
+| --- | --- |
+| Invoices, accounts, anything with constraints | PostgreSQL |
+| A document that is always read and written as a whole | MongoDB, or JSONB in PostgreSQL |
+| A cache or a counter | Redis |
+| A relationship graph you traverse | A graph store, or recursive SQL if it is shallow |
+
+The expensive part is the boundary. Once an order lives in one database and the user profile in another, you no longer have a single transaction. That is an architecture problem, not a driver problem. See [ACID vs BASE](/notes/databases/acid-vs-base).

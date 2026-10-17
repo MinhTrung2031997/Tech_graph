@@ -1,0 +1,15 @@
+{
+  "title": "11 · Architecture & Distributed Systems",
+  "description": "Monoliths, microservices, sagas, DDD, clean architecture, and caching.",
+  "icon": "Network",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "architecture-overview",
+    "monolith-vs-microservices",
+    "saga-pattern",
+    "domain-driven-design",
+    "clean-architecture",
+    "caching-strategies"
+  ]
+}

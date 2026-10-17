@@ -1,0 +1,36 @@
+---
+title: "OAuth 2.0 & OpenID Connect"
+description: "OAuth 2.0 is delegated authorization. OpenID Connect adds authentication by returning an `id_token`. For a browser or mobile app, use the authorization code flow with PKCE. Do not use the implicit flow."
+domain: "security"
+type: "concept"
+tags: ["oauth", "auth"]
+status: "reviewed"
+appliesTo: "OAuth 2.0, OpenID Connect"
+lastReviewed: "2026-10-09"
+related: ["security/jwt", "security/authentication-vs-authorization"]
+sources: ["https://datatracker.ietf.org/doc/html/rfc6749", "https://openid.net/specs/openid-connect-core-1_0.html"]
+---
+<Tldr>
+OAuth 2.0 is delegated authorization. OpenID Connect adds authentication by returning an `id_token`. For a browser or mobile app, use the authorization code flow with PKCE. Do not use the implicit flow.
+</Tldr>
+
+<Answer>
+The user authenticates at the authorization server. My app receives an authorization code, exchanges it with PKCE for tokens, and calls APIs with the access token. The `id_token` tells me who the user is. The access token tells the API what the user allowed. OAuth 1.0 is legacy and I do not implement it.
+</Answer>
+
+## The four roles
+
+| Role | Job |
+| --- | --- |
+| Resource owner | The user |
+| Client | My application |
+| Authorization server | Issues tokens (and the login screen) |
+| Resource server | The API that accepts the access token |
+
+PKCE binds the code to the client that started the request, which matters when the client cannot hide a secret. A backend that can keep a secret still uses PKCE. It is cheap and it closes the intercepted-code attack.
+
+## Pitfalls
+
+<Pitfall>
+An access token is not proof of identity. Validate the OpenID Connect `id_token` (issuer, audience, signature, expiry) when you need to know who logged in. See [JWT](/notes/security/jwt).
+</Pitfall>

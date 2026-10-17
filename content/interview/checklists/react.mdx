@@ -1,0 +1,33 @@
+---
+title: "Study Checklist: React"
+description: "A short React study list for interview revision."
+type: "cheatsheet"
+status: "reviewed"
+tags: ["react", "interview"]
+---
+A short list I walk before a React interview. It is a study outline, not a transcript of any course.
+
+## Components
+
+- Function components, props, and state. What causes a render.
+- Composition versus inheritance. Children and render props, briefly.
+- Keys in lists, and why the index is a bad key when the list reorders.
+
+## Hooks
+
+- Rules of hooks.
+- `useState`, `useReducer`, `useRef`, `useContext`.
+- `useEffect`: synchronization, cleanup, and why derived state does not belong there.
+- `useMemo` and `useCallback`: identity, not a default optimization.
+- React 19: `use`, actions, and `useOptimistic` at a high level.
+
+## Rendering
+
+- Render is pure. Effects and event handlers are where side effects live.
+- State updates are queued. Several `setState` calls in one event are batched.
+- Lifting state, and when a context is the wrong global store.
+
+## Data
+
+- Where the server cache lives (I name the library I last used and stop there).
+- Forms: controlled inputs, pending state, and showing an error without wiping what the user typed.

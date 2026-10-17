@@ -1,0 +1,36 @@
+---
+title: "Race Conditions & Concurrency Control"
+description: "A race condition is a bug whose result depends on timing. In a database-backed API the usual shape is check-then-act: two requests both see \"allowed\" and both write. Fix it with an atomic write, a lock, a unique constrai"
+domain: "concurrency"
+type: "concept"
+tags: ["postgresql", "concurrency"]
+status: "reviewed"
+appliesTo: "PostgreSQL 17"
+lastReviewed: "2026-10-11"
+interviewPriority: true
+related: ["databases/transaction-isolation-levels", "databases/acid-vs-base", "concurrency/idempotency-outbox"]
+---
+<Tldr>
+A race condition is a bug whose result depends on timing. In a database-backed API the usual shape is check-then-act: two requests both see "allowed" and both write. Fix it with an atomic write, a lock, a unique constraint, or an idempotency key — not with hope about request order.
+</Tldr>
+
+<Answer>
+I name the invariant first (one debit, one seat, one webhook side effect). Then I pick the smallest mechanism that enforces it: an atomic `UPDATE`, `SELECT … FOR UPDATE`, a unique index, or an idempotency key stored in the same transaction as the side effect. Isolation level alone does not save a read-modify-write at Read Committed. See [Transaction Isolation Levels](/notes/databases/transaction-isolation-levels).
+</Answer>
+
+## Six ways I actually use
+
+| Mechanism | Use it when |
+| --- | --- |
+| Atomic update | The new value is `balance = balance - 100` |
+| Row lock (`FOR UPDATE`) | You must read, decide in application code, then write |
+| Optimistic version column | Conflicts are rare and retry is easy |
+| Unique constraint | "Only one" is a fact about data, not about timing |
+| Advisory lock | The critical section is not a single row |
+| Idempotency key | A retry must not apply the side effect twice |
+
+## Pitfalls
+
+<Pitfall>
+Catching a duplicate-key error and continuing as if nothing happened is correct only when the existing row is the same operation. If two different payments collide on a bad key, you just dropped one of them.
+</Pitfall>
