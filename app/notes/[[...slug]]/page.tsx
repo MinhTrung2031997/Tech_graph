@@ -1,3 +1,4 @@
+import { stackHeadingComponents } from '@/components/article-stack';
 import { DomainGrid } from '@/components/domain-grid';
 import { getMDXComponents } from '@/components/mdx';
 import { NoteMeta } from '@/components/note-meta';
@@ -23,9 +24,10 @@ export default async function Page(props: PageProps<'/notes/[[...slug]]'>) {
   const overview = page.slugs.length === 0;
   const domainPage = page.data.type === 'domain';
   const notePage = !overview && !domainPage;
+  const stack = page.data.article === 'stack';
   const neighbours = noteNeighbours(page.url);
   const related = relatedNotes(page);
-  const toc = notePage ? [{ title: 'TL;DR', url: '#tldr', depth: 2 as const }, ...page.data.toc] : page.data.toc;
+  const toc = notePage && !stack ? [{ title: 'TL;DR', url: '#tldr', depth: 2 as const }, ...page.data.toc] : page.data.toc;
   const domainNotes = domainPage ? orderedNotesInDomain(page.slugs[0] ?? '') : [];
 
   return (
@@ -44,14 +46,16 @@ export default async function Page(props: PageProps<'/notes/[[...slug]]'>) {
       {domainPage ? <p className="mb-2 text-xs text-[#6b7285]">{domainLabel(page.slugs[0])}</p> : null}
       <DocsTitle>{page.data.title}</DocsTitle>
       {notePage ? (
-        <NoteMeta
-          type={page.data.type}
-          status={page.data.status}
-          interviewPriority={page.data.interviewPriority}
-          appliesTo={page.data.appliesTo}
-          lastReviewed={page.data.lastReviewed}
-          tags={page.data.tags}
-        />
+        stack ? null : (
+          <NoteMeta
+            type={page.data.type}
+            status={page.data.status}
+            interviewPriority={page.data.interviewPriority}
+            appliesTo={page.data.appliesTo}
+            lastReviewed={page.data.lastReviewed}
+            tags={page.data.tags}
+          />
+        )
       ) : (
         <DocsDescription>{page.data.description}</DocsDescription>
       )}
@@ -61,7 +65,12 @@ export default async function Page(props: PageProps<'/notes/[[...slug]]'>) {
         </p>
       ) : null}
       <DocsBody>
-        <MDX components={getMDXComponents({ a: createRelativeLink(notes, page) })} />
+        <MDX
+          components={getMDXComponents({
+            a: createRelativeLink(notes, page),
+            ...(stack ? stackHeadingComponents : {}),
+          })}
+        />
       </DocsBody>
       {overview ? (
         <div className="mt-8">

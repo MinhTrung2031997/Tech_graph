@@ -1,18 +1,46 @@
 ---
 title: "Array vs Linked List"
-description: "Placeholder outline for Array vs Linked List."
+description: "A data structure that stores elements of the same type in a contiguous /kənˈtɪɡ.ju.əs/ memory block. A dynamic data structure consisting of nodes that are randomly stored in memory."
 domain: "cs-fundamentals"
 type: "comparison"
 tags: ["data-structures"]
 status: "draft"
-placeholder: true
+article: stack
 ---
-<Tldr>
-Placeholder for Array vs Linked List. The full note is not written yet.
-</Tldr>
 
-This page is part of the CS Fundamentals tree so navigation works. It is not a copy of a Notion page.
+<ArticleStack>
+  <SplitPair>
+    <SplitCol title="Array">
 
-## What this note will cover
+- A **data structure** that stores elements of the **same type** in a **contiguous /kənˈtɪɡ.ju.əs/** memory block.
+- Elements are **independent**, and each can be **accessed directly** using an index **(O(1) time complexity)**.
+- **Insertion and deletion** can be costly **(O(n) complexity)** since elements may need to be shifted.
+- **Memory efficiency** is low if pre-allocated space is unused.
 
-Array vs Linked List: a comparison note for backend work and interviews.
+</SplitCol>
+    <SplitCol title="Linked List">
+
+- A **dynamic data structure** consisting of **nodes** that are **randomly stored** in memory.
+- Each **node** contains **data** and a **pointer** (link) to the next node.
+  - Here, data is the value stored at that particular /pɚˈtɪk.jə.lɚ/ node
+  - the link is the pointer that holds the address /ˈæd.res/ of the next node.
+    - Uses **dynamic memory allocation**, meaning memory is allocated or reallocated **as needed** at runtime.
+- Elements are **dependent** on each other, requiring **traversal (O(n) time complexity)** to access an element.
+- **Insertion and deletion** are more efficient **(O(1) complexity)** when modifying nodes.
+- **Memory-efficient** for varying data sizes, but extra memory is used for pointers.
+
+</SplitCol>
+  </SplitPair>
+  <SplitPair>
+    <SplitCol title="When to use an Array:">
+
+You need fast lookups by index, the size is known or stable, and cache efficiency matters (e.g., numerical computations, queues with bounded size).
+
+</SplitCol>
+    <SplitCol title="When to use a Linked List">
+
+You need frequent insertions/deletions at random positions, size is highly dynamic, and random access is rare (e.g., implementing stacks, queues, or certain graph adjacency representations).
+
+</SplitCol>
+  </SplitPair>
+</ArticleStack>

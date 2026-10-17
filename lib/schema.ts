@@ -16,4 +16,5 @@ export const notePageSchema = pageSchema.extend({
   sources: z.array(z.string()).optional(),
   number: z.string().optional(),
   placeholder: z.boolean().optional(),
+  article: z.enum(['stack']).optional(),
 });

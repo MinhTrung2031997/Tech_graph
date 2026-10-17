@@ -1,3 +1,4 @@
+import { ArticleStack, Divided, SplitCol, SplitLead, SplitPair } from '@/components/article-stack';
 import defaultMdxComponents from 'fumadocs-ui/mdx';
 import type { MDXComponents } from 'mdx/types';
 import type { ReactNode } from 'react';
@@ -35,6 +36,11 @@ export function getMDXComponents(components?: MDXComponents) {
     Tldr,
     Answer,
     Pitfall,
+    ArticleStack,
+    SplitPair,
+    SplitLead,
+    SplitCol,
+    Divided,
     ...components,
   } satisfies MDXComponents;
 }

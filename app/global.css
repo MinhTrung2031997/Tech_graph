@@ -176,3 +176,126 @@ html > body[data-scroll-locked] {
   font-size: 13px;
   font-weight: 500;
 }
+
+/* Quiet stack: a split pair and divided sections. Rules use the existing border gray. */
+.article-stack {
+  color: var(--color-fd-foreground);
+  font-size: 0.975rem;
+  line-height: 1.65;
+}
+
+.article-stack strong {
+  font-weight: 700;
+}
+
+.article-stack a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}
+
+.article-stack u {
+  display: block;
+  margin: 0 0 0.75rem;
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}
+
+.article-stack ul {
+  margin: 0.35rem 0 0;
+  padding-left: 1.15rem;
+  list-style: disc;
+}
+
+.article-stack li {
+  margin: 0.4rem 0;
+}
+
+.article-stack li > ul {
+  margin-top: 0.2rem;
+  list-style: circle;
+}
+
+.article-split {
+  display: grid;
+  grid-template-columns: 1fr;
+}
+
+.article-split-lead {
+  grid-column: 1 / -1;
+  margin: 0 0 1.15rem;
+}
+
+.article-split-title {
+  margin: 0 0 0.45rem;
+  font-size: 1.02rem;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.article-split-body p {
+  margin: 0;
+}
+
+.article-split-col + .article-split-col {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid #2a3142;
+}
+
+.article-stack > .article-split + .article-split,
+.article-stack > .article-split + .article-divided {
+  margin-top: 1.35rem;
+  padding-top: 1.2rem;
+  border-top: 1px solid #2a3142;
+}
+
+.article-divided h2 {
+  margin: 0 0 0.9rem;
+  font-size: 1.35rem;
+  font-weight: 700;
+  line-height: 1.3;
+  letter-spacing: -0.015em;
+}
+
+.article-divided h3 {
+  margin: 1.35rem 0 0.55rem;
+  padding-top: 1.05rem;
+  border-top: 1px solid #2a3142;
+  font-size: 1.02rem;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.article-divided h2 + h3 {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.article-divided p {
+  margin: 0 0 0.75rem;
+}
+
+.article-divided ul {
+  margin-bottom: 0.25rem;
+}
+
+@media (min-width: 768px) {
+  .article-split {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .article-split-lead + .article-split-col,
+  .article-split-col:first-child {
+    padding-right: 1.5rem;
+  }
+
+  .article-split-col + .article-split-col {
+    margin-top: 0;
+    padding-top: 0;
+    padding-left: 1.5rem;
+    border-top: 0;
+    border-left: 1px solid #2a3142;
+  }
+}
