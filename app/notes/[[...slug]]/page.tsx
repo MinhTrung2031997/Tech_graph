@@ -56,7 +56,7 @@ export default async function Page(props: PageProps<'/notes/[[...slug]]'>) {
         <DocsDescription>{page.data.description}</DocsDescription>
       )}
       {page.data.placeholder ? (
-        <p className="not-prose mb-4 rounded-lg border border-[#53401a] bg-[#221a0b] px-3 py-2 text-sm text-amber-200">
+        <p className="not-prose mb-4 rounded-lg border border-[#3a3e78] bg-[#15172e] px-3 py-2 text-sm text-[#e0e4fc]">
           Placeholder. This page keeps the category tree navigable. The full note is not written yet, and it is not copied from Notion.
         </p>
       ) : null}

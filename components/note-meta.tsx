@@ -21,7 +21,7 @@ export function NoteMeta({
 
   return (
     <div className="mb-2 flex flex-wrap items-center gap-2 text-[12.5px] text-fd-muted-foreground">
-      {type ? <Badge tone="indigo">{typeLabel(type)}</Badge> : null}
+      {type ? <Badge tone="neutral">{typeLabel(type)}</Badge> : null}
       {status ? (
         <Badge tone={statusTone(status)}>
           {status === 'reviewed' ? '● ' : null}

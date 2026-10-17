@@ -6,7 +6,7 @@ export function baseOptions(): BaseLayoutProps {
     nav: {
       title: (
         <span className="inline-flex items-center gap-2.5 font-bold tracking-tight">
-          <span className="inline-block size-[22px] rounded-md bg-gradient-to-br from-indigo-500 to-cyan-400" />
+          <span className="inline-block size-[22px] rounded-md bg-[#818cf8]" />
           {appName}
         </span>
       ),

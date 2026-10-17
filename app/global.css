@@ -37,7 +37,7 @@ html > body[data-scroll-locked] {
   --color-fd-muted-foreground: #9aa1b2;
 }
 
-/* Soft-card sidebar: rounded parent rows, expanded panel, green active pill. */
+/* Soft-card sidebar: rounded parent rows, expanded panel, indigo active pill. */
 .sidebar-card {
   display: block;
   margin: 0 0 8px;
@@ -151,13 +151,19 @@ html > body[data-scroll-locked] {
   width: fit-content;
   padding: 5px 10px;
   border-radius: 8px;
-  background: #1b463c;
-  color: #e8f7f0;
+  background: #33366b;
+  color: #eeeefe;
 }
 
 .sidebar-card-child[data-active='true']:hover {
-  background: #215646;
-  color: #f3fbf7;
+  background: #3c3f7a;
+  color: #f7f7ff;
+}
+
+/* On this page: indigo marker stays on --color-fd-primary; the label is the lighter indigo. */
+#nd-toc a[data-active='true'],
+[data-toc-popover-content] a[data-active='true'] {
+  color: #a5b4fc;
 }
 
 .sidebar-card-nested {
