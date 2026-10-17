@@ -1,5 +1,6 @@
 import { DocsLayout } from 'fumadocs-ui/layouts/notebook';
 import type { Root } from 'fumadocs-core/page-tree';
+import { sidebarCardComponents } from '@/components/sidebar-cards';
 import { baseOptions } from '@/lib/layout.shared';
 import { notes } from '@/lib/source';
 
@@ -20,7 +21,12 @@ function withInterviewLinks(tree: Root): Root {
 export default function Layout({ children }: LayoutProps<'/notes'>) {
   const options = baseOptions();
   return (
-    <DocsLayout tree={withInterviewLinks(notes.getPageTree())} {...options} nav={{ ...options.nav, mode: 'top' }}>
+    <DocsLayout
+      tree={withInterviewLinks(notes.getPageTree())}
+      {...options}
+      nav={{ ...options.nav, mode: 'top' }}
+      sidebar={{ components: sidebarCardComponents }}
+    >
       {children}
     </DocsLayout>
   );

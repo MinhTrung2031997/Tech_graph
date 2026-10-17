@@ -36,3 +36,137 @@ html > body[data-scroll-locked] {
   --color-fd-secondary: #151822;
   --color-fd-muted-foreground: #9aa1b2;
 }
+
+/* Soft-card sidebar: rounded parent rows, expanded panel, green active pill. */
+.sidebar-card {
+  display: block;
+  margin: 0 0 8px;
+  border: 1px solid #2a3142;
+  border-radius: 12px;
+  background: #161b24;
+  color: #e7e9f0;
+}
+
+.sidebar-card[data-open] {
+  background: #141820;
+}
+
+.sidebar-card:hover {
+  border-color: #3a4458;
+  background: #1b212c;
+}
+
+.sidebar-card[data-open]:hover {
+  background: #171d28;
+}
+
+.sidebar-card-row,
+.sidebar-card-nested-row {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 500;
+  line-height: 1.35;
+  text-align: start;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.sidebar-card-row {
+  padding: 10px 12px;
+  border-radius: 12px;
+}
+
+.sidebar-card-row > span,
+.sidebar-card-nested-row > span {
+  min-width: 0;
+  flex: 1;
+}
+
+/* Same glyphs and size as the current Fumadocs sidebar: 16px, left of the label. */
+.sidebar-card-row > svg:not([data-icon]),
+.sidebar-card-nested-row > svg:not([data-icon]),
+.sidebar-card-child > svg:not([data-icon]),
+.sidebar-card-label > svg:not([data-icon]) {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: #9aa1b2;
+}
+
+.sidebar-card-row svg[data-icon],
+.sidebar-card-nested-row svg[data-icon] {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  margin-inline-start: auto;
+  color: #8b93a7;
+}
+
+.sidebar-card-row:hover,
+.sidebar-card-nested-row:hover {
+  color: #f4f6fb;
+}
+
+.sidebar-card-row:focus-visible,
+.sidebar-card-nested-row:focus-visible,
+.sidebar-card-child:focus-visible {
+  outline: 1px solid #3d4a63;
+  outline-offset: -1px;
+}
+
+.sidebar-card-children {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 1px;
+  padding: 0 8px 8px 10px;
+}
+
+.sidebar-card-child {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  max-width: 100%;
+  padding: 5px 8px;
+  border-radius: 8px;
+  color: #9aa3b5;
+  font-size: 13px;
+  line-height: 1.35;
+  text-decoration: none;
+}
+
+.sidebar-card-child:hover {
+  color: #e7e9f0;
+}
+
+.sidebar-card-child[data-active='true'] {
+  width: fit-content;
+  padding: 5px 10px;
+  border-radius: 8px;
+  background: #1b463c;
+  color: #e8f7f0;
+}
+
+.sidebar-card-child[data-active='true']:hover {
+  background: #215646;
+  color: #f3fbf7;
+}
+
+.sidebar-card-nested {
+  margin: 2px 0 4px;
+}
+
+.sidebar-card-nested-row {
+  padding: 4px 8px;
+  color: #c5cad6;
+  font-size: 13px;
+  font-weight: 500;
+}
