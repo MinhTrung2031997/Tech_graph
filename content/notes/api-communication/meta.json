@@ -1,0 +1,15 @@
+{
+  "title": "06 · API & Communication",
+  "description": "REST, GraphQL, gRPC, gateways, and rate limits.",
+  "icon": "Waypoints",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "rest-api",
+    "graphql",
+    "grpc",
+    "rest-vs-graphql-vs-grpc",
+    "api-rate-limiting",
+    "api-gateway"
+  ]
+}

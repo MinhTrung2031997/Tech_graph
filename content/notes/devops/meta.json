@@ -1,0 +1,13 @@
+{
+  "title": "13 · DevOps & Tooling",
+  "description": "Docker, CI/CD, Terraform, Ansible, and Git history.",
+  "icon": "Container",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "docker-image-optimization",
+    "cicd-pipelines",
+    "terraform-vs-ansible",
+    "git-merge-vs-rebase"
+  ]
+}

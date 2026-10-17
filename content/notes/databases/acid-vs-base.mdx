@@ -1,0 +1,35 @@
+---
+title: "ACID vs BASE"
+description: "ACID is a promise about one database: the transaction is all-or-nothing, constraints hold, concurrent transactions are isolated to some level, and committed data survives a crash. BASE describes systems that stay up by a"
+domain: "databases"
+type: "comparison"
+tags: ["postgresql", "transactions"]
+status: "reviewed"
+appliesTo: "PostgreSQL 17"
+lastReviewed: "2026-10-11"
+interviewPriority: true
+related: ["databases/transaction-isolation-levels", "databases/sql-vs-nosql"]
+---
+<Tldr>
+ACID is a promise about one database: the transaction is all-or-nothing, constraints hold, concurrent transactions are isolated to some level, and committed data survives a crash. BASE describes systems that stay up by accepting stale or temporary disagreement.
+</Tldr>
+
+<Answer>
+ACID is Atomicity, Consistency, Isolation, and Durability. BASE is Basically Available, Soft state, and Eventually consistent. Isolation is not one thing. It is a dial, which is why [Transaction Isolation Levels](/notes/databases/transaction-isolation-levels) exists. I use ACID inside a service's database and design explicit compensation when a workflow crosses services.
+</Answer>
+
+## What each letter actually constrains
+
+| | ACID | BASE |
+| --- | --- | --- |
+| Failure | The transaction rolls back | The system answers even if a replica is behind |
+| Correctness | Constraints are true at commit | Invariants catch up later, if you designed them to |
+| Typical home | PostgreSQL, MySQL | Caches, logs, some distributed stores |
+
+Consistency in ACID means application invariants (foreign keys, checks), not the "C" in CAP. Mixing those two words is how this topic gets muddled in interviews.
+
+## Pitfalls
+
+<Pitfall>
+"We use a SQL database, so we are consistent" is not true once you have replicas, caches, or a second service writing its own database. Isolation level and replication lag are separate knobs.
+</Pitfall>

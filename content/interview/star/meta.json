@@ -1,0 +1,9 @@
+{
+  "title": "STAR Stories",
+  "pages": [
+    "kafka-consumer-lag",
+    "kafka-ordering",
+    "iot-chart-timeout",
+    "dashboard-preaggregation"
+  ]
+}

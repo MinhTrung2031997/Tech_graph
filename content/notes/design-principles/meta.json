@@ -1,0 +1,12 @@
+{
+  "title": "02 · Design Principles & Patterns",
+  "description": "SOLID, classic design patterns, and dependency injection.",
+  "icon": "Shapes",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "solid-principles",
+    "design-patterns-gof",
+    "ioc-dependency-injection"
+  ]
+}

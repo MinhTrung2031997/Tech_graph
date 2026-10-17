@@ -1,0 +1,15 @@
+{
+  "title": "07 · Security",
+  "description": "Authentication, authorization, tokens, cookies, and a Node.js checklist.",
+  "icon": "Shield",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "authentication-vs-authorization",
+    "jwt",
+    "oauth",
+    "api-authentication-methods",
+    "cookies-vs-sessions",
+    "nodejs-security-checklist"
+  ]
+}

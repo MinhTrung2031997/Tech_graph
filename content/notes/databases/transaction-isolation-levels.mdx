@@ -1,0 +1,136 @@
+---
+title: "Transaction Isolation Levels"
+description: "Isolation levels define which anomalies concurrent transactions may observe. Higher levels prevent more anomalies at the cost of more locking or more retries. PostgreSQL implements Repeatable Read as snapshot isolation."
+domain: "databases"
+type: "concept"
+tags: ["postgresql", "mysql", "mvcc"]
+status: "reviewed"
+appliesTo: "PostgreSQL 17, MySQL 8.4"
+lastReviewed: "2026-10-12"
+interviewPriority: true
+related: ["databases/acid-vs-base", "concurrency/race-conditions", "databases/mysql-vs-postgresql"]
+sources: ["https://www.postgresql.org/docs/current/transaction-iso.html", "https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html"]
+---
+<Tldr>
+Isolation levels define which anomalies concurrent transactions may observe. Higher levels prevent more anomalies at the cost of more locking or more retries. PostgreSQL implements Repeatable Read as snapshot isolation.
+</Tldr>
+
+<Answer>
+There are four ANSI levels: Read Uncommitted, Read Committed, Repeatable Read, and Serializable. Each one rules out more anomalies — dirty reads, non-repeatable reads, and phantoms. In practice Postgres uses MVCC snapshots, so readers never block writers. Its Repeatable Read does not show phantoms, and Serializable may abort a transaction that the application must retry.
+</Answer>
+
+## Anomalies by level
+
+A **dirty read** sees another transaction's uncommitted write. A **non-repeatable read** sees a committed update to a row it already read. A **phantom** sees a newly committed row that matches a predicate it already queried.
+
+<table>
+  <thead>
+    <tr>
+      <th>Level</th>
+      <th>Dirty read</th>
+      <th>Non-repeatable read</th>
+      <th>Phantom read</th>
+      <th>PostgreSQL in practice</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Read Uncommitted</td>
+      <td><span className="text-red-400">possible</span></td>
+      <td><span className="text-red-400">possible</span></td>
+      <td><span className="text-red-400">possible</span></td>
+      <td>behaves as Read Committed</td>
+    </tr>
+    <tr>
+      <td>Read Committed</td>
+      <td><span className="text-green-400">prevented</span></td>
+      <td><span className="text-red-400">possible</span></td>
+      <td><span className="text-red-400">possible</span></td>
+      <td>default</td>
+    </tr>
+    <tr>
+      <td>Repeatable Read</td>
+      <td><span className="text-green-400">prevented</span></td>
+      <td><span className="text-green-400">prevented</span></td>
+      <td><span className="text-amber-300">ANSI: possible</span></td>
+      <td>snapshot, no phantoms</td>
+    </tr>
+    <tr>
+      <td>Serializable</td>
+      <td><span className="text-green-400">prevented</span></td>
+      <td><span className="text-green-400">prevented</span></td>
+      <td><span className="text-green-400">prevented</span></td>
+      <td>SSI, may abort and must be retried</td>
+    </tr>
+  </tbody>
+</table>
+
+### ANSI vs PostgreSQL and MySQL
+
+PostgreSQL never shows dirty reads. Asking for Read Uncommitted silently runs as Read Committed. The default is Read Committed: each statement sees a fresh snapshot, so a later statement in the same transaction can observe commits that happened after the previous statement.
+
+Repeatable Read in PostgreSQL is snapshot isolation. The snapshot is taken at the first statement, and every later statement uses it, so phantoms from concurrent commits do not appear. That is stronger than the ANSI definition of Repeatable Read.
+
+Serializable in PostgreSQL is Serializable Snapshot Isolation. It does not take the read locks a textbook would. It watches for dangerous read/write dependency cycles and aborts one transaction with SQLSTATE `40001`. The application retries the whole transaction.
+
+MySQL InnoDB's default is Repeatable Read. It stops many phantoms with next-key locks: a lock on the index record plus the gap before it. InnoDB's Read Uncommitted really can return dirty reads. Its Serializable level turns plain `SELECT` into locking reads (`LOCK IN SHARE MODE`).
+
+## Avoiding lost updates
+
+Read Committed does not stop two transactions from reading the same balance and both writing a new one. The second commit overwrites the first. That is a lost update, and it is allowed at every level except, in practice, the ones that lock or abort.
+
+<CodeBlockTabs defaultValue="sql">
+  <CodeBlockTabsList>
+    <CodeBlockTabsTrigger value="sql">transfer.sql</CodeBlockTabsTrigger>
+    <CodeBlockTabsTrigger value="ts">transfer.ts</CodeBlockTabsTrigger>
+  </CodeBlockTabsList>
+  <CodeBlockTab value="sql">
+
+```sql title="transfer.sql"
+BEGIN ISOLATION LEVEL READ COMMITTED;
+SELECT balance FROM accounts WHERE id = 42 FOR UPDATE; -- [!code highlight]
+UPDATE accounts SET balance = balance - 100 WHERE id = 42;
+COMMIT;
+```
+
+  </CodeBlockTab>
+  <CodeBlockTab value="ts">
+
+```ts title="transfer.ts"
+await db.transaction(async (tx) => {
+  const [row] = await tx`
+    SELECT balance FROM accounts WHERE id = ${42} FOR UPDATE
+  `;
+  await tx`
+    UPDATE accounts SET balance = balance - ${100} WHERE id = ${42}
+  `;
+  return row;
+});
+```
+
+  </CodeBlockTab>
+</CodeBlockTabs>
+
+An atomic `UPDATE accounts SET balance = balance - 100` is enough when the new value is a pure function of the current row. `FOR UPDATE` is for when the application must read the row, decide, and then write. Optimistic locking (`UPDATE … WHERE version = $1`) is the other pattern: the write fails if someone else committed first, and the app retries.
+
+## Pitfalls
+
+<Pitfall>
+Read Committed alone does not prevent lost updates. Use `SELECT … FOR UPDATE`, an atomic `UPDATE`, or optimistic locking. See [Race Conditions & Concurrency Control](/notes/concurrency/race-conditions).
+</Pitfall>
+
+## Interview questions
+
+<details>
+<summary>Why does PostgreSQL not have phantom reads at Repeatable Read?</summary>
+
+Its Repeatable Read is snapshot isolation. Every statement in the transaction reads the same snapshot taken at the first query, so rows inserted and committed by others later are invisible.
+
+</details>
+
+<details>
+<summary>How does InnoDB's next-key locking differ from PostgreSQL's SSI?</summary>
+
+InnoDB blocks conflicting inserts by locking index records plus the gaps between them. PostgreSQL's Serializable Snapshot Isolation does not block. It tracks read/write dependencies and aborts one transaction on a dangerous cycle, so the app must retry.
+
+</details>

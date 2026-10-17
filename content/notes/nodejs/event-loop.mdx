@@ -1,0 +1,53 @@
+---
+title: "Event Loop & Task Queues"
+description: "Node.js runs JavaScript on one main thread. The event loop interleaves timers, I/O callbacks, and microtasks so many connections can be in flight without a thread per request. CPU-heavy synchronous work blocks every conn"
+domain: "nodejs"
+type: "concept"
+tags: ["nodejs"]
+status: "reviewed"
+appliesTo: "Node.js 22"
+lastReviewed: "2026-10-08"
+interviewPriority: true
+related: ["nodejs/sync-vs-async", "nodejs/cluster-worker-threads"]
+sources: ["https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick"]
+---
+<Tldr>
+Node.js runs JavaScript on one main thread. The event loop interleaves timers, I/O callbacks, and microtasks so many connections can be in flight without a thread per request. CPU-heavy synchronous work blocks every connection on that process.
+</Tldr>
+
+<Answer>
+The event loop is a set of phases. Timers (`setTimeout`) run, then poll waits for I/O, then `setImmediate` runs in the check phase. Between phases, Node drains `process.nextTick` and then resolved Promises. Libuv's thread pool covers some blocking work (file system, DNS, crypto), but your JavaScript still runs on one thread.
+</Answer>
+
+## Phases that matter
+
+| Phase | What runs |
+| --- | --- |
+| Timers | `setTimeout` and `setInterval` callbacks whose delay has elapsed |
+| Poll | Incoming I/O. If the queue is empty, it may wait here |
+| Check | `setImmediate` |
+| Close | `socket.on('close')` and similar |
+
+`process.nextTick` and Promise reactions are microtasks. They run before the loop moves to the next phase. A `nextTick` that schedules another `nextTick` can starve I/O.
+
+## What actually leaves the main thread
+
+Network sockets are non-blocking on the main thread. `fs` APIs, `dns.lookup`, and `crypto.pbkdf2` can use the libuv thread pool (default size 4, via `UV_THREADPOOL_SIZE`). That pool is small. A burst of CPU-heavy `pbkdf2` calls queues behind each other even though the API is async.
+
+## Pitfalls
+
+<Pitfall>
+`await` does not make CPU work concurrent. A tight loop, `JSON.parse` of a huge payload, or synchronous `bcrypt` still blocks the loop. Move that work to a worker thread, or break it up. See [Cluster & Worker Threads](/notes/nodejs/cluster-worker-threads).
+</Pitfall>
+
+## Interview questions
+
+<details>
+<summary>Why can one Node process serve thousands of connections?</summary>
+Most of those connections are waiting on the network. The process stores a small amount of state per socket and wakes the callback when the kernel says the socket is readable. Threads are not created per request.
+</details>
+
+<details>
+<summary>What is the difference between `nextTick` and `setImmediate`?</summary>
+`nextTick` runs before the event loop continues, as soon as the current operation finishes. `setImmediate` runs in the check phase, after poll. Use `setImmediate` when you want to yield to I/O.
+</details>

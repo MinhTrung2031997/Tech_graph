@@ -1,0 +1,13 @@
+{
+  "title": "10 · Messaging & Jobs",
+  "description": "Kafka, RabbitMQ, and BullMQ: logs, queues, and background work.",
+  "icon": "MessagesSquare",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "kafka-fundamentals",
+    "rabbitmq-fundamentals",
+    "kafka-vs-rabbitmq",
+    "bullmq"
+  ]
+}

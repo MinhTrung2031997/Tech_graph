@@ -1,0 +1,37 @@
+---
+title: "Kafka Fundamentals"
+description: "Kafka is a distributed log. Producers append records to a topic partition. Consumers read by offset and track progress themselves. Order is guaranteed inside one partition, not across a topic. Modern clusters use KRaft i"
+domain: "messaging"
+type: "concept"
+tags: ["kafka"]
+status: "reviewed"
+appliesTo: "Kafka 4.x"
+lastReviewed: "2026-10-10"
+related: ["messaging/kafka-vs-rabbitmq", "messaging/rabbitmq-fundamentals"]
+sources: ["https://kafka.apache.org/documentation/#intro_concepts"]
+---
+<Tldr>
+Kafka is a distributed log. Producers append records to a topic partition. Consumers read by offset and track progress themselves. Order is guaranteed inside one partition, not across a topic. Modern clusters use KRaft instead of ZooKeeper.
+</Tldr>
+
+<Answer>
+A topic is split into partitions. Each partition is an ordered, append-only log. A consumer group splits partitions across members, so two consumers in one group do not read the same partition. Consumer lag is the difference between the log end offset and the group's committed offset. Records stay for the retention window even after they are consumed, which is why a new group can replay history.
+</Answer>
+
+## Words I keep straight
+
+| Term | Meaning |
+| --- | --- |
+| Offset | Position of a record in a partition |
+| Consumer group | A set of consumers sharing the partitions of a topic |
+| Commit | The group recording "I have processed up to here" |
+| Lag | Log end offset minus the committed offset |
+| KRaft | Kafka's own consensus for cluster metadata. ZooKeeper is gone in current versions |
+
+The group coordinator assigns partitions. When a member dies, partitions move and in-flight records may be processed again. Delivery is at-least-once unless you turn on transactions and design the consumer to be idempotent.
+
+## Pitfalls
+
+<Pitfall>
+A key chooses the partition. If you need order for one account, key by that account. If you key by nothing, you get throughput and no order across records that belong together.
+</Pitfall>

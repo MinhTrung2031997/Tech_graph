@@ -1,0 +1,14 @@
+{
+  "title": "01 · CS Fundamentals",
+  "description": "Core computer-science ideas that show up in backend interviews: data structures, processes, and how to talk about them.",
+  "icon": "BookOpen",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "oop-fundamentals",
+    "array-vs-linked-list",
+    "sorting-algorithms",
+    "process-vs-thread",
+    "uml-diagrams"
+  ]
+}

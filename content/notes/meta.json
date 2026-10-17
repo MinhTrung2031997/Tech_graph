@@ -1,0 +1,20 @@
+{
+  "title": "Notes",
+  "pages": [
+    "index",
+    "cs-fundamentals",
+    "design-principles",
+    "javascript-typescript",
+    "nodejs",
+    "backend-frameworks",
+    "api-communication",
+    "security",
+    "databases",
+    "concurrency",
+    "messaging",
+    "architecture",
+    "frontend",
+    "devops",
+    "testing-process"
+  ]
+}

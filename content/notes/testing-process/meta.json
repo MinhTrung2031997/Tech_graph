@@ -1,0 +1,11 @@
+{
+  "title": "14 · Testing & Process",
+  "description": "What to test at which layer, and the delivery process around the code.",
+  "icon": "FlaskConical",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "testing-strategy",
+    "sdlc-scrum"
+  ]
+}
