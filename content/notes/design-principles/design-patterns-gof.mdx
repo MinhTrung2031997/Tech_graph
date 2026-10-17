@@ -1,18 +1,132 @@
 ---
 title: "Design Patterns (GoF)"
-description: "Placeholder outline for Design Patterns (GoF)."
+description: "Design Pattern is an existing design pattern that helps maintain and extend the code, and optimizes the solidity in the code)"
 domain: "design-principles"
 type: "pattern"
 tags: ["design-patterns"]
 status: "draft"
-placeholder: true
+article: stack
 ---
-<Tldr>
-Placeholder for Design Patterns (GoF). The full note is not written yet.
-</Tldr>
 
-This page is part of the Design Principles & Patterns tree so navigation works. It is not a copy of a Notion page.
+<ArticleStack>
 
-## What this note will cover
+- Design Pattern is an existing design pattern that helps maintain and extend the code, and optimizes the solidity in the code)
+- It's not the code, it's the way we write the code
+- Ensure principles
+- When you apply a design pattern You need to consider Should it be applied, if so, see if it has a modern influence?
 
-Design Patterns (GoF): a pattern note for backend work and interviews.
+<Divided>
+
+## Strategy Design pattern
+
+- Is a behavioral design pattern that lets you define a family of algorithms, put each of them into a separate class, and make their objects interchangeable.
+- Design patterns help abstract the behavior (behavior, method, function) of an object  by exposing implementations (interfaces) to different classes.
+- In TypeScript, you can implement the Strategy Design Pattern using interfaces and classes. Here's a simple example:
+
+```typescript
+// Define the strategy interface
+interface PaymentStrategy {
+  pay(amount: number): void;
+}
+
+// Implement concrete strategies
+class CreditCardPayment implements PaymentStrategy {
+  pay(amount: number): void {
+    console.log(`Paying ${amount} using credit card.`);
+  }
+}
+
+class PayPalPayment implements PaymentStrategy {
+  pay(amount: number): void {
+    console.log(`Paying ${amount} using PayPal.`);
+  }
+}
+
+class CashPayment implements PaymentStrategy {
+  pay(amount: number): void {
+    console.log(`Paying ${amount} in cash.`);
+  }
+}
+
+// Context class that uses the strategy
+class ShoppingCart {
+  private paymentStrategy: PaymentStrategy;
+
+  constructor(paymentStrategy: PaymentStrategy) {
+    this.paymentStrategy = paymentStrategy;
+  }
+
+  checkout(amount: number): void {
+    this.paymentStrategy.pay(amount);
+  }
+}
+
+// Example usage
+const cart1 = new ShoppingCart(new CreditCardPayment());
+cart1.checkout(100);
+
+const cart2 = new ShoppingCart(new PayPalPayment());
+cart2.checkout(50);
+
+const cart3 = new ShoppingCart(new CashPayment());
+cart3.checkout(30);
+```
+
+In this example:
+
+- **`PaymentStrategy`** is the interface that defines the contract for concrete strategy classes.
+- **`CreditCardPayment`**, **`PayPalPayment`**, and **`CashPayment`** are concrete strategy classes implementing the **`PaymentStrategy`** interface.
+- **`ShoppingCart`** is the context class that uses a strategy to perform the payment.
+
+By encapsulating the payment algorithms in separate strategy classes, you can easily switch between different payment methods without modifying the **`ShoppingCart`** class. This promotes flexibility and allows you to add new payment methods without affecting the existing code.
+
+- mẫu thiết kế giúp bạn trừu tượng hóa những hành vi (behavior, method, function) của một đối tượng bằng cách đưa ra những cài đặt (interface) vào những lớp khác nhau.
+- Áp dụng thay đổi các chức năng thường xuyên ở các lớp con
+  (Apply changes to regular functions in subclasses)
+- tách rời phần xử lý một chức năng cụ thể ra khỏi đối tượng hoặc đoạn code thay đổi quá nhiều lần nên tách ra khỏi chương trình chính
+  (separate the handling of a particular function from the object)
+- Thay đổi behavior của object trong run time
+
+## Observer Design Pattern
+
+- Usually used in 1-n relationships between objects. Where an object changes and wants to notify all related objects about that change
+- When changing one object, it is required to change another object and we do not know how many objects need to be changed, who these objects are
+
+## Singleton Design Pattern
+
+- Ensure that a class has only one instance (initialization)
+- Config file, caching
+
+## Decorator (/ˈdekəreɪtər/) Design pattern
+
+- The Decorator pattern is used to extend the functionality of an object without changing the current class or constructor. This pattern can be used to add new features to an object.
+
+## Builder Design Pattern
+
+- Break down the constructor into many smaller components
+- Initialize objects from different things
+- Why to break it down: When there is a constructor (many parameters) too large, the data is hard to distinguish → Difficult to build an object → Difficult for others to understand what you write
+
+## Factory Method Design Pattern
+
+- Interface is a pattern that uses special methods to create objects without specifying the exact class or constructor
+- Apply for we need to initialize multiple object types depends on certain conditions
+- Avoid using logic in different places from being duplicated
+
+## Adapter Design Pattern
+
+- Convert an interface of a class → to another interface client expected
+- Support for incompatible
+- Use for interface with different modules to integrate together
+- Don't change the software behavior, just change the interface
+
+## Abstract Factory Design Pattern
+
+## Command Design Pattern
+
+## Proxy Design Pattern
+
+## Facade Design Pattern
+
+</Divided>
+</ArticleStack>
