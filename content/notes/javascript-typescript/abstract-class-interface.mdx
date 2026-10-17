@@ -1,0 +1,79 @@
+---
+title: "Abstract Class - Interface"
+description: "Abstract classes can contain both abstract methods and regular methods with an implementation."
+domain: "javascript-typescript"
+type: "comparison"
+tags: ["typescript"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+  <SplitPair>
+    <SplitCol title="Abstract Class:">
+
+1. **Partial Implementation:** Abstract classes can contain both abstract methods and regular methods with an implementation. Abstract methods must be implemented by the concrete subclasses.
+2. **Single Inheritance:** TypeScript supports single inheritance, so a class can extend only one abstract class.
+3. **Access Modifiers:** Abstract class members can have access modifiers (public, private, protected).
+4. **Constructor:** Abstract classes can have constructors, and they can be used to initialize properties.
+
+**Example:**
+
+```typescript
+abstract class Shape {
+    abstract draw(): void; // Abstract method
+
+    move() {
+        console.log("Moving the shape");
+    }
+}
+
+class Circle extends Shape {
+    draw() {
+        console.log("Drawing a circle");
+    }
+}
+
+class Square extends Shape {
+    draw() {
+        console.log("Drawing a square");
+    }
+}
+```
+
+</SplitCol>
+    <SplitCol title="Interface">
+
+1. **No Implementation:** Interfaces in TypeScript only declare the structure of the members (properties and methods) that a class must have. They don't provide any implementation.
+2. **Multiple Inheritance:** TypeScript interfaces support multiple inheritance. A class can implement multiple interfaces.
+3. **No Access Modifiers:** Interface members are always public and cannot have access modifiers (public, private, protected).
+4. **Declaration /ˌdek.ləˈreɪ.ʃən/ Merging:** Interfaces in TypeScript support declaration merging, which means you can extend or merge multiple interfaces with the same name.
+
+**Example:**
+
+```typescript
+interface Shape {
+    draw(): void;
+}
+
+class Circle implements Shape {
+    draw() {
+        console.log("Drawing a circle");
+    }
+}
+
+class Square implements Shape {
+    draw() {
+        console.log("Drawing a square");
+    }
+}
+```
+
+</SplitCol>
+  </SplitPair>
+  <Divided>
+
+⇒ In summary, use interfaces when you want to define a contract with no implementation and support multiple inheritance. Use abstract classes when you want to provide some common functionality along with a contract that the subclasses must implement, and when you need single inheritance.
+
+</Divided>
+</ArticleStack>

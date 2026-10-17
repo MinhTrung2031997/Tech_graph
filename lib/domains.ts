@@ -24,7 +24,7 @@ export const domains: Domain[] = [
   {
     number: '03',
     slug: 'javascript-typescript',
-    title: 'JavaScript & TypeScript',
+    title: 'Typescript - Javascript',
     description: 'Language details I rely on every day: scope, types, equality, and the parts of modern JavaScript that still surprise people.',
     icon: 'FileCode',
   },

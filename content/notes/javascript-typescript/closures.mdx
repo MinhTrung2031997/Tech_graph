@@ -1,0 +1,26 @@
+---
+title: "Closures"
+description: "A closure is a feature in JavaScript where a function remembers and can access variables from its outer scope, even after the outer function has finished executing."
+domain: "javascript-typescript"
+type: "concept"
+tags: ["javascript"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+  <Divided>
+
+- A closure is a feature in JavaScript where a function remembers and can access variables from its outer scope, even after the outer function has finished executing.
+- The key question is: If `outer()` has finished executing, why can `inner()` still access `name`? ⇒ Because the returned function retains access to its lexical environment through a closure.
+- Why is this useful? ⇒ Closures let us preserve state between function calls without using global variables.
+
+2. Where do we use closures in real projects?
+
+- Data privacy: Keep variables accessible only through specific functions.
+- Callbacks: Access variables from the scope where a callback was created.
+- Event handlers: Remember information needed when an event occurs later.
+- Function factories: Create customized functions, such as counters or configurable handlers.
+
+</Divided>
+</ArticleStack>

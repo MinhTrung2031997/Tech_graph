@@ -1,0 +1,175 @@
+---
+title: "Type And Interface"
+description: "Both can define the shape of objects and functions."
+domain: "javascript-typescript"
+type: "comparison"
+tags: ["typescript"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+  <Divided>
+
+## Similarities
+
+- Both can define the shape of objects and functions.
+- Both can be extended or implemented by other types or classes.
+
+```javascript
+// Both can define object shapes
+interface PersonInterface {
+  name: string;
+  age: number;
+}
+
+type PersonType = {
+  name: string;
+  age: number;
+};
+
+// Both can be implemented by classes
+class MyPerson implements PersonInterface { // or implements PersonType
+  name: string;
+  age: number;
+  constructor(name: string, age: number) {
+    this.name = name;
+    this.age = age;
+  }
+}
+```
+
+## Differences
+
+</Divided>
+  <SplitPair>
+    <SplitLead>1. Declaration /ˌdek.ləˈreɪ.ʃən/ Merging</SplitLead>
+    <SplitCol title="interface">
+
+`interface` supports declaration merging. If you declare multiple interfaces with the same name, TypeScript will merge their members into a single interface. This is particularly useful when working with libraries or when you want to extend existing types.
+
+**When to use `interface`:** When you need the ability for definitions with the same name to automatically merge. This is common in declaration files (`.d.ts`) to extend built-in types or when a library wants to allow users to add properties to its types.
+
+```javascript
+// interface merging
+interface Box {
+  width: number;
+}
+
+interface Box {
+  height: number;
+}
+
+let myBox: Box = { width: 10, height: 20 }; // Merged interface has both width and heig
+```
+
+</SplitCol>
+    <SplitCol title="type">
+
+`type` **does not** support declaration merging. Declaring two types with the same name in the same scope will result in an error.
+
+**When to use `type`:** When you want to explicitly define a type that will not be automatically merged with other definitions of the same name.
+
+```javascript
+// type will NOT merge (causes a duplicate identifier error)
+type Point = {
+  x: number;
+};
+
+// This would cause an error: Duplicate identifier 'Point'.
+// type Point = {
+//   y: number;
+// };
+```
+
+</SplitCol>
+  </SplitPair>
+  <SplitPair>
+    <SplitLead>2. Defining Types other than Object Shapes</SplitLead>
+    <SplitCol title="type">
+
+`type` can define aliases /ˈeɪ.li.əs/ for primitive /ˈprɪm.ə.t̬ɪv/ types, union types, tuple types, mapped types, and conditional types.
+
+**When to use `type`:** For anything other than a plain object/function shape, especially:
+
+- **Primitives:** `type ID = string;`
+- **Unions:** `type Status = "active" | "inactive" | "pending";`
+- **Tuples:** `type HTTPResponse = [number, string];`
+- **Mapped Types:** `type Readonly<T> = { readonly [P in keyof T]: T[P] };`
+- **Conditional Types:** `type IsString<T> = T extends string ? true : false;`
+
+```javascript
+// Examples where type is necessary or preferred
+type Result<T, E> = { success: T } | { error: E }; // Union
+type PointTuple = [number, number]; // Tuple
+type Dictionary<T> = { [key: string]: T }; // Index Signature (can also be in interface)
+type Nullable<T> = T | null | undefined; // Union with primitives
+
+// interface cannot define these directly
+// interface Status = "active" | "inactive"; // Error
+```
+
+</SplitCol>
+    <SplitCol title="interface">
+
+`interface` is **primarily** used to define the shape of objects and functions. It cannot directly represent primitives, unions, or tuples in the same way `type` can.
+
+</SplitCol>
+  </SplitPair>
+  <SplitPair>
+    <SplitLead>3. Extending</SplitLead>
+    <SplitCol title="interface">
+
+`interface` uses the `extends` keyword to inherit from other interfaces or types.
+
+**When to use `interface` for extending:** Often preferred for extending other interfaces, as it uses the dedicated `extends` keyword which can sometimes be slightly more readable for inheritance hierarchies. /ˈhaɪə.rɑː.ki/
+
+```javascript
+interface Animal {
+  name: string;
+}
+
+interface Dog extends Animal { // using extends
+  breed: string;
+}
+```
+
+</SplitCol>
+    <SplitCol title="type">
+
+`type` uses the `&` (**ampersand /ˈæm.pɚ.sænd/**) operator (intersection types) to combine properties from other types or interfaces.
+
+**When to use `type` for extending/combining:** Required when combining unions, primitives, or other non-object types. Also works perfectly fine for combining object types.
+
+```javascript
+type AnimalType = {
+  name: string;
+};
+
+type DogType = AnimalType & { // using & for intersection
+  breed: string;
+};
+
+// Combining a type alias for an object with an interface
+interface CatInterface {
+  purrs: boolean;
+}
+
+type CuteCat = CatInterface & AnimalType; // Combining interface and type
+```
+
+</SplitCol>
+  </SplitPair>
+  <Divided>
+
+A common and often recommended approach is:
+
+- Use `interface` for defining the shape of **objects** and **API contracts**. This leverages declaration merging which can be helpful, especially in larger projects or when writing library definitions.
+- Use `type` for everything **else**: primitive aliases, unions, tuples, mapped types, conditional types, and when you need to combine types using intersections (`&`).
+
+Consistency within your project is generally more important than strictly adhering to one rule everywhere. Choose a convention and stick to it.
+
+In many simple cases where you're just defining a basic object shape, `interface` and `type` are largely interchangeable in terms of functionality. The decision often comes down to whether you need declaration merging (`interface`) or need to define types other than object shapes (`type`).
+
+</Divided>
+</ArticleStack>

@@ -201,10 +201,18 @@ html > body[data-scroll-locked] {
   text-underline-offset: 0.15em;
 }
 
-.article-stack ul {
+.article-stack ul,
+.article-stack ol {
   margin: 0.35rem 0 0;
   padding-left: 1.15rem;
+}
+
+.article-stack ul {
   list-style: disc;
+}
+
+.article-stack ol {
+  list-style: decimal;
 }
 
 .article-stack li {
@@ -214,6 +222,37 @@ html > body[data-scroll-locked] {
 .article-stack li > ul {
   margin-top: 0.2rem;
   list-style: circle;
+}
+
+.article-stack li > ol {
+  margin-top: 0.2rem;
+}
+
+.article-stack :not(pre) > code {
+  border-radius: 0.25rem;
+  background: #1b212c;
+  padding: 0.1em 0.35em;
+  font-size: 0.9em;
+}
+
+.article-stack figure {
+  margin: 0.85rem 0 0.35rem;
+}
+
+.article-stack table {
+  width: 100%;
+  margin: 0.85rem 0 0.35rem;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.article-stack th,
+.article-stack td {
+  border: 1px solid #2a3142;
+  padding: 0.45rem 0.65rem;
+  text-align: left;
+  vertical-align: top;
 }
 
 .article-split {
@@ -234,7 +273,29 @@ html > body[data-scroll-locked] {
 }
 
 .article-split-body p {
+  margin: 0 0 0.75rem;
+}
+
+.article-split-body p:last-child {
+  margin-bottom: 0;
+}
+
+.article-split-lead h2 {
+  margin: 0 0 0.85rem;
+  padding: 0;
+  border: 0;
+  font-size: 1.35rem;
+  font-weight: 700;
+  line-height: 1.3;
+  letter-spacing: -0.015em;
+}
+
+.article-split-lead p {
   margin: 0;
+}
+
+.article-split-lead p + p {
+  margin-top: 0.75rem;
 }
 
 .article-split-col + .article-split-col {
@@ -245,6 +306,8 @@ html > body[data-scroll-locked] {
 
 .article-stack > .article-split + .article-split,
 .article-stack > .article-split + .article-divided,
+.article-stack > .article-divided + .article-split,
+.article-stack > .article-divided + .article-divided,
 .article-stack > p + .article-divided,
 .article-stack > ul + .article-divided,
 .article-stack > .article-divided + p {

@@ -1,0 +1,130 @@
+---
+title: "Use Strict"
+description: "The purpose of \"use strict\" is to indicate that the code should be executed in \"strict mode\"."
+domain: "javascript-typescript"
+type: "concept"
+tags: ["javascript"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+
+**Use strict:** The purpose of `"use strict"` is to indicate that the code should be executed in "strict mode"
+
+  <Divided>
+
+## Do not assign a value to an undeclared variable
+
+```javascript
+// Strict mode
+
+function strictFunc() {
+  "use strict"
+  username = "Marie"
+  console.log(username)
+}
+
+strictFunc()
+
+=> username is not defined
+```
+
+## The parameters of a function must not have the same name.
+
+```javascript
+function addNums (num, num) {
+  "use strict"
+  console.log(num + num)
+}
+
+addNums(2, 3)
+
+=> Duplicate parameter name not allowed in this context
+```
+
+## Throw an error if using the `delete` keyword.
+
+```javascript
+"use strict";
+
+// Define a variable in strict mode
+var myVar = 42;
+
+try {
+  // Try to delete the variable in strict mode
+  delete myVar;
+} catch (error) {
+  // Catch the error and log it
+  console.error("Error:", error.message);
+}
+```
+
+## Declaring variables in binary notation is not allowed.
+
+```javascript
+"use strict";
+let x = 010;
+```
+
+## Octal numeric literals are not allowed:
+
+```javascript
+"use strict";
+let x = "\010";            // This will cause an error
+```
+
+## Writing to a read-only property is not allowed
+
+```javascript
+"use strict";
+const obj = {};
+Object.defineProperty(obj, "x", {value:0, writable:false});
+
+obj.x = 3.14;            // This will cause an error
+```
+
+## Writing to a get-only property is not allowed
+
+```javascript
+"use strict";
+const obj = {get x() {return 0} };
+obj.x = 3.14;            // This will cause an error
+```
+
+## The word `eval` cannot be used as a variable
+
+```javascript
+"use strict";
+let eval = 3.14;         // This will cause an error
+```
+
+## The word `arguments` cannot be used as a variable
+
+```javascript
+"use strict";
+with (Math){x = cos(2)}; // This will cause an error
+```
+
+## The `with` statement is not allowed
+
+```javascript
+"use strict";
+with (Math){x = cos(2)}; // This will cause an error
+```
+
+## Do not use the following keywords for declarations: (list the keywords here)
+
+- `implements`
+- `interface`
+- `let`
+- `package`
+- `private`
+- `protected`
+- `public`
+- `static`
+- `yield`
+- `arguments`
+
+</Divided>
+</ArticleStack>
