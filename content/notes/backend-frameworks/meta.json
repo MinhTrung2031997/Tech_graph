@@ -5,8 +5,7 @@
   "collapsible": true,
   "defaultOpen": false,
   "pages": [
-    "nestjs-modules",
-    "nestjs-design-patterns",
-    "express-vs-nestjs"
+    "nestjs",
+    "express-design-application"
   ]
 }
