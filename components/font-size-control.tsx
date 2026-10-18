@@ -88,21 +88,22 @@ export function FontSizeControl({ className }: { className?: string }) {
 }
 
 /** Desktop search field, with the size control on its right. */
-export function ContentSearch({ className, ...props }: FullSearchTriggerProps) {
+/** Desktop search field, with the size control on its right. */
+export function ContentSearch({ className, style, ...props }: FullSearchTriggerProps) {
   return (
-    <>
-      <FullSearchTrigger className={className} {...props} />
+    <div className="contents">
+      <FullSearchTrigger className={className} style={{ maxWidth: 240, ...style }} {...props} />
       <FontSizeControl className="my-auto max-md:hidden shrink-0" />
-    </>
+    </div>
   );
 }
 
 /** Mobile search icon, with the size control beside it. */
 export function ContentSearchIcon(props: SearchTriggerProps) {
   return (
-    <>
+    <div className="contents">
       <FontSizeControl className="my-auto shrink-0" />
       <SearchTrigger {...props} />
-    </>
+    </div>
   );
 }
