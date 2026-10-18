@@ -1,5 +1,8 @@
-import { englishPaths, englishTitleForSlug } from '@/lib/english';
-import { DocsPage, DocsTitle } from 'fumadocs-ui/layouts/notebook/page';
+import { stackHeadingComponents } from '@/components/article-stack';
+import { getMDXComponents } from '@/components/mdx';
+import { englishPaths, englishSets, englishTitleForSlug } from '@/lib/english';
+import { english } from '@/lib/source';
+import { DocsBody, DocsPage, DocsTitle } from 'fumadocs-ui/layouts/notebook/page';
 import { Text } from 'lucide-react';
 import type { Metadata } from 'next';
 import { notFound, redirect } from 'next/navigation';
@@ -21,13 +24,31 @@ function EmptyOnThisPage() {
 export default async function Page(props: PageProps<'/english/[[...slug]]'>) {
   const params = await props.params;
   const slug = params.slug ?? [];
+  const interview = englishSets.find((set) => set.id === 'interview');
 
   if (slug.length === 0 || (slug.length === 1 && slug[0] === 'interview')) {
-    redirect('/english/interview/self-introduction');
+    redirect(interview?.href ?? '/english/interview/microservice-benefits');
   }
 
   const title = englishTitleForSlug(slug);
   if (!title) notFound();
+
+  const doc = english.getPage(slug);
+  if (doc) {
+    const MDX = doc.data.body;
+    return (
+      <DocsPage toc={doc.data.toc} breadcrumb={{ enabled: false }} footer={{ enabled: false }}>
+        <DocsTitle>{doc.data.title}</DocsTitle>
+        <DocsBody>
+          <MDX
+            components={getMDXComponents({
+              ...(doc.data.article === 'stack' ? stackHeadingComponents : {}),
+            })}
+          />
+        </DocsBody>
+      </DocsPage>
+    );
+  }
 
   return (
     <DocsPage toc={[]} breadcrumb={{ enabled: false }} footer={{ enabled: false }} tableOfContent={{ component: <EmptyOnThisPage /> }}>
@@ -45,6 +66,10 @@ export function generateStaticParams() {
 export async function generateMetadata(props: PageProps<'/english/[[...slug]]'>): Promise<Metadata> {
   const params = await props.params;
   const slug = params.slug ?? [];
+  const doc = english.getPage(slug);
+  if (doc) {
+    return { title: doc.data.title, description: doc.data.description };
+  }
   const title = englishTitleForSlug(slug);
   if (!title) return {};
   return { title };
