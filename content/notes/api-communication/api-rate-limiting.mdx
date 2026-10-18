@@ -1,18 +1,115 @@
 ---
 title: "API Rate Limiting"
-description: "Placeholder outline for API Rate Limiting."
+description: "API Rate Limiting is a mechanism that controls how many API requests a client can make within a fixed time window (per second, per minute, per hour)."
 domain: "api-communication"
 type: "how-to"
 tags: ["http"]
 status: "draft"
-placeholder: true
+article: stack
 ---
-<Tldr>
-Placeholder for API Rate Limiting. The full note is not written yet.
-</Tldr>
 
-This page is part of the API & Communication tree so navigation works. It is not a copy of a Notion page.
+<ArticleStack>
+<Divided>
 
-## What this note will cover
+## What it is
 
-API Rate Limiting: a how-to note for backend work and interviews.
+**API Rate Limiting** is a mechanism that controls how many API requests a client can make within a fixed time window (per second, per minute, per hour).
+
+It protects your system from:
+
+- Overload
+- Abuse
+- DDoS-like traffic
+- Sudden traffic spikes
+- Expensive operations are being called too frequently
+
+## Simple definition
+
+**API Rate Limit = Max number of API requests allowed for each client in a specific time.**
+
+- **60 requests per minute per user**
+- **1000 requests per hour per API key**
+- **5 requests per second per IP**
+- **100 requests per minute globally**
+
+## Why it matters
+
+- ✔ Prevents servers from crashing
+- ✔ Prevents brute-force attacks
+- ✔ Protects paid APIs from overuse
+- ✔ Ensures fair usage among clients
+- ✔ Controls cost (for APIs billed per request)
+- ✔ Increases reliability during load spikes
+
+## Strategies
+
+### Fixed window
+
+- Count requests in a time window (1 min, 1 hour)
+- Easy to implement
+- Not smooth during boundary jumps (spikes)
+
+### Sliding window
+
+- Uses a rolling time window
+- More accurate and fair
+- Harder to implement
+
+### Token bucket
+
+(Most popular)
+
+- Tokens added to a bucket over time
+- Each request consumes a token
+- Allows short bursts
+- Used by: AWS, GCP, Cloudflare
+
+### Leaky bucket
+
+- Similar to token bucket
+- Processes requests at a fixed rate
+
+## Flow
+
+- Request comes in
+- Check the client’s remaining quota
+- If quota > 0 → allow & reduce quota
+- If quota = 0 → block with **429 — Too Many Requests**
+- Reset quota after time window expires
+
+## Client identity
+
+Rate limit can be applied by:
+
+- **IP address** (public APIs)
+- **User ID** (authenticated systems)
+- **API key / token**
+- **Device ID**
+- **Session**
+- **Route-specific**
+- **Global limit** (for whole API/server)
+
+## Practice
+
+Example in Express:
+
+```javascript
+import rateLimit from 'express-rate-limit';
+
+const limiter = rateLimit({
+  windowMs: 60 * 1000,  // 1 minute
+  max: 100,             // limit each IP to 100 requests per minute
+});
+
+app.use('/api', limiter);
+```
+
+Example in NestJS:
+
+```typescript
+@UseGuards(ThrottlerGuard)
+@Throttle(10, 60)  // 10 requests per 60 seconds
+```
+
+</Divided>
+</ArticleStack>

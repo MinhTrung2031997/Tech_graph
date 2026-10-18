@@ -1,18 +1,58 @@
 ---
-title: "REST API"
-description: "Placeholder outline for REST API."
+title: "Restful API"
+description: "REST (Representational State Transfer) is an architectural style that uses standard HTTP methods (GET, POST, PUT, DELETE) and exposes resources via URLs."
 domain: "api-communication"
 type: "concept"
 tags: ["http", "rest"]
 status: "draft"
-placeholder: true
+article: stack
 ---
-<Tldr>
-Placeholder for REST API. The full note is not written yet.
-</Tldr>
 
-This page is part of the API & Communication tree so navigation works. It is not a copy of a Notion page.
+<ArticleStack>
 
-## What this note will cover
+REST (Representational State Transfer) is an architectural style that uses standard HTTP methods (GET, POST, PUT, DELETE) and exposes resources via URLs.
 
-REST API: a concept note for backend work and interviews.
+<SplitPair>
+  <SplitCol title="Pros">
+
+- **Simple design and easy to understand**
+  - The resource-based structure makes the API intuitive /ɪnˈtuː.ɪ.t̬ɪv/. A developer can quickly guess what is the purpose of the API
+- **Easy to test and debug**
+  - REST commonly uses JSON, which is human-readable /ˈriː.də.bəl/ and easy to inspect ɪnˈspekt/. Developers can manually test endpoints through the browser or Postman.
+- **Strong support for caching**
+  - REST can rely on built-in HTTP caching features such as:
+    - `Cache-Control`
+    - `ETag`
+    - `Last-Modified`
+  - This reduces load on servers and improves performance significantly, especially for data that doesn’t change often.
+- **Great ecosystem and tooling**
+  - REST has been the default for decades. Tools like OpenAPI/Swagger, Postman, API Gateway, Kong, Nginx, and load balancers support REST without extra configuration.
+- **Works on every platform**
+  - Any device that supports HTTP can use REST:
+    - Browsers
+    - Mobile apps
+    - Smart TVs
+    - IoT devices
+    - Server-side scripts
+
+</SplitCol>
+  <SplitCol title="Cons">
+
+- **Overfetching**
+  - Clients receive more data than they need.
+- **Underfetching**
+  - Sometimes clients need to call multiple endpoints to build one UI screen
+- **Versioning overhead**
+  - When you need to make backward-incompatible changes, REST commonly forces you to publish `/v1`, `/v2`, `/v3` of the API. Over years, this becomes difficult to maintain.
+- **Weak type safety**
+  - Payloads are dynamic JSON. Errors happen at runtime instead of compile time. You can easily send or receive the wrong fields.
+- **Limited real-time support**
+  - REST does not support streaming or push communication. To get updates, clients must:
+    - poll repeatedly, or
+    - switch to WebSockets or Server-sent events (SSE)
+  - REST is not naturally designed for real-time communication.
+
+</SplitCol>
+</SplitPair>
+
+</ArticleStack>
