@@ -1,0 +1,243 @@
+---
+title: "NESTJS, EXPRESS (DESIGN APPLICATION)"
+description: "When to Choose Express.js or NestJS (System Design Perspective)"
+domain: "backend-frameworks"
+type: "comparison"
+tags: ["nestjs", "express"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+
+When to Choose Express.js or NestJS (System Design Perspective)
+
+<SplitPair>
+<SplitLead>
+
+## Project complexity
+
+</SplitLead>
+<SplitCol title="Express.js">
+
+**Choose Express.js when:**
+
+- You are building **simple or mid-size APIs** (CRUD services, internal tools, prototypes).
+- Architecture is **not too complex**, no strict domain boundaries.
+- You want **full freedom** to design the folder structure and patterns.
+
+**Because:**
+
+Express is minimalist. You decide everything (routing, validation, architecture).
+
+</SplitCol>
+<SplitCol title="NestJS">
+
+**Choose NestJS when:**
+
+- Building **large-scale, enterprise-grade systems**.
+- You need layered architecture like **controllers, services, modules**.
+- Your project has **multiple domains**, microservices, or complex business rules.
+
+**Because:**
+
+NestJS enforces structure → easier to scale with many modules and developers.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Team size
+
+</SplitLead>
+<SplitCol title="Express.js">
+
+- Best for **small teams (1–4 developers)**.
+- Works well if developers already know Node.js deeply.
+- Less structure → easier to move fast, but harder to standardize.
+
+</SplitCol>
+<SplitCol title="NestJS">
+
+- Best for **medium or large teams (5+ developers)**.
+- Built-in architecture enforces consistency:
+  - DTOs
+  - Dependency Injection
+  - Modules
+  - Providers
+- Easier onboarding for new devs.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Learning curve
+
+</SplitLead>
+<SplitCol title="Express.js">
+
+- Very **easy to learn**.
+- You manually add:
+  - validation
+  - DI (if needed)
+  - folder structure
+  - architectural rules
+- Fast to start, slower to maintain.
+
+</SplitCol>
+<SplitCol title="NestJS">
+
+- **Higher learning curve** (decorators, DI, modules, providers).
+- After learning, productivity dramatically /drəˈmæt̬.ɪ.kəl.i/ increases:
+  - CLI code generation
+  - auto DI
+  - built-in testing patterns
+  - consistent architecture
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Architecture
+
+</SplitLead>
+<SplitCol title="Express.js">
+
+- No architecture by default.
+- You need to design your own:
+  - folder structure
+  - service layers
+  - error handling patterns
+- Good for flexible or experimental architectures.
+
+</SplitCol>
+<SplitCol title="NestJS">
+
+- Provides **opinionated /əˈpɪn.jə.neɪ.t̬ɪd/ architecture**:
+  - Modules
+  - Controllers
+  - Guards
+  - Pipes
+  - Interceptors
+- Great for DDD, clean architecture, microservices.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Performance
+
+Both frameworks run on top of **Node.js**, performance is almost equal.
+
+In high-scale systems, performance differences come from **system design**, not the framework.
+
+</SplitLead>
+<SplitCol title="Express.js">
+
+Express.js is slightly faster **out of the box** (lighter).
+
+</SplitCol>
+<SplitCol title="NestJS">
+
+NestJS adds abstraction layers → slightly heavier but **negligible** in real systems.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Microservices
+
+</SplitLead>
+<SplitCol title="Express.js">
+
+- No built-in support.
+- You must manually integrate Kafka, MQTT, Redis, NATS.
+
+</SplitCol>
+<SplitCol title="NestJS">
+
+- First-class support for microservices:
+  - Kafka
+  - NATS
+  - RabbitMQ
+  - Redis
+  - gRPC
+  - WebSockets
+- Built-in module system fits event-driven architecture perfectly.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Testing
+
+</SplitLead>
+<SplitCol title="Express.js">
+
+- Manual setup for testing (Supertest + Jest or Mocha).
+
+</SplitCol>
+<SplitCol title="NestJS">
+
+- Provides ready testing utilities:
+  - TestingModule
+  - DI mocking
+- Much better for enterprise test coverage.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Maintainability
+
+</SplitLead>
+<SplitCol title="Express.js">
+
+- Maintenance cost increases as the codebase grows.
+- Harder to enforce conventions in a growing team.
+- Depends on developer discipline.
+
+</SplitCol>
+<SplitCol title="NestJS">
+
+- Convention-driven → predictable structure.
+- Easier refactoring.
+- Long-term maintainability is significantly better.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Recommendation
+
+</SplitLead>
+<SplitCol title="Express.js">
+
+**Choose Express.js if:**
+
+- You want something lightweight, quick, flexible.
+- Small team or solo developer.
+- Simple or medium-complexity services.
+- You design your own architecture and control everything.
+
+</SplitCol>
+<SplitCol title="NestJS">
+
+**Choose NestJS if:**
+
+- You are building a **large-scale system**, microservices, high traffic backend.
+- You want **clean architecture**, modular /ˈmɒdʒ.ə.lər/ structure, strong patterns.
+- Many developers work together and need consistent code.
+- You want built-in DI, testing, validation, pipes, guards, interceptors.
+
+</SplitCol>
+</SplitPair>
+</ArticleStack>

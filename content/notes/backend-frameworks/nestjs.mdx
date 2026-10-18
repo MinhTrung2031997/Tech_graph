@@ -1,0 +1,450 @@
+---
+title: "NESTJS"
+description: "NestJS applications are organized into modules, which encapsulate related components, controllers, services, and other features."
+domain: "backend-frameworks"
+type: "concept"
+tags: ["nestjs"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+<Divided>
+
+## Patterns
+
+Design patterns in NestJS
+
+### Module
+
+- Ứng dụng NestJS được tổ chức thành các module, mỗi module chứa các thành phần liên quan như controller, service và các tính năng khác. Điều này giúp tổ chức mã nguồn một cách modul và giúp cho việc mở rộng dễ dàng
+- NestJS applications are organized into modules, which encapsulate related components, controllers, services, and other features. This helps in organizing code and making it more modular and scalable.
+
+```typescript
+// users.module.ts
+import { Module } from '@nestjs/common';
+import { UserController } from './user.controller';
+import { UserService } from './user.service';
+
+@Module({
+  controllers: [UserController],
+  providers: [UserService],
+})
+export class UsersModule {}
+```
+
+```typescript
+// user.controller.ts
+import { Controller, Get } from '@nestjs/common';
+import { UserService } from './user.service';
+
+@Controller('users')
+export class UserController {
+  constructor(private readonly userService: UserService) {}
+
+  @Get()
+  getUsers(): string {
+    return this.userService.getUsers();
+  }
+}
+```
+
+```typescript
+// user.service.ts
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class UserService {
+  getUsers(): string {
+    return 'List of users';
+  }
+}
+```
+
+### Dependency injection
+
+- NestJS chủ yếu sử dụng mô hình Dependency Injection. Nó sử dụng các decorator như `@Injectable()` và `@Inject()` để quản lý các phụ thuộc giữa các thành phần khác nhau một cách module và dễ kiểm thử.
+- NestJS relies heavily on the Dependency Injection pattern. It uses decorators like `@Injectable()` and `@Inject()` to manage the dependencies between different components in a modular way. This promotes code reusability and testability.
+
+```typescript
+// user.service.ts
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class UserService {
+  getUsers(): string[] {
+    return ['User1', 'User2', 'User3'];
+  }
+}
+```
+
+Now, you want to create a controller that uses this service to get a list of users:
+
+```typescript
+// user.controller.ts
+import { Controller, Get } from '@nestjs/common';
+import { UserService } from './user.service';
+
+@Controller('users')
+export class UserController {
+  constructor(private readonly userService: UserService) {}
+
+  @Get()
+  getUsers(): string[] {
+    return this.userService.getUsers();
+  }
+}
+```
+
+In this example:
+
+- The `UserService` class is decorated with `@Injectable()` to indicate that it can be injected into other components.
+- The `UserController` class has a constructor that takes an instance of `UserService` as a parameter. NestJS uses the constructor parameter type to determine what to inject.
+- When a request is made to the `/users` endpoint, the `getUsers` method of `UserController` is executed, which in turn calls the `getUsers` method of the injected `UserService`.
+
+### Decorator
+
+- Decorators trong NestJS được sử dụng để mở rộng hoặc thay đổi hành vi của các class, method, property hoặc tham số. Các decorator phổ biến bao gồm `@Module()`, `@Controller()`, `@Injectable()`, và nhiều decorator khác.
+- Decorators in NestJS are used to enhance or modify the behavior of classes, methods, properties, or parameters. Common decorators include `@Module()`, `@Controller()`, `@Injectable()`, and many others. Decorators provide a clean and expressive way to configure and extend the functionality of components.
+
+1. **@Module() Decorator:** Used to define a module in NestJS. Modules encapsulate related components, such as controllers, services, and other features.
+
+```typescript
+@Module({
+  controllers: [MyController],
+  providers: [MyService],
+})
+export class MyModule {}
+```
+
+2. **@Controller() Decorator:** Marks a class as a controller. Controllers handle incoming HTTP requests and contain methods (endpoints) that define the application's routes.
+
+```typescript
+@Controller('example')
+export class MyController {
+  // ...
+}
+```
+
+3. **@Injectable() Decorator:** Indicates that a class is injectable and can be used as a provider in NestJS. It is often applied to services.
+
+```typescript
+@Injectable()
+export class MyService {
+  // ...
+}
+```
+
+4. **@Inject() Decorator:** Used to inject dependencies into a class constructor or method. It is commonly used in conjunction with the `@Injectable()` decorator.
+
+```typescript
+@Injectable()
+export class MyService {
+  constructor(@Inject('EXAMPLE_TOKEN') private readonly example: Example) {}
+}
+```
+
+5. **@Get(), @Post(), etc. Decorators:** Used to define HTTP request handlers within controllers. These decorators define the HTTP method (GET, POST, etc.) associated with a particular route.
+
+```typescript
+@Controller('example')
+export class MyController {
+  @Get()
+  getExample(): string {
+    return 'This is an example.';
+  }
+}
+```
+
+6. **@Param(), @Query(), etc. Decorators:** Used to extract parameters from HTTP requests in controllers.
+
+```typescript
+@Controller('example')
+export class MyController {
+  @Get(':id')
+  getExample(@Param('id') id: string): string {
+    return `Received ID: ${id}`;
+  }
+}
+```
+
+7. **@UseGuards(), @UseInterceptors(), etc. Decorators:** Applied to controllers or methods to attach middleware, guards, or interceptors.
+
+```typescript
+@Controller('example')
+@UseGuards(AuthGuard)
+export class MyController {
+  // ...
+}
+```
+
+### Singleton
+
+- Các service trong NestJS, khi được đánh dấu bằng decorator `@Injectable()`, mặc định được xử lý như các singleton, tức là chỉ có một phiên bản của service trong toàn ứng dụng. Điều này hữu ích để chia sẻ trạng thái và tài nguyên hiệu quả.
+- Services in NestJS, when marked with the `@Injectable()` decorator, are by default treated as singletons. This means that there is a single instance of the service throughout the application. This is useful for sharing state and resources efficiently.
+
+⇒ In the context of NestJS or other object-oriented programming languages, the Singleton pattern can be implemented by marking a class as a singleton. In NestJS, services decorated with `@Injectable()` are, by default, treated as singletons, meaning there is only one instance of the service throughout the application.
+
+Here's a simple example of a Singleton service in NestJS:
+
+```typescript
+// singleton.service.ts
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class SingletonService {
+  private data: string;
+
+  constructor() {
+    this.data = 'This is a singleton service';
+  }
+
+  getData(): string {
+    return this.data;
+  }
+}
+```
+
+In this example:
+
+- The `SingletonService` class is marked with the `@Injectable()` decorator, making it eligible for dependency injection and treated as a singleton by default.
+- The constructor is used to initialize any necessary state or resources.
+- The `getData` method provides access to the singleton data.
+
+Now, when you inject `SingletonService` into multiple components (e.g., controllers or other services) in your NestJS application, they all share the same instance:
+
+```typescript
+// other.service.ts
+import { Injectable } from '@nestjs/common';
+import { SingletonService } from './singleton.service';
+
+@Injectable()
+export class OtherService {
+  constructor(private readonly singletonService: SingletonService) {}
+
+  useSingleton(): string {
+    return this.singletonService.getData();
+  }
+}
+```
+
+In the example above, `OtherService` injects `SingletonService` and uses its methods. Since `SingletonService` is a singleton, all instances of `OtherService` within the application will share the same instance of `SingletonService`.
+
+### Interceptors
+
+- Xử lý và sửa đổi đối tượng yêu cầu/phản hồi một cách toàn cầu, cho phép thực hiện các hành động trước hoặc sau khi controller hoặc service thực thi.
+- Interceptors in NestJS are used to process and modify the request/response objects globally, allowing you to perform actions before or after the execution of controllers or services. They are implemented using the interceptor pattern.
+
+⇒ In NestJS, the Interceptors pattern is a structural design pattern that allows you to process and potentially modify the request, response, or data flowing between a client and a server. Interceptors provide a way to execute logic before or after the execution of a controller or service method. They are implemented using interceptors, which are classes annotated with the `@Injectable()` decorator and implementing the `NestInterceptor` interface.
+
+Here's an example of using interceptors in NestJS:
+
+```typescript
+// logging.interceptor.ts
+import { Injectable, NestInterceptor, ExecutionContext, CallHandler } from '@nestjs/common';
+import { Observable } from 'rxjs';
+import { tap } from 'rxjs/operators';
+
+@Injectable()
+export class LoggingInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    console.log('Before request is handled...');
+
+    const now = Date.now();
+
+    return next
+      .handle()
+      .pipe(
+        tap(() => console.log(`After request is handled... Time: ${Date.now() - now}ms`)),
+      );
+  }
+}
+```
+
+In this example:
+
+- `LoggingInterceptor` is an interceptor class decorated with `@Injectable()` and implementing the `NestInterceptor` interface.
+- The `intercept` method is called before and after the request is handled by the corresponding controller or route handler.
+- The `ExecutionContext` provides information about the current execution context, and `CallHandler` is a class responsible for handling the call.
+
+To use the interceptor, you need to apply it to either a specific route handler or a controller:
+
+```typescript
+// app.controller.ts
+import { Controller, Get, UseInterceptors } from '@nestjs/common';
+import { LoggingInterceptor } from './logging.interceptor';
+
+@Controller()
+@UseInterceptors(LoggingInterceptor)
+export class AppController {
+  @Get()
+  getHello(): string {
+    return 'Hello World!';
+  }
+}
+```
+
+In this example, the `@UseInterceptors(LoggingInterceptor)` decorator is used to apply the `LoggingInterceptor` to the entire `AppController`. Now, every time a request is made to any endpoint in `AppController`, the `LoggingInterceptor` will log information before and after the request is handled.
+
+Interceptors can be useful for tasks such as logging, modifying the response, handling errors, or performing other cross-cutting concerns. They provide a clean and modular way to extend the behavior of your application without cluttering your controllers or services with additional logic.
+
+### Repository
+
+- Khi làm việc với cơ sở dữ liệu, NestJS thường sử dụng mẫu repository để trừu tượng hóa logic tương tác với cơ sở dữ liệu. Điều này thường xuất hiện khi sử dụng các ORM như TypeORM.
+- When working with databases, NestJS often uses the repository pattern to abstract away the database interaction logic. This pattern is commonly seen when using ORMs (Object-Relational Mappers) like TypeORM.
+
+### Facade
+
+- Mẫu Facade được áp dụng khi tạo một giao diện đơn giản để tương tác với các module phức tạp, giúp giao tiếp với hệ thống con dễ dàng hơn. Trong NestJS, controller thường đóng vai trò của facade bằng cách cung cấp một API đơn giản cho các client.
+- The Facade pattern is applied when creating a simplified interface to a set of modules, making it easier to interact with complex subsystems. In NestJS, controllers often serve as facades by providing a simplified API to clients.
+
+### Observable
+
+- Xử lý các hoạt động không đồng bộ, đặc biệt là khi làm việc với giao tiếp qua WebSocket và các tính năng thời gian thực khác.
+- NestJS leverages observables for handling asynchronous operations, especially in the context of WebSocket communication and other real-time feature
+
+⇒ The Observable Pattern is a behavioral design pattern where an object, known as the subject, maintains a list of dependents, known as observers, that are notified of any changes in the subject's state. This pattern is particularly useful for implementing distributed event handling systems and is often associated with the publish-subscribe model.
+
+In the context of NestJS, the Observable Pattern is commonly used in the implementation of real-time features, such as WebSocket communication, where multiple clients (observers) are interested in changes to certain data or events.
+
+Here's an example of using the Observable Pattern with NestJS and WebSockets:
+
+1. **Define an Observable Service:**
+
+```typescript
+// observable.service.ts
+import { Injectable } from '@nestjs/common';
+import { Subject, Observable } from 'rxjs';
+
+@Injectable()
+export class ObservableService {
+  private subject = new Subject<string>();
+
+  sendData(data: string): void {
+    this.subject.next(data);
+  }
+
+  getDataObservable(): Observable<string> {
+    return this.subject.asObservable();
+  }
+}
+```
+
+2. **Use the Observable Service in a Controller:**
+
+```typescript
+// observable.controller.ts
+import { Controller, Get } from '@nestjs/common';
+import { ObservableService } from './observable.service';
+import { Observable } from 'rxjs';
+
+@Controller('observable')
+export class ObservableController {
+  constructor(private readonly observableService: ObservableService) {}
+
+  @Get('send/:data')
+  sendEvent(@Param('data') data: string): string {
+    this.observableService.sendData(data);
+    return 'Event sent!';
+  }
+
+  @Get('subscribe')
+  subscribe(): Observable<string> {
+    return this.observableService.getDataObservable();
+  }
+}
+```
+
+3. **WebSocket Gateway:**
+
+To fully demonstrate the Observable Pattern in the context of NestJS, you might want to use a WebSocket Gateway to manage WebSocket connections and handle events:
+
+```typescript
+// websocket.gateway.ts
+import { SubscribeMessage, WebSocketGateway, WebSocketServer } from '@nestjs/websockets';
+import { ObservableService } from './observable.service';
+import { Server } from 'socket.io';
+
+@WebSocketGateway()
+export class WebSocketGateway {
+  @WebSocketServer()
+  private server: Server;
+
+  constructor(private readonly observableService: ObservableService) {}
+
+  @SubscribeMessage('subscribeToData')
+  handleSubscribe(client: any): void {
+    const observable = this.observableService.getDataObservable();
+    const subscription = observable.subscribe((data: string) => {
+      client.emit('data', data);
+    });
+
+    client.on('disconnect', () => {
+      subscription.unsubscribe();
+    });
+  }
+}
+```
+
+In this example:
+
+- The `ObservableService` encapsulates the observable logic using RxJS's `Subject` and provides methods to send data (`sendData`) and get an observable (`getDataObservable`).
+- The `ObservableController` has endpoints to send events (`sendEvent`) and subscribe to events (`subscribe`).
+- The `WebSocketGateway` demonstrates how to use the Observable Pattern with WebSockets. Clients can subscribe to data changes, and the gateway sends updates when the `ObservableService` emits new data.
+
+This is a simplified example, and in a real-world scenario, you might want to enhance error handling, security, and other considerations based on your application's requirements.
+
+## Modules
+
+How to does the module NestJS works
+
+- Mỗi ứng dụng có ít nhất một module - **Root module**. Root module là điểm bắt đầu mà Nest sử dụng để xây dựng biểu đồ ứng dụng. Khi ứng dụng NestJS khởi động, nó sẽ tìm tất cả các modules đã định nghĩa và tạo ra một đồ thị phụ thuộc dựa trên dependencies giữa các module.
+- Mỗi Module có thể có các thành phần như controllers, providers, imports (module mà module hiện tại phụ thuộc vào), và exports (các thành phần mà module hiện tại chia sẻ với các module khác).
+- Modules có thể được sử dụng trong các module khác bằng cách import chúng.
+- Importing một module sẽ mang theo tất cả các controllers, services, và providers từ module đó.
+
+## Request lifecycle
+
+In general, the request lifecycle looks like the following:
+
+1. Incoming request
+2. Middleware
+   - 2.1. Globally bound middleware
+   - 2.2. Module bound middleware
+3. Guards
+   - 3.1 Global guards
+   - 3.2 Controller guards
+   - 3.3 Route guards
+4. Interceptors (pre-controller)
+   - 4.1 Global interceptors
+   - 4.2 Controller interceptors
+   - 4.3 Route interceptors
+5. Pipes
+   - 5.1 Global pipes
+   - 5.2 Controller pipes
+   - 5.3 Route pipes
+   - 5.4 Route parameter pipes
+6. Controller (method handler)
+7. Service (if exists)
+8. Interceptors (post-request)
+   - 8.1 Route interceptor
+   - 8.2 Controller interceptor
+   - 8.3 Global interceptor
+9. Exception filters
+   - 9.1 route
+   - 9.2 controller
+   - 9.3 global
+10. Server response
+
+## Lifecycle events
+
+## Scopes
+
+**Lifecycle Management:** Manages the lifecycle of providers based on their **scope**:
+
+- **SINGLETON (default):** One instance per application (within the module scope).
+- **REQUEST:** One instance per HTTP request.
+- **TRANSIENT:** A new instance each time the dependency is injected.
+
+</Divided>
+</ArticleStack>

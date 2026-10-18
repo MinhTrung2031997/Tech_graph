@@ -43,7 +43,7 @@ export const domains: Domain[] = [
     icon: 'AppWindow',
   },
   {
-    number: '06',
+    number: '05',
     slug: 'backend-frameworks',
     title: 'Backend Frameworks',
     description: 'NestJS and Express: modules, the request lifecycle, and which framework fits which service.',
