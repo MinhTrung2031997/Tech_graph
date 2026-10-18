@@ -1,0 +1,122 @@
+---
+title: "var, let, and const"
+description: "var declarations are function-scoped or globally-scoped."
+domain: "javascript-typescript"
+type: "comparison"
+tags: ["javascript"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+  <Divided>
+
+## `var` (Older Way - ES5 and earlier)
+
+- **Scope:** `var` declarations are **function-scoped** or **globally-scoped**. This means a variable declared with `var` is accessible anywhere within the function it's declared in, or globally if declared outside of any function. They ignore block scope (like `if` statements or `for` loops).
+- **Hoisting:** `var` declarations are **hoisted** to the top of their scope (function or global). This means you can use a `var` variable before it is declared in the code. However, only the *declaration* is hoisted, not the *initialization*. So, if you access a `var` before its assignment, its value will be `undefined`.
+- **Reassignment & Redeclaration:** Variables declared with `var` can be **reassigned** and **redeclared** within the same scope without throwing an error.
+
+```javascript
+// var example
+function demonstrateVar() {
+  console.log(x); // Output: undefined (due to hoisting)
+  var x = 10;
+  console.log(x); // Output: 10
+
+  if (true) {
+    var y = 20; // Function-scoped, NOT block-scoped
+    console.log(y); // Output: 20
+  }
+  console.log(y); // Output: 20 (accessible outside the if block)
+
+  var x = 30; // Redeclaration is allowed
+  console.log(x); // Output: 30
+}
+demonstrateVar();
+// console.log(x); // Error: x is not defined (scoped to the function)
+```
+
+**Issues with `var`:** The lack of block scope and the behavior of hoisting and redeclaration can lead to unexpected bugs, especially in larger codebases or complex loops and conditional structures where variables might unintentionally overwrite each other or "leak" out of blocks.
+
+## `let` (Modern Way - ES6+)
+
+- **Scope:** `let` declarations are **block-scoped**. This means a variable declared with `let` is only accessible within the block (`{}`) where it is defined. This includes `if` blocks, `for` loops, `while` loops, and simple standalone blocks.
+- **Hoisting:** `let` declarations are also **hoisted**, but they are not initialized. Accessing a `let` variable before its declaration in the code results in a `ReferenceError`. This period between the start of the block scope and the variable's declaration is called the **Temporal Dead Zone (TDZ)**.
+
+```javascript
+// let example
+function demonstrateLet() {
+  // console.log(a); // ReferenceError: Cannot access 'a' before initialization (TDZ)
+  let a = 10;
+  console.log(a); // Output: 10
+
+  if (true) {
+    let b = 20; // Block-scoped
+    console.log(b); // Output: 20
+  }
+  // console.log(b); // Error: b is not defined (scoped to the if block)
+
+  a = 30; // Reassignment is allowed
+  console.log(a); // Output: 30
+
+  // let a = 40; // Error: Identifier 'a' has already been declared (Redeclaration not allowed)
+}
+demonstrateLet();
+```
+
+## `const` (Modern Way - ES6+)
+
+- **Scope:** `const` declarations are also **block-scoped**, just like `let`.
+- **Hoisting:** Similar to `let`, `const` declarations are hoisted but are in the **Temporal Dead Zone (TDZ)**. Accessing a `const` before its declaration results in a `ReferenceError`.
+- **Reassignment & Redeclaration:** Variables declared with `const` **cannot** be **reassigned** after initialization, and they **cannot** be **redeclared** in the same scope. A `const` variable **must** be initialized at the time of declaration.
+
+```javascript
+// const example
+function demonstrateConst() {
+  // const PI; // Error: Missing initializer in const declaration (must be initialized)
+  const PI = 3.14;
+  console.log(PI); // Output: 3.14
+
+  // PI = 3.14159; // Error: Assignment to constant variable (Reassignment not allowed)
+
+  if (true) {
+    const greeting = "hello"; // Block-scoped
+    console.log(greeting); // Output: "hello"
+  }
+  // console.log(greeting); // Error: greeting is not defined (scoped to the if block)
+
+  // const PI = 3.0; // Error: Identifier 'PI' has already been declared (Redeclaration not allowed)
+
+  // Important Note: const with objects/arrays
+  const person = { name: "Alice" };
+  person.name = "Bob"; // Allowed: Modifying properties of a const object is allowed
+  console.log(person); // Output: { name: "Bob" }
+
+  // person = { name: "Charlie" }; // Error: Assignment to constant variable (Cannot reassign the object itself)
+
+  const numbers = [1, 2, 3];
+  numbers.push(4); // Allowed: Modifying elements of a const array is allowed
+  console.log(numbers); // Output: [ 1, 2, 3, 4 ]
+}
+demonstrateConst();
+```
+
+The `const` keyword indicates that the variable's *binding* is constant. You cannot change which value the variable *points to*. However, if the value is an object or array, the *contents* of that object or array can still be mutated.
+
+## Summary Table:
+
+| Feature | `var` | `let` | `const` |
+| --- | --- | --- | --- |
+| **Scope** | Function/Global | Block | Block |
+| **Hoisting** | Yes (`undefined`) | Yes (TDZ/`RefErr`) | Yes (TDZ/`RefErr`) |
+| **Reassignment** | Yes | Yes | No |
+| **Redeclaration** | Yes | No | No |
+| **Initialization** | Optional | Optional | Required |
+
+## Modern Best Practices:
+
+Since ES6, the general recommendation for variable declarations is to **prefer `const` by default** and use `let` only when you know the variable needs to be reassigned later. Avoid using `var` in new code to prevent potential issues related to its scoping and hoisting behavior. This approach makes your code more predictable and easier to understand.
+
+</Divided>
+</ArticleStack>

@@ -1,0 +1,85 @@
+---
+title: "Pass by value and pass by reference"
+description: "A copy of the variable's value is passed to the function."
+domain: "javascript-typescript"
+type: "comparison"
+tags: ["javascript"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+  <SplitPair>
+    <SplitCol title="Pass by Value">
+
+- **What is passed?** A *copy* of the variable's value is passed to the function.
+- **How it works:** The function receives its own separate copy of the data. Any modifications made to the parameter inside the function only affect this copy. The original variable outside the function remains unchanged.
+- **Analogy:** Imagine giving someone a *photocopy* of a document. They can write all over their copy, but your original document is unaffected.
+- **Typically applies to:** Primitive data types (like numbers, strings, booleans) in many languages.
+
+```javascript
+function modifyValue(num) {
+  num = num + 10; // Modifies the *copy* of the value inside the function
+  console.log("Inside function:", num);
+}
+
+let originalNumber = 5;
+modifyValue(originalNumber);
+console.log("Outside function:", originalNumber); // Output: 5 (original is unchanged)
+```
+
+In this example, `modifyValue` gets a copy of `originalNumber`'s value (which is 5). It changes its internal `num` to 15, but the `originalNumber` variable outside the function is not affected.
+
+</SplitCol>
+    <SplitCol title={'Pass by Reference (or often, "Pass by Value of the Reference")'}>
+
+- **What is passed?** Instead of a copy of the value, a way to *access* the original variable or the memory location where the data is stored is passed. This could be a direct memory address (like a pointer) or a reference (an alias to the original).
+- **How it works:** The function works directly with the original data in memory. Any modifications made to the data *through this reference* inside the function will affect the original variable outside the function.
+- **Analogy:** Imagine giving someone the *key* to a locker. They can open the locker and change its contents, and those changes are permanent to the *original* locker.
+- **Typically applies to:** Objects and arrays in many languages (though often implemented as "Pass by Value of the Reference" - see below).
+
+</SplitCol>
+  </SplitPair>
+  <Divided>
+
+## Here's how that works:
+
+- **What is passed?** A *copy of the reference* (the memory address) to the object or array is passed to the function.
+- **How it works:** The function parameter becomes a *new variable*, but it holds the *same memory address* as the original variable outside the function. Both the original variable and the function parameter point to the *same object/array* in memory.
+  - If you modify the **contents** (properties of an object, elements of an array) using the function parameter, the original object/array is affected because you're operating on the same data in memory.
+  - If you **reassign** the function parameter to point to a *completely new object or array*, this only changes what the *parameter variable* points to. It does **not** change what the original variable outside the function points to.
+
+**Example (JavaScript with an object):**
+
+```javascript
+function modifyObject(obj) {
+  // Modifying a property of the object (contents)
+  obj.name = "Bob";
+  console.log("Inside function (modified prop):", obj); // Output: { name: "Bob", age: 30 }
+
+  // Reassigning the parameter to a *new* object
+  obj = { name: "Charlie", age: 35 };
+  console.log("Inside function (reassigned param):", obj); // Output: { name: "Charlie", age: 35 }
+}
+
+let originalObject = { name: "Alice", age: 30 };
+modifyObject(originalObject);
+
+// Output: { name: "Bob", age: 30 }
+// The original object's 'name' property was changed because 'obj' and 'originalObject'
+// pointed to the same object initially. But the reassignment inside the function
+// did not affect what 'originalObject' points to.
+console.log("Outside function:", originalObject);
+```
+
+## Key Distinction Summary
+
+- **Pass by Value:** The function gets a *copy* of the data. Changes to the parameter **variable itself** inside the function *do not* affect the original variable outside. (Applies to primitives in JS).
+- **Pass by Reference (or Value of Reference):** The function gets a way to *access* the original data.
+  - In true "pass by reference" languages, changes to the parameter variable can sometimes affect the original variable binding.
+  - In "pass by value of reference" languages (like JS for objects/arrays), changing the *contents* of the data via the parameter *does* affect the original data, but **reassigning the parameter variable itself** does *not* affect what the original variable points to.
+
+Understanding this distinction is crucial for predicting how function calls will affect your data, especially when working with objects and arrays in languages like JavaScript.
+
+</Divided>
+</ArticleStack>

@@ -1,0 +1,97 @@
+---
+title: "Javascript Advanced"
+description: "Use super() to call the constructor of its parent class (inherit the parent class)."
+domain: "javascript-typescript"
+type: "concept"
+tags: ["javascript"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+  <Divided>
+
+## supper
+
+- Use super() to call the constructor of its parent class (inherit the parent class)
+- Use `super.<methodName>` to call methods in its parent class
+
+## static
+
+- cannot be called on instances of the class
+- Instead, they are called on the class itself.
+
+## rest
+
+- Gather the remaining values into an array - Reference
+- Represent an infinite number of arguments as an array
+
+## spread
+
+- Copy and update an object
+- Returns values of array become to elements
+
+## destructuring
+
+- A syntax that allows you to assign properties of an Object or an Array.
+
+## closure
+
+“A closure is when a function retains access to variables from its outer scope even after that scope has finished executing. It’s commonly used for data encapsulation, callbacks, and maintaining state.”
+
+## this
+
+- To represent an object.
+- All JavaScript functions have properties, just like any other object.
+- It is used to refer to the objects to which the function (where `this` is used) is bound.
+- It also holds the value of the object being referenced.
+
+## bind
+
+- “`bind` is used to create a new function with a fixed `this` context. It’s commonly used when passing methods as callbacks to ensure `this` still refers to the original object.”
+- “In JavaScript, `this` is determined by how a function is called, not where it is defined.”
+
+```javascript
+const person = {
+  name: "Alice",
+  greet: function () {
+    console.log(`Hello, my name is ${this.name}`);
+  },
+};
+
+const greetFn = person.greet.bind(person);
+greetFn(); // Output: Hello, my name is Alice
+```
+
+## apply & call
+
+- `call` and `apply` are methods of `Function.prototype`, so they can only be used on functions.
+- They are used to **invoke /ɪnˈvoʊk/ a function with an explicit `this` context**.
+- Both allow passing arguments to the function:
+  - `call` → arguments passed individually
+  - `apply` → arguments passed as an array
+- Common use cases:
+  - **Function borrowing** (reuse a function for another object)
+  - Handling array-like objects (e.g. `arguments`)
+  - Extending functionality without modifying the original function
+
+```javascript
+function greet(greeting, punctuation) {
+  console.log(`${greeting}, my name is ${this.name}${punctuation}`);
+}
+
+const person = { name: "Alice" };
+
+greet.call(person, "Hello", "!");
+// Output: Hello, my name is Alice!
+```
+
+```javascript
+greet.apply(person, ["Hi", "!!!"]);
+// Output: Hi, my name is Alice!!!
+```
+
+“The key difference is that `call` and `apply` invoke the function immediately with a given `this`, while `bind` Returns a new function with `this` permanently bound, which can be executed later.”
+
+</Divided>
+</ArticleStack>

@@ -1,0 +1,178 @@
+---
+title: "ES5 VS ES6"
+description: "The syntax ES6 is briefer than ES5."
+domain: "javascript-typescript"
+type: "comparison"
+tags: ["javascript"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+  <Divided>
+
+## Reducing code with Arrow Function
+
+- The syntax ES6 is briefer than ES5
+- We don’t have to use the **function** keyword, even if The simple function doesn’t have to handle much, you don’t have to use the **return** keyword.
+
+## Manipulating (/məˈnɪpjuleɪt/) objects in ES6 vs ES5
+
+Things like object **destructuring** and **rest/spread operators** made it working with objects very easy
+
+</Divided>
+  <SplitPair>
+    <SplitLead>destructuring</SplitLead>
+    <SplitCol title="ES5">
+
+If you have to extract multiple values from ES5 you have to write 3–4 lines of code
+
+```text
+var obj1 = { a: 1, b: 2, c: 3, d: 4 }
+var a = obj1.a
+var b = obj1.b
+var c = obj1.c
+var d = obj1.d
+```
+
+</SplitCol>
+    <SplitCol title="ES6">
+
+```text
+const obj1 = { a: 1, b: 2, c: 3, d: 4 }
+const { a, b, c, d } = obj1
+```
+
+</SplitCol>
+  </SplitPair>
+  <Divided>
+
+**rest**: Gather the remaining values into an array - Reference
+
+**spread**:
+
+- Copy and update and object
+- Returns values of array become to elements
+
+</Divided>
+  <SplitPair>
+    <SplitLead>Example</SplitLead>
+    <SplitCol title="merge two objects in ES5">
+
+```text
+var obj1 = { a: 1, b: 2 }
+var obj2 = { a: 2, c: 3, d: 4}
+var obj3 = Object.assign(obj1, obj2)
+```
+
+</SplitCol>
+    <SplitCol title="merge two objects in ES6">
+
+```text
+const obj1 = { a: 1, b: 2 }
+const obj2 = { a: 2, c: 3, d: 4}
+const obj3 = {...obj1, ...obj2}
+```
+
+</SplitCol>
+  </SplitPair>
+  <SplitPair>
+    <SplitCol title="ES5:">
+
+```text
+var a = 1
+var b = 2
+var c = 3
+var d = 4
+var obj1 = { a: a, b: b, c: c, d: d }
+```
+
+</SplitCol>
+    <SplitCol title="In ES6 you will do something like this:">
+
+```text
+var a = 1
+var b = 2
+var c = 3
+var d = 4 var obj1 = { a, b, c, d }
+```
+
+</SplitCol>
+  </SplitPair>
+  <Divided>
+
+## Promises vs Callbacks
+
+- The ES6 Promises allows us to `resolve` and `reject` a request. Whenever we resolve a request, it will call the callback provided in `then` and whenever we reject a request it will call the `catch` callback.
+- The ES6 promise is better than callback because it allows us to distinguish easily between `success` and `error` so we don’t have to check again for things in callback function.
+
+</Divided>
+  <SplitPair>
+    <SplitLead>
+
+## Exporting & Importing Modules
+
+Export
+
+</SplitLead>
+    <SplitCol title="ES5">
+
+```javascript
+module.exports = myModule;
+```
+
+</SplitCol>
+    <SplitCol title="ES6">
+
+```javascript
+export default myModule;
+```
+
+- The ES6 syntax is more readable than ES5
+- Comes up with `export default` keyword
+
+</SplitCol>
+  </SplitPair>
+  <SplitPair>
+    <SplitLead>Import</SplitLead>
+    <SplitCol title="ES5">
+
+```javascript
+var myModule = require('./myModule');
+```
+
+</SplitCol>
+    <SplitCol title="ES6 version">
+
+```javascript
+import myModule from './myModule';
+```
+
+With the ES6 version When you export something using `export default` keyword we will import a module with **import** keyword
+
+</SplitCol>
+  </SplitPair>
+  <SplitPair>
+    <SplitLead>
+
+ES6 also provides us with the ability to `export` and `import` multiple child modules or variables from a single module
+
+</SplitLead>
+    <SplitCol title="export">
+
+```javascript
+export const x = 1;
+export const y = 2;
+export const z = 'String';
+```
+
+</SplitCol>
+    <SplitCol title="import">
+
+```javascript
+import {x, y, z} from './myModule';
+```
+
+</SplitCol>
+  </SplitPair>
+</ArticleStack>
