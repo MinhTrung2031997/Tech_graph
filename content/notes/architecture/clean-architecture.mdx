@@ -1,18 +1,138 @@
 ---
-title: "Clean Architecture"
-description: "Placeholder outline for Clean Architecture."
+title: "Clean architecture"
+description: "Clean Architecture is a software design pattern that organizes code into concentric layers to isolate core business logic from frameworks, UI, and databases."
 domain: "architecture"
 type: "concept"
 tags: ["architecture"]
 status: "draft"
-placeholder: true
+article: stack
 ---
-<Tldr>
-Placeholder for Clean Architecture. The full note is not written yet.
-</Tldr>
 
-This page is part of the Architecture & Distributed Systems tree so navigation works. It is not a copy of a Notion page.
+<ArticleStack>
+<Divided>
 
-## What this note will cover
+**Clean Architecture** is **a software design pattern that organizes code into concentric /kənˈsen.trɪk/ layers to isolate /ˈaɪ.sə.leɪt/ core business logic from frameworks, UI, and databases**. The primary goal is to achieve low coupling, high maintainability, testability, and independence from external technologies
 
-Clean Architecture: a concept note for backend work and interviews.
+## Key principles
+
+### Dependency rule
+
+- **Source code dependencies must always point inward**, toward the **core business rules**.
+- Outer layers depend on inner layers — **never the opposite**.
+
+### Separation of concerns
+
+Each layer has a single purpose:
+
+- Business rules
+- Application logic
+- Frameworks / external details
+
+### Independence
+
+The system should not depend on:
+
+- UI (React, Vue, Angular, etc.)
+- Database (Postgres, MySQL, Mongo, etc.)
+- Frameworks (NestJS, Spring Boot)
+- External devices / APIs
+
+Your **core business** must work even if you replace these.
+
+## Layers
+
+Architecture layers (onion rings).
+
+### Entities
+
+Enterprise business rules, domain model.
+
+- Contain **enterprise-wide business rules**.
+- Pure logic: entities, value objects, domain services.
+- No external dependencies.
+
+Example: `Order`, `PaymentPolicy`, `ContainerStatus`
+
+### Use cases
+
+Application business rules, application layer.
+
+- Contain **application-specific business rules**.
+- Orchestrate tasks using entities.
+- Define **what** the system does (but not how tech is implemented).
+
+Example: `CreateOrderUseCase`, `UpdateContainerIoTLatestUseCase`
+
+### Interface adapters
+
+Adapters layer.
+
+- Convert data between use cases and external world.
+- Includes:
+  - Controllers
+  - Presenters
+  - Repositories (interfaces + implementations)
+  - mappers / DTOs
+
+Think of them as **translators**.
+
+### Frameworks & drivers
+
+Infrastructure layer.
+
+- External things:
+  - Databases (Postgres, MongoDB)
+  - Web frameworks (Express, NestJS)
+  - Message brokers (Kafka, RabbitMQ)
+  - External services (AWS S3, GCP)
+
+This layer plugs into your system, but **never owns business logic**.
+
+## Benefits
+
+### Testability
+
+Business logic can be tested without database or framework.
+
+### Maintainability
+
+Changing UI / DB / framework does not break core logic.
+
+### Flexibility
+
+Easily replace components (e.g., switch from MongoDB → PostgreSQL).
+
+### Scalability
+
+Large systems remain organized and stable.
+
+### Boundaries
+
+Teams can work independently — UI, domain, infra, etc.
+
+### Flow
+
+Clean Architecture Flow (Simple)
+
+**Controller → Use Case → Domain → Repository Interface → Repository Impl → Database**
+
+Dependencies point inward /ˈɪn.wɚd/.
+
+## Important concepts
+
+- **Entities**: core business objects.
+- **Value Objects**: immutable objects (e.g., Money, Email).
+- **Aggregates**: group of objects treated as one.
+- **Use Case Interactors**: execute business flows.
+- **Ports**: interfaces (input/output).
+- **Adapters**: implementation of ports.
+- **Inversion of Control**: outer layer implements inner layer contracts.
+
+## Summary
+
+One-sentence summary.
+
+**Clean Architecture makes your software independent of frameworks and infrastructure by keeping business logic at the center and forcing all dependencies to point inward.**
+
+</Divided>
+</ArticleStack>
