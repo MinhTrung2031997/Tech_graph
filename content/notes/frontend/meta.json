@@ -1,14 +1,14 @@
 {
-  "title": "12 · Frontend",
+  "title": "05 · Frontend",
   "description": "React and Vue notes from a backend engineer who also ships UI.",
   "icon": "AppWindow",
   "collapsible": true,
   "defaultOpen": false,
   "pages": [
-    "react-fundamentals",
+    "react",
     "react-hooks",
-    "react-rendering",
-    "redux",
-    "vue"
+    "vuejs",
+    "tanstack",
+    "core-web-vitals"
   ]
 }

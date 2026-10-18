@@ -1,0 +1,33 @@
+---
+title: "Core Web Vitals"
+description: "I use Core Web Vitals to evaluate real-world frontend performance."
+domain: "frontend"
+type: "concept"
+tags: ["web-vitals"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+  <Divided>
+
+I use Core Web Vitals to evaluate real-world frontend performance.
+
+## LCP
+
+**LCP** measures loading performance. I optimize the critical rendering path, prioritize the main image using `fetchpriority="high"`, avoid lazy-loading the LCP image, and improve server response time when necessary.
+
+## INP
+
+**INP** measures responsiveness. I identify long tasks using Chrome DevTools Performance, break up expensive JavaScript work, reduce unnecessary rendering, and move CPU-intensive tasks to Web Workers when appropriate.
+
+## CLS
+
+**CLS** measures visual stability. I reserve space for images, ads, and embedded content using explicit dimensions or CSS `aspect-ratio`.
+
+## FCP
+
+**FCP** measures when the browser first renders content and helps diagnose initial loading performance.
+
+</Divided>
+</ArticleStack>
