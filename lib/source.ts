@@ -37,4 +37,20 @@ export const interview = loader({
   plugins: [lucideIconsPlugin()],
 });
 
+const englishDocs = defineDocs({
+  dir: 'content/english',
+  docs: {
+    schema: notePageSchema,
+  },
+  meta: {
+    schema: metaSchema,
+  },
+});
+
+export const english = loader({
+  baseUrl: '/english',
+  source: englishDocs.toFumadocsSource(),
+  plugins: [lucideIconsPlugin()],
+});
+
 export type NotePage = ReturnType<typeof notes.getPages>[number];
