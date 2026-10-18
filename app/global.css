@@ -505,12 +505,12 @@ html > body[data-scroll-locked] {
   border-top: 1px solid #2a3142;
 }
 
-.article-line-rules > p.speaker-man {
-  color: #818cf8;
+.article-line-rules .speaker-man {
+  color: #2dd4bf;
 }
 
-.article-line-rules > p.speaker-woman {
-  color: #fb7185;
+.article-line-rules .speaker-woman {
+  color: #fbbf24;
 }
 
 .article-divided ul {
