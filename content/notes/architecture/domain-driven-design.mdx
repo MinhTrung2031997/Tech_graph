@@ -1,18 +1,164 @@
 ---
-title: "Domain-Driven Design"
-description: "Placeholder outline for Domain-Driven Design."
+title: "DDD - Domain-driven design"
+description: "DDD is a collaborative approach where developers, domain experts, and stakeholders build a deep shared understanding of the business."
 domain: "architecture"
 type: "concept"
-tags: ["architecture"]
+tags: ["architecture", "ddd"]
 status: "draft"
-placeholder: true
+article: stack
 ---
-<Tldr>
-Placeholder for Domain-Driven Design. The full note is not written yet.
-</Tldr>
 
-This page is part of the Architecture & Distributed Systems tree so navigation works. It is not a copy of a Notion page.
+<ArticleStack>
+<Divided>
 
-## What this note will cover
+## Foundation
 
-Domain-Driven Design: a concept note for backend work and interviews.
+Domain-Driven Design (DDD): Foundational Concepts
+
+> DDD is a collaborative approach where developers, domain experts, and stakeholders build a deep shared understanding of the business, use a ubiquitous /juːˈbɪk.wə.t̬əs/ language, divide the system into precise bounded contexts, and create models that accurately /ˈæk.jɚ.ət.li/ represent business rules through entities, value objects, aggregates, domain services, domain events, repositories, and application services.
+
+## Strategic building blocks
+
+### Ubiquitous language
+
+- A shared, precise vocabulary used by developers and domain experts in code, docs, and conversations.
+
+### Bounded context
+
+- A clear semantic boundary within which a specific model and language apply.
+- Prevents terms from drifting in meaning across the system.
+
+### Context map
+
+- Describes relationships between bounded contexts: upstream/downstream, conformist, anticorruption layer, customer-supplier, published language.
+
+### Subdomains
+
+- Core: Differentiating capability. Invest most modeling effort here.
+- Supporting: Important but not differentiating. Build pragmatically.
+- Generic: Commodity capabilities. Prefer buy or reuse.
+
+## Tactical modeling patterns
+
+### Entity
+
+- Defined by identity that persists over time and through change. Equality by ID, not by attributes.
+- Mutable; holds behavior related to its own state.
+
+### Value object
+
+- No identity. Immutable; equality by value.
+- Self-validating (e.g. Money cannot be negative). Great for money, measurements, addresses, date ranges.
+
+### Aggregate and aggregate root
+
+- A cluster of entities and value objects that forms one consistency boundary. It enforces business invariants.
+- Only the root is accessed from outside; inner objects are changed only through the root.
+- Reference other aggregates by ID only.
+- One transaction modifies one aggregate. Consistency across aggregates is eventual, via domain events.
+- Keep aggregates small, designed around true transactional invariants.
+
+### Domain service
+
+- A domain operation that doesn't naturally belong to a single Entity or Value Object, e.g. a transfer between two accounts.
+- Stateless, contains business rules only (no transactions, HTTP or infrastructure). It may depend on domain interfaces such as repositories.
+
+### Repository
+
+- Collection-like interface to load and persist aggregates by identity; hides storage details.
+- One repository per Aggregate Root (none for inner entities).
+
+### Domain event
+
+- Records something meaningful that already happened in the domain, named in the past tense (e.g. OrderPaid).
+- Raised by aggregates; enables reactive flows, eventual consistency between aggregates, and integration with other bounded contexts.
+
+### Factory
+
+- Encapsulates complex creation so an aggregate is valid from birth (all invariants satisfied).
+- Can be a static method on the aggregate or a separate class.
+
+## Architectural alignment
+
+### Layers
+
+- User Interface
+- Application (orchestration, transactions, no business rules)
+- Domain (model + rules + invariants)
+- Infrastructure (persistence, messaging, I/O)
+
+### Anti-corruption layer
+
+- Protects a model from another by translating between contexts.
+
+### Published language
+
+- A stable, documented contract for inter-context communication.
+
+## Modeling guidance
+
+### Start from the language
+
+- Harvest terms, clarify meanings, capture invariants as code.
+
+### Model exploration
+
+- Use domain storytelling, event storming, example mapping, and quick spikes.
+
+### Focus the aggregate
+
+- Model for invariants and transactional boundaries, not for tables.
+
+### Iterate intentionally
+
+- Expect refactoring as your understanding deepens.
+
+</Divided>
+<SplitPair>
+<SplitLead>
+
+## When to use
+
+When DDD shines vs. when to keep it simple.
+
+</SplitLead>
+<SplitCol title="Use DDD when">
+
+- Complex, evolving business rules
+- High collaboration with domain experts
+- Need for clear boundaries and integration patterns
+
+</SplitCol>
+<SplitCol title="Keep it simple">
+
+- CRUD‑centric, stable requirements
+- Commodity or generic subdomains
+
+</SplitCol>
+</SplitPair>
+<Divided>
+
+## Common pitfalls
+
+- Anemic models: putting rules in services instead of entities/aggregates.
+- Overlarge aggregates: causing contention and slow transactions.
+- Missing bounded contexts: one model stretched to fit all meanings.
+- Premature microservices: split by tables or layers instead of by domain boundaries.
+- Ignoring ubiquitous language: names drift, bugs follow.
+
+## Quick checklist
+
+- Do we share a precise Ubiquitous Language with experts?
+- Are Bounded Contexts identified and mapped?
+- Are Aggregates small and centered on invariants?
+- Are Repositories per aggregate root and persistence details hidden?
+- Are Domain Events named in past tense and meaningful to experts?
+
+## Further reading
+
+- Domain-Driven Design by Eric Evans
+- Implementing Domain-Driven Design by Vaughn Vernon
+- Patterns, Principles, and Practices of DDD by Scott Millett and Nick Tune
+
+</Divided>
+</ArticleStack>

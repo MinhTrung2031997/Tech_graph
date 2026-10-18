@@ -1,18 +1,237 @@
 ---
-title: "Monolith vs Microservices"
-description: "Placeholder outline for Monolith vs Microservices."
+title: "Monolithic vs. Microservices Architecture"
+description: "Easier to develop and debug as everything is in a single codebase."
 domain: "architecture"
 type: "comparison"
 tags: ["architecture"]
 status: "draft"
-placeholder: true
+article: stack
 ---
-<Tldr>
-Placeholder for Monolith vs Microservices. The full note is not written yet.
-</Tldr>
 
-This page is part of the Architecture & Distributed Systems tree so navigation works. It is not a copy of a Notion page.
+<ArticleStack>
+<SplitPair>
+<SplitLead>
 
-## What this note will cover
+## Development simplicity
 
-Monolith vs Microservices: a comparison note for backend work and interviews.
+</SplitLead>
+<SplitCol title="Monolithic">
+
+Easier to develop and debug as everything is in a single codebase.
+
+</SplitCol>
+<SplitCol title="Microservices">
+
+More complex due to multiple services and inter-service communication.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Deployment
+
+</SplitLead>
+<SplitCol title="Monolithic">
+
+A single deployment unit makes it easier to deploy but requires redeploying the entire application for any change.
+
+</SplitCol>
+<SplitCol title="Microservices">
+
+Independent deployments allow faster releases, but deployment complexity increases.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Scalability
+
+</SplitLead>
+<SplitCol title="Monolithic">
+
+Horizontal scaling is possible, but it scales the entire application rather than specific components.
+
+</SplitCol>
+<SplitCol title="Microservices">
+
+Independent scaling of services based on demand, optimizing resource usage.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Technology flexibility
+
+</SplitLead>
+<SplitCol title="Monolithic">
+
+Limited to a single technology stack, making development uniform but less flexible.
+
+</SplitCol>
+<SplitCol title="Microservices">
+
+Different services can use different technologies, allowing for optimized performance and innovation.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Fault isolation
+
+</SplitLead>
+<SplitCol title="Monolithic">
+
+A failure in one module can affect the entire application, making it less resilient.
+
+</SplitCol>
+<SplitCol title="Microservices">
+
+Failures are isolated to individual services, reducing the impact on the whole system.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Team autonomy
+
+</SplitLead>
+<SplitCol title="Monolithic">
+
+A single codebase makes collaboration easier but can cause bottlenecks as teams grow.
+
+</SplitCol>
+<SplitCol title="Microservices">
+
+Teams can work independently on different services, improving efficiency and agility.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Performance optimization
+
+</SplitLead>
+<SplitCol title="Monolithic">
+
+Performance tuning applies to the whole application rather than specific components.
+
+</SplitCol>
+<SplitCol title="Microservices">
+
+Each service can be optimized individually, improving system-wide efficiency.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Security
+
+</SplitLead>
+<SplitCol title="Monolithic">
+
+Easier to manage security since everything is within a single application boundary.
+
+</SplitCol>
+<SplitCol title="Microservices">
+
+More challenging due to distributed services, requiring extra effort for authentication and data security.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Maintenance & updates
+
+</SplitLead>
+<SplitCol title="Monolithic">
+
+Simpler maintenance since all components are in one place but requires full redeployment for changes.
+
+</SplitCol>
+<SplitCol title="Microservices">
+
+Individual services can be updated without affecting others, reducing downtime and improving maintainability.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Testing & debugging
+
+</SplitLead>
+<SplitCol title="Monolithic">
+
+Easier debugging and testing within a single environment.
+
+</SplitCol>
+<SplitCol title="Microservices">
+
+More challenging due to distributed services, requiring observability tools.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Business agility
+
+</SplitLead>
+<SplitCol title="Monolithic">
+
+Slower innovation due to the need to modify and redeploy the entire application.
+
+</SplitCol>
+<SplitCol title="Microservices">
+
+Faster time-to-market with independent feature releases and updates.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Data management
+
+</SplitLead>
+<SplitCol title="Monolithic">
+
+A single database simplifies transactions and consistency.
+
+</SplitCol>
+<SplitCol title="Microservices">
+
+Each service may have its own database, leading to complexity in data consistency and transactions.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## When to choose
+
+</SplitLead>
+<SplitCol title="Choose monolithic if">
+
+- You have a small team and want quick development.
+- The application is relatively simple and does not require frequent scaling.
+- You want simpler deployment and maintenance.
+
+</SplitCol>
+<SplitCol title="Choose microservices if">
+
+- You expect high scalability and independent service evolution.
+- Different teams manage different functionalities and require flexibility.
+- You need fault isolation and faster innovation cycles.
+
+</SplitCol>
+</SplitPair>
+</ArticleStack>
