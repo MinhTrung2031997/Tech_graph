@@ -48,62 +48,28 @@ html > body[data-scroll-locked] {
   transition: none;
 }
 
-#nd-sidebar > .sidebar-resize-handle {
+/* 12px hold strip centered on each sidebar card's right edge. */
+.sidebar-card {
+  position: relative;
+}
+
+.sidebar-card::after {
+  content: '';
   position: absolute;
+  z-index: 2;
   inset-block: 0;
-  inset-inline-end: -5px;
-  z-index: 30;
-  width: 10px;
-  margin: 0;
-  padding: 0;
-  border: 0;
-  background: transparent;
+  inset-inline-end: -6px;
+  width: 12px;
   cursor: col-resize;
   touch-action: none;
-  user-select: none;
+  border-start-end-radius: inherit;
+  border-end-end-radius: inherit;
 }
 
-#nd-sidebar > .sidebar-resize-handle::before {
-  content: '';
-  position: absolute;
-  inset-block: 0;
-  left: 50%;
-  width: 1px;
-  transform: translateX(-50%);
-  background: #2a3142;
-}
-
-#nd-sidebar > .sidebar-resize-handle::after {
-  content: '';
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 3px;
-  height: 36px;
-  transform: translate(-50%, -50%);
-  border-radius: 999px;
-  background: #3a4458;
-}
-
-#nd-sidebar > .sidebar-resize-handle:hover::before,
-#nd-sidebar > .sidebar-resize-handle[data-dragging]::before,
-#nd-sidebar > .sidebar-resize-handle:focus-visible::before {
-  width: 2px;
-  background: #6d7589;
-}
-
-#nd-sidebar > .sidebar-resize-handle:hover::after,
-#nd-sidebar > .sidebar-resize-handle[data-dragging]::after,
-#nd-sidebar > .sidebar-resize-handle:focus-visible::after {
-  background: #6d7589;
-}
-
-#nd-sidebar > .sidebar-resize-handle:focus-visible {
-  outline: none;
-}
-
-#nd-sidebar > .sidebar-resize-handle:focus-visible::before {
-  background: #818cf8;
+/* Same 12px hold strip along the sidebar scrollbar. Vertical drags still scroll. */
+#nd-sidebar [data-orientation='vertical'] {
+  width: 12px;
+  cursor: col-resize;
 }
 
 .sidebar-folder-controls {
