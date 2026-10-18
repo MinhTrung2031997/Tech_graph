@@ -1,3 +1,4 @@
+import { LogoutControl } from '@/components/logout-control';
 import { RootProvider } from 'fumadocs-ui/provider/next';
 import './global.css';
 import { Inter } from 'next/font/google';
@@ -37,6 +38,7 @@ export default function Layout({ children }: LayoutProps<'/'>) {
           }}
         >
           {children}
+          <LogoutControl />
         </RootProvider>
       </body>
     </html>
