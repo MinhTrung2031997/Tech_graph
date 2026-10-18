@@ -2,8 +2,70 @@
 @import 'fumadocs-ui/css/neutral.css';
 @import 'fumadocs-ui/css/preset.css';
 
+/*
+ * --content-size is the body step (12, 14, 16, or 18).
+ * Captions and meta are 4px smaller. The page title is 6px larger.
+ * Headings sit on the steps between those two.
+ */
 html {
   scrollbar-gutter: stable;
+  --content-size: 14;
+  --fs-caption: calc((var(--content-size) - 4) * 1px);
+  --fs-body: calc(var(--content-size) * 1px);
+  --fs-subhead: calc((var(--content-size) + 2) * 1px);
+  --fs-heading: calc((var(--content-size) + 4) * 1px);
+  --fs-title: calc((var(--content-size) + 6) * 1px);
+  --text-xs: var(--fs-caption);
+  --text-sm: var(--fs-body);
+  --text-base: var(--fs-subhead);
+  --text-lg: var(--fs-heading);
+  --text-xl: var(--fs-title);
+  --text-2xl: var(--fs-title);
+  --text-3xl: var(--fs-title);
+  --text-4xl: var(--fs-title);
+}
+
+#nd-notebook-layout,
+#nd-home-layout {
+  font-size: var(--fs-body);
+}
+
+/* Compact indigo control, same pill as the header tabs. Size stays fixed so the labels stay readable. */
+.font-size-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  padding: 2px;
+  border: 1px solid #2a3142;
+  border-radius: 8px;
+  background: #141824;
+}
+
+.font-size-control button {
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  padding: 2px 6px;
+  color: #9aa1b2;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.3;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.font-size-control button:hover {
+  color: #e7e9f0;
+}
+
+.font-size-control button.is-selected {
+  background: #33366b;
+  color: #eeeefe;
+}
+
+.font-size-control button:focus-visible {
+  outline: 1px solid #818cf8;
+  outline-offset: 1px;
 }
 
 html > body[data-scroll-locked] {
@@ -98,7 +160,7 @@ html > body[data-scroll-locked] {
   background: transparent;
   color: inherit;
   font: inherit;
-  font-size: 13.5px;
+  font-size: var(--fs-body);
   font-weight: 500;
   line-height: 1.35;
   text-align: start;
@@ -166,7 +228,7 @@ html > body[data-scroll-locked] {
   padding: 5px 8px;
   border-radius: 8px;
   color: #9aa3b5;
-  font-size: 13px;
+  font-size: var(--fs-body);
   line-height: 1.35;
   text-decoration: none;
 }
@@ -223,14 +285,14 @@ html > body[data-scroll-locked] {
 .sidebar-card-nested-row {
   padding: 4px 8px;
   color: #c5cad6;
-  font-size: 13px;
+  font-size: var(--fs-body);
   font-weight: 500;
 }
 
 /* Quiet stack: a split pair and divided sections. Rules use the existing border gray. */
 .article-stack {
   color: var(--color-fd-foreground);
-  font-size: 0.975rem;
+  font-size: var(--fs-body);
   line-height: 1.65;
 }
 
@@ -293,7 +355,7 @@ html > body[data-scroll-locked] {
   width: 100%;
   margin: 0.85rem 0 0.35rem;
   border-collapse: collapse;
-  font-size: 0.9rem;
+  font-size: var(--fs-body);
   line-height: 1.45;
 }
 
@@ -317,7 +379,7 @@ html > body[data-scroll-locked] {
 
 .article-split-title {
   margin: 0 0 0.45rem;
-  font-size: 1.02rem;
+  font-size: var(--fs-subhead);
   font-weight: 700;
   line-height: 1.35;
 }
@@ -334,7 +396,7 @@ html > body[data-scroll-locked] {
   margin: 0 0 0.85rem;
   padding: 0;
   border: 0;
-  font-size: 1.35rem;
+  font-size: var(--fs-heading);
   font-weight: 700;
   line-height: 1.3;
   letter-spacing: -0.015em;
@@ -370,7 +432,7 @@ html > body[data-scroll-locked] {
   margin: 1.35rem 0 0.9rem;
   padding-top: 1.05rem;
   border-top: 1px solid #2a3142;
-  font-size: 1.35rem;
+  font-size: var(--fs-heading);
   font-weight: 700;
   line-height: 1.3;
   letter-spacing: -0.015em;
@@ -386,7 +448,7 @@ html > body[data-scroll-locked] {
   margin: 1.35rem 0 0.55rem;
   padding-top: 1.05rem;
   border-top: 1px solid #2a3142;
-  font-size: 1.02rem;
+  font-size: var(--fs-subhead);
   font-weight: 700;
   line-height: 1.35;
 }
@@ -422,4 +484,41 @@ html > body[data-scroll-locked] {
     border-top: 0;
     border-left: 1px solid #2a3142;
   }
+}
+
+#nd-page > h1 {
+  font-size: var(--fs-title);
+}
+
+#nd-page .prose {
+  font-size: var(--fs-body);
+  line-height: 1.65;
+}
+
+#nd-page .prose :is(h1) {
+  font-size: var(--fs-title);
+  line-height: 1.25;
+}
+
+#nd-page .prose :is(h2) {
+  font-size: var(--fs-heading);
+  line-height: 1.3;
+}
+
+#nd-page .prose :is(h3, h4) {
+  font-size: var(--fs-subhead);
+  line-height: 1.35;
+}
+
+#nd-page .prose :is(figcaption) {
+  font-size: var(--fs-caption);
+}
+
+#nd-page .prose :is(:not(pre) > code) {
+  font-size: var(--fs-caption);
+}
+
+#nd-toc .prose,
+[data-toc-popover-content] .prose {
+  font-size: var(--fs-body);
 }

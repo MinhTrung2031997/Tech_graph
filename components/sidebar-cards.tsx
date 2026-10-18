@@ -37,7 +37,7 @@ function containsPath(nodes: Node[], pathname: string): boolean {
 
 export function CardSeparator({ item }: { item: Separator }) {
   return (
-    <SidebarSeparator className="sidebar-card-label mt-5 mb-2 px-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-[#6d7589]">
+    <SidebarSeparator className="sidebar-card-label mt-5 mb-2 px-1 text-xs font-semibold uppercase tracking-[0.08em] text-[#6d7589]">
       {item.icon}
       {item.name}
     </SidebarSeparator>

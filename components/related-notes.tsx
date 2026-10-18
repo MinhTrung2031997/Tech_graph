@@ -28,7 +28,7 @@ export function SourceLinks({
   githubUrl: string;
 }) {
   return (
-    <div className="mt-5 flex flex-col gap-1.5 text-[12.5px]">
+    <div className="mt-5 flex flex-col gap-1.5 text-xs">
       {(sources ?? []).map((href) => (
         <a key={href} href={href} target="_blank" rel="noreferrer" className="text-fd-muted-foreground hover:text-fd-foreground">
           ↗ {labelForUrl(href)}

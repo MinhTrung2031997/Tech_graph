@@ -19,7 +19,7 @@ export default async function TagPage(props: PageProps<'/tags/[tag]'>) {
 
   return (
     <main className="mx-auto w-full max-w-3xl flex-1 px-6 py-12">
-      <p className="text-sm text-fd-muted-foreground">Tags</p>
+      <p className="text-xs text-fd-muted-foreground">Tags</p>
       <h1 className="mt-1 text-3xl font-extrabold tracking-tight">#{tag}</h1>
       <p className="mt-3 mb-6 text-fd-muted-foreground">
         {pages.length} {pages.length === 1 ? 'note' : 'notes'}

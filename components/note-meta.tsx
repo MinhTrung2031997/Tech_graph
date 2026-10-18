@@ -20,7 +20,7 @@ export function NoteMeta({
   const reviewed = formatReviewed(lastReviewed);
 
   return (
-    <div className="mb-2 flex flex-wrap items-center gap-2 text-[12.5px] text-fd-muted-foreground">
+    <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-fd-muted-foreground">
       {type ? <Badge tone="neutral">{typeLabel(type)}</Badge> : null}
       {status ? (
         <Badge tone={statusTone(status)}>
