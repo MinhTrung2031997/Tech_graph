@@ -1,6 +1,7 @@
 'use client';
 
 import { EnglishHashScroll, englishSidebarComponents } from '@/components/english-sidebar';
+import { SidebarExpansionProvider, SidebarFolderControls } from '@/components/sidebar-expansion';
 import { englishSetForPath, englishSets, englishTree } from '@/lib/english';
 import { baseOptions } from '@/lib/layout.shared';
 import { DocsLayout } from 'fumadocs-ui/layouts/notebook';
@@ -14,14 +15,16 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const options = baseOptions();
 
   return (
-    <DocsLayout
-      tree={tree}
-      {...options}
-      nav={{ ...options.nav, mode: 'top' }}
-      sidebar={{ components: englishSidebarComponents }}
-    >
-      <EnglishHashScroll />
-      {children}
-    </DocsLayout>
+    <SidebarExpansionProvider>
+      <DocsLayout
+        tree={tree}
+        {...options}
+        nav={{ ...options.nav, mode: 'top' }}
+        sidebar={{ banner: SidebarFolderControls, components: englishSidebarComponents }}
+      >
+        <EnglishHashScroll />
+        {children}
+      </DocsLayout>
+    </SidebarExpansionProvider>
   );
 }

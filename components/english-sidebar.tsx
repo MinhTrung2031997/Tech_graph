@@ -2,6 +2,7 @@
 
 import { SidebarFolder, SidebarFolderContent, SidebarFolderLink, SidebarItem, useFolderDepth } from 'fumadocs-ui/components/sidebar/base';
 import { CardSeparator } from '@/components/sidebar-cards';
+import { useControlledFolder } from '@/components/sidebar-expansion';
 import type { Folder, Item, Node } from 'fumadocs-core/page-tree';
 import { usePathname } from 'next/navigation';
 import { useEffect, useState, type MouseEvent, type ReactNode } from 'react';
@@ -115,9 +116,16 @@ export function EnglishCardFolder({ item, children }: { item: Folder; children: 
   const nested = depth > 0;
   const onSection = item.index ? samePath(item.index.url, pathname) : false;
   const active = onSection || containsPath(item.children, pathname);
+  const folder = useControlledFolder(active, item.defaultOpen);
 
   return (
-    <SidebarFolder collapsible={item.collapsible !== false} active={active} defaultOpen={item.defaultOpen} className={nested ? 'sidebar-card-nested' : 'sidebar-card'}>
+    <SidebarFolder
+      key={folder.key}
+      collapsible={item.collapsible !== false}
+      active={folder.active}
+      defaultOpen={folder.defaultOpen}
+      className={nested ? 'sidebar-card-nested' : 'sidebar-card'}
+    >
       {item.index ? (
         <SidebarFolderLink href={item.index.url} active={onSection && !hash} className={nested ? 'sidebar-card-nested-row' : 'sidebar-card-row'}>
           {item.icon}

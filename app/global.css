@@ -37,6 +37,34 @@ html > body[data-scroll-locked] {
   --color-fd-muted-foreground: #9aa1b2;
 }
 
+.sidebar-folder-controls {
+  display: flex;
+  gap: 8px;
+}
+
+.sidebar-folder-controls button {
+  border: 1px solid #2a3142;
+  border-radius: 8px;
+  background: #161b24;
+  color: #c5cad6;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.3;
+  cursor: pointer;
+}
+
+.sidebar-folder-controls button:hover {
+  border-color: #3a4458;
+  color: #eeeefe;
+}
+
+.sidebar-folder-controls button:focus-visible {
+  outline: 1px solid #3d4a63;
+  outline-offset: 1px;
+}
+
 /* Soft-card sidebar: rounded parent rows, expanded panel, indigo active pill. */
 .sidebar-card {
   display: block;

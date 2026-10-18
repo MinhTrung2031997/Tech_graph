@@ -3,6 +3,7 @@
 import { type ReactNode } from 'react';
 import { usePathname } from 'next/navigation';
 import type { Folder, Item, Node, Separator } from 'fumadocs-core/page-tree';
+import { useControlledFolder } from '@/components/sidebar-expansion';
 import {
   SidebarFolder,
   SidebarFolderContent,
@@ -69,12 +70,14 @@ export function CardFolder({ item, children }: { item: Folder; children: ReactNo
   const nested = depth > 0;
   const active =
     (item.index ? samePath(item.index.url, pathname) : false) || containsPath(item.children, pathname);
+  const folder = useControlledFolder(active, item.defaultOpen);
 
   return (
     <SidebarFolder
+      key={folder.key}
       collapsible={item.collapsible !== false}
-      active={active}
-      defaultOpen={item.defaultOpen}
+      active={folder.active}
+      defaultOpen={folder.defaultOpen}
       className={nested ? 'sidebar-card-nested' : 'sidebar-card'}
     >
       {item.index ? (
