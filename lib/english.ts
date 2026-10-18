@@ -212,6 +212,8 @@ function sectionNode(page: EnglishPage): Node {
 
 export function englishTree(set: EnglishSet): Root {
   return {
+    // Fumadocs keeps the first tree when $id is missing, so the sidebar would stay on English Interview.
+    $id: set.id,
     name: set.title,
     children: [{ type: 'separator', name: set.title }, ...set.pages.map(sectionNode)],
   };
