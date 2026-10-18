@@ -2,6 +2,7 @@ import { DocsLayout } from 'fumadocs-ui/layouts/notebook';
 import type { Root } from 'fumadocs-core/page-tree';
 import { sidebarCardComponents } from '@/components/sidebar-cards';
 import { SidebarExpansionProvider, SidebarFolderControls } from '@/components/sidebar-expansion';
+import { DocsHeaderMeasure } from '@/components/docs-header-measure';
 import { SidebarResize } from '@/components/sidebar-resize';
 import { baseOptions } from '@/lib/layout.shared';
 import { notes } from '@/lib/source';
@@ -31,6 +32,7 @@ export default function Layout({ children }: LayoutProps<'/notes'>) {
         sidebar={{ banner: SidebarFolderControls, components: sidebarCardComponents }}
       >
         <SidebarResize />
+        <DocsHeaderMeasure />
         {children}
       </DocsLayout>
     </SidebarExpansionProvider>

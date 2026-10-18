@@ -1,6 +1,7 @@
 import { DocsLayout } from 'fumadocs-ui/layouts/notebook';
 import type { Root } from 'fumadocs-core/page-tree';
 import { sidebarCardComponents } from '@/components/sidebar-cards';
+import { DocsHeaderMeasure } from '@/components/docs-header-measure';
 import { SidebarExpansionProvider, SidebarFolderControls } from '@/components/sidebar-expansion';
 import { baseOptions } from '@/lib/layout.shared';
 import { interview } from '@/lib/source';
@@ -22,6 +23,7 @@ export default function Layout({ children }: LayoutProps<'/interview'>) {
         nav={{ ...options.nav, mode: 'top' }}
         sidebar={{ banner: SidebarFolderControls, components: sidebarCardComponents }}
       >
+        <DocsHeaderMeasure />
         {children}
       </DocsLayout>
     </SidebarExpansionProvider>
