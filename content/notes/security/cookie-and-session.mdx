@@ -1,0 +1,40 @@
+---
+title: "Cookie and Session"
+description: "A cookie is a small piece of data, stored on the client's browser, sent by the server to the browser, and saved on the user's device."
+domain: "security"
+type: "comparison"
+tags: ["auth", "http"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+  <SplitPair>
+    <SplitCol title="Cookie">
+
+- A cookie is a small piece of data, stored on the client's browser, sent by the server to the browser, and saved on the user's device.
+- Used to store information such as user preferences, session IDs, and tracking information
+- Cookies save user preferences like login info, language, and themes, improving user experience (UX).
+
+</SplitCol>
+    <SplitCol title="Session">
+
+- A session represents a user's interaction period with an application. It begins when a client sends a request to the server and continues across different pages until a timeout occurs or the application is closed. Sessions are stored in the server's RAM, which means excessive use can consume significant memory resources.
+- Each session has a unique SessionID. When one session ends, and another begins, a new SessionID is generated. This SessionID is stored in a cookie, helping the server identify which session belongs to which client.
+- Sessions should primarily store temporary information, such as shopping cart contents or draft comments.
+
+</SplitCol>
+  </SplitPair>
+  <SplitPair>
+    <SplitCol title="Session">
+
+Use a session for storing confidential information securely.
+
+</SplitCol>
+    <SplitCol title="Cookie">
+
+Use cookies for quick data transfer with lower security requirements.
+
+</SplitCol>
+  </SplitPair>
+</ArticleStack>
