@@ -1,5 +1,7 @@
 import { NotesSwitcher } from '@/components/notes-switcher';
+import fireMark from '@/app/icon.png';
 import type { BaseLayoutProps } from 'fumadocs-ui/layouts/shared';
+import Image from 'next/image';
 import { appName, githubRepoUrl } from './shared';
 
 export function baseOptions(): BaseLayoutProps {
@@ -7,11 +9,11 @@ export function baseOptions(): BaseLayoutProps {
     nav: {
       title: (
         <span className="inline-flex items-center gap-2.5 whitespace-nowrap font-bold tracking-tight">
-          <span className="inline-block size-[22px] shrink-0 rounded-md bg-[#818cf8]" />
-          <span className="max-sm:sr-only">{appName}</span>
+          <Image src={fireMark} alt="" width={22} height={22} className="size-[22px] shrink-0" />
+          {appName}
         </span>
       ),
-      url: '/',
+      url: '/notes',
       children: <NotesSwitcher />,
     },
     githubUrl: githubRepoUrl(),
