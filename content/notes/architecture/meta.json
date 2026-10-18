@@ -7,7 +7,6 @@
   "pages": [
     "architecture-overview",
     "monolith-vs-microservices",
-    "saga-pattern",
     "domain-driven-design",
     "clean-architecture",
     "caching-strategies"
