@@ -6,6 +6,7 @@
     "design-principles",
     "javascript-typescript",
     "nodejs",
+    "frontend",
     "backend-frameworks",
     "api-communication",
     "security",
@@ -13,7 +14,6 @@
     "concurrency",
     "messaging",
     "architecture",
-    "frontend",
     "devops",
     "testing-process"
   ]

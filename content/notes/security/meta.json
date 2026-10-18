@@ -1,5 +1,5 @@
 {
-  "title": "07 · Security",
+  "title": "08 · Security",
   "description": "Authentication, authorization, tokens, cookies, and a Node.js checklist.",
   "icon": "Shield",
   "collapsible": true,
