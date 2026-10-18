@@ -160,6 +160,16 @@ html > body[data-scroll-locked] {
   color: #f7f7ff;
 }
 
+.sidebar-card-child.english-question {
+  align-items: flex-start;
+  white-space: normal;
+}
+
+.sidebar-card-child.english-question[data-active='true'] {
+  width: 100%;
+  max-width: 100%;
+}
+
 .sidebar-card:has(> .english-note-card[data-active='true']) {
   border-color: #33366b;
   background: #33366b;

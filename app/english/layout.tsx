@@ -1,6 +1,6 @@
 'use client';
 
-import { englishSidebarComponents } from '@/components/english-sidebar';
+import { EnglishHashScroll, englishSidebarComponents } from '@/components/english-sidebar';
 import { englishSetForPath, englishSets, englishTree } from '@/lib/english';
 import { baseOptions } from '@/lib/layout.shared';
 import { DocsLayout } from 'fumadocs-ui/layouts/notebook';
@@ -20,6 +20,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
       nav={{ ...options.nav, mode: 'top' }}
       sidebar={{ components: englishSidebarComponents }}
     >
+      <EnglishHashScroll />
       {children}
     </DocsLayout>
   );
