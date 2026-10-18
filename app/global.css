@@ -99,6 +99,75 @@ html > body[data-scroll-locked] {
   --color-fd-muted-foreground: #9aa1b2;
 }
 
+/* Remembered sidebar width. Fumadocs sets 268px from a layered utility; this unlayered rule wins on the docs pages that mount the handle. */
+@media (width >= 48rem) {
+  #nd-notebook-layout:has([data-sidebar-resize]) {
+    --fd-sidebar-width: var(--docs-sidebar-width, 268px);
+  }
+}
+
+#nd-notebook-layout[data-sidebar-resizing] {
+  transition: none;
+}
+
+#nd-sidebar > .sidebar-resize-handle {
+  position: absolute;
+  inset-block: 0;
+  inset-inline-end: -5px;
+  z-index: 30;
+  width: 10px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+#nd-sidebar > .sidebar-resize-handle::before {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-50%);
+  background: #2a3142;
+}
+
+#nd-sidebar > .sidebar-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 3px;
+  height: 36px;
+  transform: translate(-50%, -50%);
+  border-radius: 999px;
+  background: #3a4458;
+}
+
+#nd-sidebar > .sidebar-resize-handle:hover::before,
+#nd-sidebar > .sidebar-resize-handle[data-dragging]::before,
+#nd-sidebar > .sidebar-resize-handle:focus-visible::before {
+  width: 2px;
+  background: #6d7589;
+}
+
+#nd-sidebar > .sidebar-resize-handle:hover::after,
+#nd-sidebar > .sidebar-resize-handle[data-dragging]::after,
+#nd-sidebar > .sidebar-resize-handle:focus-visible::after {
+  background: #6d7589;
+}
+
+#nd-sidebar > .sidebar-resize-handle:focus-visible {
+  outline: none;
+}
+
+#nd-sidebar > .sidebar-resize-handle:focus-visible::before {
+  background: #818cf8;
+}
+
 .sidebar-folder-controls {
   display: flex;
   gap: 8px;
