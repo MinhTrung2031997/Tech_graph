@@ -12,8 +12,8 @@ export function DomainGrid() {
           href={`/notes/${domain.slug}`}
           className="flex min-h-[108px] flex-col rounded-xl border border-fd-border bg-fd-card p-3.5 transition-colors hover:border-indigo-500/70"
         >
-          <span className="text-[11px] text-[#6b7285]">{domain.number}</span>
-          <span className="mt-1 text-[13.5px] font-semibold leading-snug">{domain.title}</span>
+          <span className="text-xs text-[#6b7285]">{domain.number}</span>
+          <span className="mt-1 text-sm font-semibold leading-snug">{domain.title}</span>
           <span className="mt-auto flex items-center justify-between pt-3 text-xs text-[#7d8496]">
             <span>
               {domain.noteCount} {domain.noteCount === 1 ? 'note' : 'notes'}

@@ -9,7 +9,7 @@ export const metadata: Metadata = {
 export default function AboutPage() {
   return (
     <main className="mx-auto w-full max-w-3xl flex-1 px-6 py-12">
-      <p className="text-sm text-fd-muted-foreground">About</p>
+      <p className="text-xs text-fd-muted-foreground">About</p>
       <h1 className="mt-1 text-3xl font-extrabold tracking-tight">Trung Nguyen</h1>
       <p className="mt-4 text-fd-muted-foreground">
         I am a backend engineer. I have been building server-side systems since 2018, mostly with TypeScript, Node.js, and NestJS, and the databases and messaging systems those services sit on.

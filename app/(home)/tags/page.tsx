@@ -12,7 +12,7 @@ export default function TagsPage() {
 
   return (
     <main className="mx-auto w-full max-w-3xl flex-1 px-6 py-12">
-      <p className="text-sm text-fd-muted-foreground">Tags</p>
+      <p className="text-xs text-fd-muted-foreground">Tags</p>
       <h1 className="mt-1 text-3xl font-extrabold tracking-tight">Tags</h1>
       <p className="mt-3 text-fd-muted-foreground">
         {tags.length === 0 ? 'No tags yet.' : `${tags.length} tags across the notes.`}

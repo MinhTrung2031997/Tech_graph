@@ -1,3 +1,4 @@
+import { ContentSearch, ContentSearchIcon } from '@/components/font-size-control';
 import { NotesSwitcher } from '@/components/notes-switcher';
 import fireMark from '@/app/icon.png';
 import type { BaseLayoutProps } from 'fumadocs-ui/layouts/shared';
@@ -17,6 +18,12 @@ export function baseOptions(): BaseLayoutProps {
       children: <NotesSwitcher />,
     },
     githubUrl: githubRepoUrl(),
+    slots: {
+      searchTrigger: {
+        full: ContentSearch,
+        sm: ContentSearchIcon,
+      },
+    },
     links: [
       { text: 'Notes', url: '/notes', active: 'nested-url' },
       { text: 'Interview Prep', url: '/interview', active: 'nested-url' },

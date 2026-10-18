@@ -15,7 +15,7 @@ export function Badge({
   children: ReactNode;
 }) {
   return (
-    <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11.5px] leading-5 ${tones[tone]}`}>
+    <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs leading-5 ${tones[tone]}`}>
       {children}
     </span>
   );
