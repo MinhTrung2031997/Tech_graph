@@ -1,0 +1,79 @@
+---
+title: "Microtask queue and macrotask queue (event queue, callback queue)"
+description: "The event loop decides what piece of code runs next. It processes tasks from two main queues."
+domain: "nodejs"
+type: "comparison"
+tags: ["nodejs"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+  <Divided>
+
+## Event Loop Basics
+
+The **event loop** decides what piece of code runs next. It processes tasks from **two main queues**:
+
+- **Macrotask Queue** — regular callbacks.
+- **Microtask Queue** — higher-priority callbacks.
+
+</Divided>
+  <SplitPair>
+    <SplitCol title="Microtask Queue">
+
+- **Contains**: `Promise.then/catch/finally`, `queueMicrotask`, `MutationObserver`.
+- **When processed**: After **each macrotask** and **before** rendering or starting another macrotask.
+- **Priority**: Higher — all queued microtasks run **before** moving on.
+
+</SplitCol>
+    <SplitCol title="Macrotask Queue">
+
+- **Contains**: `setTimeout`, `setInterval`, `setImmediate` (Node.js), I/O callbacks, UI rendering tasks.
+- **When processed**:
+  1. Pick the first macrotask from the queue.
+  2. Execute it **fully**.
+  3. Then process all pending microtasks.
+- **Priority**: Lower than microtasks — after a macrotask finishes, the event loop checks microtasks before moving to the next macrotask.
+
+</SplitCol>
+  </SplitPair>
+  <Divided>
+
+## Execution Order Example
+
+```javascript
+console.log("Start");
+setTimeout(() => console.log("Macrotask"), 0);
+Promise.resolve().then(() => console.log("Microtask"));
+console.log("End");
+```
+
+**Output**:
+
+```text
+Start
+End
+Microtask
+Macrotask
+```
+
+Reason:
+
+1. Synchronous logs: `Start`, `End`.
+2. All microtasks (`Promise.then`) run.
+3. Then macrotasks (`setTimeout`) run.
+
+## Key Differences
+
+| Feature | Macrotask Queue | Microtask Queue |
+| --- | --- | --- |
+| Examples | `setTimeout`, `setInterval`, I/O | `Promise.then`, `queueMicrotask` |
+| Priority | Lower | Higher |
+| Runs when? | After all microtasks are cleared | Immediately after current task |
+| Multiple runs? | One macrotask → all microtasks → next | Runs until empty before next macro |
+
+If you want, I can also give you a **visual diagram** of how microtasks and macrotasks are processed in the event loop—it makes the concept click instantly.
+
+</Divided>
+</ArticleStack>

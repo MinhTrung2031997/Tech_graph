@@ -1,0 +1,40 @@
+---
+title: "Asynchronous And Synchronous"
+description: "Synchronous: Tasks run in order; each step waits for the previous one to finish (blocking)."
+domain: "nodejs"
+type: "comparison"
+tags: ["nodejs"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+  <SplitPair>
+    <SplitCol title="Synchronous">
+
+- **Synchronous**: Tasks run in order; each step waits for the previous one to finish (**blocking**).
+  - Easy to understand and debug
+  - Can be slow if one task takes time (API/DB/file I/O)
+
+</SplitCol>
+    <SplitCol title="Asynchronous">
+
+- **Asynchronous**: Tasks don’t have to wait one by one; the program can do other work while waiting (**non-blocking**).
+  - Better responsiveness and throughput, especially for I/O-heavy systems
+  - More complex flow and error handling (race conditions, callback complexity)
+
+</SplitCol>
+  </SplitPair>
+  <Divided>
+
+## One-line interview answer
+
+*“Synchronous execution is blocking and sequential, while asynchronous execution is non-blocking and lets the system continue other work during I/O waits, improving performance and scalability.”*
+
+## When to use
+
+- Use **synchronous** for simple, strictly ordered logic.
+- Use **asynchronous** for I/O-heavy workloads where responsiveness matters.
+
+</Divided>
+</ArticleStack>
