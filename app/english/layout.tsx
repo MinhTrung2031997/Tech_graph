@@ -2,6 +2,7 @@
 
 import { EnglishHashScroll, englishSidebarComponents } from '@/components/english-sidebar';
 import { SidebarExpansionProvider, SidebarFolderControls } from '@/components/sidebar-expansion';
+import { SidebarResize } from '@/components/sidebar-resize';
 import { englishSetForPath, englishSets, englishTree } from '@/lib/english';
 import { baseOptions } from '@/lib/layout.shared';
 import { DocsLayout } from 'fumadocs-ui/layouts/notebook';
@@ -22,6 +23,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         nav={{ ...options.nav, mode: 'top' }}
         sidebar={{ banner: SidebarFolderControls, components: englishSidebarComponents }}
       >
+        <SidebarResize />
         <EnglishHashScroll />
         {children}
       </DocsLayout>
