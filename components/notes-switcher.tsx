@@ -20,8 +20,7 @@ export function NotesSwitcher() {
   const menuId = useId();
   const onEnglish = pathname.startsWith('/english');
   const current = englishSetForPath(pathname);
-  const techActive = !onEnglish && !open;
-  const englishActive = onEnglish || open;
+  const englishActive = onEnglish;
 
   useEffect(() => {
     setOpen(false);
@@ -45,9 +44,6 @@ export function NotesSwitcher() {
 
   return (
     <div ref={rootRef} className="ms-2 inline-flex shrink-0 items-center gap-1 sm:ms-3">
-      <Link href="/notes" className={tabClass(techActive)} aria-current={techActive ? 'page' : undefined}>
-        Tech Notes
-      </Link>
       <div className="relative">
         <button
           type="button"
