@@ -106,6 +106,131 @@ html > body[data-scroll-locked] {
   }
 }
 
+/*
+ * Below the desktop three-column width, the notebook grid is inline on #nd-notebook-layout.
+ * These unlayered rules replace it: phone is one column, iPad is sidebar plus article,
+ * and "On this page" follows the article instead of taking a third column.
+ */
+@media (width < 80rem) {
+  #nd-notebook-layout {
+    --fd-toc-width: 0px !important;
+    --fd-toc-col: 0px !important;
+    --fd-toc-popover-height: 0px !important;
+  }
+
+  #nd-notebook-layout [data-toc-popover] {
+    display: none !important;
+  }
+
+  #nd-toc {
+    display: flex !important;
+    position: static !important;
+    top: auto !important;
+    height: auto !important;
+    width: auto !important;
+    max-height: none !important;
+    grid-area: toc !important;
+    padding: 0.25rem 1.5rem 2.5rem !important;
+    overflow: visible !important;
+  }
+
+  #nd-toc .relative {
+    overflow: visible !important;
+    max-height: none !important;
+    mask-image: none !important;
+  }
+
+  #nd-subnav [data-header-body] {
+    height: auto;
+    flex-wrap: wrap;
+    align-items: center;
+    row-gap: 0.5rem;
+    column-gap: 0.5rem;
+    padding-block: 0.5rem;
+  }
+
+  #nd-subnav [data-header-body] > * {
+    min-width: 0;
+    max-width: 100%;
+    flex: 1 1 auto;
+  }
+
+  #nd-subnav [data-header-body] div {
+    flex-wrap: wrap;
+  }
+
+  #nd-subnav [data-search-full] {
+    flex: 1 1 10rem;
+    width: auto;
+    max-width: min(100%, 24rem);
+    min-width: 0;
+  }
+
+  #nd-page {
+    min-width: 0;
+    overflow-wrap: break-word;
+  }
+}
+
+/* iPhone: one column. The sidebar stays a drawer opened from the header button. */
+@media (width < 48rem) {
+  #nd-notebook-layout {
+    grid-template:
+      "header" auto
+      "main" auto
+      "toc" auto
+      / minmax(0, 1fr) !important;
+    --fd-sidebar-col: 0px !important;
+    --fd-sidebar-width: 0px !important;
+  }
+
+  #nd-notebook-layout > [data-sidebar-placeholder] {
+    display: none !important;
+  }
+
+  #nd-toc {
+    padding-inline: 1rem !important;
+  }
+
+  /* The size control is inline-flex outside Tailwind's layers, so max-md:hidden cannot hide the desktop copy. */
+  #nd-subnav [data-header-body] > .font-size-control {
+    display: none;
+  }
+
+  #nd-notebook-layout {
+    padding-bottom: 4.5rem;
+  }
+
+  .font-size-control button {
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+    padding-inline: 0.5rem;
+  }
+
+  #nd-subnav [data-header-body] button,
+  #nd-subnav [data-header-body] a,
+  #nd-sidebar-mobile button {
+    min-height: 2.75rem;
+  }
+
+  #nd-subnav [data-search],
+  #nd-subnav button[aria-controls='nd-sidebar-mobile'],
+  #nd-sidebar-mobile button[aria-controls='nd-sidebar-mobile'] {
+    min-width: 2.75rem;
+  }
+}
+
+/* iPad portrait and landscape: sidebar and article share the row. TOC sits under the article. */
+@media (width >= 48rem) and (width < 80rem) {
+  #nd-notebook-layout {
+    grid-template:
+      "header header" auto
+      "sidebar main" minmax(0, 1fr)
+      "sidebar toc" auto
+      / minmax(0, var(--fd-sidebar-col, 268px)) minmax(0, 1fr) !important;
+  }
+}
+
 #nd-notebook-layout[data-sidebar-resizing] {
   transition: none;
 }
