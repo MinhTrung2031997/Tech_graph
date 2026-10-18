@@ -1,0 +1,26 @@
+---
+title: "Optimize queries"
+description: "To enhance or optimize a heavy query, I often apply several strategies:"
+domain: "databases"
+type: "how-to"
+tags: ["sql"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+<Divided>
+
+To enhance or optimize a heavy query, I often apply several strategies:
+
+- First, I review the code to determine if tasks can run in parallel to reduce response time.
+- Second, I ensure appropriate indexes are applied to columns involved in `JOIN` conditions and `WHERE` clauses to improve query performance.
+- Next, I use the "**EXPLAIN ANALYZE**" keyword to analyze a query. I mainly focus on the indexes on columns that are frequently used in `WHERE`, `JOIN`, `GROUP BY`, or `ORDER BY` clauses.
+- Avoid unnecessary columns in `SELECT`.
+- Minimize subqueries or replace them with `JOINs` if appropriate.
+- If performance remains poor, I consider creating an aggregation table that combines data from multiple tables based on business logic. This reduces JOIN operations and can improve query speed.
+- Additionally, we can implement caching to improve performance. For large datasets, we can use batch processing to break the query into manageable chunks.
+- Partition /pɑːrˈtɪʃ.ən/ large tables to divide the data logically and improve access speed.
+
+</Divided>
+</ArticleStack>

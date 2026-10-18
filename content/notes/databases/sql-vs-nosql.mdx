@@ -1,29 +1,186 @@
 ---
-title: "SQL vs NoSQL"
-description: "SQL databases give you a schema, joins, and strong transactions. Document and key-value stores give you flexible records and easy horizontal partitioning. Many systems now do both: PostgreSQL has JSONB, and MongoDB has m"
+title: "Compare SQL and NoSQL"
+description: "SQL = Structured, relational, consistent, powerful queries, stable schema."
 domain: "databases"
 type: "comparison"
 tags: ["sql", "nosql"]
-status: "reviewed"
-appliesTo: "PostgreSQL 17, MongoDB 8"
-lastReviewed: "2026-10-04"
-related: ["databases/acid-vs-base", "databases/mysql-vs-postgresql"]
+status: "draft"
+article: stack
 ---
-<Tldr>
-SQL databases give you a schema, joins, and strong transactions. Document and key-value stores give you flexible records and easy horizontal partitioning. Many systems now do both: PostgreSQL has JSONB, and MongoDB has multi-document transactions.
-</Tldr>
 
-<Answer>
-I start with PostgreSQL unless I have a concrete reason not to. I reach for a document store when the data is a self-contained aggregate, the shape changes often, and I do not need joins across those aggregates. I do not pick "NoSQL" as a performance strategy. Indexes and data modeling decide performance.
-</Answer>
+<ArticleStack>
+<SplitPair>
+<SplitLead>
 
-## How I choose
+## Data model
 
-| Need | Usually |
-| --- | --- |
-| Invoices, accounts, anything with constraints | PostgreSQL |
-| A document that is always read and written as a whole | MongoDB, or JSONB in PostgreSQL |
-| A cache or a counter | Redis |
-| A relationship graph you traverse | A graph store, or recursive SQL if it is shallow |
+</SplitLead>
+<SplitCol title="SQL">
 
-The expensive part is the boundary. Once an order lives in one database and the user profile in another, you no longer have a single transaction. That is an architecture problem, not a driver problem. See [ACID vs BASE](/notes/databases/acid-vs-base).
+- Structured and **table-based** (rows, columns).
+- Requires a **fixed, predefined schema**.
+- Suitable for consistent, highly structured data.
+
+</SplitCol>
+<SplitCol title="NoSQL">
+
+- Supports **document**, **key–value**, **column-family**, or **graph** models.
+- **Schema-less or flexible schema**.
+- Suitable for semi-structured or unstructured data.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Schema & flexibility
+
+</SplitLead>
+<SplitCol title="SQL">
+
+- **Schema-first**: Columns must be defined before inserting data.
+- Schema changes require migrations → slower but more controlled.
+
+</SplitCol>
+<SplitCol title="NoSQL">
+
+- **Schema-on-read**: Structure can be differ between items.
+- Easy to evolve data structure → ideal for rapidly changing applications.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Scalability
+
+</SplitLead>
+<SplitCol title="SQL">
+
+- Primarily **vertical scaling** (increase CPU/RAM on a single server).
+- Horizontal scaling via sharding is possible but more complex.
+
+</SplitCol>
+<SplitCol title="NoSQL">
+
+- Built for **horizontal scaling** (add more nodes).
+- Automatic sharding & replication common in modern NoSQL systems.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Query capability
+
+</SplitLead>
+<SplitCol title="SQL">
+
+- Uses **SQL language**, very powerful for complex joins, filters, groups.
+- Best for **rich relational queries** and analytics /ˌæn.əˈlɪt̬.ɪks/.
+
+</SplitCol>
+<SplitCol title="NoSQL">
+
+- Query models depend on database type.
+- Typically optimized for **fast reads/writes**, not complex joins.
+- Graph databases support complex relationship queries.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Transactions & consistency
+
+</SplitLead>
+<SplitCol title="SQL">
+
+- Strong consistency with **ACID transactions**.
+- Ideal for financial systems, inventory, banking.
+
+</SplitCol>
+<SplitCol title="NoSQL">
+
+- Many use **BASE** (Basically Available, Soft state, Eventual consistency).
+- Some modern NoSQL (e.g., MongoDB, Cosmos DB) provide ACID but with tradeoffs.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Performance & use cases
+
+</SplitLead>
+<SplitCol title="SQL">
+
+- High performance for relational data and complex queries.
+- Use cases: ERP, CRM, banking, HR systems, analytics, reporting.
+
+</SplitCol>
+<SplitCol title="NoSQL">
+
+- High performance for massive scale, distributed workloads.
+- Use cases: IoT, real-time analytics, caching, social networks, streaming.
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Examples
+
+</SplitLead>
+<SplitCol title="SQL">
+
+- MySQL, PostgreSQL, Oracle, SQL Server.
+
+</SplitCol>
+<SplitCol title="NoSQL">
+
+- MongoDB (Document), Redis (Key–Value), Cassandra (Column family), Neo4j (Graph).
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## When to use
+
+</SplitLead>
+<SplitCol title="Use SQL when">
+
+- Data is structured and consistent
+- Relationships are important
+- You need strong ACID transactions
+- Complex queries or reporting are required
+
+</SplitCol>
+<SplitCol title="Use NoSQL when">
+
+- Large-scale data or high throughput
+- Rapid schema evolution
+- Data is unstructured or semi-structured
+- Horizontal scaling is needed
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Summary
+
+</SplitLead>
+<SplitCol title="SQL">
+
+**SQL = Structured, relational, consistent, powerful queries, stable schema.**
+
+</SplitCol>
+<SplitCol title="NoSQL">
+
+**NoSQL = Flexible, scalable, distributed, fast for large or changing datasets.**
+
+</SplitCol>
+</SplitPair>
+</ArticleStack>

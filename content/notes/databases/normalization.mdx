@@ -1,18 +1,69 @@
 ---
-title: "Normalization"
-description: "Placeholder outline for Normalization."
+title: "NORMALIZATION"
+description: "Normalization in SQL is the process of organizing data in a relational database to reduce redundancy, remove anomalies, and ensure data integrity."
 domain: "databases"
 type: "concept"
 tags: ["sql"]
 status: "draft"
-placeholder: true
+article: stack
 ---
-<Tldr>
-Placeholder for Normalization. The full note is not written yet.
-</Tldr>
 
-This page is part of the Databases tree so navigation works. It is not a copy of a Notion page.
+<ArticleStack>
 
-## What this note will cover
+- **Normalization in SQL** is the process of organizing data in a relational database to **reduce redundancy**, **remove anomalies**, and **ensure data integrity**.
+- Think of normalization as a set of rules that help you design **clean, efficient, consistent database schemas**.
 
-Normalization: a concept note for backend work and interviews.
+<Divided>
+
+## What it is
+
+What is normalization?
+
+Normalization ensures:
+
+✔ No duplicated data
+
+✔ No unnecessary dependencies
+
+✔ No update anomalies
+
+✔ Consistent structure
+
+✔ Efficient storage
+
+It breaks a large, unorganized table into **smaller, well-structured tables** connected by **foreign keys**.
+
+## Why
+
+Why we need normalization? Problems it solves.
+
+### Update anomaly
+
+Same data stored in multiple places must be updated everywhere.
+
+### Insertion anomaly
+
+You cannot insert data because another field is missing.
+
+### Deletion anomaly
+
+Deleting one row removes valuable related data unintentionally.
+
+Example:
+
+If you delete a student's course row → the student disappears entirely.
+
+Normalization eliminates these issues.
+
+## Normal forms
+
+The normal forms (NF) — step by step.
+
+Normalization uses levels called **normal forms**.
+
+Here are the important ones:
+
+**1NF → 2NF → 3NF → BCNF**
+
+</Divided>
+</ArticleStack>

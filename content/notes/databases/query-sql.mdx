@@ -1,0 +1,137 @@
+---
+title: "Query SQL"
+description: "SELECT, FROM, WHERE, GROUP BY, HAVING, ORDER BY."
+domain: "databases"
+type: "how-to"
+tags: ["sql"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+<Divided>
+
+```text
+SELECT <Danh sách các cột>
+FROM <Danh sách Bảng>
+WHERE <Các điều kiện>
+GROUP BY <Tên cột>
+HAVING <Điều kiện dựa trên GROUP BY>
+ORDER BY <Danh sách cột>
+```
+
+## Dạng truy vấn đơn giản
+
+- SELECT &lt;Danh sách các cột&gt;
+- FROM &lt;Danh sách Bảng&gt;
+
+**Ví dụ: lấy ra mã sinh viên, họ đệm và tên của các sinh viên trong bảng SINHVIEN**
+
+```text
+SELECT MaSV, Hodem, Ten
+FROM SINHVIEN;
+```
+
+## Mệnh đề WHERE
+
+- SELECT &lt;Danh sách các cột&gt;
+- FROM &lt;Tên bảng&gt;
+- WHERE
+
+**Ví dụ: lấy ra mã sinh viên, họ đệm và tên của các sinh viên nữ**
+
+```text
+SELECT MaSV, HoDem, Ten
+FROM SINHVIEN
+WHERE GioiTinh = "Nữ";
+```
+
+- Các phép toán trong mệnh đề WHERE:
+  - Toán tử so sánh: &gt;, &lt;, &gt;=, &lt;=, =, &lt;&gt;
+  - Toán tử Logic: And, Or, Not
+
+- Toán tử BETWEEN &lt;giá trị 1&gt; AND &lt;giá trị 2&gt;
+  - Ví dụ: Lấy ra danh sách các môn học có từ 2 đến 5 tín chỉ
+
+```text
+SELECT *
+FROM MONHOC
+WHERE SoTC BETWEEN 2 and 5;
+```
+
+- Toán tử [NOT] LIKE: tìm một mẫu ký tự
+- Sử dụng với các ký tự đại diện: _(1 ký tự), % (1 chuỗi bất kỳ)
+  - **Ví dụ: lấy ra danh sách Sinh viên có Họ đệm bắt đầu là “Nguyễn”**
+
+```text
+SELECT *
+FROM SINHVIEN
+WHERE HoDem LIKE "Nguyễn%";
+```
+
+- Toán tử [NOT] IN: phép toán so sánh trong 1 tập hợp, 1 danh sách
+  - Ví dụ: lấy ra thông tin của các lớp thuộc khoa công nghệ thông tin (mã CNTT), nông học (mã NH) và chăn nuôi thú y (mã CNTY).
+
+```text
+SELECT *
+FROM LOP
+WHERE MaKhoa IN ("CNTT", "NH", "CNTY");
+```
+
+## Truy vấn dữ liệu từ nhiều bảng
+
+- **Ví dụ: Hiển thị thông tin về các sinh viên với các kết quả học tập của họ. Thông tin hiển thị cần (Mã sinh viên, Họ tên, Ngày sinh, Giới tính, Tên môn học, Kết quả)**
+
+```text
+SELECT SINHVIEN.MaSV, Hodem, Ten, NgaySinh, GioiTinh, TenMH, KetQua
+FROM SINHVIEN, KETQUA, MONHOC
+WHERE SINHVIEN.MaSV = KETQUA.MaSV AND KETQUA.MaMH = MONHOC.MaMH;
+```
+
+## Mệnh đề ORDER BY
+
+- ORDER BY [ASC | DESC]
+- **Ví dụ: lấy ra các sinh viên nữ học lớp K55CNSHA, được sắp xếp theo vần alphabet của họ và tên**
+
+```text
+SELECT MaSV, HoDem, Ten
+FROM SINHVIEN
+WHERE GioiTinh = "Nữ" and MaLop = "K55CNSHA"
+ORDER BY Ten, HoDem ASC
+```
+
+## Mệnh đề GROUP BY
+
+- **Ví dụ: In ra danh sách các lớp và số sinh viên trong mỗi lớp từ bảng SinhVien**
+
+```text
+SELECT SINHVIEN.MaLop, LOP.TenLop, COUNT(SINHVIEN.MaSV) AS 'Số sinh viên'
+FROM SINHVIEN, LOP
+WHERE SINHVIEN.MaLop = LOP.MaLop
+GROUP BY SINHVIEN.MaLop, LOP.TenLop;
+```
+
+### Hàm thông dụng
+
+Một số hàm thông dụng:
+
+- AVG: giá trị trung bình
+- MIN: giá trị nhỏ nhất
+- MAX: giá trị lớn nhất
+- COUNT: đếm số phần tử
+- SUM: Tổng các phần tử
+
+## Mệnh đề HAVING
+
+- **Ví dụ: In ra danh sách các lớp có số sinh viên &gt; 2 từ bảng SINHVIEN**
+
+```text
+SELECT SINHVIEN.MaLop, LOP.TenLop, COUNT(SINHVIEN.MaSV) AS 'Số sinh viên'
+FROM SINHVIEN, LOP
+WHERE SINHVIEN.MaLop = LOP.MaLop
+GROUP BY SINHVIEN.MaLop, LOP.TenLop
+HAVING COUNT(SINHVIEN.MaSV) >= 2
+```
+
+</Divided>
+</ArticleStack>

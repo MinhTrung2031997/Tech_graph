@@ -1,35 +1,195 @@
 ---
-title: "ACID vs BASE"
-description: "ACID is a promise about one database: the transaction is all-or-nothing, constraints hold, concurrent transactions are isolated to some level, and committed data survives a crash. BASE describes systems that stay up by a"
+title: "BASE vs ACID"
+description: "BASE is the model used by many NoSQL systems (like Cassandra, DynamoDB, MongoDB) designed for massive scale and distributed networks."
 domain: "databases"
 type: "comparison"
-tags: ["postgresql", "transactions"]
-status: "reviewed"
-appliesTo: "PostgreSQL 17"
-lastReviewed: "2026-10-11"
-interviewPriority: true
-related: ["databases/transaction-isolation-levels", "databases/sql-vs-nosql"]
+tags: ["transactions"]
+status: "draft"
+article: stack
 ---
-<Tldr>
-ACID is a promise about one database: the transaction is all-or-nothing, constraints hold, concurrent transactions are isolated to some level, and committed data survives a crash. BASE describes systems that stay up by accepting stale or temporary disagreement.
-</Tldr>
 
-<Answer>
-ACID is Atomicity, Consistency, Isolation, and Durability. BASE is Basically Available, Soft state, and Eventually consistent. Isolation is not one thing. It is a dial, which is why [Transaction Isolation Levels](/notes/databases/transaction-isolation-levels) exists. I use ACID inside a service's database and design explicit compensation when a workflow crosses services.
-</Answer>
+<ArticleStack>
+<Divided>
 
-## What each letter actually constrains
+## BASE
 
-| | ACID | BASE |
-| --- | --- | --- |
-| Failure | The transaction rolls back | The system answers even if a replica is behind |
-| Correctness | Constraints are true at commit | Invariants catch up later, if you designed them to |
-| Typical home | PostgreSQL, MySQL | Caches, logs, some distributed stores |
+BASE is the model used by many NoSQL systems (like Cassandra, DynamoDB, MongoDB) designed for massive scale and distributed networks. It accepts that perfect consistency across 1,000 servers instantly is impossible, so it relaxes the rules
 
-Consistency in ACID means application invariants (foreign keys, checks), not the "C" in CAP. Mixing those two words is how this topic gets muddled in interviews.
+### Basically available
 
-## Pitfalls
+- The system guarantees /ˌɡer.ənˈtiː/ a response to every request. It might be a failure or "old" data, but the system (the "base") does not go down.
 
-<Pitfall>
-"We use a SQL database, so we are consistent" is not true once you have replicas, caches, or a second service writing its own database. Isolation level and replication lag are separate knobs.
-</Pitfall>
+**Example:**
+
+- User A sees “📦 5 items left”.
+- At the same moment, User B also sees “📦 5 items left”.
+- The real inventory might already be 4, but the system still returns a response (not blocking).
+
+The system prefers **availability over strict accuracy**.
+
+### Soft state
+
+- The state of the system can change without application input due to background syncing between servers
+
+**Example:**
+
+- Inventory data is stored in multiple replicas.
+- One replica may still show “5 items”
+- Another replica already shows “4 items”.
+- These copies aren’t strictly identical in real time.
+
+The state is “soft” (= temporarily inconsistent).
+
+### Eventual consistency
+
+- The system will *eventually* become consistent once it stops receiving input. If you update a profile /ˈproʊ.faɪl/ your friend might see the old photo for 2 seconds (inconsistency), but eventually, they will see the new one.
+
+**Example:**
+
+- A background process, replication log, or event stream updates all replicas.
+- Eventually all nodes show the correct number: “4 items left”.
+
+The key idea:
+
+👉 **Not consistent now, but will be consistent later.**
+
+## ACID
+
+ACID is a set of **four fundamental /ˌfʌn.dəˈmen.t̬əl/ guarantees** that define **correct, reliable transactions** in relational databases.
+
+It ensures that every transaction is processed **safely and consistently**, even if there are crashes, errors, or concurrent users.
+
+### Atomicity
+
+Atomicity /æt̬.əˈmɪs.ɪ.t̬i/
+
+- A transaction is **all-or-nothing**.
+- If any part fails, the entire transaction is rolled back.
+- Ensures **no partial updates** occur.
+
+**Example**
+
+Bank transfer:
+
+- Step 1: Deduct $100 from Account A
+- Step 2: Add $100 to Account B
+
+If Step 2 fails (system crash, network error), Atomicity ensures Step 1 is **rolled back**.
+
+→ The $100 is not lost or duplicated.
+
+### Consistency
+
+- A transaction must move the database from one **valid state** to another.
+- Enforces rules such as:
+  - Constraints (PK, FK, Unique)
+  - Data types
+  - Business rules
+- Prevents invalid data from being saved.
+
+**Example**
+
+A table has a constraint:
+
+```text
+CHECK (age >= 18)
+```
+
+If a transaction tries to insert `age = 15`, the transaction fails.
+
+The database prevents violating rules → remains consistent.
+
+### Isolation
+
+Isolation /ˈaɪ.sə.leɪt/
+
+- Concurrent transactions do **not affect /əˈfekt/ each other**.
+- Each transaction behaves as if it were **executed alone**.
+- Prevents issues like:
+  - Dirty reads
+  - Non-repeatable reads
+  - Phantom reads
+- Controlled through isolation levels (READ COMMITTED, SERIALIZABLE, etc.)
+
+**Example**
+
+Two users updating the same product quantity simultaneously:
+
+- Transaction A reads quantity = 10
+- Transaction B also reads quantity = 10
+
+If both try to update:
+
+- A sets quantity = 8
+- B sets quantity = 7
+
+With proper isolation → only **one** update succeeds correctly, and the other must retry.
+
+This avoids overwriting each other’s changes.
+
+### Durability
+
+Durability /ˌdʊr.əˈbɪl.ə.t̬i/ — Data is Permanent After Commit
+
+Once a transaction is committed, the changes are **saved permanently** — even if the system crashes immediately after.
+
+**Example**
+
+You insert a new order into the database:
+
+```text
+BEGIN;
+INSERT INTO orders (...) VALUES (...);
+COMMIT;
+```
+
+Right after commit, the database crashes.
+
+When it restarts → the order **still exists** because the data was written to durable storage (WAL logs, disk).
+
+</Divided>
+<SplitPair>
+<SplitLead>
+
+## Example
+
+Detailed Example: "The Last Concert Ticket"
+
+To truly understand the difference, let's look at a high-pressure scenario: **Two users (Alice and Bob) try to buy the very last ticket for a concert at the exact same millisecond.**
+
+</SplitLead>
+<SplitCol title="ACID">
+
+The ACID Approach (e.g., Banking, Airline Seats)
+
+In an ACID system (SQL), the database is paranoid. It assumes conflict will happen and protects against it using **Locks**.
+
+1. **Alice** clicks "Buy". The database starts a transaction.
+2. **Locking:** The database **locks** the specific row for that seat.
+3. **Bob** clicks "Buy". He tries to access the seat row.
+4. **Blocking:** Because Alice has the lock, Bob's request is forced to **wait** (spin). He sees a loading spinner.
+5. **Execution:** Alice's payment processes. Inventory goes from 1 to 0.
+6. **Commit:** Alice's transaction saves. The lock is released.
+7. **Bob's Turn:** Bob's request is finally let in. It checks inventory, sees 0.
+8. **Result:** Alice gets "Confirmed." Bob gets "Sold Out."
+   - *The Trade-off:* Data was perfect, but Bob had to wait. If 10,000 people tried to buy at once, the system might crash from the locking overhead.
+
+</SplitCol>
+<SplitCol title="BASE">
+
+The BASE Approach (e.g., Amazon Lightning Deal, Social Media)
+
+In a BASE system (NoSQL), the database is optimistic. It assumes high traffic is more important than preventing every single conflict upfront.
+
+1. **Alice** clicks "Buy". The request hits Server A (New York).
+2. **Bob** clicks "Buy". The request hits Server B (London).
+3. **Processing:** Server A sees "1 ticket left" and processes Alice. Server B *also* sees "1 ticket left" (because it hasn't synced with New York yet) and processes Bob.
+4. **Confirmation:** **Both** Alice and Bob get an "Order Placed" screen immediately. No waiting, no locks.
+5. **Reconciliation (The "Eventual" part):** In the background, Server A and Server B sync up. They realize, "Uh oh, we sold ticket #101 twice."
+6. **Resolution:** The business logic kicks in. The system sees Alice was 2ms faster.
+7. **Result:** Alice gets a shipping confirmation. Bob gets an apology email: *"We're sorry, due to high demand, we couldn't fulfill your order."*
+   - *The Trade-off:* The system handled massive traffic instantly, but it created a temporary mess (overselling) that had to be fixed later.
+
+</SplitCol>
+</SplitPair>
+</ArticleStack>

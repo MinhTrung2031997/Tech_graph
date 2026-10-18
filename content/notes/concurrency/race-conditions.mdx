@@ -15,7 +15,7 @@ A race condition is a bug whose result depends on timing. In a database-backed A
 </Tldr>
 
 <Answer>
-I name the invariant first (one debit, one seat, one webhook side effect). Then I pick the smallest mechanism that enforces it: an atomic `UPDATE`, `SELECT … FOR UPDATE`, a unique index, or an idempotency key stored in the same transaction as the side effect. Isolation level alone does not save a read-modify-write at Read Committed. See [Transaction Isolation Levels](/notes/databases/transaction-isolation-levels).
+I name the invariant first (one debit, one seat, one webhook side effect). Then I pick the smallest mechanism that enforces it: an atomic `UPDATE`, `SELECT … FOR UPDATE`, a unique index, or an idempotency key stored in the same transaction as the side effect. Isolation level alone does not save a read-modify-write at Read Committed. See [SQL ISOLATION](/notes/databases/transaction-isolation-levels).
 </Answer>
 
 ## Six ways I actually use

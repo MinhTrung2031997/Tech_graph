@@ -59,7 +59,7 @@ export const domains: Domain[] = [
   {
     number: '08',
     slug: 'databases',
-    title: 'Databases',
+    title: 'DATABASES',
     description: 'SQL and NoSQL, transactions, isolation, indexing, and how to choose PostgreSQL, MySQL, or MongoDB.',
     icon: 'Database',
   },

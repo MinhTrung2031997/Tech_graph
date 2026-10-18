@@ -1,0 +1,20 @@
+---
+title: "JSONB (Post)"
+description: "JSONB is a PostgreSQL data type that stores JSON data in a processed binary representation."
+domain: "databases"
+type: "concept"
+tags: ["postgresql"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+<Divided>
+
+- **JSONB is a PostgreSQL data type that stores JSON data in a processed binary representation.**
+- Unlike the JSON type, which preserves the original JSON text, JSONB parses the input when data is written. This makes it useful for querying and manipulating JSON data.
+- Its main advantages are efficient JSON operations, support for indexing with GIN and expression indexes, and the flexibility to store semi-structured data without creating a separate column for every attribute. (GIN stands for Generalized Inverted Index. It is useful for indexing composite values such as JSONB and arrays. For JSONB, it can speed up supported containment and key-existence queries by indexing the components inside the document.)
+- I would use JSONB for flexible metadata or attributes, while keeping important fields that require constraints, relationships, or frequent queries in regular relational columns.
+
+</Divided>
+</ArticleStack>

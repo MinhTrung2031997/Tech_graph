@@ -1,18 +1,175 @@
 ---
-title: "MySQL vs PostgreSQL"
-description: "Placeholder outline for MySQL vs PostgreSQL."
+title: "MySQL vs PostgreSQL — Key Differences"
+description: "MySQL → ACID only with InnoDB engine. PostgreSQL → Always ACID, no engine selection needed."
 domain: "databases"
 type: "comparison"
 tags: ["mysql", "postgresql"]
 status: "draft"
-placeholder: true
+article: stack
 ---
-<Tldr>
-Placeholder for MySQL vs PostgreSQL. The full note is not written yet.
-</Tldr>
 
-This page is part of the Databases tree so navigation works. It is not a copy of a Notion page.
+<ArticleStack>
+<SplitPair>
+<SplitLead>
 
-## What this note will cover
+## Architecture
 
-MySQL vs PostgreSQL: a comparison note for backend work and interviews.
+</SplitLead>
+<SplitCol title="MySQL">
+
+- **Type:** Relational DB
+- **Engine:** Multiple engines (InnoDB, MyISAM...)
+- **Owned by:** Oracle
+
+</SplitCol>
+<SplitCol title="PostgreSQL">
+
+- **Type:** Object-Relational DB
+- **Engine:** Single engine, always consistent
+- **Owned by:** Open source community
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## ACID & transactions
+
+</SplitLead>
+<SplitCol title="MySQL">
+
+MySQL → ACID only with InnoDB engine
+
+MyISAM (legacy) = NO ACID ⚠️
+
+</SplitCol>
+<SplitCol title="PostgreSQL">
+
+PostgreSQL → Always ACID, no engine selection needed
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Concurrency (MVCC)
+
+</SplitLead>
+<SplitCol title="MySQL">
+
+MySQL: Writer locks row → Reader must WAIT 😴
+
+</SplitCol>
+<SplitCol title="PostgreSQL">
+
+PostgreSQL: Writer creates new row version
+
+Reader reads old version → NEVER waits ✅
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## JSON support
+
+</SplitLead>
+<SplitCol title="MySQL">
+
+MySQL → JSON stored as text, limited indexing
+
+</SplitCol>
+<SplitCol title="PostgreSQL">
+
+PostgreSQL → JSONB (binary), fully indexable
+
+→ Can replace MongoDB in many cases
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## SQL compliance
+
+</SplitLead>
+<SplitCol title="MySQL">
+
+MySQL → Some non-standard behaviors
+
+GROUP BY less strict
+
+</SplitCol>
+<SplitCol title="PostgreSQL">
+
+PostgreSQL → Strictly follows SQL standards
+
+Window functions, CTEs, Recursive queries supported longer & more reliably
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Extensions
+
+</SplitLead>
+<SplitCol title="MySQL">
+
+MySQL → No equivalent ecosystem ❌
+
+</SplitCol>
+<SplitCol title="PostgreSQL">
+
+PostgreSQL rich ecosystem:
+
+- pgvector → AI / embeddings
+- PostGIS → Geospatial data
+- TimescaleDB → Time-series data
+- Citus → Distributed PostgreSQL
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Replication
+
+</SplitLead>
+<SplitCol title="MySQL">
+
+MySQL → Binlog replication, async by default
+
+</SplitCol>
+<SplitCol title="PostgreSQL">
+
+PostgreSQL → WAL streaming replication
+
+Sync or Async, more flexible config
+
+Logical replication per individual table
+
+</SplitCol>
+</SplitPair>
+<SplitPair>
+<SplitLead>
+
+## Licensing & cost
+
+</SplitLead>
+<SplitCol title="MySQL">
+
+MySQL → Community: free
+
+Enterprise: paid (Oracle) ⚠️
+
+</SplitCol>
+<SplitCol title="PostgreSQL">
+
+PostgreSQL → 100% free, all features included
+
+No vendor lock-in risk
+
+</SplitCol>
+</SplitPair>
+</ArticleStack>

@@ -29,7 +29,7 @@ export default function Layout({ children }: LayoutProps<'/'>) {
           }}
           search={{
             links: [
-              ['Transaction Isolation Levels', '/notes/databases/transaction-isolation-levels'],
+              ['SQL ISOLATION', '/notes/databases/transaction-isolation-levels'],
               ['Event Loop & Task Queues', '/notes/nodejs/event-loop'],
               ['Kafka vs RabbitMQ', '/notes/messaging/kafka-vs-rabbitmq'],
               ['Quick Review', '/review'],

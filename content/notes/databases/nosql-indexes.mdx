@@ -1,0 +1,152 @@
+---
+title: "NoSQL - Indexes"
+description: "Index bounds define the range of index values that MongoDB searches when using an index to fulfill a query."
+domain: "databases"
+type: "how-to"
+tags: ["nosql", "mongodb"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+<Divided>
+
+## Single field indexes
+
+```javascript
+db.students.insertMany( [
+  {
+    "name": "Alice",
+    "gpa": 3.6,
+    "location": { city: "Sacramento", state: "California" }
+  },
+  {
+    "name": "Bob",
+    "gpa": 3.2,
+    "location": { city: "Albany", state: "New York" }
+  }
+] )
+```
+
+### Single field
+
+Create an index on a single field.
+
+```javascript
+db.students.createIndex( { gpa: 1 } )
+```
+
+### Embedded document
+
+Create an index on an embedded document.
+
+```javascript
+db.students.createIndex( { "location.state": 1 } )
+```
+
+## Compound indexes
+
+```javascript
+{ "item": 1, "location": 1, "stock": 1 }
+```
+
+The index has these index prefixes:
+
+- `{ item: 1 }`
+- `{ item: 1, location: 1 }`
+
+MongoDB can use the compound index to support queries on these field combinations:
+
+- `item`
+- `item` and `location`
+- `item`, `location`, and `stock`
+
+## Multikey indexes
+
+**Index bounds** define the range of index values that MongoDB searches when using an index to fulfill a query
+
+### Array field
+
+Create an index on an array field.
+
+```javascript
+db.students.insertMany( [
+  {
+    "name": "Andre Robinson",
+    "test_scores": [ 88, 97 ]
+  },
+  {
+    "name": "Wei Zhang",
+    "test_scores": [ 62, 73 ]
+  },
+  {
+    "name": "Jacob Meyer",
+    "test_scores": [ 92, 89 ]
+  }
+] )
+
+db.students.createIndex( { test_scores: 1 } )
+```
+
+### Embedded field
+
+Create an index on an embedded field in an array.
+
+```javascript
+db.inventory.insertMany( [
+  {
+    "item": "t-shirt",
+    "stock": [
+      {
+        "size": "small",
+        "quantity": 8
+      },
+      {
+        "size": "large",
+        "quantity": 10
+      },
+    ]
+  },
+  {
+    "item": "sweater",
+    "stock": [
+      {
+        "size": "small",
+        "quantity": 4
+      },
+      {
+        "size": "large",
+        "quantity": 7
+      },
+    ]
+  },
+] )
+
+db.inventory.createIndex( { "stock.quantity": 1 } )
+```
+
+### Bounds
+
+Multikey index bounds.
+
+```javascript
+db.students.insertMany(
+  [
+    { _id: 1, name: "Shawn", grades: [ 70, 85 ] },
+    { _id: 2, item: "Elena", grades: [ 92, 84 ] }
+  ]
+)
+
+db.students.createIndex( { grades: 1 } )
+```
+
+## Text indexes
+
+## Wildcard indexes
+
+## Geospatial indexes
+
+## Hashed indexes
+
+</Divided>
+</ArticleStack>

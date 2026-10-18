@@ -1,136 +1,183 @@
 ---
-title: "Transaction Isolation Levels"
-description: "Isolation levels define which anomalies concurrent transactions may observe. Higher levels prevent more anomalies at the cost of more locking or more retries. PostgreSQL implements Repeatable Read as snapshot isolation."
+title: "SQL ISOLATION"
+description: "In relational databases, multiple transactions often run at the same time (concurrency)."
 domain: "databases"
 type: "concept"
-tags: ["postgresql", "mysql", "mvcc"]
-status: "reviewed"
-appliesTo: "PostgreSQL 17, MySQL 8.4"
-lastReviewed: "2026-10-12"
-interviewPriority: true
-related: ["databases/acid-vs-base", "concurrency/race-conditions", "databases/mysql-vs-postgresql"]
-sources: ["https://www.postgresql.org/docs/current/transaction-iso.html", "https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html"]
+tags: ["sql", "transactions"]
+status: "draft"
+article: stack
 ---
-<Tldr>
-Isolation levels define which anomalies concurrent transactions may observe. Higher levels prevent more anomalies at the cost of more locking or more retries. PostgreSQL implements Repeatable Read as snapshot isolation.
-</Tldr>
 
-<Answer>
-There are four ANSI levels: Read Uncommitted, Read Committed, Repeatable Read, and Serializable. Each one rules out more anomalies — dirty reads, non-repeatable reads, and phantoms. In practice Postgres uses MVCC snapshots, so readers never block writers. Its Repeatable Read does not show phantoms, and Serializable may abort a transaction that the application must retry.
-</Answer>
+<ArticleStack>
+<Divided>
 
-## Anomalies by level
+## Foundation
 
-A **dirty read** sees another transaction's uncommitted write. A **non-repeatable read** sees a committed update to a row it already read. A **phantom** sees a newly committed row that matches a predicate it already queried.
+What is SQL isolation?
 
-<table>
-  <thead>
-    <tr>
-      <th>Level</th>
-      <th>Dirty read</th>
-      <th>Non-repeatable read</th>
-      <th>Phantom read</th>
-      <th>PostgreSQL in practice</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>Read Uncommitted</td>
-      <td><span className="text-red-400">possible</span></td>
-      <td><span className="text-red-400">possible</span></td>
-      <td><span className="text-red-400">possible</span></td>
-      <td>behaves as Read Committed</td>
-    </tr>
-    <tr>
-      <td>Read Committed</td>
-      <td><span className="text-green-400">prevented</span></td>
-      <td><span className="text-red-400">possible</span></td>
-      <td><span className="text-red-400">possible</span></td>
-      <td>default</td>
-    </tr>
-    <tr>
-      <td>Repeatable Read</td>
-      <td><span className="text-green-400">prevented</span></td>
-      <td><span className="text-green-400">prevented</span></td>
-      <td><span className="text-amber-300">ANSI: possible</span></td>
-      <td>snapshot, no phantoms</td>
-    </tr>
-    <tr>
-      <td>Serializable</td>
-      <td><span className="text-green-400">prevented</span></td>
-      <td><span className="text-green-400">prevented</span></td>
-      <td><span className="text-green-400">prevented</span></td>
-      <td>SSI, may abort and must be retried</td>
-    </tr>
-  </tbody>
-</table>
+- In relational databases, multiple transactions often run at the same time (concurrency). Isolation ensures that each transaction behaves as if it’s running alone, even though in reality the DB is multitasking.
+- Isolation prevents incorrect reads, race conditions, phantom rows, dirty data, and ensures correctness.
 
-### ANSI vs PostgreSQL and MySQL
+## Why
 
-PostgreSQL never shows dirty reads. Asking for Read Uncommitted silently runs as Read Committed. The default is Read Committed: each statement sees a fresh snapshot, so a later statement in the same transaction can observe commits that happened after the previous statement.
+Why is isolation needed?
 
-Repeatable Read in PostgreSQL is snapshot isolation. The snapshot is taken at the first statement, and every later statement uses it, so phantoms from concurrent commits do not appear. That is stronger than the ANSI definition of Repeatable Read.
+✔ Many users
 
-Serializable in PostgreSQL is Serializable Snapshot Isolation. It does not take the read locks a textbook would. It watches for dangerous read/write dependency cycles and aborts one transaction with SQLSTATE `40001`. The application retries the whole transaction.
+✔ Many writes
 
-MySQL InnoDB's default is Repeatable Read. It stops many phantoms with next-key locks: a lock on the index record plus the gap before it. InnoDB's Read Uncommitted really can return dirty reads. Its Serializable level turns plain `SELECT` into locking reads (`LOCK IN SHARE MODE`).
+✔ Many reads
 
-## Avoiding lost updates
+✔ High concurrency
 
-Read Committed does not stop two transactions from reading the same balance and both writing a new one. The second commit overwrites the first. That is a lost update, and it is allowed at every level except, in practice, the ones that lock or abort.
+✔ Different transactions touching the same rows
 
-<CodeBlockTabs defaultValue="sql">
-  <CodeBlockTabsList>
-    <CodeBlockTabsTrigger value="sql">transfer.sql</CodeBlockTabsTrigger>
-    <CodeBlockTabsTrigger value="ts">transfer.ts</CodeBlockTabsTrigger>
-  </CodeBlockTabsList>
-  <CodeBlockTab value="sql">
+→ Without isolation, anomalies occur.
 
-```sql title="transfer.sql"
-BEGIN ISOLATION LEVEL READ COMMITTED;
-SELECT balance FROM accounts WHERE id = 42 FOR UPDATE; -- [!code highlight]
-UPDATE accounts SET balance = balance - 100 WHERE id = 42;
-COMMIT;
+## Anomalies
+
+Concurrency problems (anomalies).
+
+### Dirty read
+
+Transaction A reads data that Transaction B has written but not committed.
+
+**Example:**
+
+```text
+T1: UPDATE accounts SET balance = 0 WHERE id = 1;   -- not committed
+T2: SELECT balance FROM accounts WHERE id = 1;      -- sees 0 (dirty)
+T1: ROLLBACK;
 ```
 
-  </CodeBlockTab>
-  <CodeBlockTab value="ts">
+T2 reads data that never became real.
 
-```ts title="transfer.ts"
-await db.transaction(async (tx) => {
-  const [row] = await tx`
-    SELECT balance FROM accounts WHERE id = ${42} FOR UPDATE
-  `;
-  await tx`
-    UPDATE accounts SET balance = balance - ${100} WHERE id = ${42}
-  `;
-  return row;
-});
+► Dangerous when reading money, inventory, scores, status flags.
+
+### Non-repeatable read
+
+A transaction reads the same row twice but gets different values because another transaction modified it.
+
+```text
+T1: SELECT balance FROM accounts WHERE id = 1;    -- balance = 200
+T2: UPDATE accounts SET balance = 100 WHERE id=1; -- commit
+T1: SELECT balance FROM accounts WHERE id = 1;    -- balance = 100
 ```
 
-  </CodeBlockTab>
-</CodeBlockTabs>
+► The row changed inside a transaction → broken read stability.
 
-An atomic `UPDATE accounts SET balance = balance - 100` is enough when the new value is a pure function of the current row. `FOR UPDATE` is for when the application must read the row, decide, and then write. Optimistic locking (`UPDATE … WHERE version = $1`) is the other pattern: the write fails if someone else committed first, and the app retries.
+### Lost update
 
-## Pitfalls
+Two writes overwrite each other.
 
-<Pitfall>
-Read Committed alone does not prevent lost updates. Use `SELECT … FOR UPDATE`, an atomic `UPDATE`, or optimistic locking. See [Race Conditions & Concurrency Control](/notes/concurrency/race-conditions).
-</Pitfall>
+```text
+T1: SELECT balance = 200
+T2: SELECT balance = 200
 
-## Interview questions
+T1: UPDATE balance = 150
+T2: UPDATE balance = 100  <-- overwrites T1
+```
 
-<details>
-<summary>Why does PostgreSQL not have phantom reads at Repeatable Read?</summary>
+► Happens in wallet, inventory, bank, booking systems.
 
-Its Repeatable Read is snapshot isolation. Every statement in the transaction reads the same snapshot taken at the first query, so rows inserted and committed by others later are invisible.
+### Phantom read
 
-</details>
+A transaction queries a range twice, but new rows appear.
 
-<details>
-<summary>How does InnoDB's next-key locking differ from PostgreSQL's SSI?</summary>
+```text
+T1: SELECT * FROM orders WHERE amount > 100  -- gets 5 rows
+T2: INSERT INTO orders(amount) VALUES (200)
+T1: SELECT * FROM orders WHERE amount > 100  -- now 6 rows
+```
 
-InnoDB blocks conflicting inserts by locking index records plus the gaps between them. PostgreSQL's Serializable Snapshot Isolation does not block. It tracks read/write dependencies and aborts one transaction on a dangerous cycle, so the app must retry.
+► Affects analytics, pagination, counting, searching tables.
 
-</details>
+## Isolation levels
+
+SQL standard isolation levels.
+
+### Read uncommitted
+
+- **Description**: The lowest isolation level. Transactions can read uncommitted changes made by other transactions.
+- **Prevents**: None (dirty reads, non-repeatable reads, and phantom reads can all occur).
+- **Use Case**: Rarely used; suitable only for scenarios where performance is more critical than accuracy /ˈæk.jɚ.ə.si/, such as logging or reporting on volatile /ˈvɒl.ə.taɪl/ data.
+
+### Read committed
+
+Postgres default.
+
+- **Description**: A transaction can only read data that has been committed. Uncommitted changes are not visible.
+- **Prevents**: Dirty reads.
+- **Allows**: Non-repeatable reads and phantom reads.
+- **Use Case**: Most common default isolation level (e.g., in PostgreSQL and SQL Server). Suitable for applications where avoiding dirty reads is sufficient.
+
+### Repeatable read
+
+MySQL default.
+
+- **Description**: Ensures that if a transaction reads a record, no other transaction can modify that record until the first transaction completes.
+- **Prevents**: Dirty reads and non-repeatable reads.
+- **Allows**: Phantom reads.
+- **Use Case**: Scenarios requiring consistent reads of the same data, such as financial calculations.
+
+### Serializable
+
+- **Description**: The highest isolation level. Transactions are executed in a way that they appear to run sequentially (one after another), even if they are executed concurrently.
+- **Prevents**: Dirty reads, non-repeatable reads, and phantom reads.
+- **Use Case**: Scenarios requiring the highest level of consistency, such as critical financial operations. It may reduce performance due to increased locking and contention.
+
+</Divided>
+<SplitPair>
+<SplitLead>
+
+## Implementation
+
+How databases implement isolation (internal techniques).
+
+There are two big families:
+
+</SplitLead>
+<SplitCol title="Lock-based">
+
+**Lock-based concurrency control**
+
+- **shared Lock**: Allows multiple transactions to read a resource but prevents writes.
+- **Exclusive Lock**: Prevents other transactions from reading or writing a resource.
+- Range locks for preventing phantom reads
+
+**Used by:** SQL Server, MySQL (InnoDB uses combination of locks + MVCC)
+
+Pros: strong consistency
+
+Cons: deadlocks, blocking
+
+</SplitCol>
+<SplitCol title="MVCC">
+
+**MVCC (Multi-Version Concurrency Control)**
+
+Most modern databases use this.
+
+- Writers **do not block** readers
+- Readers **read snapshots** in the past
+- When updating, new row versions are created
+
+**Used by:** PostgreSQL, MySQL InnoDB (partial), Oracle
+
+Pros:
+
+✔ high performance
+
+✔ avoid read locks
+
+✔ consistent snapshots
+
+Cons:
+
+✘ vacuuming / old versions overhead
+
+✘ serializable isolation requires more computation
+
+</SplitCol>
+</SplitPair>
+</ArticleStack>
