@@ -30,6 +30,11 @@ export default async function Page(props: PageProps<'/english/[[...slug]]'>) {
     redirect(interview?.href ?? '/english/interview/microservice-benefits');
   }
 
+  if (slug.length === 1 && slug[0] === 'daily') {
+    const daily = englishSets.find((set) => set.id === 'daily');
+    redirect(daily?.href ?? '/english/daily/a-day-of-new-friendship');
+  }
+
   const title = englishTitleForSlug(slug);
   if (!title) notFound();
 
