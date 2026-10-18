@@ -3,7 +3,7 @@
 import { SidebarFolder, SidebarFolderContent, SidebarFolderLink, SidebarItem, useFolderDepth } from 'fumadocs-ui/components/sidebar/base';
 import { CardSeparator } from '@/components/sidebar-cards';
 import { useControlledFolder } from '@/components/sidebar-expansion';
-import type { Folder, Item, Node } from 'fumadocs-core/page-tree';
+import type { Folder, Item } from 'fumadocs-core/page-tree';
 import { usePathname } from 'next/navigation';
 import { useEffect, useState, type MouseEvent, type ReactNode } from 'react';
 
@@ -20,17 +20,6 @@ function samePath(href: string, pathname: string) {
 function splitHref(href: string) {
   const [path, hash = ''] = href.split('#');
   return { path: path ?? href, hash };
-}
-
-function containsPath(nodes: Node[], pathname: string): boolean {
-  for (const node of nodes) {
-    if (node.type === 'page' && samePath(node.url, pathname)) return true;
-    if (node.type === 'folder') {
-      if (node.index && samePath(node.index.url, pathname)) return true;
-      if (containsPath(node.children, pathname)) return true;
-    }
-  }
-  return false;
 }
 
 function useHash() {
@@ -115,8 +104,8 @@ export function EnglishCardFolder({ item, children }: { item: Folder; children: 
   const depth = useFolderDepth();
   const nested = depth > 0;
   const onSection = item.index ? samePath(item.index.url, pathname) : false;
-  const active = onSection || containsPath(item.children, pathname);
-  const folder = useControlledFolder(active, item.defaultOpen);
+  // Fumadocs opens a folder when `active` is true. Interview sections stay collapsed until clicked or Expand all.
+  const folder = useControlledFolder(false, item.defaultOpen);
 
   return (
     <SidebarFolder
