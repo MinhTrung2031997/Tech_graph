@@ -1,18 +1,72 @@
 ---
 title: "GraphQL"
-description: "Placeholder outline for GraphQL."
+description: "GraphQL is a query language and a runtime where the client defines exactly what data it wants, and the server returns that data."
 domain: "api-communication"
 type: "concept"
 tags: ["graphql"]
 status: "draft"
-placeholder: true
+article: stack
 ---
-<Tldr>
-Placeholder for GraphQL. The full note is not written yet.
-</Tldr>
 
-This page is part of the API & Communication tree so navigation works. It is not a copy of a Notion page.
+<ArticleStack>
 
-## What this note will cover
+GraphQL is a query language and a runtime where the client defines **exactly what data it wants**, and the server returns that data.
 
-GraphQL: a concept note for backend work and interviews.
+<SplitPair>
+  <SplitCol title="Pros">
+
+- **Fetch only the data the client needs**
+  - With GraphQL, the client specifies exactly what fields it wants. No more overfetching.
+- **Eliminates multiple round-trips**
+  - You can fetch deeply nested relational data in one query, even if that data spans multiple backend services.
+- **Strongly-typed schema**
+  - The GraphQL schema ensures:
+    - predictable /prɪˈdɪk.tə.bəl/ responses,
+    - field-level validation,
+- **Flexible for frontend teams**
+  - Frontend developers can change the requested fields without needing backend changes—if the data is already in the schema.
+- **Single endpoint**
+  - No need to version API by URL.
+  - Changes can be introduced in the schema gradually without breaking existing queries.
+
+  </SplitCol>
+  <SplitCol title="Cons">
+
+- **Harder to cache**
+  - Because GraphQL uses POST and payloads are dynamic, HTTP caching does not work well.
+- **Increased backend complexity**
+  - GraphQL requires:
+    - a schema language,
+    - resolvers,
+    - resolver chaining,
+    - query analysis and validation,
+    - batching and optimization.
+- **N+1 query problem**
+  - A poorly implemented resolver may cause each field to trigger its own database call. This can explode /ɪkˈsploʊd/ into hundreds of expensive queries.
+- **Performance risks**
+  - Clients can write heavy queries that require a lot of nested data. Without proper limits, this can overload servers.
+- **Security concerns**
+  - GraphQL must defend against:
+    - overly deep queries,
+    - complexity bombs,
+    - introspection /ˌɪn.trəˈspek.ʃən/ misuse,
+    - brute-force schema exploration.
+  - More security layers are required compared to REST.
+
+  </SplitCol>
+</SplitPair>
+
+<Divided>
+
+## N+1
+
+How to Avoid the N+1 Problem
+
+- **DataLoader** is a library that batches and caches database requests to reduce the number of queries.
+- How it Works:
+  - Data Loader collects all the keys requested during a single execution of the GraphQL query.
+  - It makes a single batched query to the database and returns the results in a format that maps back to the requested keys.
+
+</Divided>
+
+</ArticleStack>
