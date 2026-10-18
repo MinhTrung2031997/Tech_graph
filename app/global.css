@@ -498,6 +498,21 @@ html > body[data-scroll-locked] {
   margin: 0 0 0.75rem;
 }
 
+/* Same 1px section rule as .article-divided h2, between lines instead of headings. */
+.article-line-rules > p + p {
+  margin-top: 1.35rem;
+  padding-top: 1.05rem;
+  border-top: 1px solid #2a3142;
+}
+
+.article-line-rules > p.speaker-man {
+  color: #818cf8;
+}
+
+.article-line-rules > p.speaker-woman {
+  color: #fb7185;
+}
+
 .article-divided ul {
   margin-bottom: 0.25rem;
 }
