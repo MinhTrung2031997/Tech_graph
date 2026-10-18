@@ -1,18 +1,288 @@
 ---
 title: "API Gateway"
-description: "Placeholder outline for API Gateway."
+description: "All client requests pass through a single gateway before reaching microservices."
 domain: "api-communication"
 type: "concept"
 tags: ["http"]
 status: "draft"
-placeholder: true
+article: stack
 ---
-<Tldr>
-Placeholder for API Gateway. The full note is not written yet.
-</Tldr>
 
-This page is part of the API & Communication tree so navigation works. It is not a copy of a Notion page.
+<ArticleStack>
+<Divided>
 
-## What this note will cover
+## Characteristics
 
-API Gateway: a concept note for backend work and interviews.
+### Entry point
+
+**Centralized Entry Point**
+
+**Characteristic:**
+
+All client requests pass through a single gateway before reaching microservices.
+
+**Why it matters:**
+
+- Simplifies routing
+- Enforces consistent policies (auth, rate limit)
+- Reduces client complexity
+
+**Risk:**
+
+- Single point of failure (SPOF) if not replicated
+- Can become a performance bottleneck
+
+### Routing
+
+**Request Routing & Load Balancing**
+
+**Characteristic:**
+
+Routes requests to appropriate downstream microservices.
+
+**Limitations / Problems:**
+
+- Incorrect routing rules can break entire systems
+- Heavy routing logic slows performance
+- Requires synchronization of service discovery (e.g., Consul, Eureka)
+
+### Authentication
+
+**Authentication & Authorization**
+
+**Characteristic:**
+
+Gateways often handle:
+
+- JWT validation
+- OAuth2, API Keys
+- Session management
+- RBAC / ABAC policies
+
+**Challenges:**
+
+- Validating heavy JWT tokens can increase latency
+- Token refresh logic adds complexity
+- Rate-limiting + auth combined may overload the gateway
+
+### Aggregation
+
+**Request Aggregation**
+
+**Characteristic:**
+
+Gateway can merge multiple backend calls into a single response.
+
+**Benefit:**
+
+- Reduces client round-trips
+- Better UX performance
+
+**Limitations:**
+
+- Gateway becomes overloaded if it performs too much orchestration
+- Hard to maintain as microservices evolve
+- Increases coupling between gateway ↔ business services
+- Slowest downstream service slows the entire aggregated response
+
+### Security
+
+**Security Enforcement**
+
+**Characteristic:**
+
+Implements:
+
+- TLS termination
+- IP whitelisting
+- CSRF checks
+- API throttling
+- WAF rules
+
+**Potential Problems:**
+
+- Security misconfiguration exposes all microservices
+- High cost of SSL termination slows performance
+- WAF/ACL rules create big latency if rules grow large
+
+### Throttling
+
+**Rate Limiting & Throttling**
+
+**Characteristic:**
+
+Controls traffic to prevent overload on backend services.
+
+**Challenges:**
+
+- Distributed rate limiting is hard (needs Redis/etcd)
+- Incorrect settings → DOS on your own services
+- Introduces extra latency
+- Global rate-limiting becomes expensive at scale
+
+### Caching
+
+**Characteristic:**
+
+Routes frequently-accessed responses from cache (memory/Redis).
+
+**Limitations:**
+
+- Cache invalidation is notoriously hard
+- Stale data leads to inconsistent client states
+- Caching dynamic data may break business rules
+
+### Logging
+
+**Logging, Monitoring, and Tracing**
+
+**Characteristic:**
+
+Gateway collects:
+
+- Access logs
+- Request metrics
+- Distributed tracing headers
+
+**Challenges:**
+
+- Logging is expensive at high traffic
+- Need to propagate tracing (Jaeger/Zipkin/OTEL)
+- Heavy logging → CPU + I/O pressure → can slow all requests
+
+## Problems
+
+### Single point of failure
+
+(if poorly designed)
+
+If the gateway fails → entire system becomes unavailable.
+
+**Mitigation:**
+
+- Multiple replicas
+- Load balancer in front (ALB, NLB, HAProxy)
+- Automatic failover
+
+### Bottleneck
+
+**Performance Bottleneck**
+
+Everything passes through the gateway → becomes the “choke point”.
+
+**Common bottlenecks:**
+
+- High CPU usage
+- Large request payloads
+- Heavy JWT verification
+- Traffic spikes
+- Request transformation (JSON ↔ XML)
+- Gzip compression
+
+**Mitigation:**
+
+- Horizontal scaling
+- Limit heavy logic in gateway
+- Use streaming instead of buffering
+- Offload heavy tasks to backend
+
+### Latency
+
+**Increased Latency**
+
+Every request takes an extra hop.
+
+**Sources of latency:**
+
+- SSL termination
+- Logging and metrics
+- Routing logic
+- Transformations (headers, body)
+
+**Mitigation:**
+
+- Minimize transformation logic
+- Enable caching
+- Tune timeouts
+
+### Configuration
+
+**Complexity in Configuration**
+
+API Gateway rules (routes, transforms, filters) can become massive.
+
+**Problems:**
+
+- Hard to maintain
+- Hard to test
+- Difficult versioning
+- Risk of breaking downstream services
+
+**Mitigation:**
+
+- Use IaC (Terraform, CDK)
+- Split configuration by domain
+- Automated tests for routing
+
+### Coupling
+
+**Coupling Between Teams**
+
+If the gateway performs too much logic (aggregation, transformation), backend teams become dependent on gateway changes.
+
+**Risks:**
+
+- Slows down development
+- Gateway becomes a monolithic bottleneck
+- Harder to refactor microservices
+
+### Scalability
+
+**Scalability Challenges**
+
+API Gateway must scale to handle:
+
+- Traffic spikes
+- Security checks
+- Logging
+- Transformations
+
+Some gateways (like Kong, Nginx) scale better than others.
+
+Low-end gateways can collapse under high concurrency.
+
+### Cost
+
+**Cost Considerations**
+
+Cloud API gateways (AWS API Gateway, Apigee) can be expensive.
+
+High-volume traffic → extremely high cost.
+
+## Summary
+
+</Divided>
+
+<SplitPair>
+  <SplitLead>Professional Summary</SplitLead>
+  <SplitCol title="Strengths">
+
+- Centralized entry point
+- Uniform security and auth
+- Rate limiting, caching, routing
+- Aggregation reduces client complexity
+
+</SplitCol>
+  <SplitCol title="Risks">
+
+- Can become a single point of failure
+- Performance bottleneck under load
+- Adds extra latency
+- Hard to maintain when logic grows
+- Heavy security/monitoring slows the gateway
+- Expensive scaling in cloud
+
+</SplitCol>
+</SplitPair>
+
+</ArticleStack>

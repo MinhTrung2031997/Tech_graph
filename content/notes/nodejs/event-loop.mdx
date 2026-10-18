@@ -1,53 +1,49 @@
 ---
-title: "Event Loop & Task Queues"
-description: "Node.js runs JavaScript on one main thread. The event loop interleaves timers, I/O callbacks, and microtasks so many connections can be in flight without a thread per request. CPU-heavy synchronous work blocks every conn"
+title: "Event loop"
+description: "JavaScript executes code on a single thread, meaning there is only one Call Stack and it can run one thing at a time."
 domain: "nodejs"
 type: "concept"
 tags: ["nodejs"]
-status: "reviewed"
-appliesTo: "Node.js 22"
-lastReviewed: "2026-10-08"
-interviewPriority: true
-related: ["nodejs/sync-vs-async", "nodejs/cluster-worker-threads"]
-sources: ["https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick"]
+status: "draft"
+article: stack
 ---
-<Tldr>
-Node.js runs JavaScript on one main thread. The event loop interleaves timers, I/O callbacks, and microtasks so many connections can be in flight without a thread per request. CPU-heavy synchronous work blocks every connection on that process.
-</Tldr>
 
-<Answer>
-The event loop is a set of phases. Timers (`setTimeout`) run, then poll waits for I/O, then `setImmediate` runs in the check phase. Between phases, Node drains `process.nextTick` and then resolved Promises. Libuv's thread pool covers some blocking work (file system, DNS, crypto), but your JavaScript still runs on one thread.
-</Answer>
+<ArticleStack>
+  <Divided>
 
-## Phases that matter
+## Event Loop — interview answer
 
-| Phase | What runs |
-| --- | --- |
-| Timers | `setTimeout` and `setInterval` callbacks whose delay has elapsed |
-| Poll | Incoming I/O. If the queue is empty, it may wait here |
-| Check | `setImmediate` |
-| Close | `socket.on('close')` and similar |
+"JavaScript executes code on a single thread, meaning there is only one Call Stack and it can run one thing at a time. If we waited for every network request or timer to finish, the whole application would freeze. The Event Loop is the mechanism that solves this.
 
-`process.nextTick` and Promise reactions are microtasks. They run before the loop moves to the next phase. A `nextTick` that schedules another `nextTick` can starve I/O.
+When code runs, synchronous functions are pushed onto the Call Stack and popped off when they finish, in LIFO order. When we hit an asynchronous operation, like setTimeout, an HTTP request or reading a file, JavaScript doesn't wait. It hands that work to the runtime: Web APIs in the browser, or libuv in Node.js. Then it keeps executing the next line.
 
-## What actually leaves the main thread
+When the async work completes, its callback isn't executed immediately. It is placed into a queue. Promise callbacks are queued as soon as the Promise settles. There are two types of queue:
 
-Network sockets are non-blocking on the main thread. `fs` APIs, `dns.lookup`, and `crypto.pbkdf2` can use the libuv thread pool (default size 4, via `UV_THREADPOOL_SIZE`). That pool is small. A burst of CPU-heavy `pbkdf2` calls queues behind each other even though the API is async.
+</Divided>
+  <SplitPair>
+    <SplitCol title="Microtask Queue">
 
-## Pitfalls
+the Microtask Queue: Promise .then/.catch/.finally, await continuations, queueMicrotask; in Node.js also process.nextTick, which has its own queue with even higher priority.
 
-<Pitfall>
-`await` does not make CPU work concurrent. A tight loop, `JSON.parse` of a huge payload, or synchronous `bcrypt` still blocks the loop. Move that work to a worker thread, or break it up. See [Cluster & Worker Threads](/notes/nodejs/cluster-worker-threads).
-</Pitfall>
+</SplitCol>
+    <SplitCol title="Macrotask Queue">
 
-## Interview questions
+the Macrotask Queue, also called the Task Queue: setTimeout, setInterval, I/O callbacks, UI events, and setImmediate in Node.js.
 
-<details>
-<summary>Why can one Node process serve thousands of connections?</summary>
-Most of those connections are waiting on the network. The process stores a small amount of state per socket and wakes the callback when the kernel says the socket is readable. Threads are not created per request.
-</details>
+</SplitCol>
+  </SplitPair>
+  <Divided>
 
-<details>
-<summary>What is the difference between `nextTick` and `setImmediate`?</summary>
-`nextTick` runs before the event loop continues, as soon as the current operation finishes. `setImmediate` runs in the check phase, after poll. Use `setImmediate` when you want to yield to I/O.
-</details>
+The rule is: wait until the Call Stack is empty, run all microtasks, then run one macrotask, then all microtasks again, and repeat. Microtasks always cut in line, so a resolved Promise runs before a setTimeout of zero scheduled at the same time. For example: log 'A', set a timeout logging 'B', resolve a Promise logging 'C', log 'D'. The output is A, D, C, B.
+
+In Node.js, macrotasks are not one single queue. libuv runs them in six phases, and each phase has its own queue:
+
+1. Timers: runs setTimeout and setInterval callbacks whose delay has expired. The delay is a minimum, not an exact time.
+2. Pending callbacks: a few system-level callbacks deferred from the previous loop, like certain TCP errors.
+3. Idle / prepare: internal to Node, not something we use.
+4. Poll: the most important one. It runs I/O callbacks such as file reads, network responses and database results. If there's nothing to do, it waits here for new I/O, but only until the next timer is due. If setImmediate callbacks are waiting, it stops waiting and moves on.
+5. Check: runs setImmediate callbacks, right after poll.
+6. Close callbacks: cleanup events like socket.on('close').
+
+</Divided>
+</ArticleStack>

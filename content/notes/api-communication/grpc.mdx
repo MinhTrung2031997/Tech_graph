@@ -1,18 +1,141 @@
 ---
-title: "gRPC & Streaming Modes"
-description: "Placeholder outline for gRPC & Streaming Modes."
+title: "gRPC"
+description: "gRPC (Google Remote Procedure Call) is an open-source, high-performance framework developed by Google for building APIs that enable communication between services, often in microservice architectures."
 domain: "api-communication"
 type: "concept"
 tags: ["grpc"]
 status: "draft"
-placeholder: true
+article: stack
 ---
-<Tldr>
-Placeholder for gRPC & Streaming Modes. The full note is not written yet.
-</Tldr>
 
-This page is part of the API & Communication tree so navigation works. It is not a copy of a Notion page.
+<ArticleStack>
 
-## What this note will cover
+**gRPC (Google Remote Procedure Call)** is an open-source, high-performance framework developed by Google for building APIs that enable communication between services, often in microservice architectures. It is built on **HTTP/2** and uses **Protocol Buffers (Protobuf)** for efficient data serialization.
 
-gRPC & Streaming Modes: a concept note for backend work and interviews.
+<SplitPair>
+  <SplitCol title="Pros">
+
+- **Extremely fast and efficient**
+  - Binary data is much smaller than JSON, and HTTP/2 supports:
+    - Multiplexing is a core feature of HTTP/2 that allows multiple requests and responses to be sent simultaneously over a single TCP connection, without blocking each other.
+    - header compression (is a performance feature of **HTTP/2** that reduces the size of HTTP headers so they take up less space when sent over the network.)
+    - bidirectional /ˌbaɪ.dɪˈrek.ʃən.əl/ streams (means the client and the server can both send messages independently and at the same time through a single persistent connection.)
+  - This makes gRPC ideal for high-throughput systems.
+- **Auto-generated SDKs**
+  - gRPC can generate clients in many languages:
+    - Java
+    - Go
+    - C#
+    - Node.js
+    - Python
+  - This reduces the risk of bugs and ensures consistency.
+- **Full streaming capabilities**
+  - gRPC supports:
+    - Unary RPC (1 request → 1 response)
+    - **Server-to-client streaming (1 request → many responses)**
+    - **Client-to-server streaming ( n requests → 1 response)**
+    - **Bidirectional streaming (n messages → n messages)**
+  - This makes it perfect for real-time systems like chat apps, IoT telemetry, or live dashboards.
+- **Strong typing through Protobuf**
+  - Protobuf describes message structure. This gives:
+    - strict validation,
+    - shared contracts,
+    - compile-time safety.
+- **Best for internal microservices**
+  - Since both the client and server are under control, we can enforce contracts, update services smoothly, and keep communication fast and efficient.
+
+</SplitCol>
+  <SplitCol title="Cons">
+
+- **Not browser-friendly**
+  - Browsers do not support HTTP/2 framing required by gRPC.
+  - You must use **grpc-web** + an Envoy proxy, which adds complexity.
+- **Difficult debugging**
+  - Binary data is not human-readable, unlike JSON.
+- **Requires code generation**
+  - Whenever protobuf files change, you must rebuild the generated client/server interface. This is more work than REST or GraphQL.
+- **Not suitable for public APIs**
+  - External developers expect:
+    - JSON,
+    - URLs,
+    - easy testing.
+  - gRPC is too heavy and requires special toolchains.
+- **Strong coupling**
+  - Clients depend on generated code; changing a proto /proʊ.t̬oʊ-/ file impacts all consuming services immediately.
+
+</SplitCol>
+</SplitPair>
+
+<Divided>
+
+## Methods
+
+The main communication methods supported by gRPC:
+
+### Unary
+
+**Unary RPC**
+
+- **Description**: This is the simplest communication model where the client sends a single request to the server, and the server responds with a single reply.
+- **Use Case**: Suitable for simple, non-streaming scenarios like fetching a single resource or sending a single command.
+- **Example**:
+
+```protobuf
+rpc GetUserDetails(UserRequest) returns (UserResponse);
+```
+
+### Server streaming
+
+**Server-Side Streaming RPC**
+
+- **Description**: The client sends a single request to the server, and the server sends back a stream of responses. The client reads these responses as they arrive.
+- **Use Case**: Useful when the server needs to send a sequence of data, such as log entries or real-time notifications.
+- **Example**:
+
+```protobuf
+rpc ListUsers(UserListRequest) returns (stream UserResponse);
+```
+
+### Client streaming
+
+**Client-Side Streaming RPC**
+
+- **Description**: The client sends a stream of requests to the server, and the server sends back a single response once it has processed all the client data.
+- **Use Case**: Suitable for scenarios where the client needs to send multiple pieces of data for processing, such as uploading chunks of a file.
+- **Example**:
+
+```protobuf
+rpc UploadFile(stream FileChunk) returns (UploadResponse);
+```
+
+### Bidirectional
+
+**Bidirectional /ˌbaɪ.dɪˈrek.ʃən.əl/ Streaming RPC**
+
+- **Description**: Both the client and the server send a stream of messages to each other. The two streams operate independently, so the client and server can read and write in whatever order they like.
+- **Use Case**: Ideal for real-time, interactive applications like chat systems or collaborative tools.
+- **Example**:
+
+```protobuf
+rpc Chat(stream ChatMessage) returns (stream ChatMessage);
+```
+
+## Together
+
+**Can you use REST, GraphQL, and gRPC together in one system?**
+
+Yes — and this is a common real-world architecture. A typical pattern:
+
+- **gRPC** for all internal microservice-to-microservice communication (fast, typed, streaming).
+- **GraphQL** as a BFF (Backend for Frontend) layer that aggregates data from multiple gRPC services and serves mobile/web clients with exactly the data they need.
+- **REST** for public APIs or webhooks where external developers need simple, well-documented endpoints. Each protocol is used where its strengths are most valuable.
+
+## Browser clients
+
+**What are the limitations of gRPC for browser-based clients?**
+
+Browsers cannot make raw HTTP/2 gRPC calls because they don't expose low-level HTTP/2 framing control via fetch/XHR. The solution is **gRPC-Web** — a modified protocol that wraps gRPC over HTTP/1.1 or HTTP/2 in a browser-compatible way, requiring an Envoy proxy (or similar) to translate between gRPC-Web and native gRPC on the server side. This adds infrastructure complexity, which is why gRPC is rarely used as a direct browser API — GraphQL or REST handle that layer instead.
+
+</Divided>
+
+</ArticleStack>

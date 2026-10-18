@@ -1,0 +1,1192 @@
+---
+title: "React"
+description: "React JS is a JavaScript library developed by Meta for building fast and interactive user interfaces, especially single-page applications."
+domain: "frontend"
+type: "concept"
+tags: ["react"]
+status: "draft"
+article: stack
+related: ["frontend/react-hooks"]
+---
+
+<ArticleStack>
+  <Divided>
+
+## What is ReactJS
+
+- **React JS** is a JavaScript library developed by Meta for building fast and interactive user interfaces, especially single-page applications.
+- It follows a **component-based architecture**, where the UI is divided into reusable components that manage their own state.
+- React uses a **Virtual DOM** to improve performance. Instead of updating the real DOM directly, it compares changes in the Virtual DOM and updates only the necessary parts of the UI.
+
+## ReactJS
+
+### React Basics
+
+- Components: Understand the concept of components, both functional and class components.
+- JSX: Learn how to write JSX (JavaScript XML) to define React elements.
+- Props: Understand how to pass data from a parent component to a child component.
+
+### State and Lifecycle
+
+- State: Know how to use state to manage dynamic data within a component.
+- Lifecycle methods: Be familiar with lifecycle methods such as `componentDidMount`, `componentDidUpdate`, and `componentWillUnmount`.
+
+### Hooks
+
+- useState: Manage state in functional components.
+- useEffect: Handle side effects in functional components.
+- useContext: Share data between components without prop drilling.
+- useRef: Access and interact with the DOM.
+
+### Component Composition
+
+- Nesting components: Compose UIs by combining smaller components.
+- Higher-Order Components (HOCs): Understand the concept of HOCs for reusability.
+
+### Routing
+
+- React Router: Know how to set up routing in a React application.
+
+### Forms
+
+- Controlled components: Handle form inputs using controlled components.
+- Form submission: Understand how to handle form submissions.
+
+### State Management
+
+- Context API: Use the Context API for state management in larger applications.
+- Redux: Understand the basics of Redux for global state management.
+
+### Component Styling
+
+- CSS-in-JS: Be familiar with styling options, such as using styled-components or Emotion.
+- CSS Modules: Know how to use CSS Modules for scoped styles.
+
+### Testing
+
+- Jest and React Testing Library: Understand how to write tests for React components.
+
+### Optimization
+
+- Memoization: Optimize performance using techniques like memoization.
+- PureComponent and shouldComponentUpdate: Understand how to optimize rendering.
+
+### Error Boundaries
+
+- Implement error boundaries to catch JavaScript errors anywhere in the component tree.
+
+### Virtual DOM
+
+- Understand the concept of Virtual DOM and how React uses it for efficient rendering.
+
+Remember that React is a versatile library, and the specific focus areas may vary depending on the job role and the company's tech stack. It's essential to review the job description and requirements to tailor your preparation accordingly.
+
+## Class component
+
+### Lifecycle
+
+**Mounting**
+
+- ComponentDidMount
+
+**Updating**
+
+- ComponentWillReceiveProps
+- ComponentWillUpdate
+- ComponentDidUpdate
+
+**Unmounting**
+
+- ComponentWillUnmount
+
+### Props vs State
+
+</Divided>
+  <SplitPair>
+    <SplitCol title="Props">
+
+- Để truyền gửi dữ liệu đến các component.
+  (pass data /ˈdeɪ.t̬ə/ to other components)
+- Nó lưu trữ các giá trị của các attribute (thuộc tính) , component có thể nhận được các giá trị của thuộc tính truyền vào từ bên ngoài vào
+  (It stores the values of the attributes (attributes), the component can receive the values of the attributes passed in from the outside.)
+- Không thể thay đổi dữ liệu của props .
+  (Unable to change props data)
+
+</SplitCol>
+    <SplitCol title="State">
+
+- state cũng lưu trữ thông tin về component, nhưng là lưu trữ dữ liệu động của một component.
+  (the state also stores information about the component, but stores the dynamic data of a component.)
+
+</SplitCol>
+</SplitPair>
+  <Divided>
+
+### Function Component và React Component
+
+</Divided>
+  <SplitPair>
+    <SplitCol title="Function component">
+
+- Không có các phương thức trong lifecycle
+  (There are no methods in the lifecycle)
+- Không quản lý state
+  (No state management)
+- Việc re-render xảy ra liên tục mỗi khi component cha của nó có cập nhật.
+  (The re-render happens continuously every time its parent component has an update.)
+
+</SplitCol>
+    <SplitCol title="React Component">
+
+- phương thức khởi tạo
+  (constructor method)
+- Life-cycle,
+- Hàm render() và
+- Quản lý state (data)
+  (state management)
+
+</SplitCol>
+</SplitPair>
+  <Divided>
+
+### React Component và Pure Component
+
+</Divided>
+  <SplitPair>
+    <SplitCol title="React component">
+
+- Re-render mỗi khi state hay props thay đổi kéo theo các component con cũng sẽ bị re-render kể cả props truyền xuống component con là không đổi.
+  (Re-render every time the state or props change, the child components will also be re-rendered even if the props passed down to the child component are unchanged.)
+
+</SplitCol>
+    <SplitCol title="Pure Component">
+
+- Chỉ re-render mỗi khi có sự thay đổi về props.
+  (Only re-render every time there is a change in props.)
+
+</SplitCol>
+</SplitPair>
+  <Divided>
+
+## State & Prop
+
+### State
+
+- Refers to an internal data store that belongs to a component.
+- Each component can have its own state, and it is used to manage dynamic data that may change over time.
+- The state is a JavaScript object that contains key-value pairs representing different pieces of data relevant to the component.
+- When the state of a component changes, React automatically re-renders the component to reflect the updated state. This is a fundamental mechanism for creating dynamic and interactive user interfaces in React applications.
+- Here's a basic example of how state is used in a React class component:
+
+```javascript
+import React, { Component } from 'react';
+
+class Counter extends Component {
+  constructor(props) {
+    super(props);
+    // Initializing state
+    this.state = {
+      count: 0,
+    };
+  }
+
+  // A method that updates the state
+  incrementCount = () => {
+    this.setState({ count: this.state.count + 1 });
+  };
+
+  render() {
+    return (
+      <div>
+        <p>Count: {this.state.count}</p>
+        <button onClick={this.incrementCount}>Increment</button>
+      </div>
+    );
+  }
+}
+
+export default Counter;
+```
+
+- It's important to note that if you are using a functional component, you can use the `useState` hook to manage state. The `useState` hook returns an array with the current state value and a function to update it.
+
+```javascript
+import React, { useState } from 'react';
+
+function Counter() {
+  // Initializing state with useState
+  const [count, setCount] = useState(0);
+
+  // A function that updates the state
+  const incrementCount = () => {
+    setCount(count + 1);
+  };
+
+  return (
+    <div>
+      <p>Count: {count}</p>
+      <button onClick={incrementCount}>Increment</button>
+    </div>
+  );
+}
+
+export default Counter;
+```
+
+### Props
+
+- "props" is short for "properties,"
+- It refers to a mechanism for passing data from a parent component to a child component.
+- Props allow sending values or functions from a higher-level component to a lower-level component, enabling communication and sharing of data between them.
+- Props are immutable within the child component, meaning that the child component cannot modify the props it receives directly.
+
+Here's a basic example to illustrate the use of props in React:
+
+```javascript
+// ParentComponent.jsx
+import React from 'react';
+import ChildComponent from './ChildComponent';
+
+function ParentComponent() {
+  // Passing a prop named "message" to the ChildComponent
+  return <ChildComponent message="Hello from ParentComponent!" />;
+}
+
+// ChildComponent.jsx
+import React from 'react';
+
+function ChildComponent(props) {
+  // Accessing the "message" prop
+  return <p>{props.message}</p>;
+}
+
+export default ChildComponent;
+```
+
+## React Hooks
+
+### useState
+
+- Allows functional components to manage and update state.
+
+```javascript
+import React, { useState } from 'react';
+
+function ExampleComponent() {
+  // Using useState to initialize a state variable
+  const [count, setCount] = useState(0);
+
+  // Event handler to update the state variable
+  const incrementCount = () => {
+    setCount(count + 1);
+  };
+
+  return (
+    <div>
+      <p>Count: {count}</p>
+      <button onClick={incrementCount}>Increment</button>
+    </div>
+  );
+}
+
+export default ExampleComponent;
+```
+
+### useEffect
+
+- Allows functional components to perform side effects.
+- Side effects in React typically involve interactions with the outside world, such as data fetching, subscriptions, or manually changing the DOM.
+- The `useEffect` hook is used to manage these side effects in a functional component
+- The function passed to `useEffect` will be executed after the component has been rendered.
+- The second argument to `useEffect` is an array of dependencies.
+- If any of the dependencies change between renders, the effect will be re-run.
+- If the dependency array is empty, the effect will only run once when the component is mounted.
+
+Here's an example of using `useEffect` for fetching data:
+
+```javascript
+import React, { useState, useEffect } from 'react';
+
+function MyComponent() {
+  const [data, setData] = useState(null);
+
+  useEffect(() => {
+    // Fetch data from an API
+    const fetchData = async () => {
+      try {
+        const response = await fetch('https://api.example.com/data');
+        const result = await response.json();
+        setData(result);
+      } catch (error) {
+        console.error('Error fetching data:', error);
+      }
+    };
+
+    fetchData(); // Call the fetchData function
+
+    // Cleanup function (optional)
+    return () => {
+      // Perform cleanup if needed (e.g., canceling subscriptions)
+    };
+  }, []); // Empty dependency array, so the effect runs only once on mount
+
+  // Rest of the component logic using the 'data' state
+}
+```
+
+### useContext
+
+- Allows functional components to consume values from the React context.
+- Context provides a way to pass data through the component tree without having to pass props down manually at every level. It is particularly useful for sharing values like themes, authentication status, or other global data across components.
+
+1. First, create a context using `React.createContext()`:
+
+```javascript
+import React, { createContext, useContext } from 'react';
+
+// Create a context with a default value
+const MyContext = createContext('default value');
+
+// Export a provider component to wrap around the parts of your app that need access to the context
+export const MyContextProvider = ({ children }) => {
+  const contextValue = 'value from context provider';
+
+  return (
+    <MyContext.Provider value={contextValue}>
+      {children}
+    </MyContext.Provider>
+  );
+};
+```
+
+2. Use `MyContextProvider` to wrap the parts of your app where you want to make the context available.
+
+```javascript
+import React from 'react';
+import { MyContextProvider } from './MyContextProvider';
+import ChildComponent from './ChildComponent';
+
+function App() {
+  return (
+    <MyContextProvider>
+      <ChildComponent />
+    </MyContextProvider>
+  );
+}
+
+export default App;
+```
+
+3. In the child component, use `useContext` to access the value from the context:
+
+```javascript
+import React, { useContext } from 'react';
+import { MyContext } from './MyContextProvider';
+
+function ChildComponent() {
+  const contextValue = useContext(MyContext);
+
+  return <p>Value from context: {contextValue}</p>;
+}
+
+export default ChildComponent;
+```
+
+In this example, the `ChildComponent` uses `useContext` to access the value stored in the `MyContext` context. The value is provided by the nearest `MyContextProvider` ancestor in the component tree.
+
+### useReducer
+
+- Managing more complex state logic in functional components.
+- It is an alternative to using `useState` when the state transitions are more complexity and involve multiple sub-states or when the next state depends on the previous one.
+- The basic idea of `useReducer` is similar to how reducers work in Redux.
+- It takes a reducer function and an initial state as arguments and returns the current state and a dispatch function to trigger state transitions
+
+```javascript
+import React, { useReducer } from 'react';
+
+// Reducer function
+const reducer = (state, action) => {
+  switch (action.type) {
+    case 'INCREMENT':
+      return { count: state.count + 1 };
+    case 'DECREMENT':
+      return { count: state.count - 1 };
+    default:
+      return state;
+  }
+};
+
+// Component using useReducer
+function Counter() {
+  // useReducer returns the current state and a dispatch function
+  const [state, dispatch] = useReducer(reducer, { count: 0 });
+
+  return (
+    <div>
+      <p>Count: {state.count}</p>
+      <button onClick={() => dispatch({ type: 'INCREMENT' })}>Increment</button>
+      <button onClick={() => dispatch({ type: 'DECREMENT' })}>Decrement</button>
+    </div>
+  );
+}
+
+export default Counter;
+```
+
+### useCallback
+
+- Used to memoize functions, preventing unnecessary re-creations of functions on each render.
+- It is particularly useful when passing functions as props to child components, especially in situations where the child component's performance relies on stable references to the functions.
+
+The basic syntax of `useCallback` is as follows:
+
+```javascript
+const memoizedCallback = useCallback(
+  () => {
+    // function body
+  },
+  [dependencies]
+);
+```
+
+Here, the first argument is the function you want to memoize, and the second argument is an array of dependencies. The function will only be re-created if any of the dependencies change.
+
+Let's look at a specific example to illustrate the usage of `useCallback`. Suppose you have a parent component that renders a child component and passes a callback function to it. Without `useCallback`, the callback would be recreated on each render of the parent component, potentially causing unnecessary re-renders of the child component.
+
+```javascript
+import React, { useState, useCallback } from 'react';
+
+const ParentComponent = () => {
+  const [count, setCount] = useState(0);
+
+  // Without useCallback, this function would be recreated on each render
+  const handleClick = () => {
+    alert('Button clicked!');
+  };
+
+  return (
+    <div>
+      <p>Count: {count}</p>
+      <button onClick={() => setCount(count + 1)}>Increment</button>
+      <ChildComponent onClick={handleClick} />
+    </div>
+  );
+};
+
+const ChildComponent = ({ onClick }) => {
+  return (
+    <div>
+      <p>Child Component</p>
+      <button onClick={onClick}>Click me</button>
+    </div>
+  );
+};
+
+export default ParentComponent;
+```
+
+In this example, every time the `ParentComponent` re-renders, a new `handleClick` function is created. If `ParentComponent` re-renders frequently (due to state changes, for example), it might lead to unnecessary re-renders of `ChildComponent`.
+
+Now, let's optimize it using `useCallback`:
+
+```javascript
+// ...
+
+const ParentComponent = () => {
+  const [count, setCount] = useState(0);
+
+  const handleClick = useCallback(() => {
+    alert('Button clicked!');
+  }, []); // No dependencies, as the function doesn't depend on any external values
+
+  return (
+    <div>
+      <p>Count: {count}</p>
+      <button onClick={() => setCount(count + 1)}>Increment</button>
+      <ChildComponent onClick={handleClick} />
+    </div>
+  );
+};
+
+// ...
+```
+
+Now, with `useCallback`, the `handleClick` function is memoized, meaning it will only be recreated if the dependencies specified in the second argument change. In this case, since there are no dependencies (`[]`), the function is created once and remains the same across renders unless the component is unmounted and remounted. This can improve the performance of your application, especially in scenarios where components re-render frequently.
+
+### useMemo
+
+- Used to memoize the result of a computation, preventing unnecessary recalculations of that result on every render.
+- Memoization is a technique that involves caching the result of a function based on its inputs.
+- `useMemo` It is particularly useful when dealing with expensive computations or when you want to optimize the performance of a component.
+
+```javascript
+import React, { useState, useMemo } from 'react';
+
+function ExpensiveComponent({ data }) {
+  const sum = useMemo(() => {
+    console.log('Recalculating sum...');
+    return data.reduce((acc, num) => acc + num, 0);
+  }, [data]);
+
+  return (
+    <div>
+      <p>Sum: {sum}</p>
+    </div>
+  );
+}
+```
+
+### useRef
+
+- Persist values between renders.
+- It can be used to store a mutable value that does not cause a re-render when updated
+- It can be used to access a DOM element directly.
+
+Here's a basic example using `useRef` to access a DOM element:
+
+```javascript
+import React, { useRef, useEffect } from 'react';
+
+function MyComponent() {
+  // Create a ref object
+  const myRef = useRef(null);
+
+  useEffect(() => {
+    // Access the DOM element using the ref
+    if (myRef.current) {
+      myRef.current.focus();
+    }
+  }, []);
+
+  return (
+    <input ref={myRef} type="text" />
+  );
+}
+```
+
+Here's another example using `useRef` to store a mutable value:
+
+```javascript
+import React, { useRef, useState } from 'react';
+
+function MyComponent() {
+  // Create a ref object with an initial value of 0
+  const countRef = useRef(0);
+
+  const [count, setCount] = useState(0);
+
+  const increment = () => {
+    setCount((prevCount) => {
+      countRef.current = prevCount + 1;
+      return prevCount + 1;
+    });
+  };
+
+  return (
+    <div>
+      <p>Count: {count}</p>
+      <button onClick={increment}>Increment</button>
+      <p>Previous Count (via ref): {countRef.current}</p>
+    </div>
+  );
+}
+```
+
+### useImperativeHandle
+
+- Used to customize the instance value that is exposed when using React.forwardRef.
+- This hook allows you to specify which properties and methods of a child component's instance should be accessible to the parent component when using the `ref` attribute.
+- This hook is useful when you want to encapsulate certain functionality within a child component but provide a way for the parent component to interact with specific aspects of that child component's behavior or state.
+- It's commonly used with components that use `React.forwardRef` to forward a ref from a parent to a child component.
+
+```javascript
+import React, { useImperativeHandle, useRef } from 'react';
+
+const ChildComponent = React.forwardRef((props, ref) => {
+  // Create a ref to hold the child component instance
+  const internalRef = useRef();
+
+  // Use useImperativeHandle to expose specific properties/methods to the parent component
+  useImperativeHandle(ref, () => ({
+    // Properties/methods to expose
+    doSomething: () => {
+      // Implementation of a method
+      console.log('Child component is doing something!');
+    },
+    // Other properties/methods...
+  }), [/* dependencies */]);
+
+  // Component logic...
+
+  return (
+    <div>
+      {/* JSX for the child component */}
+    </div>
+  );
+});
+
+const ParentComponent = () => {
+  // Create a ref to hold the child component instance
+  const childRef = useRef();
+
+  const handleButtonClick = () => {
+    // Access the exposed method from the child component
+    childRef.current.doSomething();
+  };
+
+  return (
+    <div>
+      <ChildComponent ref={childRef} />
+      <button onClick={handleButtonClick}>Invoke Child Method</button>
+    </div>
+  );
+};
+```
+
+### useLayoutEffect
+
+`useLayoutEffect` is a React hook that is similar to `useEffect`, but it fires synchronously after all DOM mutations. It is commonly used when you need to read from the DOM or perform other side effects that depend on the layout of the elements in the DOM immediately after the component has been updated and before the browser repaints.
+
+The basic syntax of `useLayoutEffect` is the same as `useEffect`:
+
+```javascript
+import React, { useLayoutEffect } from 'react';
+
+function MyComponent() {
+  useLayoutEffect(() => {
+    // Code to run after the DOM has been mutated
+    // This will run synchronously before the browser repaints
+
+    // Example: Measure the height of an element
+    const element = document.getElementById('myElement');
+    const height = element.clientHeight;
+    console.log('Height:', height);
+  }, []); // Dependency array, similar to useEffect
+
+  return (
+    <div id="myElement">
+      {/* JSX for the component */}
+    </div>
+  );
+}
+```
+
+Key points about `useLayoutEffect`:
+
+1. **Synchronous Execution:** `useLayoutEffect` runs synchronously after all DOM mutations, before the browser paints. This makes it suitable for tasks that require up-to-date layout information.
+2. **Similar to `useEffect`:** The syntax and usage are similar to `useEffect`, but it's important to use it judiciously since it can block painting and potentially lead to performance issues.
+3. **Dependencies:** Like `useEffect`, `useLayoutEffect` accepts a dependency array as the second parameter. The effect will run when the component mounts and if any of the dependencies change.
+4. **Use Cases:** It is commonly used when you need to perform measurements or other operations that depend on the layout of the DOM elements. For example, fetching layout information, measuring element dimensions, or interacting with the DOM directly.
+
+Keep in mind that while `useLayoutEffect` can be powerful for certain use cases, in most scenarios, you may prefer using `useEffect` because it runs asynchronously after the browser repaints, which can lead to a smoother user experience. Only use `useLayoutEffect` when the synchronous nature is necessary for your specific use case.
+
+### useDebugValue
+
+- Provides a way to display custom labels or values for custom hooks in the React DevTools.
+- The purpose of `useDebugValue` is to make it easier to understand and debug custom hooks by providing additional information in the React DevTools.
+- This hook is not used in the typical application logic but is rather a tool for improving the developer experience when working with custom hooks.
+
+```javascript
+import { useState, useEffect, useDebugValue } from 'react';
+
+function useCustomHook(initialValue) {
+  const [value, setValue] = useState(initialValue);
+
+  useEffect(() => {
+    // Some side effect logic here...
+
+    // Use useDebugValue to display a label in React DevTools
+    useDebugValue(`Custom Hook Value: ${value}`);
+
+  }, [value]);
+
+  // Rest of the custom hook logic...
+
+  return value;
+}
+```
+
+## Redux-Thunk
+
+- Redux Thunk is a middleware for Redux that allows to write asynchronous logic in your Redux actions. It enables you to dispatch functions as actions in addition to regular plain objects. These functions, often referred to as "thunks," have access to the `dispatch` function and can perform asynchronous operations, such as API calls, before dispatching the actual actions.
+- Redux Thunk middleware is commonly used when dealing with asynchronous actions in Redux. By using thunks, you can encapsulate asynchronous logic inside your action creators, keeping your action creators clean and focused.
+
+Here's a brief overview of how to use Redux Thunk in a Redux setup:
+
+1. **Install Redux Thunk:**
+
+```shell
+npm install redux-thunk
+```
+
+2. **Apply Middleware:**
+
+In your Redux store setup, apply the Redux Thunk middleware using `applyMiddleware` from `redux`.
+
+```javascript
+import { createStore, applyMiddleware } from 'redux';
+import thunk from 'redux-thunk';
+import rootReducer from './reducers';
+
+const store = createStore(
+  rootReducer,
+  applyMiddleware(thunk)
+);
+
+export default store;
+```
+
+3. **Write Async Action Creators:**
+
+Define action creators that return functions instead of plain objects. These functions can perform asynchronous operations and dispatch regular actions when needed.
+
+```javascript
+// actions.js
+export const fetchData = () => {
+  return (dispatch) => {
+    dispatch({ type: 'FETCH_DATA_REQUEST' });
+
+    // Simulating an asynchronous API call
+    setTimeout(() => {
+      dispatch({ type: 'FETCH_DATA_SUCCESS', payload: { data: /* fetched data */ } });
+    }, 1000);
+  };
+};
+```
+
+4. **Dispatch Thunks in Components:**
+
+In your React components, you can dispatch the asynchronous action creators just like regular action creators.
+
+```javascript
+// MyComponent.js
+import React, { useEffect } from 'react';
+import { useDispatch, useSelector } from 'react-redux';
+import { fetchData } from './actions';
+
+function MyComponent() {
+  const dispatch = useDispatch();
+  const data = useSelector((state) => state.data);
+
+  useEffect(() => {
+    // Dispatch the async action creator
+    dispatch(fetchData());
+  }, [dispatch]);
+
+  return (
+    <div>
+      <p>Data: {data}</p>
+    </div>
+  );
+}
+
+export default MyComponent;
+```
+
+By using Redux Thunk, you can handle asynchronous actions in a more straightforward way within your Redux application, making it easier to manage and coordinate asynchronous behavior in your Redux state management.
+
+## Redux-Toolkit
+
+- Redux Toolkit is the official opinionated toolset for Redux that aims to simplify and streamline the process of writing Redux code. It provides a set of utilities and abstractions to help developers adopt best practices, reduce boilerplate code, and enhance the overall developer experience when working with Redux.
+- Key features of Redux Toolkit include:
+
+### createSlice
+
+- `createSlice` is a utility function that reduces the amount of boilerplate code needed to define action creators and reducers.
+- It automatically generates action creators and reducer functions based on a set of reducer logic and an initial state.
+- The resulting code is more concise and readable.
+
+```javascript
+import { createSlice } from '@reduxjs/toolkit';
+
+const counterSlice = createSlice({
+  name: 'counter',
+  initialState: { value: 0 },
+  reducers: {
+    increment: (state) => {
+      state.value += 1;
+    },
+    decrement: (state) => {
+      state.value -= 1;
+    },
+  },
+});
+
+export const { increment, decrement } = counterSlice.actions;
+export default counterSlice.reducer;
+```
+
+### configureStore
+
+- `configureStore` is a utility function that simplifies the process of creating a Redux store with common configurations.
+- It automatically sets up middleware, including `redux-thunk` for handling asynchronous actions, and provides other enhancements out of the box.
+
+```javascript
+import { configureStore } from '@reduxjs/toolkit';
+import counterReducer from './counterSlice';
+
+const store = configureStore({
+  reducer: {
+    counter: counterReducer,
+  },
+});
+
+export default store;
+```
+
+### createAsyncThunk
+
+- `createAsyncThunk` is a utility for handling asynchronous actions.
+- It creates a pair of action creators (pending, fulfilled/rejected) and can be used to manage the lifecycle of asynchronous operations.
+
+```javascript
+import { createAsyncThunk } from '@reduxjs/toolkit';
+
+const fetchUser = createAsyncThunk('user/fetchUser', async (userId, thunkAPI) => {
+  const response = await api.fetchUser(userId);
+  return response.data;
+});
+```
+
+### createEntityAdapter
+
+- `createEntityAdapter` is a utility for managing normalized state data structures.
+- It simplifies the process of working with data in a normalized form and helps with common CRUD operations.
+
+```javascript
+import { createEntityAdapter, createSlice } from '@reduxjs/toolkit';
+
+const usersAdapter = createEntityAdapter();
+
+const usersSlice = createSlice({
+  name: 'users',
+  initialState: usersAdapter.getInitialState(),
+  reducers: {
+    addUser: usersAdapter.addOne,
+    removeUser: usersAdapter.removeOne,
+  },
+});
+
+export const { addUser, removeUser } = usersSlice.actions;
+export default usersSlice.reducer;
+```
+
+By using Redux Toolkit, developers can adopt a more streamlined and consistent approach to writing Redux code. It encourages best practices, reduces boilerplate, and addresses some of the common pain points associated with setting up and maintaining a Redux-based state management system in a React application. While Redux Toolkit is not mandatory, it's often recommended for new Redux projects and can be used alongside existing Redux codebases.
+
+## Redux
+
+Redux is a state management library for JavaScript applications, commonly used with React. It provides a predictable state container that helps manage the state of an application in a centralized way. The core idea behind Redux is to have a single source of truth for the state of the entire application, making it easier to manage, debug, and reason about.
+
+The main components of Redux are:
+
+### Store
+
+The store is a single JavaScript object that holds the entire state of the application. It is the source of truth, and any changes to the state are managed by the store. Components in the application can subscribe to the store to get updates when the state changes.
+
+### Actions
+
+Actions are plain JavaScript objects that describe a change in the state. They have a `type` property that specifies the type of action and can include additional data called the "payload."
+
+### Reducers
+
+Reducers are functions that specify how the state changes in response to an action. They take the current state and an action as arguments and return a new state. Reducers must be pure functions, meaning they produce the same output for the same input and don't have side effects.
+
+### Dispatch
+
+The `dispatch` function is used to send actions to the store. When an action is dispatched, the store calls the appropriate reducer, and the state is updated accordingly.
+
+### Selectors
+
+Selectors are functions that extract specific pieces of data from the state. They are useful for accessing and computing derived state.
+
+Redux follows a unidirectional data flow, meaning that the data in the application flows in a single direction: from the state to the UI components. Actions trigger changes in the state, and these changes are reflected in the components that subscribe to the state.
+
+Here's a simple example of using Redux with React:
+
+```javascript
+// actions.js
+export const increment = () => ({ type: 'INCREMENT' });
+export const decrement = () => ({ type: 'DECREMENT' });
+
+// reducer.js
+const counterReducer = (state = { count: 0 }, action) => {
+  switch (action.type) {
+    case 'INCREMENT':
+      return { count: state.count + 1 };
+    case 'DECREMENT':
+      return { count: state.count - 1 };
+    default:
+      return state;
+  }
+};
+
+export default counterReducer;
+
+// store.js
+import { createStore } from 'redux';
+import counterReducer from './reducer';
+
+const store = createStore(counterReducer);
+
+export default store;
+
+// App.js
+import React from 'react';
+import { useSelector, useDispatch } from 'react-redux';
+import { increment, decrement } from './actions';
+
+function App() {
+  const count = useSelector((state) => state.count);
+  const dispatch = useDispatch();
+
+  return (
+    <div>
+      <p>Count: {count}</p>
+      <button onClick={() => dispatch(increment())}>Increment</button>
+      <button onClick={() => dispatch(decrement())}>Decrement</button>
+    </div>
+  );
+}
+
+export default App;
+```
+
+In this example:
+
+- `actions.js` defines two actions: `INCREMENT` and `DECREMENT`.
+- `reducer.js` defines a reducer function that specifies how the state changes in response to these actions.
+- `store.js` creates a Redux store with the reducer.
+- `App.js` is a React component that uses the `useSelector` and `useDispatch` hooks from `react-redux` to interact with the Redux store.
+
+This is a basic example, and as applications grow in complexity, Redux can help manage state in a scalable and maintainable way.
+
+### Why Redux
+
+Here are some reasons why React developers choose to use Redux:
+
+1. **Predictable State Management:**
+   - Redux provides a predictable state container. The state of the entire application is stored in a single JavaScript object (the "store"), making it easier to reason about the state changes.
+2. **Centralized State:**
+   - Redux promotes a centralized state management approach. Instead of spreading the state across different components, the state is maintained in a single store, which makes it easier to track and manage.
+3. **Global State Access:**
+   - Redux allows any component to access the global state. Components can subscribe to changes in the state and get notified when it is updated. This eliminates the need to pass down props through multiple layers of components.
+4. **Debugging:**
+   - Redux's time-travel debugging capabilities are valuable for developers. With tools like Redux DevTools, developers can step back and forth through the state changes, making it easier to identify and fix bugs.
+5. **Middleware:**
+   - Redux middleware allows developers to extend the behavior of the store. Middleware can be used for logging, asynchronous actions, and other custom operations.
+6. **Large-Scale Applications:**
+   - For large-scale applications with complex state management requirements, Redux provides a structured and scalable solution. It enforces a unidirectional data flow and helps prevent common pitfalls associated with state management in larger applications.
+7. **Predictable Flow of Data:**
+   - Redux follows a strict unidirectional data flow, making it easier to understand how data changes over time. Actions are dispatched, reducers process those actions, and the state is updated predictably.
+8. **Ecosystem and Community Support:**
+   - Redux has a large and active community, which means there is a wealth of resources, plugins, and middleware available. Developers can find solutions to common problems and share best practices.
+
+It's important to note that while Redux can be beneficial for managing state in certain scenarios, it might introduce additional complexity for smaller applications. React itself provides its own state management capabilities through component state, and for many applications, that might be sufficient.
+
+The decision to use Redux often depends on the complexity of the application, the team's familiarity with Redux, and specific requirements related to state management and scalability.
+
+## Virtual DOM
+
+The Virtual DOM (Document Object Model) is a concept in React that optimizes updates to the actual DOM by maintaining a lightweight copy of it in memory. React uses the Virtual DOM to improve performance and efficiently update the UI by minimizing direct manipulations of the real DOM.
+
+Here's how the Virtual DOM works in React:
+
+1. **Initial Render:**
+   - When a React component is first rendered or updated, it constructs a virtual representation of the UI components in the form of a Virtual DOM.
+2. **Virtual DOM Representation:**
+   - Each React component corresponds to a node in the Virtual DOM, which is a lightweight JavaScript representation of the actual DOM elements.
+3. **Rendering to the Real DOM:**
+   - The Virtual DOM is then used to generate the corresponding real DOM elements and their structure.
+4. **Changes and Reconciliation:**
+   - When a component's state or props change, React doesn't immediately update the real DOM. Instead, it creates a new Virtual DOM representing the updated UI.
+5. **Differential Algorithm:**
+   - React employs a reconciliation algorithm (also known as the "diffing" algorithm) to compare the new Virtual DOM with the previous one. It identifies the differences (or "diffs") between the two versions.q
+6. **Minimizing DOM Manipulations:**
+   - Rather than updating the entire real DOM, React calculates the minimal set of changes required and updates only those specific elements. This minimizes the performance impact of manipulating the actual DOM.
+7. **Batching Updates:**
+   - React may batch multiple updates and apply them in a single pass to further optimize performance.
+
+By using the Virtual DOM, React aims to make UI updates efficient and reduce the performance cost of interacting with the browser's DOM, which can be a relatively slow operation.
+
+Here's a simple example to illustrate the idea:
+
+```javascript
+// React component using JSX function MyComponent({ data }) {
+  return (
+    <ul>
+      {data.map(item => (
+        <li key={item.id}>{item.name}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+In this example:
+
+- React creates a Virtual DOM representation of the JSX code.
+- When the `data` prop changes, React generates a new Virtual DOM.
+- The diffing algorithm identifies the minimal changes needed to update the real DOM, such as adding or removing list items.
+- React updates only the specific elements that have changed in the real DOM.
+
+This process significantly improves the performance of React applications by reducing the number of direct manipulations and updates to the actual DOM, which is a costly operation in terms of CPU and memory.
+
+## Side effects
+
+In React, "side effects" refer to any changes or operations that affect the external world or the component's environment beyond its own render. Side effects can include data fetching, subscriptions, manual DOM manipulations, and other operations that don't directly relate to rendering the component.
+
+In class components, side effects were typically handled using lifecycle methods, such as `componentDidMount`, `componentDidUpdate`, and `componentWillUnmount`. However, with the introduction of functional components and the `useEffect` hook in React, side effects can be managed more effectively.
+
+The `useEffect` hook in React allows you to perform side effects in functional components. It takes two arguments: a function containing the code for the side effect, and an optional dependency array that specifies when the effect should run.
+
+Here's a basic example of using `useEffect`:
+
+```javascript
+import React, { useEffect, useState } from 'react';
+
+function MyComponent() {
+  const [data, setData] = useState(null);
+
+  useEffect(() => {
+    // Side effect: Fetch data from an API
+    const fetchData = async () => {
+      try {
+        const response = await fetch('https://api.example.com/data');
+        const result = await response.json();
+        setData(result);
+      } catch (error) {
+        console.error('Error fetching data:', error);
+      }
+    };
+
+    fetchData();
+
+    // Cleanup function (optional): It runs when the component is unmounted
+    return () => {
+      // Perform cleanup (if needed)
+    };
+  }, []); // Dependency array is empty, meaning the effect runs once after the initial render
+
+  // Render component based on the fetched data
+  return (
+    <div>
+      {data ? (
+        <p>Data: {data}</p>
+      ) : (
+        <p>Loading...</p>
+      )}
+    </div>
+  );
+}
+
+export default MyComponent;
+```
+
+In this example:
+
+- The `useEffect` hook is used to initiate the data fetching side effect.
+- The cleanup function (returned from `useEffect`) can be used to perform cleanup operations, such as canceling network requests or clearing intervals, when the component is unmounted or when dependencies change.
+
+The concept of "side effects" is a fundamental aspect of React's design, allowing developers to manage asynchronous and non-render-related operations in a clean and declarative way.
+
+## When it renders
+
+In React, components render when there is a change in their state or props. Rendering is the process of generating a React element tree, which represents the user interface, and updating the actual DOM to reflect any changes.
+
+Here are the common scenarios in which a React component will render:
+
+### Initial Render
+
+- When a component is first mounted onto the DOM, it goes through an initial render. This is where the `render` method is called, creating the initial UI.
+
+```javascript
+import React from 'react';
+
+const MyComponent = () => {
+  return <div>Hello, World!</div>;
+};
+
+// Initial render when the component is first mounted
+ReactDOM.render(<MyComponent />, document.getElementById('root'));
+```
+
+### State Changes
+
+- When the `setState` method is called, triggering a change in the component's state, React will re-render the component. This is a fundamental mechanism for updating the UI in response to user interactions or other dynamic changes.
+
+```javascript
+import React, { useState } from 'react';
+
+const Counter = () => {
+  const [count, setCount] = useState(0);
+
+  const increment = () => {
+    setCount(count + 1);
+  };
+
+  return (
+    <div>
+      <p>Count: {count}</p>
+      <button onClick={increment}>Increment</button>
+    </div>
+  );
+};
+```
+
+### Props Changes
+
+- When a parent component passes new props to a child component, the child component will re-render to reflect the changes in its props.
+
+```javascript
+class ParentComponent extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { value: 'Hello' };
+  }
+
+  handleChange = () => {
+    this.setState({ value: 'Updated Hello' });
+  };
+
+  render() {
+    return (
+      <div>
+        <ChildComponent text={this.state.value} />
+        <button onClick={this.handleChange}>Change Text</button>
+      </div>
+    );
+  }
+}
+
+class ChildComponent extends React.Component {
+  render() {
+    return <p>{this.props.text}</p>;
+  }
+}
+```
+
+### Forceful Re-render
+
+- In certain situations, you might need to force a re-render using the `forceUpdate` method. However, it's generally recommended to use state or props to trigger updates.
+
+```javascript
+class ForceUpdateComponent extends React.Component {
+  handleClick = () => {
+    this.forceUpdate();
+  };
+
+  render() {
+    return (
+      <div>
+        <p>Random Value: {Math.random()}</p>
+        <button onClick={this.handleClick}>Force Update</button>
+      </div>
+    );
+  }
+}
+```
+
+It's important to note that React's reconciliation algorithm ensures that only the necessary parts of the UI are updated, improving performance by avoiding unnecessary re-renders. React components implement a `shouldComponentUpdate` lifecycle method, and functional components can use the `React.memo` higher-order component to optimize when re-rendering is not needed
+
+</Divided>
+</ArticleStack>

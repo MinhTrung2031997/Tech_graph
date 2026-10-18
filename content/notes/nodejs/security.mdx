@@ -1,0 +1,173 @@
+---
+title: "Security"
+description: "Always validate inputs from client, parameters, queries, bodies."
+domain: "nodejs"
+type: "cheatsheet"
+tags: ["nodejs"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+  <Divided>
+
+## Input Validation & Sanitization
+
+- Always validate **inputs from client**, parameters, queries, bodies.
+- Prevents:
+  - **SQL Injection**
+  - **NoSQL Injection**
+  - **Command Injection**
+  - **XSS**
+- Use libraries/tools:
+  - `Joi`, `Yup`, or `Zod` for validation.
+  - `validator.js` for sanitizing.
+
+## Authentication & Authorization
+
+- Use strong, modern methods:
+  - JWT (with short expiry + refresh tokens)
+  - OAuth2, OpenID Connect
+  - Session-based auth with `express-session`
+- Implement:
+  - Role-Based Access Control (RBAC)
+  - Permissions checks on each sensitive route
+  - Rate-limiting login attempts
+
+## Protect Against Common Web Attacks
+
+### a) Cross-Site Scripting (XSS)
+
+- Sanitize user input
+- Escape output
+- Use `helmet` to set security headers
+- Disable `X-Power-By: Express`
+
+### b) Cross-Site Request Forgery (CSRF)
+
+- Use CSRF tokens
+- Use SameSite cookies
+- Avoid GET requests modifying data
+
+### c) SQL / NoSQL Injection
+
+- Always use parameterized queries
+- ORM/Query builders (Prisma, TypeORM, Knex) also help reduce risk
+
+### d) Directory Traversal
+
+- Never trust user file paths
+- Whitelist directories
+- Use `path.join` and normalize paths
+
+### e) Denial of Service (DoS)
+
+- Rate limiting: `express-rate-limit`
+- Slowloris defense: reverse proxy (Nginx)
+- Input size limits on JSON body parser
+
+## Secure Dependency & Supply-Chain Management
+
+- Keep Node.js & dependencies up to date
+- Use:
+  - `npm audit`
+  - `snyk`
+  - Dependabot
+- Avoid installing unnecessary packages
+- Be careful with unmaintained/open-source libraries
+
+## Environment Variables & Secrets Management
+
+- Never commit `.env` to Git
+- Use tools:
+  - HashiCorp Vault
+  - AWS Secrets Manager
+  - GCP Secret Manager
+- Rotate secrets regularly
+
+## Secure HTTP Headers
+
+Install **helmet**:
+
+```javascript
+app.use(require('helmet')());
+```
+
+Helmet helps with:
+
+- HSTS
+- Frameguard
+- XSS filter
+- MIME sniffing protection
+- Hiding Express signature
+
+## HTTPS Everywhere
+
+- Use HTTPS in production
+- Redirect all traffic to HTTPS
+- Use TLS 1.2+
+
+## Logging & Monitoring
+
+- Use structured logs (Winston, Pino)
+- Enable:
+  - Access logs
+  - Error logs
+  - Suspicious activity monitoring
+- Track failed logins, rate limits, unusual patterns
+
+## Error Handling & Safe Responses
+
+- Do NOT expose stack traces in production
+- Custom error handler
+- Return generic error messages to end-users
+
+## File Upload Security
+
+- Validate file types and sizes
+- Store uploads in safe directories
+- Scan files if needed
+- Use Multer or Busboy in secure mode
+
+## Secure Architecture Practices
+
+- Use reverse proxy (Nginx/Traefik)
+- Separation of concerns:
+  - App layer
+  - Database layer
+  - Cache layer
+- Least privilege for DB user
+- Container security (if using Docker):
+  - Non-root user
+  - Use minimal base images (`node:alpine`)
+
+## Security Testing
+
+- Use automated security tools:
+  - OWASP ZAP
+  - Burp Suite
+  - Node.js security scanners
+- Add security tests to CI/CD pipeline
+- Perform penetration testing for important systems
+
+**Node.js app security = Secure code + Secure configs + Secure infrastructure + Secure dependencies.**
+
+Main objectives:
+
+1. Validate & sanitize all inputs
+2. Protect authentication & sessions
+3. Use secure headers (Helmet)
+4. Avoid injections & XSS
+5. Secure dependencies and secrets
+6. Rate limit & monitor
+7. Write safe error-handling logic
+8. Enforce HTTPS and proper permissions
+
+If you want, I can also generate:
+
+- ✅ A shorter one-page summary
+- ✅ A checklist for production Node.js security
+- ✅ A Clean Architecture + Security diagram for backend apps
+
+</Divided>
+</ArticleStack>

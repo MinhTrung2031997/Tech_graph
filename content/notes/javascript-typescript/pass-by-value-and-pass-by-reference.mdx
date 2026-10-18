@@ -9,8 +9,9 @@ article: stack
 ---
 
 <ArticleStack>
-  <SplitPair>
-    <SplitCol title="Pass by Value">
+  <Divided>
+
+## Pass by Value
 
 - **What is passed?** A *copy* of the variable's value is passed to the function.
 - **How it works:** The function receives its own separate copy of the data. Any modifications made to the parameter inside the function only affect this copy. The original variable outside the function remains unchanged.
@@ -30,17 +31,14 @@ console.log("Outside function:", originalNumber); // Output: 5 (original is unch
 
 In this example, `modifyValue` gets a copy of `originalNumber`'s value (which is 5). It changes its internal `num` to 15, but the `originalNumber` variable outside the function is not affected.
 
-</SplitCol>
-    <SplitCol title={'Pass by Reference (or often, "Pass by Value of the Reference")'}>
+## Pass by Reference
+
+(or often, "Pass by Value of the Reference")
 
 - **What is passed?** Instead of a copy of the value, a way to *access* the original variable or the memory location where the data is stored is passed. This could be a direct memory address (like a pointer) or a reference (an alias to the original).
 - **How it works:** The function works directly with the original data in memory. Any modifications made to the data *through this reference* inside the function will affect the original variable outside the function.
 - **Analogy:** Imagine giving someone the *key* to a locker. They can open the locker and change its contents, and those changes are permanent to the *original* locker.
 - **Typically applies to:** Objects and arrays in many languages (though often implemented as "Pass by Value of the Reference" - see below).
-
-</SplitCol>
-  </SplitPair>
-  <Divided>
 
 ## Here's how that works:
 

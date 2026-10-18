@@ -1,0 +1,148 @@
+---
+title: "SAGA PATTERN"
+description: "The Saga Pattern is a design pattern used to manage long-running and complex business processes that span multiple microservices or systems."
+domain: "design-principles"
+type: "pattern"
+tags: ["saga"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+
+The **Saga Pattern** is a design pattern used to manage long-running and complex business processes that span multiple microservices or systems. It provides a way to handle distributed transactions by breaking them into smaller, manageable steps, each of which can be independently committed or rolled back.
+
+  <Divided>
+
+## Key Concepts
+
+1. **Long-running transactions**: A saga consists of a sequence of local transactions that each update one service's database and trigger the next step in the saga. These transactions are coordinated to complete a business process.
+2. **Compensating Transactions**: If any step in the saga fails, compensating actions (also known as "compensation" or "undo" actions) are triggered to revert the changes made by previous steps.
+3. **Distributed and Asynchronous**: Sagas are designed to work across multiple services or systems, typically in a distributed architecture like microservices. Each service executes a local transaction and may either commit the transaction or trigger a compensating transaction in case of failure.
+
+## Choreography-based Saga
+
+In a **choreography (/ˌkɒr.iˈɒɡ.rə.fi/) -based saga**, there is **no central controller** (no orchestrator). Instead, each service in the saga is aware of the next step and directly communicates with the next service. Services coordinate with each other by publishing events that trigger the next service's local transaction. The saga's flow is determined by the services themselves.
+
+### Key Characteristics
+
+- **Decentralized control**: Each service knows what to do next and when. They listen for events and act accordingly.
+- **Event-driven**: Services communicate via events. Each service emits events like `order-placed`, `payment-approved`, etc., to trigger the next service.
+- **No central orchestrator**: There's no single service controlling the entire saga. Each service is responsible for its own transaction and its next action.
+- **Fault tolerance**: If a failure occurs, services may listen for a failure event and perform compensating actions (e.g., a service can undo changes if it hears a failure event).
+
+### Example
+
+Consider an **Order Processing** system in an e-commerce platform with services like Order, Inventory, Payment, and Shipping.
+
+1. **Order Service**: When an order is placed, it emits an `order-placed` event.
+2. **Inventory Service**: Listens for the `order-placed` event and reserves the inventory. It emits an `inventory-reserved` event.
+3. **Payment Service**: Listens for the `inventory-reserved` event, processes the payment, and emits a `payment-approved` event.
+4. **Shipping Service**: Listens for the `payment-approved` event and ships the order.
+
+If any service fails, compensating actions are triggered:
+
+- If the **payment** fails, it might emit a `payment-failed` event, and the **Inventory** service will cancel the reservation.
+
+### Advantages
+
+- **Scalability**: No central point of control means services can scale independently.
+- **Loose coupling**: Services are loosely coupled because they only depend on events rather than direct calls.
+- **Fault tolerance**: The system can respond to failures in a decentralized way, using compensating actions triggered by events.
+
+### Disadvantages
+
+- **Complexity**: Managing and tracking the flow of the saga can be challenging, especially when there are many services and events.
+- **Event storm**: As more services are added, the number of events can grow, making it harder to manage and monitor.
+- **Harder to debug**: With no central controller, it can be more difficult to track down the cause of a failure or understand the overall flow.
+
+## Orchestrator-based Saga
+
+In an **Orchestrator-based Saga**, a **central orchestrator** (a service or workflow engine) controls the saga's flow. The orchestrator tells each service what to do, and services perform their tasks and report back to the orchestrator. This pattern is more centralized and structured compared to a choreography-based saga.
+
+### Key Characteristics
+
+- **Central control**: The orchestrator (a service or a workflow engine) controls the flow of the saga, making decisions about which service to call next.
+- **Sequential execution**: The orchestrator tells each service what to do and when to do it, ensuring the steps are executed in order.
+- **Service interaction**: Services interact with the orchestrator, rather than directly with each other. The orchestrator manages state transitions and compensating actions.
+- **Failure handling**: The orchestrator can track the saga's progress and initiate compensating transactions if any step fails.
+
+### Example
+
+In the same **Order Processing** example, the orchestrator controls the entire process:
+
+1. **Orchestrator** starts by calling the **Order Service** to place the order.
+2. The **Order Service** processes the order and notifies the **Orchestrator**.
+3. The **Orchestrator** then calls the **Inventory Service** to reserve the inventory.
+4. The **Inventory Service** reserves the inventory and notifies the **Orchestrator**.
+5. The **Orchestrator** then triggers the **Payment Service** to charge the customer.
+6. Once the payment is successful, the **Orchestrator** calls the **Shipping Service** to ship the order.
+
+If any service fails:
+
+- The **Orchestrator** initiates compensating actions (e.g., canceling the order or refunding the payment).
+
+### Advantages
+
+- **Clear control**: The central orchestrator manages the saga’s flow, making it easier to understand, monitor, and manage.
+- **Error handling**: Failure recovery is more straightforward because the orchestrator can directly trigger compensating actions.
+- **Easier debugging**: With a central point of control, it’s easier to trace and debug issues within the saga.
+
+### Disadvantages
+
+- **Single point of failure**: The orchestrator becomes a potential bottleneck and a single point of failure, so it needs to be highly available and scalable.
+- **Scalability concerns**: The orchestrator might become a bottleneck as the number of services and transactions grows, although this can be mitigated with proper scaling techniques.
+- **Tight coupling**: Services are more tightly coupled to the orchestrator, making the system less flexible in certain cases.
+
+## Comparison
+
+<SplitPair>
+  <SplitCol title="Choreography-based Saga">
+
+- **Control:** Decentralized, each service knows its role
+- **Service Communication:** Services communicate via events
+- **Failure Handling:** Compensating actions triggered by events
+- **Scalability:** Highly scalable, no single point of failure
+- **Complexity:** Can become complex with many services
+- **Flexibility:** Highly flexible and decoupled
+
+</SplitCol>
+  <SplitCol title="Orchestrator-based Saga">
+
+- **Control:** Centralized, orchestrator controls flow
+- **Service Communication:** Services communicate with orchestrator
+- **Failure Handling:** Orchestrator triggers compensating actions
+- **Scalability:** Scalable but depends on the orchestrator
+- **Complexity:** Easier to manage but introduces a bottleneck
+- **Flexibility:** Less flexible due to central control
+
+</SplitCol>
+</SplitPair>
+
+## When to Use
+
+<SplitPair>
+  <SplitCol title="Choreography-based Saga">
+
+**Choreography-based Saga** is best when:
+
+- You want a decentralized, event-driven system.
+- You need services to operate independently and scale autonomously.
+- The saga involves multiple services with loosely coupled interactions.
+
+</SplitCol>
+  <SplitCol title="Orchestrator-based Saga">
+
+**Orchestrator-based Saga** is best when:
+
+- You need clear, centralized control over the saga’s flow.
+- You want a more predictable and manageable approach to failure recovery.
+- The business process involves complex workflows where orchestration is easier to manage than relying on event listeners.
+
+</SplitCol>
+</SplitPair>
+
+Both approaches have their trade-offs, and the choice between them depends on the specific needs of your system, such as scalability, fault tolerance, and how complex the business logic is.
+
+</Divided>
+</ArticleStack>

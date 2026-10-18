@@ -1,13 +1,18 @@
 {
-  "title": "04 · Node.js",
+  "title": "04 · NodeJS",
   "description": "The event loop, async I/O, and how one thread serves concurrent requests.",
   "icon": "Server",
   "collapsible": true,
   "defaultOpen": false,
   "pages": [
-    "nodejs-overview",
+    "what-is-nodejs",
+    "asynchronous-and-synchronous",
+    "blocking-vs-non-blocking",
+    "asynchronous-and-non-blocking",
     "event-loop",
-    "sync-vs-async",
-    "cluster-worker-threads"
+    "microtask-and-macrotask-queue",
+    "nodejs-and-webserver",
+    "security",
+    "thread-and-process"
   ]
 }

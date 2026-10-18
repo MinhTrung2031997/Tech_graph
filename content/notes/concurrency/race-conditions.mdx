@@ -1,36 +1,312 @@
 ---
-title: "Race Conditions & Concurrency Control"
-description: "A race condition is a bug whose result depends on timing. In a database-backed API the usual shape is check-then-act: two requests both see \"allowed\" and both write. Fix it with an atomic write, a lock, a unique constrai"
+title: "RACE CONDITION"
+description: "A race condition is a type of bug that happens when two or more operations run at the same time, and the final result depends on the order in which they finish."
 domain: "concurrency"
 type: "concept"
-tags: ["postgresql", "concurrency"]
-status: "reviewed"
-appliesTo: "PostgreSQL 17"
-lastReviewed: "2026-10-11"
-interviewPriority: true
-related: ["databases/transaction-isolation-levels", "databases/acid-vs-base", "concurrency/idempotency-outbox"]
+tags: ["concurrency"]
+status: "draft"
+article: stack
 ---
-<Tldr>
-A race condition is a bug whose result depends on timing. In a database-backed API the usual shape is check-then-act: two requests both see "allowed" and both write. Fix it with an atomic write, a lock, a unique constraint, or an idempotency key — not with hope about request order.
-</Tldr>
 
-<Answer>
-I name the invariant first (one debit, one seat, one webhook side effect). Then I pick the smallest mechanism that enforces it: an atomic `UPDATE`, `SELECT … FOR UPDATE`, a unique index, or an idempotency key stored in the same transaction as the side effect. Isolation level alone does not save a read-modify-write at Read Committed. See [SQL ISOLATION](/notes/databases/transaction-isolation-levels).
-</Answer>
+<ArticleStack>
 
-## Six ways I actually use
+A **race condition** is a type of bug that happens when **two or more operations run at the same time**, and the **final result depends on the order** in which they finish. Because the order is unpredictable, you can get **wrong, inconsistent, or unexpected results**.
 
-| Mechanism | Use it when |
+<Divided>
+
+## Database Locking
+
+(Pessimistic Locking)
+
+Also known as:
+
+- SQL row-level locks
+- `SELECT ... FOR UPDATE`
+- Document-level lock (like in MongoDB transactions)
+
+**How it works**
+
+When a transaction reads a row, it **locks that row** so no other transaction can modify it until the lock is released.
+
+Example (SQL):
+
+```sql
+BEGIN;
+SELECT * FROM tickets WHERE id = 1 FOR UPDATE;
+UPDATE tickets SET status = 'BOOKED';
+COMMIT;
+```
+
+Only **one** transaction can lock the row.
+
+<SplitPair>
+  <SplitCol title="Pros">
+
+- **Absolute correctness** → no overselling, no inconsistent writes.
+- **Easy to implement** inside a monolithic or single-database system.
+- Works well when data is stored in a **relational DB**.
+- The database guarantees strong consistency.
+
+</SplitCol>
+  <SplitCol title="Cons">
+
+- Risk of:
+  - Deadlocks
+  - Long waiting times
+  - Performance bottlenecks under high load
+- Not ideal for **high concurrency** (thousands of requests per second).
+
+</SplitCol>
+</SplitPair>
+
+## Optimistic Locking
+
+(+ Versioning)
+
+Used widely in:
+
+- JPA/Hibernate (`@Version`)
+- MongoDB with version fields
+- REST APIs with `etag`
+
+**How it works**
+
+Instead of locking, each row/document has a **version number**.
+
+**Flow:**
+
+1. Read record → version = 5
+2. Modify data
+3. Write with condition: version must still be 5
+4. If another request wrote first → version changed → your update fails → retry
+
+**Example**
+
+```sql
+UPDATE tickets
+SET reserved_by = 'userA', version = version + 1
+WHERE id = 1 AND version = 5;
+```
+
+If affected rows = **0**, another process won → retry.
+
+<SplitPair>
+  <SplitCol title="Pros">
+
+- **High performance**: no locking, no blocking.
+- Works very well for:
+  - Microservices
+  - Distributed systems
+- Prevents lost updates clearly.
+- Good for use cases where *conflicts are rare*.
+
+</SplitCol>
+  <SplitCol title="Cons">
+
+- If the conflict rate is high → many retries → waste of resources.
+- More complex with large transactions.
+- Requires retry logic.
+
+</SplitCol>
+</SplitPair>
+
+## Atomic Operations
+
+(Database or Redis)
+
+**How it works**
+
+You let the database or Redis perform the entire operation in **one atomic instruction** so no two processes can break it.
+
+**Examples:**
+
+**SQL Atomic Update:**
+
+```sql
+UPDATE inventory SET stock = stock - 1 WHERE id = 1 AND stock > 0;
+```
+
+**Redis Atomic Increment:**
+
+```text
+INCR counter
+```
+
+<SplitPair>
+  <SplitCol title="Pros">
+
+- Extremely fast (especially Redis)
+- No locks needed
+- Perfect for counters, stock decrement, rate limiters
+
+</SplitCol>
+  <SplitCol title="Cons">
+
+- Limited: only works for condition updates
+- Not suitable for complex transactions
+- Redis requires consistent distributed architecture (Redis cluster)
+
+</SplitCol>
+</SplitPair>
+
+## Distributed Lock
+
+(Redis, ZooKeeper, Consul)
+
+**How it works**
+
+Processes acquire a **distributed mutex** before updating shared data.
+
+Example with Redis Redlock:
+
+```javascript
+LOCK_KEY(product:1)
+do work
+UNLOCK
+```
+
+Multiple servers share the lock.
+
+<SplitPair>
+  <SplitCol title="Pros">
+
+Works across multiple servers, microservices, containers.
+
+</SplitCol>
+  <SplitCol title="Cons">
+
+- Hard to implement correctly (especially Redis Redlock reliability debates).
+- If lock server goes down → risk of stale locks.
+- Slower than DB locks.
+
+</SplitCol>
+</SplitPair>
+
+## Message Queue
+
+(Serializing Requests)
+
+**Examples:**
+
+- Kafka
+- RabbitMQ
+- SQS
+
+**How it works**
+
+Instead of handling concurrent writes directly, you **put all requests into a queue**.
+
+A worker processes them **one by one**, guaranteeing correct order.
+
+**Example flow:**
+
+1. API receives “book ticket”
+2. Pushes message to queue
+3. Worker processes strictly in order:
+   - Check availability
+   - Decrease stock
+   - Confirm booking
+
+<SplitPair>
+  <SplitCol title="Pros">
+
+- Zero race conditions (only one consumer)
+- Highly scalable
+- Very reliable for high-volume systems
+- Decouples front-end API and backend worker
+
+</SplitCol>
+  <SplitCol title="Cons">
+
+- Adds architectural complexity
+- Requires async architecture
+- User may not get instant confirmation (unless using callback or polling)
+- Harder to debug
+
+</SplitCol>
+</SplitPair>
+
+## Unique Constraints
+
+(Database-level Check)
+
+**Example:**
+
+```sql
+CREATE UNIQUE INDEX unique_seat ON bookings(seat_id);
+```
+
+If two users try to book the **same seat**, the database rejects one automatically.
+
+<SplitPair>
+  <SplitCol title="Pros">
+
+- Very simple & extremely reliable
+- Zero race condition for uniqueness constraints
+- Database ensures correctness
+
+</SplitCol>
+  <SplitCol title="Cons">
+
+- Only solves **duplicate insert** race conditions
+- Does not prevent race conditions that modify existing rows
+
+</SplitCol>
+</SplitPair>
+
+## Recommended Solution
+
+### Strict correctness
+
+**If you need strict correctness (tickets, money, stock):**
+
+**Use atomic update or pessimistic locking**
+
+This is the most reliable and simplest.
+
+**Why?**
+
+- Always accurate
+- Database guarantees consistency
+- Easy to reason about
+
+### High concurrency
+
+**For high concurrency systems (1000s RPS):**
+
+**Atomic Update + Message Queue**
+
+Best combination for scaling.
+
+### Microservices
+
+**For microservices architecture:**
+
+**Optimistic Locking (versioning)**
+
+Because:
+
+- No blocking
+- Very high performance
+- Ideal for distributed architecture
+
+### Shared resources
+
+**For distributed shared resources:**
+
+**Distributed locks (Redis/ZooKeeper)**
+
+### Summary
+
+| Use Case | Best Solution |
 | --- | --- |
-| Atomic update | The new value is `balance = balance - 100` |
-| Row lock (`FOR UPDATE`) | You must read, decide in application code, then write |
-| Optimistic version column | Conflicts are rare and retry is easy |
-| Unique constraint | "Only one" is a fact about data, not about timing |
-| Advisory lock | The critical section is not a single row |
-| Idempotency key | A retry must not apply the side effect twice |
+| Ticket booking | Pessimistic lock OR atomic update |
+| High concurrency flash sale | Queue + Atomic update |
+| Money transfer | Pessimistic lock + Transactions |
+| Microservices writing same data | Optimistic locking |
+| Distributed workers | Redis/Zookeeper locks |
+| Prevent duplication | Unique constraint |
+| Simple counter (likes/views) | Redis atomic ops |
 
-## Pitfalls
-
-<Pitfall>
-Catching a duplicate-key error and continuing as if nothing happened is correct only when the existing row is the same operation. If two different payments collide on a bad key, you just dropped one of them.
-</Pitfall>
+</Divided>
+</ArticleStack>

@@ -1,0 +1,228 @@
+---
+title: "VueJS"
+description: "Vue.js is a progressive JavaScript framework used for building user interfaces (UI) and single-page applications (SPA)."
+domain: "frontend"
+type: "concept"
+tags: ["vue"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+  <Divided>
+
+## Vue.js Summary
+
+Vue.js is a **progressive JavaScript framework** used for building **user interfaces (UI)** and **single-page applications (SPA)**. It is popular because it is **easy to learn**, **lightweight**, and **flexible**.
+
+## Core Concepts
+
+### Reactive Data Binding
+
+- Vue automatically updates the UI when the underlying data changes.
+- Uses a **reactivity system** with proxies (Vue 3) to track changes.
+
+### Component-Based Architecture
+
+- UI is split into small, reusable pieces called **components**.
+- Each component contains:
+  - **Template** (HTML)
+  - **Script** (JavaScript logic)
+  - **Style** (CSS)
+
+### Declarative Templates
+
+- Use directives like:
+  - `v-if`, `v-for`, `v-model`
+- Templates make code readable and expressive.
+
+### Computed Properties
+
+- Cached values based on reactive data.
+- Automatically recompute when dependencies change.
+
+### Lifecycle Hooks
+
+- Examples:
+  - `created()`
+  - `mounted()`
+  - `updated()`
+  - `unmounted()`
+- Let you run logic at specific stages.
+
+### Props & Emits
+
+- **Props**: Parent → Child data flow.
+- **Emit**: Child → Parent events.
+
+### Composition API (Vue 3)
+
+- More flexible logic reuse using:
+  - `setup()`
+  - `ref`, `reactive`
+  - `computed`
+  - `watch`
+- Easier to organize complex logic.
+
+### Routing
+
+- Using **Vue Router** for:
+  - Page navigation
+  - Dynamic routes
+  - Guarding routes
+
+### State Management
+
+- Using **Pinia** (new standard) or Vuex (older).
+- Store global, shareable state across components.
+
+### Single File Components (SFC)
+
+- `.vue` files package logic, template, and styles in one place.
+- Supported by tooling like Vite.
+
+## Why Vue.js Is Popular
+
+- Simple learning curve.
+- Clean syntax.
+- Excellent documentation.
+- Flexible: use it for small widgets or full applications.
+- Strong ecosystem (Vue Router, Pinia, Vite).
+- Fast performance (Vue 3 rewritten with Virtual DOM optimizations).
+
+## When to Use Vue.js
+
+- Building SPAs with smooth user experience.
+- Dashboard applications.
+- Admin panels.
+- Forms with real-time validation.
+- Projects that need maintainable, scalable UI.
+
+## setup()
+
+**The Heart of Composition API**
+
+`setup()` runs **before the component is created**.
+
+You define all your reactive data, functions, computed properties, and watchers inside it.
+
+Example:
+
+```javascript
+<script setup>
+import { ref, computed } from 'vue'
+
+const count = ref(0)
+
+const double = computed(() => count.value * 2)
+
+function increase() {
+  count.value++
+}
+</script>
+```
+
+**Everything declared here can be used in your template.**
+
+## ref()
+
+**Reactive Primitive Values**
+
+`ref()` creates a **reactive variable**.
+
+- Used for **numbers, strings, booleans, nullable values**.
+- Always access the value using **`.value`** in script.
+- In templates you **don’t need `.value`**.
+
+Example:
+
+```javascript
+const name = ref('Trung')
+name.value = 'John'
+```
+
+## reactive()
+
+**Reactive Objects**
+
+`reactive()` makes an **object or array** reactive.
+
+Example:
+
+```javascript
+const user = reactive({
+  name: 'Alice',
+  age: 25
+})
+
+user.age = 30 // updates UI
+```
+
+✔ Good for **complex objects**
+
+✔ Automatically unwraps in templates
+
+## computed()
+
+**Derived Values (Cached)**
+
+`computed()` creates a value that **depends on other values**.
+
+- Only recalculates when dependencies change.
+- Good for **expensive calculations** or **derived UI values**.
+
+Example:
+
+```javascript
+const firstName = ref('Trung')
+const lastName = ref('Nguyen')
+
+const fullName = computed(() => `${firstName.value} ${lastName.value}`)
+```
+
+## watch()
+
+**Run Side Effects When Data Changes**
+
+`watch()` lets you **perform actions when data changes**, such as:
+
+- API calls
+- Logging
+- Updating multiple variables
+- Debouncing inputs
+
+Example:
+
+```javascript
+watch(
+  () => count.value,
+  (newVal, oldVal) => {
+    console.log('Count changed:', newVal)
+  }
+)
+```
+
+✔ Only runs when the watched value changes
+
+✔ Good for “side effects,” not for UI calculations
+
+## Why Composition API Is Powerful
+
+### Logic is grouped together
+
+(e.g., all authentication logic in one place)
+
+### Easy to extract reusable logic
+
+(using composables → `useAuth()`, `useFetch()`, etc.)
+
+### More scalable for large apps
+
+Better than splitting into data/methods/computed sections.
+
+### Better TypeScript support
+
+More predictable and type-friendly.
+
+</Divided>
+</ArticleStack>

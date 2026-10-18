@@ -1,0 +1,80 @@
+---
+title: "Blocking vs Non-blocking"
+description: "A blocking operation stops everything else until it finishes."
+domain: "nodejs"
+type: "comparison"
+tags: ["nodejs"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+  <SplitPair>
+    <SplitCol title="Blocking (Synchronous)">
+
+A **blocking operation** stops everything else until it finishes.
+
+- The next line of code **cannot run** until the current task is done.
+- This is also called **synchronous execution**.
+
+**Example (TypeScript – Blocking)**
+
+```typescript
+function sleepBlocking(ms: number) {
+const start = Date.now();
+while (Date.now() - start < ms) {
+// Busy wait (blocks the thread)
+  }
+}
+
+console.log("Start");
+
+sleepBlocking(3000); // Blocks for 3 seconds
+
+console.log("End");
+```
+
+**Output:**
+
+```text
+Start
+(wait 3 seconds...)
+End
+```
+
+👉 During those 3 seconds, the program **cannot do anything else**.
+
+</SplitCol>
+    <SplitCol title="Non-Blocking (Asynchronous)">
+
+A **non-blocking operation** allows other code to run while waiting.
+
+- The task is delegated (e.g., to the event loop, OS, or background worker).
+- The program continues execution and handles the result later.
+
+**Example (TypeScript – Non-blocking)**
+
+```typescript
+console.log("Start");
+
+setTimeout(() => {
+console.log("Async task done");
+},3000);
+
+console.log("End");
+```
+
+**Output:**
+
+```text
+Start
+End
+(wait 3 seconds...)
+Async task done
+```
+
+👉 The program **does not wait** — it keeps running.
+
+</SplitCol>
+  </SplitPair>
+</ArticleStack>
