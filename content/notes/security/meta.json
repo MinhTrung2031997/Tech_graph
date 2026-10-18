@@ -5,11 +5,13 @@
   "collapsible": true,
   "defaultOpen": false,
   "pages": [
-    "authentication-vs-authorization",
+    "cookie-and-session",
+    "authentication",
+    "authorization",
+    "ory",
     "jwt",
     "oauth",
     "api-authentication-methods",
-    "cookies-vs-sessions",
     "nodejs-security-checklist"
   ]
 }

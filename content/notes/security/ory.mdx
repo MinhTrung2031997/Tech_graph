@@ -1,0 +1,40 @@
+---
+title: "ORY"
+description: "Ory is a modular Identity and Access Management (IAM) platform that helps applications manage user identities, authentication, authorization, and access control."
+domain: "security"
+type: "concept"
+tags: ["auth"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+
+- Ory is a modular Identity and Access Management (IAM) platform that helps applications manage user identities, authentication, authorization, and access control.
+
+<Divided>
+
+## Used for
+
+What is Ory used for?
+
+- Authentication: Verify who the user is.
+- Identity management: Handle registration, login, password recovery, and user sessions.
+- OAuth 2.0 / OpenID Connect (OIDC): Enable secure token issuance and delegated access.
+- Authorization: Determine what resources and actions a user is allowed to access.
+
+## Main components
+
+- Ory Kratos: Identity management, login, registration, MFA, sessions
+- Ory Hydra: OAuth 2.0 and OIDC; issues access tokens and ID tokens
+- Ory Keto: Fine-grained authorization and permission checks
+- Ory Oathkeeper: Identity-aware proxy that authenticates and authorizes incoming requests
+
+<img
+  src="/notes/security/ory-login.png"
+  alt="Login sequence across the browser, backend, Cerberus, and Microsoft"
+  style={{ display: "block", maxWidth: "100%", height: "auto", marginTop: "1rem" }}
+/>
+
+</Divided>
+</ArticleStack>
