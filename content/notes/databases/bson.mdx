@@ -1,0 +1,34 @@
+---
+title: "BSON (MongoDB)"
+description: "BSON stands for Binary JSON. It is a binary-encoded data format used by MongoDB to store and exchange documents."
+domain: "databases"
+type: "concept"
+tags: ["mongodb"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+<Divided>
+
+- **BSON stands for Binary JSON.** It is a binary-encoded data format used by MongoDB to store and exchange documents.
+- Compared to JSON, BSON supports additional data types such as `ObjectId`, `Date`, `Int64`, and `Decimal128`. It also stores type information for each field, making it easier to represent and decode structured data.
+- MongoDB uses BSON because it supports richer data types and provides an efficient format for document storage and data exchange.
+- However, BSON can consume more storage than JSON in some cases because it includes type information and field names.
+
+## Difference
+
+What is the difference between JSON and BSON?
+
+- JSON is a text-based data format, while BSON is binary-encoded.
+- BSON supports additional data types, such as `ObjectId` and `Date`.
+- BSON is designed for efficient document storage and processing, but it is not always smaller or faster than JSON.
+
+## JSONB
+
+Q: Is BSON the same as JSONB in PostgreSQL?
+
+BSON is the binary document format used by MongoDB, whereas JSONB is PostgreSQL's binary representation of JSON data. They have different implementations and purposes.
+
+</Divided>
+</ArticleStack>

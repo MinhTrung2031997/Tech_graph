@@ -1,0 +1,19 @@
+---
+title: "Materialized View"
+description: "A materialized view in PostgreSQL stores the result of a query physically, unlike a regular view, which executes its underlying query when accessed."
+domain: "databases"
+type: "concept"
+tags: ["postgresql"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+<Divided>
+
+- A materialized view in PostgreSQL stores the result of a query physically, unlike a regular view, which executes its underlying query when accessed.
+- It is useful for improving read performance, especially for expensive aggregations and reporting queries, because the results are precomputed.
+- However, a materialized view does not automatically reflect changes in the underlying tables. We need to refresh it, so there is a trade-off between query performance and data freshness.
+
+</Divided>
+</ArticleStack>

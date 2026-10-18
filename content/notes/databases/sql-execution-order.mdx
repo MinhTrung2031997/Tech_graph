@@ -1,0 +1,74 @@
+---
+title: "SQL Execution Order"
+description: "FROM, JOIN / ON, WHERE, GROUP BY, HAVING, SELECT, DISTINCT, ORDER BY, LIMIT / OFFSET."
+domain: "databases"
+type: "concept"
+tags: ["sql"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+
+- **FROM**
+- **JOIN / ON**
+- **WHERE**
+- **GROUP BY**
+- **HAVING**
+- **SELECT**
+- **DISTINCT**
+- **ORDER BY**
+- **LIMIT / OFFSET**
+
+<Divided>
+
+## Explanation
+
+Explanation of each step.
+
+### FROM
+
+SQL starts by identifying the base table(s).
+
+### JOIN / ON
+
+Tables are joined and combined into one dataset.
+
+### WHERE
+
+Filters rows **before grouping**.
+
+Removes rows that do not meet the condition.
+
+### GROUP BY
+
+Groups the remaining rows into buckets.
+
+### HAVING
+
+Filters groups **after aggregation**.
+
+Example: `HAVING COUNT(*) > 5`.
+
+### SELECT
+
+Projects the final output columns.
+
+Expressions, functions, and calculated fields are evaluated here.
+
+### DISTINCT
+
+Removes duplicate rows *after* SELECT.
+
+### ORDER BY
+
+Sorts the final result.
+
+Can sort by aliases created in the SELECT step.
+
+### LIMIT / OFFSET
+
+Returns only the top N rows or skips rows.
+
+</Divided>
+</ArticleStack>

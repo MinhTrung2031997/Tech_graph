@@ -2,7 +2,7 @@
 
 Backend engineering notes by Trung Nguyen.
 
-Dark documentation site. Opening it shows Transaction Isolation Levels: the domain sidebar, the note, and the "On this page" list. Interview prep, quick review, and tags stay in the top nav. Built with Next.js, Fumadocs, MDX, Tailwind CSS, and Shiki. Search is the Fumadocs `⌘K` dialog. Fumadocs 16.17 builds that index with its bundled engine (ZBSearch). Orama is still the optional cloud add-on and is not required for this site.
+Dark documentation site. Opening it shows SQL ISOLATION: the domain sidebar, the note, and the "On this page" list. Interview prep, quick review, and tags stay in the top nav. Built with Next.js, Fumadocs, MDX, Tailwind CSS, and Shiki. Search is the Fumadocs `⌘K` dialog. Fumadocs 16.17 builds that index with its bundled engine (ZBSearch). Orama is still the optional cloud add-on and is not required for this site.
 
 ## Scripts
 
