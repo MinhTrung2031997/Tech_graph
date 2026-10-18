@@ -160,6 +160,18 @@ html > body[data-scroll-locked] {
   color: #f7f7ff;
 }
 
+.sidebar-card:has(> .english-note-card[data-active='true']) {
+  border-color: #33366b;
+  background: #33366b;
+  color: #eeeefe;
+}
+
+.sidebar-card:has(> .english-note-card[data-active='true']):hover {
+  border-color: #3c3f7a;
+  background: #3c3f7a;
+  color: #f7f7ff;
+}
+
 /* On this page: indigo marker stays on --color-fd-primary; the label is the lighter indigo. */
 #nd-toc a[data-active='true'],
 [data-toc-popover-content] a[data-active='true'] {

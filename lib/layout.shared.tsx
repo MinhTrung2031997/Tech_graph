@@ -1,3 +1,4 @@
+import { NotesSwitcher } from '@/components/notes-switcher';
 import type { BaseLayoutProps } from 'fumadocs-ui/layouts/shared';
 import { appName, githubRepoUrl } from './shared';
 
@@ -5,12 +6,13 @@ export function baseOptions(): BaseLayoutProps {
   return {
     nav: {
       title: (
-        <span className="inline-flex items-center gap-2.5 font-bold tracking-tight">
-          <span className="inline-block size-[22px] rounded-md bg-[#818cf8]" />
-          {appName}
+        <span className="inline-flex items-center gap-2.5 whitespace-nowrap font-bold tracking-tight">
+          <span className="inline-block size-[22px] shrink-0 rounded-md bg-[#818cf8]" />
+          <span className="max-sm:sr-only">{appName}</span>
         </span>
       ),
       url: '/',
+      children: <NotesSwitcher />,
     },
     githubUrl: githubRepoUrl(),
     links: [
