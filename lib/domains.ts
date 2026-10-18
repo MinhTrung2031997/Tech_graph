@@ -31,7 +31,7 @@ export const domains: Domain[] = [
   {
     number: '04',
     slug: 'nodejs',
-    title: 'Node.js',
+    title: 'NodeJS',
     description: 'The Node.js runtime: the event loop, async I/O, and how a single thread serves concurrent requests.',
     icon: 'Server',
   },

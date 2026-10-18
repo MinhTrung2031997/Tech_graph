@@ -1,0 +1,56 @@
+---
+title: "NodeJS and Webserver"
+description: "Node.js is a JavaScript runtime built on the V8 JavaScript engine. It allows developers to execute JavaScript code server-side."
+domain: "nodejs"
+type: "comparison"
+tags: ["nodejs"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+  <SplitPair>
+    <SplitCol title="Node.js">
+
+- **Definition:** Node.js is a JavaScript runtime built on the V8 JavaScript engine. It allows developers to execute JavaScript code server-side.
+- **Use Case:** Node.js is commonly used for building scalable network applications, particularly server-side applications. It's suitable for developing web servers, APIs, and other types of networked software.
+- **Key Features:**
+  - Asynchronous and event-driven: Node.js uses a non-blocking, event-driven architecture that makes it efficient for handling a large number of concurrent connections.
+  - Single programming language: Allows developers to use JavaScript for both client-side and server-side development.
+  - Large ecosystem: Node.js has a rich ecosystem of modules and packages available through npm (Node Package Manager).
+- **Example:**
+
+```javascript
+const http = require('http');
+
+const server = http.createServer((req, res) => {
+  res.writeHead(200, {'Content-Type': 'text/plain'});
+  res.end('Hello, World!\n');
+});
+
+server.listen(3000, '127.0.0.1', () => {
+  console.log('Server listening on port 3000');
+});
+```
+
+</SplitCol>
+    <SplitCol title="Web Server">
+
+- **Definition:** A web server is software that handles incoming requests over the HTTP protocol and sends back responses. It listens for requests from clients (like web browsers) and serves static or dynamic content.
+- **Use Case:** Web servers are the backbone of the World Wide Web, serving web pages and other resources to users' browsers. They can handle various types of requests, such as GET and POST, and can execute server-side scripts or interact with application servers.
+- **Key Features:**
+  - Request handling: Listens for incoming HTTP requests and processes them by returning the appropriate response (e.g., HTML pages, images, or data).
+  - Security: Implements security features, such as handling HTTPS, protecting against common web attacks, and controlling access to resources.
+- **Examples:**
+  - Apache HTTP Server
+  - Nginx
+  - Microsoft Internet Information Services (IIS)
+
+</SplitCol>
+  </SplitPair>
+  <Divided>
+
+In summary, Node.js is a runtime that allows you to execute JavaScript on the server side, while a web server is a software application that handles HTTP requests and serves web content. In many cases, Node.js can be used to create a web server, but not all web servers use Node.js, as there are various web server software options available
+
+</Divided>
+</ArticleStack>

@@ -1,0 +1,83 @@
+---
+title: "Thread and process"
+description: "A process is an independent program with its own isolated memory space."
+domain: "nodejs"
+type: "comparison"
+tags: ["nodejs"]
+status: "draft"
+article: stack
+---
+
+<ArticleStack>
+  <SplitPair>
+    <SplitLead>
+
+## Process vs thread
+
+**What is the key difference between a process and a thread?**
+
+</SplitLead>
+    <SplitCol title="Process">
+
+A process is an independent program with its own isolated memory space.
+
+</SplitCol>
+    <SplitCol title="Thread">
+
+A thread is a unit of execution inside a process that shares the same address space (heap, globals, file descriptors) with other threads but has its own stack and registers.
+
+</SplitCol>
+    <SplitLead>
+
+⇒ The core tradeoff is isolation vs. overhead — processes are safer but heavier, threads are faster but require careful synchronization /ˌsɪŋ.krə.naɪˈzeɪ.ʃən/.
+
+</SplitLead>
+  </SplitPair>
+  <SplitPair>
+    <SplitLead>
+
+## Context switching
+
+**Why is thread context switching faster than process context switching?**
+
+</SplitLead>
+    <SplitCol title="Thread">
+
+Because threads share the same virtual address space. Switching between threads only requires saving and restoring CPU registers and the stack pointer — the memory maps stay the same.
+
+</SplitCol>
+    <SplitCol title="Process">
+
+Process context switching must also swap the entire page table, flush the TLB (Translation Lookaside Buffer), and reload the memory map, which is significantly more expensive.
+
+</SplitCol>
+  </SplitPair>
+  <SplitPair>
+    <SplitLead>
+
+## When to use
+
+**When would you use a process over a thread?**
+
+</SplitLead>
+    <SplitCol title="Process">
+
+Use a process when isolation /ˌaɪ.səlˈeɪ.ʃən/ and fault tolerance matter — e.g. a crash in one worker should not affect others (web server workers, microservices, browser tabs). Also prefer processes for CPU-bound tasks in Python to bypass the GIL.
+
+</SplitCol>
+    <SplitCol title="Thread">
+
+Use threads when tasks are I/O-bound and need to share a lot of data, and when low overhead and fast communication are priorities.
+
+</SplitCol>
+  </SplitPair>
+  <Divided>
+
+## Shared memory
+
+**What problems arise from shared memory in threads?**
+
+Race conditions (two threads read-modify-write the same variable concurrently, producing inconsistent results), deadlocks (two threads each hold a lock the other needs and both wait forever), and priority inversion (a low-priority thread holds a lock needed by a high-priority thread). These are solved with synchronization primitives: mutex, semaphore, read-write lock, and atomic operations.
+
+</Divided>
+</ArticleStack>
