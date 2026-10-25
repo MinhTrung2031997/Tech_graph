@@ -2,6 +2,7 @@
 
 import { EnglishHashScroll, englishSidebarComponents } from '@/components/english-sidebar';
 import { SidebarExpansionProvider, SidebarFolderControls } from '@/components/sidebar-expansion';
+import { DocsHeaderMeasure } from '@/components/docs-header-measure';
 import { SidebarResize } from '@/components/sidebar-resize';
 import { englishSetForPath, englishSets, englishTree } from '@/lib/english';
 import { baseOptions } from '@/lib/layout.shared';
@@ -24,6 +25,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         sidebar={{ banner: SidebarFolderControls, components: englishSidebarComponents }}
       >
         <SidebarResize />
+        <DocsHeaderMeasure />
         <EnglishHashScroll />
         {children}
       </DocsLayout>
