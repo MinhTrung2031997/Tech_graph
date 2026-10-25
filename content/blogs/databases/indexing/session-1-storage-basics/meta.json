@@ -1,0 +1,14 @@
+{
+  "title": "Session 1: Storage basics",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-pages/index"
+  ],
+  "planned": [
+    "Concept 2: Heap vs clustered tables",
+    "Concept 3: Seq Scan — what a full scan does",
+    "Concept 4: Sequential vs random I/O",
+    "Lab and session quiz"
+  ]
+}

@@ -1,0 +1,137 @@
+---
+title: "Answers: The database reads pages, not rows"
+description: "Worked answers to the Concept 1 check questions, with the formulas and the common mistakes."
+companion: "answers"
+tags: ["indexing", "postgresql", "storage", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/storage-page-layout.html"
+  - "https://www.postgresql.org/docs/current/using-explain.html#USING-EXPLAIN-ANALYZE"
+  - "https://www.postgresql.org/docs/current/runtime-config-statistics.html#GUC-TRACK-IO-TIMING"
+---
+
+<Tldr>
+Three formulas cover every question here. **Rows per page** = 8,168 / (row bytes + 4). **Size** = pages × 8 KB, or 128 pages per MB. **Unit number** = byte position / unit size. Compare queries by pages touched (hit + read), not by time.
+</Tldr>
+
+## Q1. Pages in a 1M-row table
+
+**Question:** a PostgreSQL table has 1M rows, each taking about 80 bytes in the page. Roughly how many 8 KB pages does it have?
+
+| Step | Calculation |
+|---|---|
+| Space per row | 80 B row + 4 B line pointer = 84 B |
+| Usable space per page | 8,192 − 24 B header = 8,168 B |
+| Rows per page | 8,168 / 84 ≈ **97** |
+| Pages | 1,000,000 / 97 ≈ **10,300** |
+| Size | 10,300 × 8 KB ≈ **80 MB** |
+
+> **Common mistake:** stopping at "1M / 97". Always finish with the number of pages: it is what the planner's cost estimate starts from (Session 3).
+
+## Q2. The minimum read for one row
+
+**Question:** a query returns one 80-byte row. What is the minimum amount the database reads, and why can it not read less?
+
+**One full 8 KB page**, even though only 80 bytes of it are used.
+
+| Layer | Why it cannot be less |
+|---|---|
+| PostgreSQL | The page is the smallest unit it addresses and caches. A `shared_buffers` slot holds one page, and the request to the OS is "page N", never "bytes X to Y". |
+| OS and disk | Even if Postgres asked for 80 bytes, the OS caches 4 KB pages and the SSD reads 4 KB blocks. |
+
+If the page is already in `shared_buffers` (a hit), nothing is read from the OS or the disk at all.
+
+## Q3. Seq Scan of narrow vs wide rows
+
+**Question:** table A has 1M rows of about 50 bytes; table B has 1M rows of about 500 bytes. Which Seq Scan is faster, by roughly how much, and why?
+
+**A is faster, by roughly 6.5×.** A Seq Scan's cost follows the number of pages, and every row carries a fixed overhead (24 B row header, 4 B line pointer, alignment) on top of its data.
+
+| | Data per row | Space per row in the page | Rows per page | Pages for 1M rows | Size |
+|---|---|---|---|---|---|
+| A | 50 B | ≈ 84 B | ≈ 97 | ≈ 10,300 | ≈ 80 MB |
+| B | 500 B | 24 + 500 → 528 (aligned) + 4 ≈ 532 B | ≈ 15 | ≈ 66,700 | ≈ 520 MB |
+
+66,700 / 10,300 ≈ **6.5×** more pages. Both scans process 1M rows, so the per-row CPU work is similar; the difference is pages read.
+
+> **Common mistake:** answering 10× from 500 / 50. The fixed overhead per row is a bigger share of a small row, so the page ratio is smaller than the data ratio.
+
+## Q4. Reading `shared hit` and `shared read`
+
+**Question:** `EXPLAIN` shows `Buffers: shared hit=8000 read=2000`. What does it tell you, and how would a second run right after change the numbers?
+
+| Field | Meaning |
+|---|---|
+| `shared hit=8000` | 8,000 pages were already in `shared_buffers` |
+| `shared read=2000` | 2,000 pages were not, so Postgres asked the OS for them; they came from the OS page cache or the disk, and `EXPLAIN` cannot tell which (`track_io_timing` can) |
+
+- **Total work** = hit + read = 10,000 pages ≈ 80 MB. This does not change with caching.
+- **Hit ratio** = 8,000 / 10,000 = 80%.
+
+**Second run:** the 2,000 pages were loaded into `shared_buffers` by the first run, so if nothing evicted them:
+
+| | hit | read | Total |
+|---|---|---|---|
+| Run 1 | 8,000 | 2,000 | 10,000 |
+| Run 2 | 10,000 | 0 | 10,000 |
+
+Run 2 can still show reads when the data is larger than `shared_buffers`, or when a Seq Scan reads a table larger than a quarter of `shared_buffers`: it then uses a small 256 KB ring of buffers so it does not push everyone else's pages out.
+
+## Q5. Why pages, not rows
+
+**Question:** why do databases read pages instead of exactly the rows they need?
+
+| Reason | Explanation |
+|---|---|
+| The hardware cannot read less | The SSD reads 4 KB blocks and the OS caches 4 KB pages. Asking for 80 bytes still reads at least 4 KB. |
+| The fixed cost of a read dominates | One SSD read costs ~100 µs whether it returns 80 B or 8 KB; an HDD seek costs ~10 ms either way. Once the trip is paid for, a full page is taken, because neighbouring rows are often needed next. |
+| Simple bookkeeping | One unit for everything: a cache slot holds one page, a row's address is (page, slot), and checksums and WAL protection work per page. Tracking single rows would cost far more memory and CPU. |
+
+**In one line:** reading is expensive per trip, not per byte, and the layers below only work in blocks, so the database reads fixed-size pages and makes every trip count.
+
+> **Common mistake:** "because it has to load the page first". That restates what happens; the answer is why the page exists at all.
+
+## Q6. A faster second run
+
+**Question:** a query shows `shared hit=0 read=500` on run 1 and `shared hit=500 read=0` on run 2.
+
+- (a) How many pages, and roughly how many MB, does the query really touch?
+- (b) Run 1 took 40 ms and run 2 took 2 ms. Did the query get better? What would you compare instead?
+
+**(a) 500 pages ≈ 3.9 MB.** Size = pages × 8 KB:
+
+| Step | Calculation |
+|---|---|
+| Pages touched | hit + read = 0 + 500 = 500 (run 2: 500 + 0, the same) |
+| Bytes | 500 × 8,192 = 4,096,000 B |
+| KB | 500 × 8 KB = 4,000 KB |
+| MB | 4,000 / 1,024 ≈ **3.9 MB** |
+
+Shortcut: **128 pages = 1 MB** (128 × 8 KB = 1,024 KB), so 500 pages ≈ 500 / 128 ≈ 3.9 MB.
+
+**(b) No.** Both runs touched exactly 500 pages: same plan, same work. Only where the pages came from changed.
+
+| | Pages came from | Cost per page | Time |
+|---|---|---|---|
+| Run 1 | OS cache or disk (`read=500`) | µs to ~100 µs | 40 ms |
+| Run 2 | `shared_buffers` (`hit=500`) | ~100 ns | 2 ms |
+
+**Compare pages touched (hit + read) and the plan**, which only go down when the query really does less work. If you compare time, compare runs in the same cache state: both warm (run each a few times) or both cold.
+
+> **Common mistakes:** 0.4 MB instead of 3.9 MB (a factor of 10 lost when converting), and "the query got faster" when only the cache got warmer. In practice: after adding an index, 40 ms → 2 ms proves nothing by itself. If pages touched went from 500 to 4, the index helped; if it is still 500, only the cache did.
+
+## Deep dive question: page 5
+
+**Question** (from [Why pages exist](/blogs/databases/indexing/session-1-storage-basics/concept-1-pages/why-pages-exist)): Postgres needs page **5** of a table file. Which byte position does it ask the OS for, which 4 KB OS page numbers does that cover, and how many 512-byte HDD sectors would be read?
+
+One formula for every layer: **first unit = byte position / unit size; count = 8,192 / unit size.**
+
+| Layer | Calculation | Answer |
+|---|---|---|
+| Byte position | 5 × 8,192 | **40,960** |
+| OS pages (4,096 B) | first = 40,960 / 4,096 = 10; count = 2 | **#10 and #11** |
+| HDD sectors (512 B) | first = 40,960 / 512 = 80; count = 16 | **16 sectors, #80–#95** |
+
+Units are numbered from 0 within the file. The file system then maps "sector 80 of this file" to wherever it really sits on the disk.
+
+> **Common mistake:** sectors #1–#16. The count is right, but the positions must use the same division as the OS pages; #0–#15 would be page 0.

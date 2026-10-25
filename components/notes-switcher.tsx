@@ -25,10 +25,12 @@ export function NotesSwitcher() {
   const onEnglish = pathname.startsWith('/english');
   const current = englishSetForPath(pathname);
   const englishActive = onEnglish;
+  const [openPath, setOpenPath] = useState(pathname);
 
-  useEffect(() => {
+  if (openPath !== pathname) {
+    setOpenPath(pathname);
     setOpen(false);
-  }, [pathname]);
+  }
 
   useLayoutEffect(() => {
     if (!open) return;

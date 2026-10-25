@@ -1,0 +1,13 @@
+{
+  "title": "Indexing",
+  "pages": [
+    "session-1-storage-basics",
+    "session-2-btree-internals",
+    "session-3-query-planner",
+    "session-4-composite-indexes",
+    "session-5-covering-partial-expression",
+    "session-6-engine-differences",
+    "session-7-specialist-indexes",
+    "session-8-when-indexes-hurt"
+  ]
+}

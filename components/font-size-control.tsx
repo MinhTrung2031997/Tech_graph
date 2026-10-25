@@ -14,9 +14,9 @@ import {
   type FullSearchTriggerProps,
   type SearchTriggerProps,
 } from 'fumadocs-ui/layouts/shared/slots/search-trigger';
-import { useEffect, useState } from 'react';
+import { useSyncExternalStore } from 'react';
 
-const listeners = new Set<(size: ContentFontSize) => void>();
+const listeners = new Set<() => void>();
 
 function readContentFontSize(): ContentFontSize {
   try {
@@ -39,27 +39,23 @@ function selectContentFontSize(size: ContentFontSize) {
     // The page still follows the choice for this visit.
   }
   applyContentFontSize(size);
-  listeners.forEach((listener) => listener(size));
+  listeners.forEach((listener) => listener());
+}
+
+function subscribeContentFontSize(onChange: () => void) {
+  listeners.add(onChange);
+  function onStorage(event: StorageEvent) {
+    if (event.key === CONTENT_FONT_STORAGE_KEY) onChange();
+  }
+  window.addEventListener('storage', onStorage);
+  return () => {
+    listeners.delete(onChange);
+    window.removeEventListener('storage', onStorage);
+  };
 }
 
 function useContentFontSize() {
-  const [size, setSize] = useState<ContentFontSize>(DEFAULT_CONTENT_FONT_SIZE);
-
-  useEffect(() => {
-    setSize(readContentFontSize());
-    listeners.add(setSize);
-    function onStorage(event: StorageEvent) {
-      if (event.key !== CONTENT_FONT_STORAGE_KEY) return;
-      setSize(readContentFontSize());
-    }
-    window.addEventListener('storage', onStorage);
-    return () => {
-      listeners.delete(setSize);
-      window.removeEventListener('storage', onStorage);
-    };
-  }, []);
-
-  return size;
+  return useSyncExternalStore(subscribeContentFontSize, readContentFontSize, () => DEFAULT_CONTENT_FONT_SIZE);
 }
 
 export function FontSizeControl({ className }: { className?: string }) {

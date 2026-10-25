@@ -15,7 +15,8 @@ export function baseOptions(): BaseLayoutProps {
         </span>
       ),
       url: '/notes',
-      children: <NotesSwitcher />,
+      // The header renders nav children inside a list, so the element needs a key.
+      children: <NotesSwitcher key="notes-switcher" />,
     },
     githubUrl: githubRepoUrl(),
     slots: {
@@ -25,10 +26,9 @@ export function baseOptions(): BaseLayoutProps {
       },
     },
     links: [
-      { text: 'Notes', url: '/notes', active: 'nested-url' },
-      { text: 'Interview Prep', url: '/interview', active: 'nested-url' },
-      { text: 'Quick Review', url: '/review' },
-      { text: 'Tags', url: '/tags', active: 'nested-url' },
+      { text: 'Tech Blogs', url: '/blogs', active: 'nested-url' },
+      { text: 'Health', url: '/health' },
+      { text: 'Graph', url: '/graph' },
       { text: 'About', url: '/about' },
     ],
   };

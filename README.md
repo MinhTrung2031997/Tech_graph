@@ -26,7 +26,7 @@ Regenerate the tree with:
 node scripts/seed-content.mjs
 ```
 
-That overwrites `content/`. Edit the MDX afterwards if you want to keep a change.
+It only creates files that do not exist yet and logs every file it skips, so edited MDX is safe. Pass `--force` to overwrite `content/` with the generated files.
 
 ## Deploy on Vercel
 
@@ -35,7 +35,7 @@ This repository is not connected to Vercel yet. There is no token in the project
 1. Open [vercel.com/new](https://vercel.com/new) and sign in with the GitHub account that owns this repo.
 2. Import `MinhTrung2031997/Tech_graph`.
 3. Framework preset: **Next.js**. Build command: `npm run build`. Output: leave the default (do not set a static export directory).
-4. Environment variables: set `SITE_PASSWORD` (the shared login password) and `SESSION_SECRET` (a long random string that signs the session cookie). After the project has a URL, you can also set `NEXT_PUBLIC_SITE_URL` to that URL (for example `https://tech-graph-xxxxx.vercel.app`) and redeploy so the sitemap and Open Graph links use it.
+4. Environment variables: set `SITE_PASSWORD` (the shared login password) and `SESSION_SECRET` (a long random string that signs the session cookie). After the project has a URL, you can also set `NEXT_PUBLIC_SITE_URL` to that URL (for example `https://tech-graph-xxxxx.vercel.app`) and redeploy so the Open Graph links use it.
 5. Deploy. The Hobby plan is enough. Pull requests get preview deployments once the GitHub app is installed.
 
 Production branch should be `main` after this pull request is merged.

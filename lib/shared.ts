@@ -6,6 +6,7 @@ export const githubUser = 'MinhTrung2031997';
 export const githubRepo = 'Tech_graph';
 export const notesRoute = '/notes';
 export const interviewRoute = '/interview';
+export const blogsRoute = '/blogs';
 export const notesImageRoute = '/og/notes';
 
 export const gitConfig = {
@@ -18,7 +19,7 @@ export function githubRepoUrl() {
   return `https://github.com/${gitConfig.user}/${gitConfig.repo}`;
 }
 
-export function githubFileUrl(collection: 'notes' | 'interview', filePath: string) {
+export function githubFileUrl(collection: 'notes' | 'interview' | 'blogs', filePath: string) {
   return `${githubRepoUrl()}/blob/${gitConfig.branch}/content/${collection}/${filePath}`;
 }
 

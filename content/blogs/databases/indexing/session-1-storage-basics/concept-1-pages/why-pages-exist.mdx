@@ -1,0 +1,243 @@
+---
+title: "Why pages exist: the hardware forces it"
+description: "How one 8 KB database page maps onto 4 KB OS pages, file-system blocks and disk sectors, and what that mismatch causes in practice."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "storage", "os"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/storage-page-layout.html"
+  - "https://www.postgresql.org/docs/current/runtime-config-wal.html#GUC-FULL-PAGE-WRITES"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-doublewrite-buffer.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-parameters.html#sysvar_innodb_flush_method"
+  - "https://www.kernel.org/doc/html/latest/admin-guide/mm/concepts.html"
+---
+
+<Tldr>
+Each layer has its own unit: an 8 KB database page, 4 KB OS pages, 4 KB SSD blocks, 512-byte HDD sectors. A request from one layer is split into the units of the layer below, and the same bytes come back up. Because the sizes are powers of two, one 8 KB page is exactly 2 OS pages, 2 SSD blocks or 16 HDD sectors.
+</Tldr>
+
+## One 8 KB page in every layer's units
+
+The request goes **down** the stack; the same bytes come back **up**. Nothing is read twice; the bytes are only counted in different chunk sizes.
+
+| Layer | Unit | One Postgres page (8,192 B) is… |
+|---|---|---|
+| PostgreSQL | 8 KB page | 1 page |
+| OS page cache | 4 KB page | 2 OS pages |
+| SSD | 4 KB logical block | 2 blocks |
+| HDD | 512 B sector | 16 sectors |
+
+8,192 = 2 × 4,096 = 16 × 512. Every larger unit divides exactly into the smaller ones, so nothing is wasted at the edges.
+
+## The missing layer: the file system
+
+Between the OS cache and the disk sits the **file system** (ext4, XFS, APFS). A table is just a file; the file system knows which disk blocks hold each part of that file.
+
+| OS page cache | Meaning | Cost |
+|---|---|---|
+| **✓ Hit** | Both 4 KB OS pages are already in kernel RAM; the file system and disk are skipped | A few µs |
+| **✗ Miss** | At least one is not in RAM; the file system maps it to disk blocks and the disk is read | ~100 µs on SSD, ~10 ms on HDD |
+
+<Flow
+  title="Reading page 12 down the stack and back"
+  height={260}
+  nodes={[
+    { id: 'pg', label: 'PostgreSQL', sub: 'needs page 12', x: 20, y: 40, w: 150 },
+    { id: 'os', label: 'OS page cache', sub: '4 KB pages · empty', x: 230, y: 40, w: 150 },
+    { id: 'fs', label: 'File system', sub: 'file offset → block', x: 440, y: 40, w: 150 },
+    { id: 'ssd', label: 'SSD', sub: '4 KB blocks', x: 650, y: 40, w: 150 },
+    { id: 'sb', label: 'shared_buffers', sub: 'Postgres slot · 8 KB', x: 20, y: 170, w: 150 },
+    { id: 'osHit', label: '✓ Hit', sub: 'copy from RAM', x: 230, y: 170, w: 95, h: 48 },
+    { id: 'osMiss', label: '✗ Miss', sub: 'go to disk', x: 335, y: 170, w: 95, h: 48 },
+  ]}
+  edges={[
+    { id: 'pg-os', from: 'pg', to: 'os', label: '8 KB' },
+    { id: 'os-hit', from: 'os', to: 'osHit' },
+    { id: 'os-miss', from: 'os', to: 'osMiss' },
+    { id: 'miss-fs', from: 'osMiss', to: 'fs', label: 'map' },
+    { id: 'fs-ssd', from: 'fs', to: 'ssd', label: 'blocks' },
+    { id: 'ssd-fs', from: 'ssd', to: 'fs' },
+    { id: 'fs-os', from: 'fs', to: 'os' },
+    { id: 'os-sb', from: 'os', to: 'sb', label: 'copy 8 KB' },
+    { id: 'sb-pg', from: 'sb', to: 'pg' },
+  ]}
+  cases={[
+    {
+      title: 'OS cache miss',
+      path: 'OS cache ✗ miss → file system → SSD',
+      summary: 'Page 12 is not in the OS cache, so the request goes through the file system to the disk.',
+      steps: [
+        {
+          title: 'Page number to file position',
+          note: 'Postgres needs page 12 of the orders table. A table is a file, so page 12 starts at byte 12 × 8,192 = 98,304. Postgres asks the OS for 8,192 bytes from there.',
+          code: 'pread(fd, buf, 8192, 98304)',
+          active: ['pg', 'os'],
+          edges: ['pg-os'],
+        },
+        {
+          title: 'OS cache: miss',
+          note: '98,304 / 4,096 = 24, so the request covers OS pages #24 and #25 of the file. Neither is in RAM: two misses.',
+          active: ['os', 'osMiss'],
+          edges: ['os-miss'],
+          subs: { os: 'need #24, #25' },
+        },
+        {
+          title: 'The file system finds the blocks',
+          note: 'The file system looks up where those two parts of the file live on disk, for example blocks 1,000,048 and 1,000,049. They do not have to be next to each other.',
+          active: ['osMiss', 'fs'],
+          edges: ['miss-fs'],
+          subs: { fs: 'blocks 1,000,048–49' },
+        },
+        {
+          title: 'The disk reads whole blocks',
+          note: 'The SSD returns two 4 KB blocks. An HDD would read 16 sectors of 512 bytes. This is the slow step.',
+          active: ['fs', 'ssd'],
+          edges: ['fs-ssd'],
+          subs: { ssd: '2 × 4 KB read' },
+        },
+        {
+          title: 'The blocks fill the OS cache',
+          note: 'The two blocks become OS pages #24 and #25 in RAM. The next read of them is a hit.',
+          active: ['ssd', 'fs', 'os'],
+          edges: ['ssd-fs', 'fs-os'],
+          subs: { os: '#24, #25 cached' },
+        },
+        {
+          title: 'Copied into shared_buffers',
+          note: 'The kernel copies those 8 KB straight into the Postgres slot. The page now sits in RAM twice: once in the OS cache, once in shared_buffers.',
+          code: 'Buffers: shared read=1',
+          active: ['os', 'sb'],
+          edges: ['os-sb'],
+        },
+        {
+          title: 'Postgres reads the row',
+          note: 'Postgres works only with its own copy in shared_buffers.',
+          active: ['sb', 'pg'],
+          edges: ['sb-pg'],
+        },
+      ],
+    },
+    {
+      title: 'OS cache hit',
+      path: 'OS cache ✓ hit (no file system, no disk)',
+      summary: 'Page 12 was read earlier and is still in the OS cache, so the disk is never touched.',
+      subs: { os: '#24, #25 cached' },
+      steps: [
+        {
+          title: 'Page number to file position',
+          note: 'Same request as before: 8,192 bytes from byte 98,304.',
+          code: 'pread(fd, buf, 8192, 98304)',
+          active: ['pg', 'os'],
+          edges: ['pg-os'],
+        },
+        {
+          title: 'OS cache: hit',
+          note: 'OS pages #24 and #25 are already in RAM. The file system and the SSD are skipped entirely.',
+          active: ['os', 'osHit'],
+          edges: ['os-hit'],
+        },
+        {
+          title: 'Copied into shared_buffers',
+          note: 'A memory-to-memory copy of a few microseconds. EXPLAIN still reports shared read=1: it cannot tell this from a disk read.',
+          code: 'Buffers: shared read=1',
+          active: ['os', 'sb'],
+          edges: ['os-sb'],
+        },
+        {
+          title: 'Postgres reads the row',
+          note: 'From here it is identical to the miss case.',
+          active: ['sb', 'pg'],
+          edges: ['sb-pg'],
+        },
+      ],
+    },
+    {
+      title: 'Hit thanks to readahead',
+      path: 'page 11: OS reads ahead → page 12: OS cache ✓ hit',
+      summary: 'A Seq Scan reads pages in order. The OS notices and fetches the next pages before Postgres asks for them.',
+      steps: [
+        {
+          title: 'The scan asks for page 11',
+          note: 'A Seq Scan is reading the table in order. Page 11 starts at byte 11 × 8,192 = 90,112: OS pages #22 and #23.',
+          code: 'pread(fd, buf, 8192, 90112)',
+          active: ['pg', 'os', 'osMiss'],
+          edges: ['pg-os', 'os-miss'],
+          subs: { os: 'need #22, #23' },
+        },
+        {
+          title: 'The OS reads ahead',
+          note: 'The kernel sees the file being read in order, so it fetches much more than asked in one large request, for example 128 KB = 32 OS pages (#22 to #53).',
+          active: ['osMiss', 'fs', 'ssd'],
+          edges: ['miss-fs', 'fs-ssd'],
+          subs: { ssd: '128 KB read' },
+        },
+        {
+          title: 'Readahead fills the OS cache',
+          note: 'All 32 pages land in RAM, including #24 and #25, which hold page 12. Postgres has not asked for them yet.',
+          active: ['ssd', 'fs', 'os'],
+          edges: ['ssd-fs', 'fs-os'],
+          subs: { os: '#22–#53 cached' },
+        },
+        {
+          title: 'The scan asks for page 12',
+          note: 'Next request: byte 98,304, OS pages #24 and #25. Both are already in RAM: a hit produced by readahead.',
+          code: 'pread(fd, buf, 8192, 98304)',
+          active: ['pg', 'os', 'osHit'],
+          edges: ['pg-os', 'os-hit'],
+        },
+        {
+          title: 'Copied into shared_buffers',
+          note: 'A few microseconds instead of a disk read. This is why a sequential scan costs less per page than jumping around the table (Concept 4).',
+          code: 'Buffers: shared read=1',
+          active: ['os', 'sb'],
+          edges: ['os-sb'],
+        },
+      ],
+    },
+  ]}
+/>
+
+| Step | Layer | Receives | Does |
+|---|---|---|---|
+| 1 | PostgreSQL | "page 12 of `orders`" | 12 × 8,192 = byte 98,304; asks the OS for 8,192 bytes |
+| 2 | OS page cache | "8,192 bytes at 98,304" | Splits into OS pages #24 and #25; checks RAM |
+| 3 | File system | "file pages #24, #25 missing" | Maps them to disk blocks |
+| 4 | SSD / HDD | "read these blocks" | Returns 2 × 4 KB (or 16 × 512 B) |
+| 5 | Back up | — | Blocks fill OS pages, which are copied into `shared_buffers` |
+
+**Analogy:** you order one carton (8 KB). The warehouse stores goods in boxes (4 KB), so your carton is two boxes. The shelf map (file system) says which aisle each box is in, and the forklift (disk) moves one box at a time.
+
+## Consequence 1: Postgres caches data twice
+
+After a read, the page sits in both `shared_buffers` and the OS page cache. A `shared read` in `EXPLAIN` therefore often still comes from RAM, not from the disk.
+
+| Engine | Uses the OS page cache? | Typical cache sizing |
+|---|---|---|
+| PostgreSQL | Yes, so data is cached twice | `shared_buffers` ≈ 25% of RAM; the OS cache uses most of the rest |
+| MySQL InnoDB | Usually no: `innodb_flush_method = O_DIRECT` skips it | Buffer pool ≈ 60–80% of RAM |
+| MongoDB WiredTiger | Yes | WiredTiger cache ≈ 50% of RAM; the OS cache holds compressed data |
+
+## Consequence 2: the OS reads ahead
+
+When the OS sees a file being read in order, it fetches the next pages before they are asked for, often 128 KB or more at a time. This is a large part of why a sequential scan is cheaper per page than jumping around (Concept 4).
+
+## Consequence 3: torn pages
+
+Postgres writes an 8 KB page, but the disk only guarantees each 4 KB block is written in one piece. A crash between the two blocks leaves half a new page and half an old one: a **torn page**.
+
+| Engine | Protection |
+|---|---|
+| PostgreSQL | `full_page_writes`: the first change to a page after a checkpoint writes the whole page into the WAL |
+| MySQL InnoDB | Doublewrite buffer: pages are written to a separate area first, then to their real place |
+
+This problem exists only because the database page and the disk block are different sizes.
+
+<Pitfall>
+An SSD exposes 4 KB logical blocks, but its flash chips work in larger internal units (often 16 KB). The SSD controller hides that, so 4 KB is the unit that matters to the database and the OS.
+</Pitfall>
+
+## Check question
+
+Postgres needs page **5** of a table file. Which byte position does it ask the OS for, which 4 KB OS page numbers does that cover, and how many 512-byte HDD sectors would be read?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-1-storage-basics/concept-1-pages/answers#deep-dive-question-page-5">Worked answer: page 5 in bytes, OS pages and sectors</DeepDive>
