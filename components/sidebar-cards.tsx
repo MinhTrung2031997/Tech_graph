@@ -44,21 +44,23 @@ export function CardSeparator({ item }: { item: Separator }) {
   );
 }
 
-export function CardItem({ item }: { item: Item }) {
+export function CardItem({ item }: { item: Item & { placeholder?: boolean } }) {
   const pathname = usePathname();
   const depth = useFolderDepth();
   const active = samePath(item.url, pathname);
+  const placeholder = item.placeholder ? ' is-placeholder' : '';
+  const title = item.placeholder ? 'Placeholder, not written yet' : undefined;
 
   if (depth === 0) {
     return (
-      <SidebarItem href={item.url} active={active} icon={item.icon} className="sidebar-card sidebar-card-row">
+      <SidebarItem href={item.url} active={active} icon={item.icon} title={title} className={`sidebar-card sidebar-card-row${placeholder}`}>
         <span>{item.name}</span>
       </SidebarItem>
     );
   }
 
   return (
-    <SidebarItem href={item.url} active={active} icon={item.icon} className="sidebar-card-child">
+    <SidebarItem href={item.url} active={active} icon={item.icon} title={title} className={`sidebar-card-child${placeholder}`}>
       {item.name}
     </SidebarItem>
   );

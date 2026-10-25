@@ -18,12 +18,14 @@ export const metadata: Metadata = {
     template: `%s · ${appName}`,
   },
   description: 'Backend engineering notes by Trung Nguyen. Node.js, NestJS, databases, messaging, and distributed systems.',
+  robots: { index: false, follow: false },
 };
 
 export default function Layout({ children }: LayoutProps<'/'>) {
   return (
     <html lang="en" className={inter.className} suppressHydrationWarning>
-      <body className="flex min-h-screen flex-col">
+      {/* Browser extensions such as Grammarly add attributes to <body> before hydration. */}
+      <body className="flex min-h-screen flex-col" suppressHydrationWarning>
         <script dangerouslySetInnerHTML={{ __html: contentFontBootScript }} />
         <SearchHighlightStyle />
         <RootProvider

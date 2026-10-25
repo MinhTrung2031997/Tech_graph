@@ -1,0 +1,467 @@
+---
+title: "Concept 1: The database reads pages, not rows"
+description: "Before indexes make sense, you need to know how rows physically sit on disk: in fixed-size pages, read and cached as whole blocks."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "storage"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/storage-page-layout.html"
+  - "https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-SHARED-BUFFERS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-parameters.html#sysvar_innodb_page_size"
+  - "https://www.mongodb.com/docs/manual/core/wiredtiger/"
+---
+
+<Tldr>
+A database never reads a single row. It reads and caches fixed-size **pages** (8 KB in PostgreSQL, 16 KB in InnoDB) that hold many rows each. Query cost is therefore measured in **pages touched**, and every index trick in later sessions is a way to touch fewer of them.
+</Tldr>
+
+## Why pages exist: the hardware forces it
+
+Every layer under the database already works in blocks, so the database groups rows into pages to make each block read useful.
+
+| Layer | Smallest unit it reads |
+|---|---|
+| Your query | 1 row (say 80 bytes) |
+| Database | 1 page: **8 KB** (PostgreSQL) / **16 KB** (InnoDB) |
+| OS page cache | 4 KB page |
+| SSD / HDD | 4 KB block / 512 B–4 KB sector |
+
+An SSD physically cannot return 80 bytes. Since a whole block comes back anyway, packing many rows into it means one read brings back lots of useful data.
+
+| Engine | Page size | Configurable? |
+|---|---|---|
+| PostgreSQL | 8 KB | Compile time only, effectively fixed |
+| MySQL InnoDB | 16 KB | `innodb_page_size`, fixed when the instance is initialised |
+| MongoDB WiredTiger | Variable, leaf pages up to ~32 KB | Per collection, rarely changed |
+
+<DeepDive href="/blogs/databases/indexing/session-1-storage-basics/concept-1-pages/why-pages-exist">How one page maps onto OS pages, disk blocks and sectors</DeepDive>
+
+## Reading one row, end to end
+
+Step through what happens when a query needs one row whose address is already known (how the address is found is Session 2). Each cache answers with its own hit or miss. Pick a case to see its path on its own.
+
+| Term | Meaning |
+|---|---|
+| **Hit** | The page is already in that cache's memory. It is served from RAM, and the layer below is never asked. |
+| **Miss** | The page is not in that cache. The cache has to ask the layer below and wait for it. |
+
+| Cache | Hit means | Miss means | `EXPLAIN (BUFFERS)` shows |
+|---|---|---|---|
+| `shared_buffers` (Postgres memory) | Page already in a Postgres slot: ~100 ns | Pick a slot, ask the OS | Hit: `shared hit` · Miss: `shared read` |
+| OS page cache (kernel memory) | Kernel copies the page from RAM: a few µs | Kernel reads the disk: ~100 µs on SSD | Nothing: both look like `shared read` |
+
+<Flow
+  title="Reading one row: a hit or a miss at each cache"
+  height={330}
+  nodes={[
+    { id: 'query', label: 'Query', sub: 'wants 1 row · 80 B', x: 20, y: 30, w: 150 },
+    { id: 'sb', label: 'shared_buffers', sub: 'empty', x: 230, y: 30, w: 150 },
+    { id: 'os', label: 'OS page cache', sub: 'empty', x: 440, y: 30, w: 150 },
+    { id: 'ssd', label: 'SSD', sub: '4 KB blocks', x: 650, y: 30, w: 150 },
+    { id: 'sbHit', label: '✓ Hit', sub: 'use the slot', x: 195, y: 160, w: 95, h: 48 },
+    { id: 'sbMiss', label: '✗ Miss', sub: 'ask the OS', x: 300, y: 160, w: 95, h: 48 },
+    { id: 'osHit', label: '✓ Hit', sub: 'copy from RAM', x: 425, y: 160, w: 95, h: 48 },
+    { id: 'osMiss', label: '✗ Miss', sub: 'go to disk', x: 530, y: 160, w: 95, h: 48 },
+    { id: 'row', label: 'Row (12,3)', sub: '80 B returned', x: 20, y: 262, w: 150 },
+  ]}
+  edges={[
+    { id: 'q-sb', from: 'query', to: 'sb', label: 'page 12?' },
+    { id: 'sb-hit', from: 'sb', to: 'sbHit' },
+    { id: 'sb-miss', from: 'sb', to: 'sbMiss' },
+    { id: 'miss-os', from: 'sbMiss', to: 'os', label: 'pread()' },
+    { id: 'os-hit', from: 'os', to: 'osHit' },
+    { id: 'os-miss', from: 'os', to: 'osMiss' },
+    { id: 'miss-ssd', from: 'osMiss', to: 'ssd', label: 'read' },
+    { id: 'ssd-os', from: 'ssd', to: 'os' },
+    { id: 'os-sb', from: 'os', to: 'sb', label: 'copy' },
+    { id: 'hit-row', from: 'sbHit', to: 'row', label: 'slot 3' },
+  ]}
+  cases={[
+    {
+      title: 'Cold read',
+      path: 'shared_buffers ✗ miss → OS cache ✗ miss → SSD',
+      summary: 'Right after a restart: page 12 is in neither cache, so the read goes all the way to the SSD.',
+      steps: [
+        {
+          title: 'Look in shared_buffers',
+          note: 'The backend looks up (orders, page 12) in the buffer mapping table, a hash table from page to slot.',
+          code: 'SELECT * FROM orders WHERE id = 42;',
+          active: ['query', 'sb'],
+          edges: ['q-sb'],
+        },
+        {
+          title: 'shared_buffers: miss',
+          note: 'Not found. The backend picks a slot to reuse (say #731): clock sweep skips pinned and frequently used slots, and a slot holding a changed page is written out first.',
+          active: ['sb', 'sbMiss'],
+          edges: ['sb-miss'],
+        },
+        {
+          title: 'Ask the OS',
+          note: 'The backend calls pread() with slot #731 as the destination: "put 8 KB from byte 98,304 here".',
+          code: 'pread(fd, slot_731, 8192, 98304)',
+          active: ['sbMiss', 'os'],
+          edges: ['miss-os'],
+        },
+        {
+          title: 'OS page cache: miss',
+          note: 'The kernel checks its own cache for OS pages #24 and #25 of the file. Not there either.',
+          active: ['os', 'osMiss'],
+          edges: ['os-miss'],
+        },
+        {
+          title: 'Read from the SSD',
+          note: 'The only slow step: two 4 KB blocks from the SSD, about 100 µs (about 10 ms on a spinning disk).',
+          active: ['osMiss', 'ssd'],
+          edges: ['miss-ssd'],
+        },
+        {
+          title: 'The blocks land in the OS cache',
+          note: 'The kernel keeps the two blocks in its page cache, so a later read of this page can skip the disk.',
+          active: ['ssd', 'os'],
+          edges: ['ssd-os'],
+          subs: { os: 'page 12 cached' },
+        },
+        {
+          title: 'Copied straight into the slot',
+          note: 'The kernel copies the 8 KB directly into slot #731: one copy, no stop in between.',
+          code: 'Buffers: shared read=1   (came from disk)',
+          active: ['os', 'sb'],
+          edges: ['os-sb'],
+          subs: { sb: 'page 12 in slot #731' },
+        },
+        {
+          title: 'Read the row from the slot',
+          note: 'Line pointer 3 gives the offset inside the page, and only those 80 bytes go back to the query.',
+          active: ['sb', 'sbHit', 'row'],
+          edges: ['sb-hit', 'hit-row'],
+        },
+      ],
+    },
+    {
+      title: 'Warm OS cache',
+      path: 'shared_buffers ✗ miss → OS cache ✓ hit',
+      summary: 'Page 12 was evicted from shared_buffers on a busy server, but the much larger OS cache still holds it.',
+      subs: { sb: 'page 12 evicted', os: 'page 12 cached' },
+      steps: [
+        {
+          title: 'Look in shared_buffers',
+          note: 'The same query runs. The backend looks up (orders, page 12) in the buffer mapping table.',
+          code: 'SELECT * FROM orders WHERE id = 42;',
+          active: ['query', 'sb'],
+          edges: ['q-sb'],
+        },
+        {
+          title: 'shared_buffers: miss',
+          note: 'Its old slot was reused for another page. The backend picks a new slot to load it into.',
+          active: ['sb', 'sbMiss'],
+          edges: ['sb-miss'],
+        },
+        {
+          title: 'Ask the OS',
+          note: 'pread() into the new slot, exactly as in a cold read. Postgres cannot tell in advance which cache will answer.',
+          code: 'pread(fd, slot, 8192, 98304)',
+          active: ['sbMiss', 'os'],
+          edges: ['miss-os'],
+        },
+        {
+          title: 'OS page cache: hit',
+          note: 'The kernel finds OS pages #24 and #25 in RAM. The disk is never touched.',
+          active: ['os', 'osHit'],
+          edges: ['os-hit'],
+        },
+        {
+          title: 'Copied from RAM into the slot',
+          note: 'A memory-to-memory copy, a few microseconds. EXPLAIN still reports a read: it cannot tell this apart from a disk read, but track_io_timing can.',
+          code: 'Buffers: shared read=1   (came from the OS cache)',
+          active: ['os', 'sb'],
+          edges: ['os-sb'],
+          subs: { sb: 'page 12 in a slot' },
+        },
+        {
+          title: 'Read the row from the slot',
+          note: 'Same as before: line pointer 3, 80 bytes back to the query.',
+          active: ['sb', 'sbHit', 'row'],
+          edges: ['sb-hit', 'hit-row'],
+        },
+      ],
+    },
+    {
+      title: 'Hot read',
+      path: 'shared_buffers ✓ hit',
+      summary: 'Page 12 is still in shared_buffers. Neither the OS nor the disk is asked.',
+      subs: { sb: 'page 12 in slot #731', os: 'page 12 cached' },
+      steps: [
+        {
+          title: 'Look in shared_buffers',
+          note: 'The backend looks up (orders, page 12) in the buffer mapping table.',
+          code: 'SELECT * FROM orders WHERE id = 42;',
+          active: ['query', 'sb'],
+          edges: ['q-sb'],
+        },
+        {
+          title: 'shared_buffers: hit',
+          note: 'Found in slot #731. The backend pins the slot so it cannot be evicted while in use, and bumps its usage count.',
+          code: 'Buffers: shared hit=1',
+          active: ['sb', 'sbHit'],
+          edges: ['sb-hit'],
+        },
+        {
+          title: 'Read the row from the slot',
+          note: 'Line pointer 3, 80 bytes back to the query. About 100 ns in total, roughly a thousand times faster than the SSD.',
+          active: ['sbHit', 'row'],
+          edges: ['hit-row'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Inside an 8 KB PostgreSQL page
+
+A page has four regions. Line pointers grow from the front, row data grows from the back, and the page is full when they meet.
+
+| Region | Size | Purpose |
+|---|---|---|
+| Page header | 24 bytes | Free-space pointers, checksum, LSN |
+| Line pointers | 4 bytes each | Directory: "slot N lives at byte offset X, length L" |
+| Free space | Whatever is left | Shrinks from both sides as rows are added |
+| Row data | Each row: 23-byte header + data + alignment padding | The rows themselves, filled from the end of the page |
+
+A row costs more than its data. With a 24-byte header (23, padded), 8-byte alignment and a 4-byte line pointer, a row carrying about 50 bytes of data takes about **84 bytes** of the page, so one page holds roughly **97 rows**.
+
+The header records where the free space starts and ends, so an INSERT always knows where to write:
+
+| Term | Meaning |
+|---|---|
+| `pd_lower` | Byte where free space starts; the next line pointer is written here |
+| `pd_upper` | Byte where free space ends; the next row is written just below it |
+| Line pointer `[N]` | 4 bytes at offset 24 + (N − 1) × 4, saying "row N is at byte X, length L" |
+| ctid `(page, N)` | A row's address: which page, which line pointer |
+| **✓ Fits** | Row + pointer ≤ `pd_upper − pd_lower`: the row goes on this page |
+| **✗ Full** | Not enough room: the row goes on another page; a row is never split across pages |
+
+<Flow
+  title="Where a row is written in a page, and where it is read from"
+  height={350}
+  nodes={[
+    { id: 'header', label: 'Header', sub: 'free 24–8,191', x: 10, y: 30, w: 116, h: 56 },
+    { id: 'lp1', label: 'ptr [1]', sub: 'unused', x: 134, y: 30, w: 62, h: 56 },
+    { id: 'lp2', label: 'ptr [2]', sub: 'unused', x: 202, y: 30, w: 62, h: 56 },
+    { id: 'lp3', label: 'ptr [3]', sub: 'unused', x: 270, y: 30, w: 62, h: 56 },
+    { id: 'free', label: 'Free space', sub: '24–8,191', x: 340, y: 30, w: 176, h: 56 },
+    { id: 'row3', label: 'row 3', sub: 'unused', x: 524, y: 30, w: 86, h: 56 },
+    { id: 'row2', label: 'row 2', sub: 'unused', x: 616, y: 30, w: 86, h: 56 },
+    { id: 'row1', label: 'row 1', sub: 'unused', x: 708, y: 30, w: 84, h: 56 },
+    { id: 'fit', label: '✓ Fits', sub: 'write here', x: 140, y: 170, w: 95, h: 48 },
+    { id: 'full', label: '✗ Full', sub: 'no room', x: 245, y: 170, w: 95, h: 48 },
+    { id: 'insert', label: 'INSERT a row', sub: '80 B + 4 B pointer', x: 10, y: 280, w: 160 },
+    { id: 'next', label: 'Another page', sub: 'page 1', x: 230, y: 280, w: 130 },
+    { id: 'result', label: 'Query result', sub: 'row 2 · 80 B', x: 390, y: 280, w: 140 },
+    { id: 'reader', label: 'Read ctid (0,2)', sub: 'page 0, pointer 2', x: 560, y: 280, w: 170 },
+  ]}
+  edges={[
+    { id: 'ins-hdr', from: 'insert', to: 'header', label: 'room?' },
+    { id: 'hdr-fit', from: 'header', to: 'fit' },
+    { id: 'hdr-full', from: 'header', to: 'full' },
+    { id: 'full-next', from: 'full', to: 'next' },
+    { id: 'fit-lp1', from: 'fit', to: 'lp1', quiet: true },
+    { id: 'fit-lp2', from: 'fit', to: 'lp2', quiet: true },
+    { id: 'fit-lp3', from: 'fit', to: 'lp3', quiet: true },
+    { id: 'fit-r1', from: 'fit', to: 'row1', quiet: true },
+    { id: 'fit-r2', from: 'fit', to: 'row2', quiet: true },
+    { id: 'fit-r3', from: 'fit', to: 'row3', quiet: true },
+    { id: 'rd-lp2', from: 'reader', to: 'lp2', label: '1. pointer' },
+    { id: 'rd-r2', from: 'reader', to: 'row2', label: '2. bytes' },
+    { id: 'r2-res', from: 'row2', to: 'result', label: '3. copy' },
+  ]}
+  cases={[
+    {
+      title: 'Insert: the row fits',
+      path: 'header: room? ✓ fits → row at the back, pointer at the front',
+      summary: 'An empty page receives three rows. Watch the exact bytes each row and each pointer occupy.',
+      steps: [
+        {
+          title: 'An empty page',
+          note: 'A new page is 8,192 bytes (offsets 0–8,191). The header takes bytes 0–23 and records pd_lower = 24 and pd_upper = 8,192. Everything between them, 8,168 bytes, is free.',
+          active: ['header', 'free'],
+        },
+        {
+          title: 'INSERT asks the header for room',
+          note: 'The new row takes 80 bytes (23-byte row header padded to 24, plus its data, aligned to 8). It also needs a 4-byte line pointer: 84 bytes in total. Free space is pd_upper − pd_lower = 8,192 − 24 = 8,168 bytes.',
+          code: "INSERT INTO orders (id, customer_id, status) VALUES (1, 501, 'paid');",
+          active: ['insert', 'header'],
+          edges: ['ins-hdr'],
+        },
+        {
+          title: 'Header: ✓ fits',
+          note: '84 ≤ 8,168, so the row goes on this page.',
+          active: ['header', 'fit'],
+          edges: ['hdr-fit'],
+        },
+        {
+          title: 'The row is written at the back',
+          note: 'The row goes just below pd_upper: 8,192 − 80 = byte 8,112. Row 1 occupies bytes 8,112–8,191, the very end of the page.',
+          active: ['fit', 'row1'],
+          edges: ['fit-r1'],
+          subs: { row1: '8,112–8,191' },
+        },
+        {
+          title: 'Its pointer is written at the front',
+          note: 'Pointer [1] goes at pd_lower: bytes 24–27. It stores "offset 8,112, length 80". Page 0 + pointer 1 is the row\'s address: ctid (0,1).',
+          active: ['fit', 'lp1', 'row1'],
+          edges: ['fit-lp1'],
+          subs: { lp1: '→ 8,112' },
+        },
+        {
+          title: 'The header moves both boundaries',
+          note: 'pd_lower becomes 28 and pd_upper becomes 8,112. Free space is now bytes 28–8,111: 8,084 bytes.',
+          active: ['header', 'free'],
+          subs: { header: 'free 28–8,111', free: '28–8,111' },
+        },
+        {
+          title: 'Rows 2 and 3 follow the same rule',
+          note: 'Row 2 goes to 8,032–8,111 with pointer [2] at bytes 28–31; row 3 goes to 7,952–8,031 with pointer [3] at bytes 32–35. Rows grow toward the front, pointers toward the back. Free space: 36–7,951 = 7,916 bytes.',
+          active: ['fit', 'lp2', 'lp3', 'row2', 'row3', 'free', 'header'],
+          edges: ['fit-lp2', 'fit-lp3', 'fit-r2', 'fit-r3'],
+          subs: {
+            lp2: '→ 8,032',
+            lp3: '→ 7,952',
+            row2: '8,032–8,111',
+            row3: '7,952–8,031',
+            header: 'free 36–7,951',
+            free: '36–7,951',
+          },
+        },
+      ],
+    },
+    {
+      title: 'Insert: the page is full',
+      path: 'header: room? ✗ full → another page',
+      summary: 'The page already holds 97 rows. Boxes [3] and row 3 now stand for "the rest up to 97".',
+      subs: {
+        header: 'free 412–431',
+        lp1: '→ 8,112',
+        lp2: '→ 8,032',
+        lp3: '… [97]',
+        free: '20 B left',
+        row1: '8,112–8,191',
+        row2: '8,032–8,111',
+        row3: '… row 97',
+      },
+      steps: [
+        {
+          title: 'A full page',
+          note: '97 pointers end at pd_lower = 24 + 97 × 4 = 412. 97 rows start at pd_upper = 8,192 − 97 × 80 = 432. Only bytes 412–431 are free: 20 bytes.',
+          active: ['header', 'lp1', 'lp2', 'lp3', 'free', 'row1', 'row2', 'row3'],
+        },
+        {
+          title: 'INSERT asks the header for room',
+          note: 'The new row needs 84 bytes (80 + 4-byte pointer). The header says 20 bytes are free.',
+          code: "INSERT INTO orders (id, customer_id, status) VALUES (98, 733, 'paid');",
+          active: ['insert', 'header'],
+          edges: ['ins-hdr'],
+        },
+        {
+          title: 'Header: ✗ full',
+          note: '84 > 20. A row is never split across two pages, so it cannot go here. (Very large values are moved out of the row first, into a separate TOAST table.)',
+          active: ['header', 'full'],
+          edges: ['hdr-full'],
+        },
+        {
+          title: 'The row goes to another page',
+          note: 'Postgres asks the free space map for a page with room, or adds a new page at the end of the file. The row is written there by the same back-and-front rule and gets ctid (1,1).',
+          active: ['full', 'next'],
+          edges: ['full-next'],
+          subs: { next: 'ctid (1,1)' },
+        },
+      ],
+    },
+    {
+      title: 'Read a row by its address',
+      path: 'ctid (0,2) → pointer [2] at bytes 28–31 → row bytes 8,032–8,111 → query',
+      summary: 'The page with three rows is already in shared_buffers. A ctid is all Postgres needs to find one row in it.',
+      subs: {
+        header: 'free 36–7,951',
+        lp1: '→ 8,112',
+        lp2: '→ 8,032',
+        lp3: '→ 7,952',
+        free: '36–7,951',
+        row1: '8,112–8,191',
+        row2: '8,032–8,111',
+        row3: '7,952–8,031',
+      },
+      steps: [
+        {
+          title: 'Start from the address',
+          note: 'ctid (0,2) means page 0, pointer 2. The whole 8 KB page is already in shared_buffers (that was the I/O); everything from here is CPU work inside it. Indexes store exactly this address, as Session 2 shows.',
+          code: "SELECT * FROM orders WHERE ctid = '(0,2)';",
+          active: ['reader'],
+        },
+        {
+          title: 'Read pointer [2]',
+          note: 'Pointer N sits at byte 24 + (N − 1) × 4, so pointer [2] is bytes 28–31. It says: offset 8,032, length 80.',
+          active: ['reader', 'lp2'],
+          edges: ['rd-lp2'],
+        },
+        {
+          title: 'Jump to bytes 8,032–8,111',
+          note: 'Postgres goes straight to offset 8,032 and takes 80 bytes. Rows 1 and 3 are in memory too, but they are never examined.',
+          active: ['reader', 'row2'],
+          edges: ['rd-r2'],
+        },
+        {
+          title: 'Copy the row to the query',
+          note: 'Those 80 bytes are decoded into columns and returned. One row used, one full page loaded.',
+          active: ['row2', 'result'],
+          edges: ['r2-res'],
+        },
+        {
+          title: 'Why the extra pointer layer',
+          note: 'Postgres can move a row inside the page (for example when it compacts free space) and only update the pointer\'s offset. The ctid (0,2) stays the same, so indexes pointing at it do not change.',
+          active: ['lp2', 'row2'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Pages are also the unit of caching
+
+Recently used pages are kept in RAM: `shared_buffers` (plus the OS cache) in PostgreSQL, `innodb_buffer_pool_size` in InnoDB, the WiredTiger cache in MongoDB. `EXPLAIN (ANALYZE, BUFFERS)` reports exactly this:
+
+| Field | Meaning |
+|---|---|
+| `shared hit=A` | A pages were already in RAM |
+| `shared read=B` | B pages had to be loaded from the OS or disk |
+| A + B | Total pages the query touched: the real measure of its work |
+
+## Why this matters for indexes
+
+| Situation | Cost in pages |
+|---|---|
+| Seq Scan | Every page of the table |
+| Index lookup | A few index pages + the table pages that hold the matches |
+| Fat rows | Fewer rows per page, so more pages to scan |
+| Few matching rows spread over many pages | One page read per match |
+
+The reason a B-tree wins (Session 2) comes down to one thing: it touches very few pages.
+
+## Key takeaways
+
+1. The unit of I/O and caching is the **page** (8 KB in PostgreSQL, 16 KB in InnoDB), never the row.
+2. Reading one row costs one full page.
+3. Rows carry overhead (header, line pointer, padding), so rows per page are fewer than page size ÷ data size.
+4. Query cost ≈ **pages touched**, which `Buffers: hit + read` shows.
+
+## Check questions
+
+1. A PostgreSQL table has 1M rows, each taking about 80 bytes in the page. Roughly how many 8 KB pages does it have?
+2. A query returns one 80-byte row. What is the minimum amount the database reads, and why can it not read less?
+3. Table A has 1M rows of about 50 bytes; table B has 1M rows of about 500 bytes. Which Seq Scan is faster, by roughly how much, and why?
+4. `EXPLAIN` shows `Buffers: shared hit=8000 read=2000`. What does it tell you, and how would a second run right after change the numbers?
+5. Why do databases read pages instead of exactly the rows they need?
+6. A query shows `shared hit=0 read=500` on run 1 and `shared hit=500 read=0` on run 2.
+   - (a) How many pages, and roughly how many MB, does the query really touch?
+   - (b) Run 1 took 40 ms and run 2 took 2 ms. Did the query get better? What would you compare instead?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-1-storage-basics/concept-1-pages/answers">Worked answers to Q1–Q6, with formulas and common mistakes</DeepDive>

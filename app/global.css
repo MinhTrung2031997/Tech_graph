@@ -285,6 +285,12 @@ html > body[data-scroll-locked] {
   color: #f7f7ff;
 }
 
+.sidebar-card-child.is-placeholder:not([data-active='true']),
+.sidebar-card-row.is-placeholder:not([data-active='true']) {
+  opacity: 0.5;
+  font-style: italic;
+}
+
 .sidebar-card-child.english-question {
   align-items: flex-start;
   white-space: normal;

@@ -1,0 +1,14 @@
+{
+  "title": "Session 4: Composite indexes",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [],
+  "planned": [
+    "Concept 1: How multi-column keys are sorted",
+    "Concept 2: The leftmost-prefix rule",
+    "Concept 3: Equality before range",
+    "Concept 4: Index + ORDER BY + LIMIT",
+    "Concept 5: MongoDB ESR rule",
+    "Lab and session quiz"
+  ]
+}

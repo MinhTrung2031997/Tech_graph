@@ -1,8 +1,11 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join, relative } from 'node:path';
 import { articles, interviewArticles } from './articles.mjs';
 
 const root = join(import.meta.dirname, '..');
+const force = process.argv.includes('--force');
+let written = 0;
+let skipped = 0;
 
 const domains = [
   ['01', 'cs-fundamentals', 'CS Fundamentals', 'BookOpen', 'Core computer-science ideas that show up in backend interviews: data structures, processes, and how to talk about them.'],
@@ -220,8 +223,14 @@ function fm(data) {
 }
 
 function write(path, contents) {
+  if (!force && existsSync(path)) {
+    console.log(`skip ${relative(root, path)} (exists, pass --force to overwrite)`);
+    skipped++;
+    return;
+  }
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, contents);
+  written++;
 }
 
 const notesRoot = join(root, 'content/notes');
@@ -429,4 +438,4 @@ function firstParagraph(body) {
   return (text ?? 'Backend note.').slice(0, 220);
 }
 
-console.log('Seeded content/notes and content/interview');
+console.log(`Seeded content/notes and content/interview: ${written} written, ${skipped} skipped`);

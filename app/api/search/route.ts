@@ -1,10 +1,10 @@
 import { createSearchAPI } from 'fumadocs-core/search/server';
 import type { StructuredData } from 'fumadocs-core/mdx-plugins';
-import { english, interview, notes } from '@/lib/source';
+import { blogs, english, interview, notes } from '@/lib/source';
 
 export const { GET } = createSearchAPI('advanced', {
   indexes: async () => {
-    const pages = [...notes.getPages(), ...interview.getPages(), ...english.getPages()];
+    const pages = [...notes.getPages(), ...interview.getPages(), ...blogs.getPages(), ...english.getPages()];
     return Promise.all(
       pages.map(async (page) => {
         const raw = page.data.structuredData as StructuredData | (() => Promise<StructuredData>) | undefined;

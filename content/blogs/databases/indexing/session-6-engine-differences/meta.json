@@ -1,0 +1,14 @@
+{
+  "title": "Session 6: Postgres vs MySQL vs MongoDB",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [],
+  "planned": [
+    "Concept 1: Postgres heap and MVCC",
+    "Concept 2: InnoDB clustered primary key and secondary indexes",
+    "Concept 3: MongoDB WiredTiger and multikey indexes",
+    "Concept 4: UUIDv4 vs UUIDv7 as primary key",
+    "Concept 5: Reading explain() in MongoDB",
+    "Lab and session quiz"
+  ]
+}

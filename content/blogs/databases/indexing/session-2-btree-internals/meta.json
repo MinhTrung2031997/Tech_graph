@@ -1,0 +1,15 @@
+{
+  "title": "Session 2: B-tree internals",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [],
+  "planned": [
+    "Concept 1: Why a B-tree, not a binary tree or a hash",
+    "Concept 2: How CREATE INDEX builds and stores it",
+    "Concept 3: A point lookup, level by level",
+    "Concept 4: From index entry to table row",
+    "Concept 5: Range scans along the leaves",
+    "Concept 6: Page splits on insert",
+    "Lab and session quiz"
+  ]
+}

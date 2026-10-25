@@ -8,7 +8,7 @@ const STATIC_FILE = /\.(?:svg|png|jpg|jpeg|gif|webp|ico|css|js|map|woff2?)$/iu;
 
 function isPublic(pathname: string) {
   if (pathname === '/login' || pathname.startsWith('/login/')) return true;
-  if (pathname.startsWith('/_next/') || pathname === '/favicon.ico') return true;
+  if (pathname.startsWith('/_next/') || pathname === '/favicon.ico' || pathname === '/robots.txt') return true;
   // /og serves generated note images, not files from public/.
   if (pathname.startsWith('/og/')) return false;
   return STATIC_FILE.test(pathname);

@@ -25,6 +25,18 @@ export function formatShortDate(iso?: string) {
   }).format(date);
 }
 
+export function daysSince(iso?: string, now = Date.now()) {
+  if (!iso) return undefined;
+  const time = new Date(`${iso}T00:00:00Z`).getTime();
+  if (Number.isNaN(time)) return undefined;
+  return Math.floor((now - time) / 86_400_000);
+}
+
+/** Oldest `lastReviewed` first; notes without one sort before all dated notes. */
+export function byLastReviewed(a: NotePage, b: NotePage) {
+  return (a.data.lastReviewed ?? '').localeCompare(b.data.lastReviewed ?? '');
+}
+
 export function isNotePage(page: NotePage) {
   return page.slugs.length > 1 && page.data.type !== 'domain';
 }
@@ -145,4 +157,52 @@ export function contentStats() {
 
 export function interviewPages() {
   return interview.getPages();
+}
+
+export interface GraphNode {
+  url: string;
+  title: string;
+  domain: string;
+  placeholder: boolean;
+}
+
+export interface GraphEdge {
+  source: number;
+  target: number;
+  kind: 'related' | 'tag';
+  weight: number;
+}
+
+/** Notes as nodes; explicit `related` links plus weaker edges for shared tags. */
+export function noteGraph() {
+  const pages = allNotes().sort((a, b) => (a.slugs[0] ?? '').localeCompare(b.slugs[0] ?? '') || a.url.localeCompare(b.url));
+  const indexByUrl = new Map(pages.map((page, index) => [page.url, index]));
+  const edges = new Map<string, GraphEdge>();
+  const key = (a: number, b: number) => (a < b ? `${a}-${b}` : `${b}-${a}`);
+
+  pages.forEach((page, source) => {
+    for (const match of relatedNotes(page)) {
+      const target = indexByUrl.get(match.url);
+      if (target === undefined || target === source) continue;
+      edges.set(key(source, target), { source, target, kind: 'related', weight: 1 });
+    }
+  });
+
+  pages.forEach((page, source) => {
+    const tags = new Set(page.data.tags ?? []);
+    for (let target = source + 1; target < pages.length; target++) {
+      const shared = (pages[target]?.data.tags ?? []).filter((tag) => tags.has(tag)).length;
+      if (shared === 0 || edges.has(key(source, target))) continue;
+      edges.set(key(source, target), { source, target, kind: 'tag', weight: Math.min(shared, 3) * 0.25 });
+    }
+  });
+
+  const nodes: GraphNode[] = pages.map((page) => ({
+    url: page.url,
+    title: page.data.title,
+    domain: page.slugs[0] ?? '',
+    placeholder: Boolean(page.data.placeholder),
+  }));
+
+  return { nodes, edges: [...edges.values()] };
 }

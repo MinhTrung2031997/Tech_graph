@@ -1,0 +1,13 @@
+{
+  "title": "Session 8: When indexes hurt",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [],
+  "planned": [
+    "Concept 1: Write amplification",
+    "Concept 2: Bloat and unused indexes",
+    "Concept 3: CREATE INDEX CONCURRENTLY and locking",
+    "Concept 4: An index-design checklist",
+    "Lab and session quiz"
+  ]
+}
