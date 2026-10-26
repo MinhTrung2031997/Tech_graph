@@ -220,14 +220,41 @@ html > body[data-scroll-locked] {
   }
 }
 
-/* iPad portrait and landscape: sidebar and article share the row. TOC sits under the article. */
-@media (width >= 48rem) and (width < 80rem) {
+/* iPad portrait: no room for a third column, so "On this page" is the sticky dropdown bar above the article. */
+@media (width >= 48rem) and (width < 64rem) {
   #nd-notebook-layout {
+    --fd-toc-popover-height: 2.5rem !important;
     grid-template:
       "header header" auto
+      "sidebar toc-popover" auto
       "sidebar main" minmax(0, 1fr)
-      "sidebar toc" auto
       / minmax(0, var(--fd-sidebar-col, 268px)) minmax(0, 1fr) !important;
+  }
+
+  #nd-notebook-layout [data-toc-popover] {
+    display: block !important;
+  }
+
+  #nd-toc {
+    display: none !important;
+  }
+}
+
+/* iPad landscape and iPad Pro: sidebar, article, and a narrower sticky "On this page" column on the right. */
+@media (width >= 64rem) and (width < 80rem) {
+  #nd-notebook-layout {
+    grid-template:
+      "header header header" auto
+      "sidebar main toc" minmax(0, 1fr)
+      / minmax(0, var(--fd-sidebar-col, 268px)) minmax(0, 1fr) 13rem !important;
+  }
+
+  #nd-toc {
+    position: sticky !important;
+    top: var(--fd-docs-row-3) !important;
+    height: calc(var(--fd-docs-height) - var(--fd-docs-row-3)) !important;
+    overflow-y: auto !important;
+    padding: 3rem 1rem 0.5rem 0.25rem !important;
   }
 }
 
