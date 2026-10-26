@@ -172,24 +172,34 @@ html > body[data-scroll-locked] {
   }
 }
 
-/* iPhone: one column. The sidebar stays a drawer opened from the header button. */
+/* iPhone: one column. The sidebar stays a drawer opened from the header button, and "On this page" is the sticky dropdown bar above the article. */
 @media (width < 48rem) {
   #nd-notebook-layout {
+    --fd-toc-popover-height: 2.5rem !important;
     grid-template:
       "header" auto
+      "toc-popover" auto
       "main" auto
-      "toc" auto
       / minmax(0, 1fr) !important;
     --fd-sidebar-col: 0px !important;
     --fd-sidebar-width: 0px !important;
+  }
+
+  #nd-notebook-layout [data-toc-popover] {
+    display: block !important;
   }
 
   #nd-notebook-layout > [data-sidebar-placeholder] {
     display: none !important;
   }
 
+  /* The wrapped header plus the bar are ~160px tall, so jump targets must stop below both. */
+  #nd-page :is(h2, h3)[id] {
+    scroll-margin-top: 11rem !important;
+  }
+
   #nd-toc {
-    padding-inline: 1rem !important;
+    display: none !important;
   }
 
   /* The size control is inline-flex outside Tailwind's layers, so max-md:hidden cannot hide the desktop copy. */
