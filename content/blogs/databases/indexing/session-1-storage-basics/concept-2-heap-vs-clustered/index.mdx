@@ -1,0 +1,706 @@
+---
+title: "Concept 2: Heap vs clustered tables"
+description: "Which page a row goes to, and how the database finds it again: PostgreSQL's unordered heap versus InnoDB's table-is-the-primary-key B-tree, and MongoDB in between."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "storage", "primary-key"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/storage-fsm.html"
+  - "https://www.postgresql.org/docs/current/storage-hot.html"
+  - "https://www.postgresql.org/docs/current/functions-uuid.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-index-types.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-physical-structure.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html"
+  - "https://www.mongodb.com/docs/manual/core/clustered-collections/"
+  - "https://www.uber.com/blog/postgres-to-mysql-migration/"
+---
+
+<Tldr>
+Concept 1 showed how rows sit **inside** a page. This concept is about **which page** a row goes to. PostgreSQL stores a table as a **heap**: rows go into any page with room, in no order, and every index (the primary key included) points at the row's physical address, its ctid. MySQL InnoDB stores the table **as a B-tree on the primary key**: rows live in the leaf pages, sorted by primary key, and secondary indexes point at the primary key value. That one choice decides what inserts, lookups and updates cost.
+</Tldr>
+
+## Two ways to store a table
+
+| | PostgreSQL: heap | MySQL InnoDB: clustered index | MongoDB WiredTiger |
+|---|---|---|---|
+| Where the rows live | Heap file: pages in no particular order | Leaf pages of the primary-key B-tree, sorted by primary key | A B-tree keyed by an internal `RecordId` |
+| Where a new row goes | Any page with enough free space | The leaf page where its primary key belongs | The end of the `RecordId` order (it only grows) |
+| What the primary key is | Just another index, separate from the table | The table itself | The `_id` index: a separate index → `RecordId` |
+| What a secondary index stores | key → ctid `(page, slot)` | key → primary key value | key → `RecordId` |
+| Find a row by primary key | PK index → heap page | One B-tree descent | `_id` index → collection B-tree |
+| Find a row by secondary index | Index → heap page | Index → primary key → PK B-tree | Index → collection B-tree |
+
+You only need one fact about B-trees for now (Session 2 covers the rest): a **B-tree is a sorted tree of pages**. A small root page routes you down to the right **leaf page** in about 3–4 page reads, even for millions of rows.
+
+## PostgreSQL: the table is a heap
+
+| Term | Meaning |
+|---|---|
+| Heap | The table file: a sequence of 8 KB pages with rows in no particular order |
+| Free space map (FSM) | A small side file recording roughly how many free bytes each heap page has |
+| ctid `(page, slot)` | A row's physical address in the heap; what every PostgreSQL index stores |
+| **✓ Room** | The FSM finds a page with enough free space; the row goes there |
+| **✗ None** | No page has room; Postgres adds a new page at the end of the file |
+
+<Flow
+  title="PostgreSQL: where an INSERT goes in a heap"
+  height={330}
+  nodes={[
+    { id: 'p0', label: 'page 0', sub: 'full', x: 20, y: 30, w: 140, h: 56 },
+    { id: 'p1', label: 'page 1', sub: '1,900 B free', x: 180, y: 30, w: 140, h: 56 },
+    { id: 'p2', label: 'page 2', sub: 'full', x: 340, y: 30, w: 140, h: 56 },
+    { id: 'p3', label: 'page 3', sub: 'does not exist yet', x: 500, y: 30, w: 140, h: 56 },
+    { id: 'hit', label: '✓ Room', sub: 'page 1', x: 205, y: 150, w: 90, h: 48 },
+    { id: 'miss', label: '✗ None', sub: 'extend file', x: 400, y: 180, w: 90, h: 48 },
+    { id: 'insert', label: 'INSERT id = 7', sub: 'row ≈ 84 B', x: 20, y: 260, w: 150 },
+    { id: 'fsm', label: 'Free space map', sub: 'free bytes per page', x: 230, y: 260, w: 160 },
+    { id: 'pk', label: 'orders_pkey', sub: 'B-tree: id → ctid', x: 630, y: 210, w: 160 },
+  ]}
+  edges={[
+    { id: 'ins-fsm', from: 'insert', to: 'fsm', label: 'room?' },
+    { id: 'fsm-hit', from: 'fsm', to: 'hit' },
+    { id: 'fsm-miss', from: 'fsm', to: 'miss' },
+    { id: 'hit-p1', from: 'hit', to: 'p1', label: 'write' },
+    { id: 'miss-p3', from: 'miss', to: 'p3', label: 'extend' },
+    { id: 'p1-pk', from: 'p1', to: 'pk', label: 'id → ctid' },
+    { id: 'p3-pk', from: 'p3', to: 'pk' },
+  ]}
+  cases={[
+    {
+      title: 'A page has room',
+      path: 'FSM ✓ room → row into page 1 → PK index gets 7 → (1,40)',
+      summary: 'Page 1 has free space left over from earlier deletes, so the new row goes there, not at the end of the table.',
+      steps: [
+        {
+          title: 'INSERT asks for room',
+          note: 'The row needs about 84 bytes (80 B row + 4 B line pointer). Postgres first tries the page it inserted into last; when that page is full it asks the free space map for any page with at least 84 bytes free.',
+          code: "INSERT INTO orders (id, customer_id, status) VALUES (7, 501, 'paid');",
+          active: ['insert', 'fsm'],
+          edges: ['ins-fsm'],
+        },
+        {
+          title: 'FSM: ✓ room on page 1',
+          note: 'Pages 0 and 2 are full, but page 1 has about 1,900 bytes free (rows were deleted from it and VACUUM made the space reusable).',
+          active: ['fsm', 'hit', 'p0', 'p2'],
+          edges: ['fsm-hit'],
+        },
+        {
+          title: 'The row goes into page 1',
+          note: 'Postgres writes the row into page 1 exactly as in Concept 1: row data at the back of the free space, a new line pointer [40] at the front. Its address is ctid (1,40). It is not next to id 6 and not at the end of the table: a heap has no order.',
+          active: ['hit', 'p1'],
+          edges: ['hit-p1'],
+          subs: { p1: 'id 7 at (1,40)' },
+        },
+        {
+          title: 'The primary key index gets an entry',
+          note: 'orders_pkey is a separate B-tree. It gets the entry 7 → (1,40). The table itself knows nothing about the primary key; only the index does. Every other index on the table gets an entry pointing at (1,40) too.',
+          active: ['p1', 'pk'],
+          edges: ['p1-pk'],
+          subs: { pk: '7 → (1,40)' },
+        },
+      ],
+    },
+    {
+      title: 'No page has room',
+      path: 'FSM ✗ none → new page 3 at the end of the file → PK index gets 7 → (3,1)',
+      summary: 'Every existing page is full, so the table file grows by one page.',
+      subs: { p1: 'full' },
+      steps: [
+        {
+          title: 'INSERT asks for room',
+          note: 'The same 84-byte row. Postgres asks the free space map for a page with at least 84 bytes free.',
+          code: "INSERT INTO orders (id, customer_id, status) VALUES (7, 501, 'paid');",
+          active: ['insert', 'fsm'],
+          edges: ['ins-fsm'],
+        },
+        {
+          title: 'FSM: ✗ no page has room',
+          note: 'Pages 0, 1 and 2 all have less than 84 bytes free.',
+          active: ['fsm', 'miss', 'p0', 'p1', 'p2'],
+          edges: ['fsm-miss'],
+        },
+        {
+          title: 'The file grows by one page',
+          note: 'Postgres adds page 3 at the end of the file (it starts at byte 3 × 8,192 = 24,576) and writes the row as its first row: ctid (3,1).',
+          active: ['miss', 'p3'],
+          edges: ['miss-p3'],
+          subs: { p3: 'id 7 at (3,1)' },
+        },
+        {
+          title: 'The primary key index gets an entry',
+          note: 'orders_pkey gets 7 → (3,1). Same rule as before: the index records where the row physically is.',
+          active: ['p3', 'pk'],
+          edges: ['p3-pk'],
+          subs: { pk: '7 → (3,1)' },
+        },
+      ],
+    },
+  ]}
+/>
+
+Because the heap has no order, a PostgreSQL primary key does not decide where rows are stored. If rows happen to be inserted in id order, the heap ends up roughly in id order too, but nothing keeps it that way. (`CLUSTER` reorders a table once; later inserts and updates are not kept in order.)
+
+## MySQL InnoDB: the table is the primary-key B-tree
+
+| Term | Meaning |
+|---|---|
+| Clustered index | The B-tree on the primary key whose **leaf pages hold the full rows**, sorted by primary key. In InnoDB this *is* the table |
+| Leaf page | A 16 KB page at the bottom of the tree; leaves are linked to their neighbours in key order |
+| Page split | A full leaf receives a key in the middle: InnoDB moves about half its rows to a new page to make room |
+| **✓ Room** | The target leaf has space; the row is added to it |
+| **✗ Full** | The target leaf has no space; InnoDB adds a page (sequential key) or splits the page (random key) |
+
+If a table has no primary key, InnoDB uses the first `UNIQUE` index whose columns are all `NOT NULL`. If there is none, it generates a hidden 6-byte row id and clusters on that.
+
+<Flow
+  title="InnoDB: where an INSERT goes in a clustered index"
+  height={355}
+  nodes={[
+    { id: 'insert', label: 'INSERT', sub: 'new primary key', x: 20, y: 30, w: 160 },
+    { id: 'root', label: 'Root page', sub: '≤ 100 | ≤ 200 | rest', x: 260, y: 30, w: 160 },
+    { id: 'la', label: 'Leaf A', sub: 'id 1–100 · full', x: 20, y: 150, w: 160, h: 56 },
+    { id: 'lb', label: 'Leaf B', sub: 'id 101–200 · full', x: 220, y: 150, w: 160, h: 56 },
+    { id: 'lc', label: 'Leaf C', sub: 'id 201–260 · room', x: 420, y: 150, w: 160, h: 56 },
+    { id: 'ln', label: 'New leaf', sub: 'not needed', x: 620, y: 150, w: 160, h: 56 },
+    { id: 'bHit', label: '✓ Room', sub: 'leaf B', x: 110, y: 290, w: 90, h: 48 },
+    { id: 'bMiss', label: '✗ Full', sub: 'leaf B', x: 210, y: 290, w: 90, h: 48 },
+    { id: 'cHit', label: '✓ Room', sub: 'leaf C', x: 410, y: 290, w: 90, h: 48 },
+    { id: 'cMiss', label: '✗ Full', sub: 'leaf C', x: 510, y: 290, w: 90, h: 48 },
+  ]}
+  edges={[
+    { id: 'ins-root', from: 'insert', to: 'root', label: 'find leaf' },
+    { id: 'root-a', from: 'root', to: 'la' },
+    { id: 'root-b', from: 'root', to: 'lb' },
+    { id: 'root-c', from: 'root', to: 'lc' },
+    { id: 'root-n', from: 'root', to: 'ln', quiet: true },
+    { id: 'a-b', from: 'la', to: 'lb', both: true },
+    { id: 'b-c', from: 'lb', to: 'lc', both: true },
+    { id: 'c-n', from: 'lc', to: 'ln', both: true, quiet: true },
+    { id: 'b-hit', from: 'lb', to: 'bHit' },
+    { id: 'b-miss', from: 'lb', to: 'bMiss' },
+    { id: 'c-hit', from: 'lc', to: 'cHit' },
+    { id: 'c-miss', from: 'lc', to: 'cMiss' },
+    { id: 'cmiss-n', from: 'cMiss', to: 'ln' },
+    { id: 'bmiss-n', from: 'bMiss', to: 'ln' },
+  ]}
+  cases={[
+    {
+      title: 'Sequential key, leaf has room',
+      path: 'root → rightmost leaf C ✓ room → append at the end',
+      summary: 'AUTO_INCREMENT ids: every new id is the largest so far, so it always belongs at the far right of the tree.',
+      steps: [
+        {
+          title: 'INSERT id = 261',
+          note: 'InnoDB must store the row where 261 belongs in primary-key order. It starts at the root page of the clustered index.',
+          code: "INSERT INTO orders (customer_id, status) VALUES (501, 'paid');  -- id 261 from AUTO_INCREMENT",
+          active: ['insert', 'root'],
+          edges: ['ins-root'],
+        },
+        {
+          title: 'The root routes to leaf C',
+          note: 'The leaves are linked in key order: A (1–100) → B (101–200) → C (201–260). 261 > 200, so the root sends it to leaf C, the rightmost leaf.',
+          active: ['root', 'la', 'lb', 'lc'],
+          edges: ['root-c'],
+        },
+        {
+          title: 'Leaf C: ✓ room',
+          note: 'Leaf C holds ids 201–260 and still has free space.',
+          active: ['lc', 'cHit'],
+          edges: ['c-hit'],
+        },
+        {
+          title: 'Appended after 260',
+          note: 'The full row (every column) is written into leaf C after id 260. With sequential ids every insert lands on this same rightmost page, so only a few pages are being written and they stay in the buffer pool.',
+          active: ['cHit', 'lc'],
+          subs: { lc: 'id 201–261 · room' },
+        },
+      ],
+    },
+    {
+      title: 'Sequential key, rightmost leaf full',
+      path: 'root → rightmost leaf C ✗ full → new leaf to the right, nothing moves',
+      summary: 'Leaf C is full. With a sequential key InnoDB simply starts the next page.',
+      subs: { lc: 'id 201–300 · full' },
+      steps: [
+        {
+          title: 'INSERT id = 301',
+          note: 'Start at the root, as always.',
+          code: "INSERT INTO orders (customer_id, status) VALUES (501, 'paid');  -- id 301",
+          active: ['insert', 'root'],
+          edges: ['ins-root'],
+        },
+        {
+          title: 'The root routes to leaf C',
+          note: '301 > 200, so it goes to leaf C.',
+          active: ['root', 'lc'],
+          edges: ['root-c'],
+        },
+        {
+          title: 'Leaf C: ✗ full',
+          note: 'Leaf C has no room for another row.',
+          active: ['lc', 'cMiss'],
+          edges: ['c-miss'],
+        },
+        {
+          title: 'A new leaf on the right',
+          note: 'InnoDB notices the inserts are ascending, so instead of splitting leaf C it allocates a new leaf and puts 301 there. No existing row moves. Leaf C stays about 15/16 full (InnoDB keeps 1/16 free for later updates).',
+          active: ['cMiss', 'ln', 'lc'],
+          edges: ['cmiss-n', 'c-n'],
+          subs: { ln: 'id 301 · room' },
+        },
+        {
+          title: 'The root learns about the new leaf',
+          note: 'The root gets one more routing entry: ids above 300 go to the new leaf.',
+          active: ['root', 'ln'],
+          edges: ['root-n'],
+          subs: { root: '≤ 100 | ≤ 200 | ≤ 300 | rest' },
+        },
+      ],
+    },
+    {
+      title: 'Random key, leaf has room',
+      path: 'root → middle leaf B ✓ room → inserted between existing keys',
+      summary: 'Random UUIDs: a new key can belong anywhere in the tree. Here its leaf still has space.',
+      subs: {
+        root: '< 5… | < a… | rest',
+        la: '0…–4… · room',
+        lb: '5…–9… · room',
+        lc: 'a…–f… · room',
+      },
+      steps: [
+        {
+          title: "INSERT id = '7c1e…'",
+          note: 'A random UUIDv4 primary key. Where it goes depends only on its value.',
+          code: "INSERT INTO orders (id, customer_id, status) VALUES (UUID_TO_BIN('7c1e…'), 501, 'paid');  -- UUIDv4 generated by the app",
+          active: ['insert', 'root'],
+          edges: ['ins-root'],
+        },
+        {
+          title: 'The root routes to leaf B',
+          note: '5… ≤ 7c… < a…, so the key belongs in leaf B, in the middle of the tree.',
+          active: ['root', 'lb'],
+          edges: ['root-b'],
+        },
+        {
+          title: 'Leaf B: ✓ room',
+          note: 'Leaf B has free space.',
+          active: ['lb', 'bHit'],
+          edges: ['b-hit'],
+        },
+        {
+          title: 'Inserted between existing keys',
+          note: 'The row is written into the page\'s free space and linked into the page\'s sorted record list between 7a… and 7f…. No other row moves, so this is still cheap.',
+          active: ['bHit', 'lb'],
+        },
+      ],
+    },
+    {
+      title: 'Random key, leaf full: page split',
+      path: 'root → middle leaf B ✗ full → split: half of B moves to a new page',
+      summary: 'The expensive case: a random key lands in a full page in the middle of the tree.',
+      subs: {
+        root: '< 5… | < a… | rest',
+        la: '0…–4… · room',
+        lb: '5…–9… · full',
+        lc: 'a…–f… · room',
+      },
+      steps: [
+        {
+          title: "INSERT id = '6d2a…'",
+          note: 'Another random UUID.',
+          code: "INSERT INTO orders (id, customer_id, status) VALUES (UUID_TO_BIN('6d2a…'), 733, 'paid');  -- UUIDv4 generated by the app",
+          active: ['insert', 'root'],
+          edges: ['ins-root'],
+        },
+        {
+          title: 'The root routes to leaf B',
+          note: '6d… belongs in leaf B.',
+          active: ['root', 'lb'],
+          edges: ['root-b'],
+        },
+        {
+          title: 'Leaf B: ✗ full',
+          note: 'Leaf B has no room, and the new key belongs in its middle, so a new page on the right would break the key order.',
+          active: ['lb', 'bMiss'],
+          edges: ['b-miss'],
+        },
+        {
+          title: 'Page split',
+          note: 'InnoDB allocates a new page and moves the upper half of leaf B (keys 7…–9…) into it, then inserts 6d… into leaf B. Both pages are now about half full. Rows are physically copied, and the work is logged for crash safety.',
+          active: ['bMiss', 'lb', 'ln'],
+          edges: ['bmiss-n'],
+          subs: { lb: '5…–6… · ~50%', ln: '7…–9… · ~50%' },
+        },
+        {
+          title: 'Leaf order no longer matches file order',
+          note: 'The leaf links now go B → new leaf → C, but the new page sits wherever free space was found in the file. With random keys this happens all over the tree: pages end up between 1/2 and 15/16 full instead of 15/16, the table needs more pages, and a range scan jumps around the file (Concept 4).',
+          active: ['root', 'lb', 'ln', 'lc'],
+          edges: ['root-n'],
+          subs: { root: '< 5… | < 7… | < a… | rest' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: a B-tree keyed by RecordId
+
+WiredTiger stores each collection as a B-tree keyed by an internal 64-bit **`RecordId`** that only grows, so documents are appended in insertion order, much like a heap that grows at the end. The `_id` index is a separate index mapping `_id` → `RecordId`, and every secondary index also stores the `RecordId`. When a document is updated, its `RecordId` stays the same, so indexes on unchanged fields are not touched.
+
+Since MongoDB 5.3 you can create a **clustered collection**, which is keyed by `_id` instead, like InnoDB. It is opt-in and fixed at creation.
+
+## Finding a row through an index
+
+| Term | Meaning |
+|---|---|
+| Secondary index | Any index other than the one the table is stored by, e.g. on `customer_id` |
+| Physical pointer | PostgreSQL's ctid: page + slot, so the index jumps straight to the heap page |
+| Logical pointer | InnoDB's primary key value: you still have to find where that key lives |
+| `RecordId` | MongoDB's internal row id: a key into the collection's B-tree |
+
+<Flow
+  title="Finding one order through an index"
+  height={250}
+  nodes={[
+    { id: 'q', label: 'SELECT … WHERE', sub: 'customer_id = 501', x: 20, y: 30, w: 170 },
+    { id: 'sec', label: 'Secondary index', sub: 'customer_id → ctid', x: 250, y: 30, w: 170 },
+    { id: 'heap', label: 'Heap page 1', sub: 'row at slot 40', x: 480, y: 30, w: 150 },
+    { id: 'res', label: 'Row', sub: 'id 7', x: 660, y: 30, w: 130 },
+    { id: 'troot', label: 'Table B-tree root', sub: '—', x: 480, y: 170, w: 150 },
+    { id: 'tleaf', label: 'Table leaf', sub: '—', x: 660, y: 170, w: 130 },
+  ]}
+  edges={[
+    { id: 'q-sec', from: 'q', to: 'sec', label: 'lookup' },
+    { id: 'sec-heap', from: 'sec', to: 'heap', label: 'ctid' },
+    { id: 'heap-res', from: 'heap', to: 'res' },
+    { id: 'sec-troot', from: 'sec', to: 'troot', label: 'key' },
+    { id: 'q-troot', from: 'q', to: 'troot', label: 'by PK' },
+    { id: 'troot-tleaf', from: 'troot', to: 'tleaf' },
+    { id: 'tleaf-res', from: 'tleaf', to: 'res' },
+  ]}
+  cases={[
+    {
+      title: 'PostgreSQL',
+      path: 'secondary index → ctid (1,40) → heap page 1',
+      summary: 'The index entry is a physical address, so one jump reaches the row.',
+      steps: [
+        {
+          title: 'Search the index',
+          note: 'Postgres descends the B-tree on customer_id (about 3 pages) to the leaf entry 501 → (1,40).',
+          code: 'SELECT * FROM orders WHERE customer_id = 501;',
+          active: ['q', 'sec'],
+          edges: ['q-sec'],
+          subs: { sec: '501 → (1,40)' },
+        },
+        {
+          title: 'Jump to the heap page',
+          note: 'ctid (1,40) means heap page 1, line pointer 40. Postgres reads page 1 (one page) and follows the line pointer.',
+          active: ['sec', 'heap'],
+          edges: ['sec-heap'],
+        },
+        {
+          title: 'The row',
+          note: 'About 3 index pages + 1 heap page. A lookup by primary key costs the same, because orders_pkey is also just an index pointing at a ctid.',
+          active: ['heap', 'res'],
+          edges: ['heap-res'],
+        },
+      ],
+    },
+    {
+      title: 'InnoDB via a secondary index',
+      path: 'secondary index → primary key 7 → clustered B-tree root → leaf',
+      summary: 'The index entry holds the primary key, not an address, so a second tree has to be searched.',
+      subs: { sec: 'customer_id → id', troot: 'clustered index root', tleaf: 'leaf with full row', heap: '(not used)' },
+      steps: [
+        {
+          title: 'Search the secondary index',
+          note: 'InnoDB descends the B-tree on customer_id (about 3 pages) to the leaf entry 501 → id 7. It has a key, not a page number.',
+          code: 'SELECT * FROM orders WHERE customer_id = 501;',
+          active: ['q', 'sec'],
+          edges: ['q-sec'],
+          subs: { sec: '501 → id 7' },
+        },
+        {
+          title: 'Search the clustered index by id 7',
+          note: 'To find where id 7 lives, InnoDB starts again at the root of the clustered index.',
+          active: ['sec', 'troot'],
+          edges: ['sec-troot'],
+        },
+        {
+          title: 'Down to the leaf',
+          note: 'The root routes to the leaf holding id 7 (about 3 pages in total). The full row is right there in the leaf.',
+          active: ['troot', 'tleaf'],
+          edges: ['troot-tleaf'],
+        },
+        {
+          title: 'The row',
+          note: 'About 3 + 3 pages: two tree descents. The upside: page splits move rows around, but the primary key never changes, so secondary indexes never need updating when rows move.',
+          active: ['tleaf', 'res'],
+          edges: ['tleaf-res'],
+        },
+      ],
+    },
+    {
+      title: 'InnoDB by primary key',
+      path: 'clustered B-tree root → leaf (one tree)',
+      summary: 'The cheapest lookup InnoDB has: the primary key leads straight to the row.',
+      subs: { troot: 'clustered index root', tleaf: 'leaf with full row', sec: '(not used)', heap: '(not used)' },
+      steps: [
+        {
+          title: 'Search the clustered index',
+          note: 'WHERE id = 7: InnoDB descends the clustered index from the root.',
+          code: 'SELECT * FROM orders WHERE id = 7;',
+          active: ['q', 'troot'],
+          edges: ['q-troot'],
+          subs: { q: 'id = 7' },
+        },
+        {
+          title: 'Down to the leaf',
+          note: 'About 3 pages to the leaf holding id 7.',
+          active: ['troot', 'tleaf'],
+          edges: ['troot-tleaf'],
+        },
+        {
+          title: 'The row',
+          note: 'The leaf is the row: no second structure to visit. A range like id BETWEEN 7 AND 500 reads neighbouring leaves along their links.',
+          active: ['tleaf', 'res'],
+          edges: ['tleaf-res'],
+        },
+      ],
+    },
+    {
+      title: 'MongoDB',
+      path: 'secondary index → RecordId → collection B-tree root → leaf',
+      summary: 'Indexes store the RecordId, a key into the collection\'s own B-tree.',
+      subs: { sec: 'customer_id → RecordId', troot: 'collection root', tleaf: 'leaf with document', heap: '(not used)' },
+      steps: [
+        {
+          title: 'Search the index',
+          note: 'The index on customer_id gives 501 → RecordId 7.',
+          code: 'db.orders.find({ customer_id: 501 })',
+          active: ['q', 'sec'],
+          edges: ['q-sec'],
+          subs: { sec: '501 → RecordId 7' },
+        },
+        {
+          title: 'Search the collection by RecordId',
+          note: 'The collection is a B-tree keyed by RecordId, so WiredTiger descends it from the root.',
+          active: ['sec', 'troot'],
+          edges: ['sec-troot'],
+        },
+        {
+          title: 'Down to the leaf',
+          note: 'The document sits in the leaf.',
+          active: ['troot', 'tleaf'],
+          edges: ['troot-tleaf'],
+        },
+        {
+          title: 'The document',
+          note: 'Even find({ _id: … }) works this way: the _id index is an ordinary index pointing at the RecordId (unless the collection is clustered).',
+          active: ['tleaf', 'res'],
+          edges: ['tleaf-res'],
+        },
+      ],
+    },
+  ]}
+/>
+
+| Lookup | PostgreSQL | InnoDB | MongoDB |
+|---|---|---|---|
+| By primary key | ≈ 3 index pages + 1 heap page | ≈ 3 pages (one tree) | ≈ 3 `_id` index pages + collection B-tree |
+| By secondary index | ≈ 3 index pages + 1 heap page | ≈ 3 + 3 pages (two trees) | ≈ 3 index pages + collection B-tree |
+
+## Updating a row
+
+| Term | Meaning |
+|---|---|
+| MVCC | Readers see a consistent snapshot, so the old version of a row must stay available until no transaction needs it |
+| Dead tuple | A PostgreSQL row version that no transaction can see any more; it still takes space until VACUUM |
+| HOT update | Heap-only tuple: the new version is on the **same page** and **no indexed column changed**, so no index is touched |
+| Undo log | InnoDB's store of old values; old versions are rebuilt from it, and *purge* discards it later |
+| **✓ HOT** | Both HOT conditions hold |
+| **✗ Not HOT** | An indexed column changed or the page is full: every index gets a new entry |
+
+<Flow
+  title="UPDATE orders SET status = 'shipped' WHERE id = 7"
+  height={350}
+  nodes={[
+    { id: 'upd', label: 'UPDATE', sub: 'status → shipped', x: 20, y: 30, w: 160 },
+    { id: 'page1', label: 'Heap page 1', sub: '(1,40) paid', x: 420, y: 30, w: 170 },
+    { id: 'page3', label: 'Heap page 3', sub: 'has room', x: 620, y: 30, w: 160 },
+    { id: 'check', label: 'HOT check', sub: 'indexed column? room?', x: 20, y: 170, w: 160 },
+    { id: 'idx', label: 'All indexes', sub: 'pkey, idx_customer', x: 620, y: 170, w: 160 },
+    { id: 'hotYes', label: '✓ HOT', sub: 'same page', x: 20, y: 290, w: 95, h: 48 },
+    { id: 'hotNo', label: '✗ Not HOT', sub: 'other page', x: 125, y: 290, w: 95, h: 48 },
+    { id: 'leaf', label: 'Clustered leaf', sub: 'id 7 · paid', x: 420, y: 290, w: 170 },
+    { id: 'undo', label: 'Undo log', sub: 'empty', x: 650, y: 290, w: 140 },
+  ]}
+  edges={[
+    { id: 'upd-check', from: 'upd', to: 'check', label: 'check' },
+    { id: 'check-yes', from: 'check', to: 'hotYes' },
+    { id: 'check-no', from: 'check', to: 'hotNo' },
+    { id: 'yes-p1', from: 'hotYes', to: 'page1', label: 'new version' },
+    { id: 'no-p3', from: 'hotNo', to: 'page3', label: 'new version' },
+    { id: 'p3-idx', from: 'page3', to: 'idx', label: 'new entries' },
+    { id: 'upd-leaf', from: 'upd', to: 'leaf', label: 'InnoDB' },
+    { id: 'leaf-undo', from: 'leaf', to: 'undo', label: 'old value' },
+  ]}
+  cases={[
+    {
+      title: 'PostgreSQL, HOT update',
+      path: 'HOT check ✓ → new version on page 1 → indexes untouched',
+      summary: 'status is not indexed and page 1 has room: the cheapest PostgreSQL update.',
+      subs: { leaf: '(InnoDB only)', undo: '(InnoDB only)' },
+      steps: [
+        {
+          title: 'Postgres never overwrites a row',
+          note: 'Under MVCC an earlier transaction may still need to see status = paid, so Postgres writes a new version of the row. First it checks the two HOT conditions: did an indexed column change, and does page 1 have room?',
+          code: "UPDATE orders SET status = 'shipped' WHERE id = 7;",
+          active: ['upd', 'check'],
+          edges: ['upd-check'],
+        },
+        {
+          title: 'HOT check: ✓',
+          note: 'status is not in any index, and page 1 has free space.',
+          active: ['check', 'hotYes'],
+          edges: ['check-yes'],
+        },
+        {
+          title: 'New version on the same page',
+          note: 'The new version is written to page 1 as (1,41). The old version (1,40) is marked as replaced and points to (1,41), forming a HOT chain.',
+          active: ['hotYes', 'page1'],
+          edges: ['yes-p1'],
+          subs: { page1: '(1,40) old → (1,41) shipped' },
+        },
+        {
+          title: 'No index is touched',
+          note: 'orders_pkey still says 7 → (1,40). A lookup lands on (1,40) and follows the chain to (1,41), on the same page, so it costs nothing extra. Later, (1,40) is pruned once no transaction needs it.',
+          active: ['page1', 'idx'],
+          subs: { idx: 'unchanged: 7 → (1,40)' },
+        },
+      ],
+    },
+    {
+      title: 'PostgreSQL, not HOT',
+      path: 'HOT check ✗ → new version on page 3 → every index gets a new entry',
+      summary: 'Page 1 is full, so the new version goes to another page and every index must learn the new ctid.',
+      subs: { page1: '(1,40) paid · full', leaf: '(InnoDB only)', undo: '(InnoDB only)' },
+      steps: [
+        {
+          title: 'Postgres never overwrites a row',
+          note: 'Same as before: write a new version, check the HOT conditions first.',
+          code: "UPDATE orders SET status = 'shipped' WHERE id = 7;",
+          active: ['upd', 'check'],
+          edges: ['upd-check'],
+        },
+        {
+          title: 'HOT check: ✗',
+          note: 'status is not indexed, but page 1 has no room for the new version. (Changing an indexed column, such as customer_id, would also fail the check.)',
+          active: ['check', 'hotNo'],
+          edges: ['check-no'],
+        },
+        {
+          title: 'New version on another page',
+          note: 'The new version goes to page 3 as (3,1). The old version (1,40) stays in page 1 as a dead tuple.',
+          active: ['hotNo', 'page3', 'page1'],
+          edges: ['no-p3'],
+          subs: { page3: '(3,1) shipped', page1: '(1,40) dead' },
+        },
+        {
+          title: 'Every index gets a new entry',
+          note: 'Indexes store the ctid, which changed. orders_pkey gets 7 → (3,1) and idx_customer gets 501 → (3,1), even though customer_id did not change. A table with 5 indexes pays 5 index writes for one row. This write amplification is one reason Uber gave in 2016 for moving from PostgreSQL to MySQL.',
+          active: ['page3', 'idx'],
+          edges: ['p3-idx'],
+          subs: { idx: '+ 7 → (3,1), + 501 → (3,1)' },
+        },
+        {
+          title: 'VACUUM cleans up later',
+          note: 'The dead tuple (1,40) and the old index entries pointing at it stay until VACUUM removes them and marks the space reusable in the free space map.',
+          active: ['page1', 'idx'],
+        },
+      ],
+    },
+    {
+      title: 'InnoDB',
+      path: 'clustered leaf updated in place → old value to the undo log → secondary indexes untouched',
+      summary: 'InnoDB changes the row where it is and keeps the old value elsewhere.',
+      subs: { page1: '(PostgreSQL only)', page3: '(PostgreSQL only)' },
+      steps: [
+        {
+          title: 'Find the row by primary key',
+          note: 'InnoDB descends the clustered index to the leaf holding id 7.',
+          code: "UPDATE orders SET status = 'shipped' WHERE id = 7;",
+          active: ['upd', 'leaf'],
+          edges: ['upd-leaf'],
+        },
+        {
+          title: 'The old value goes to the undo log',
+          note: 'Before changing anything, InnoDB writes status = paid (with the transaction id) to the undo log. A transaction that must still see paid rebuilds that version from the undo log.',
+          active: ['leaf', 'undo'],
+          edges: ['leaf-undo'],
+          subs: { undo: 'id 7: status = paid' },
+        },
+        {
+          title: 'The row changes in place',
+          note: 'The row stays in the same leaf at the same position, now with status = shipped. Secondary indexes store the primary key 7, which did not change, so none of them is touched.',
+          active: ['leaf', 'idx'],
+          subs: { leaf: 'id 7 · shipped', idx: 'unchanged: still → id 7' },
+        },
+        {
+          title: 'Purge cleans up later',
+          note: 'Once no transaction needs the old version, InnoDB\'s purge thread discards the undo record. It plays the role of VACUUM, but it works on the undo log rather than the table.',
+          active: ['undo'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+Updating the **primary key** in InnoDB is expensive: the row must move to a different place in the clustered index (a delete plus an insert), and every secondary index entry storing the old key must change too. Primary keys that never change are part of good InnoDB design.
+</Pitfall>
+
+## Real-world scenario: choosing a primary key
+
+A team gives every table a random UUIDv4 primary key so ids can be generated by the app. Months later, MySQL inserts slow down and the tables are bigger than expected. PostgreSQL copes better, though not perfectly.
+
+| | Auto-increment `BIGINT` | Random UUIDv4 | Time-ordered UUIDv7 |
+|---|---|---|---|
+| InnoDB insert position | Always the rightmost leaf | A random leaf anywhere | Near the rightmost leaf |
+| InnoDB page splits | None (new page on the right) | Constant, all over the tree | Rare |
+| InnoDB page fill | ≈ 15/16 | Between 1/2 and 15/16 | ≈ 15/16 |
+| Cost in every InnoDB secondary index entry | 8 B | 16 B as `BINARY(16)`, 36 B as `CHAR(36)` | 16 B as `BINARY(16)` |
+| PostgreSQL heap | Appends | **Still appends:** the heap ignores the key | Appends |
+| PostgreSQL PK index | Inserts at the right edge | Random inserts and page splits in the **index only** | Inserts near the right edge |
+
+**What to do:**
+- **InnoDB:** use `BIGINT AUTO_INCREMENT`, or a time-ordered UUID stored as `BINARY(16)`. MySQL's `UUID_TO_BIN(uuid, 1)` reorders a version-1 UUID so its time part comes first.
+- **PostgreSQL:** a UUIDv4 key hurts only the primary-key index, not the table, but UUIDv7 is still the better choice. PostgreSQL 18 generates one with `uuidv7()`.
+- **Both:** never store a UUID as text (`CHAR(36)`) as a key. It more than doubles the key size, and in InnoDB every secondary index carries that cost.
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 2: B-tree internals | The InnoDB table *is* a B-tree, so the same mechanics (splits, fill) apply to the table itself |
+| Session 4: composite indexes | Every InnoDB secondary index silently ends with the primary key columns |
+| Session 5: covering indexes | Covering means "skip the second step": the heap visit in PostgreSQL, the second tree descent in InnoDB |
+| Session 8: when indexes hurt | Every PostgreSQL index adds cost to non-HOT updates; every InnoDB index carries the primary key |
+
+## Key takeaways
+
+1. **PostgreSQL:** the table is an unordered heap; every index, the primary key included, points at a physical ctid.
+2. **InnoDB:** the table is the primary-key B-tree; rows live in its leaves in key order, and secondary indexes point at the primary key.
+3. **MongoDB:** documents live in a B-tree keyed by `RecordId`; every index, `_id` included, points at the `RecordId` (unless the collection is clustered).
+4. A PostgreSQL index lookup costs index pages + 1 heap page; an InnoDB secondary lookup costs two tree descents.
+5. Random primary keys cause page splits in InnoDB's table and in PostgreSQL's PK index; sequential or time-ordered keys avoid them.
+6. A PostgreSQL update writes a new row version; unless it is HOT, every index gets a new entry. InnoDB updates in place and keeps the old value in the undo log.
+
+## Check questions
+
+1. A PostgreSQL table `orders` has a primary key on `id`. Where is the row data stored, and what does the primary key index contain?
+2. An InnoDB table has a `BIGINT AUTO_INCREMENT` primary key and a secondary index on `email`. Which structures, and roughly how many pages, does `WHERE id = 42` read? And `WHERE email = 'a@x.com'`?
+3. Why does a random UUIDv4 primary key hurt InnoDB more than PostgreSQL? Name the mechanism and two of its effects.
+4. InnoDB secondary indexes store the primary key value instead of the row's page address. Give one benefit and one cost of that design.
+5. A PostgreSQL table has 4 indexes, none on `status`. How many index entries does `UPDATE … SET status = 'shipped' WHERE id = 7` write (a) when the row's page has room, and (b) when it is full? Why the difference?
+6. In MongoDB, how many structures does `find({ _id: x })` visit on a normal collection, and what changes for a clustered collection?
