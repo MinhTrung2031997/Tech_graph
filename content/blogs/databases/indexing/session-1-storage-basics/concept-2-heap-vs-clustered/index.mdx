@@ -347,6 +347,227 @@ If a table has no primary key, InnoDB uses the first `UNIQUE` index whose column
 
 WiredTiger stores each collection as a B-tree keyed by an internal 64-bit **`RecordId`** that only grows, so documents are appended in insertion order, much like a heap that grows at the end. The `_id` index is a separate index mapping `_id` → `RecordId`, and every secondary index also stores the `RecordId`. When a document is updated, its `RecordId` stays the same, so indexes on unchanged fields are not touched.
 
+| Term | Meaning |
+|---|---|
+| `RecordId` | Internal 64-bit document id; the collection's B-tree is sorted by it. New documents get the highest one so far |
+| `_id` index | An ordinary index mapping `_id` → `RecordId`; it does not decide where the document is stored |
+| Version (update) | WiredTiger keeps the old version of a document for readers that still need it (in cache, then the history store) |
+| **✓ Room** / **✗ Full** | The rightmost leaf has space for the document / it does not, so a new leaf is started |
+| **✓ Not indexed** / **✗ Indexed** | The updated field is in no index, so no index changes / it is in an index, so only that index changes |
+
+<Flow
+  title="MongoDB: where insertOne puts a document"
+  height={355}
+  nodes={[
+    { id: 'op', label: 'insertOne', sub: 'customer_id: 501', x: 20, y: 30, w: 160 },
+    { id: 'recid', label: 'RecordId counter', sub: 'highest = 7', x: 240, y: 30, w: 160 },
+    { id: 'idIdx', label: '_id index', sub: '_id → RecordId', x: 620, y: 30, w: 170 },
+    { id: 'leaf1', label: 'Leaf 1', sub: 'RecordId 1–4', x: 20, y: 160, w: 140, h: 56 },
+    { id: 'leaf2', label: 'Leaf 2 (rightmost)', sub: 'RecordId 5–7 · room', x: 200, y: 160, w: 160, h: 56 },
+    { id: 'custIdx', label: 'customer_id index', sub: 'customer_id → RecordId', x: 620, y: 160, w: 170 },
+    { id: 'hit', label: '✓ Room', sub: 'leaf 2', x: 150, y: 290, w: 90, h: 48 },
+    { id: 'miss', label: '✗ Full', sub: 'leaf 2', x: 250, y: 290, w: 90, h: 48 },
+    { id: 'leafNew', label: 'New leaf', sub: 'not needed', x: 420, y: 290, w: 150 },
+  ]}
+  edges={[
+    { id: 'op-recid', from: 'op', to: 'recid', label: 'next id' },
+    { id: 'recid-leaf2', from: 'recid', to: 'leaf2', label: 'append' },
+    { id: 'l1-l2', from: 'leaf1', to: 'leaf2', both: true },
+    { id: 'leaf2-hit', from: 'leaf2', to: 'hit' },
+    { id: 'leaf2-miss', from: 'leaf2', to: 'miss' },
+    { id: 'miss-new', from: 'miss', to: 'leafNew', label: 'new leaf' },
+    { id: 'l2-new', from: 'leaf2', to: 'leafNew', both: true, quiet: true },
+    { id: 'recid-id', from: 'recid', to: 'idIdx', label: 'RecordId 8' },
+    { id: 'recid-cust', from: 'recid', to: 'custIdx' },
+  ]}
+  cases={[
+    {
+      title: 'Rightmost leaf has room',
+      path: 'RecordId 8 → rightmost leaf ✓ room → append → each index gets an entry → 8',
+      summary: 'Documents are stored in RecordId order, and every new RecordId is the highest, so inserts always land at the right edge.',
+      steps: [
+        {
+          title: 'insertOne',
+          note: 'The driver adds an _id (an ObjectId) if the document has none. That _id does not decide where the document is stored.',
+          code: "db.orders.insertOne({ customer_id: 501, status: 'paid' })",
+          active: ['op', 'recid'],
+          edges: ['op-recid'],
+        },
+        {
+          title: 'The document gets RecordId 8',
+          note: 'The highest RecordId so far is 7, so this document gets 8. RecordIds only grow, whatever the _id is.',
+          active: ['recid'],
+          subs: { recid: 'highest = 8' },
+        },
+        {
+          title: 'Append to the rightmost leaf',
+          note: 'The collection is a B-tree sorted by RecordId, so key 8 belongs after 7: in the rightmost leaf. The other leaves are not touched.',
+          active: ['recid', 'leaf1', 'leaf2'],
+          edges: ['recid-leaf2'],
+        },
+        {
+          title: 'Leaf 2: ✓ room',
+          note: 'Leaf 2 has space, so the document is stored there under key RecordId 8.',
+          active: ['leaf2', 'hit'],
+          edges: ['leaf2-hit'],
+          subs: { leaf2: 'RecordId 5–8 · room' },
+        },
+        {
+          title: 'Every index gets an entry → 8',
+          note: "The _id index gets ObjectId('6551…') → 8 and the customer_id index gets 501 → 8. ObjectIds start with a timestamp, so _id index inserts also land near its right edge. A random _id (UUIDv4) would scatter the _id index inserts, but the collection itself would still append, as in a PostgreSQL heap.",
+          active: ['recid', 'idIdx', 'custIdx'],
+          edges: ['recid-id', 'recid-cust'],
+          subs: { idIdx: "ObjectId('6551…') → 8", custIdx: '501 → 8' },
+        },
+      ],
+    },
+    {
+      title: 'Rightmost leaf full',
+      path: 'RecordId 8 → rightmost leaf ✗ full → new leaf on the right → each index gets an entry → 8',
+      summary: 'The rightmost leaf is full. Because new keys only ever go at the end, a new leaf is started and nothing moves.',
+      subs: { leaf2: 'RecordId 5–7 · full' },
+      steps: [
+        {
+          title: 'insertOne',
+          note: 'Same insert as before.',
+          code: "db.orders.insertOne({ customer_id: 501, status: 'paid' })",
+          active: ['op', 'recid'],
+          edges: ['op-recid'],
+        },
+        {
+          title: 'The document gets RecordId 8',
+          note: 'Highest so far is 7, so this one is 8.',
+          active: ['recid'],
+          subs: { recid: 'highest = 8' },
+        },
+        {
+          title: 'Append to the rightmost leaf',
+          note: 'Key 8 belongs after 7, in leaf 2.',
+          active: ['recid', 'leaf2'],
+          edges: ['recid-leaf2'],
+        },
+        {
+          title: 'Leaf 2: ✗ full',
+          note: 'Leaf 2 has no room for the document.',
+          active: ['leaf2', 'miss'],
+          edges: ['leaf2-miss'],
+        },
+        {
+          title: 'A new leaf on the right',
+          note: 'The document goes into a new leaf to the right of leaf 2. No existing document moves, like InnoDB with an AUTO_INCREMENT key and unlike its random-key page split.',
+          active: ['miss', 'leafNew', 'leaf2'],
+          edges: ['miss-new', 'l2-new'],
+          subs: { leafNew: 'RecordId 8 · room' },
+        },
+        {
+          title: 'Every index gets an entry → 8',
+          note: "The _id index gets ObjectId('6551…') → 8 and the customer_id index gets 501 → 8. Indexes store the RecordId, not the leaf, so it does not matter which leaf the document is in.",
+          active: ['recid', 'idIdx', 'custIdx'],
+          edges: ['recid-id', 'recid-cust'],
+          subs: { idIdx: "ObjectId('6551…') → 8", custIdx: '501 → 8' },
+        },
+      ],
+    },
+  ]}
+/>
+
+<Flow
+  title="MongoDB: what updateOne touches"
+  height={350}
+  nodes={[
+    { id: 'op', label: 'updateOne', sub: '{ _id: … }', x: 20, y: 30, w: 170 },
+    { id: 'idIdx', label: '_id index', sub: "ObjectId('6551…') → 8", x: 260, y: 30, w: 170 },
+    { id: 'leaf', label: 'Collection leaf', sub: 'RecordId 8 · paid · 501', x: 510, y: 30, w: 190 },
+    { id: 'check', label: 'Indexed field?', sub: 'does $set touch one?', x: 520, y: 170, w: 170 },
+    { id: 'custIdx', label: 'customer_id index', sub: '501 → 8', x: 20, y: 170, w: 170 },
+    { id: 'yes', label: '✗ Indexed', sub: 'that index only', x: 440, y: 290, w: 110, h: 48 },
+    { id: 'no', label: '✓ Not indexed', sub: 'no index changes', x: 560, y: 290, w: 120, h: 48 },
+  ]}
+  edges={[
+    { id: 'op-id', from: 'op', to: 'idIdx', label: 'find _id' },
+    { id: 'id-leaf', from: 'idIdx', to: 'leaf', label: 'RecordId 8' },
+    { id: 'leaf-check', from: 'leaf', to: 'check', label: 'new version' },
+    { id: 'check-yes', from: 'check', to: 'yes' },
+    { id: 'check-no', from: 'check', to: 'no' },
+    { id: 'yes-cust', from: 'yes', to: 'custIdx', label: 'swap entry' },
+  ]}
+  cases={[
+    {
+      title: 'Update a field that is not indexed',
+      path: '_id index → RecordId 8 → new version, same RecordId → ✓ not indexed → no index changes',
+      summary: 'status is in no index. The document changes, its RecordId does not, so no index is touched.',
+      steps: [
+        {
+          title: 'Find the document by _id',
+          note: 'The _id index maps the ObjectId to RecordId 8 (about 3 index pages).',
+          code: "db.orders.updateOne({ _id: ObjectId('6551…') }, { $set: { status: 'shipped' } })",
+          active: ['op', 'idIdx'],
+          edges: ['op-id'],
+        },
+        {
+          title: 'Go to RecordId 8 in the collection',
+          note: 'WiredTiger descends the collection B-tree to the leaf holding key 8.',
+          active: ['idIdx', 'leaf'],
+          edges: ['id-leaf'],
+        },
+        {
+          title: 'A new version, same RecordId',
+          note: 'WiredTiger writes the new version of the document under the same key, RecordId 8. The old version (status: paid) is kept for readers that still need it, first in cache and then in the history store, and discarded later.',
+          active: ['leaf', 'check'],
+          edges: ['leaf-check'],
+          subs: { leaf: 'RecordId 8 · shipped · 501' },
+        },
+        {
+          title: 'Indexed field? ✓ not indexed',
+          note: 'status is in no index, and the RecordId did not change, so no index is touched. Compare a PostgreSQL non-HOT update, where every index gets a new entry because the ctid changes.',
+          active: ['check', 'no', 'custIdx', 'idIdx'],
+          edges: ['check-no'],
+        },
+      ],
+    },
+    {
+      title: 'Update an indexed field',
+      path: '_id index → RecordId 8 → new version → ✗ indexed → only the customer_id index changes',
+      summary: 'customer_id is indexed, so that one index must change. Every other index stays as it is.',
+      steps: [
+        {
+          title: 'Find the document by _id',
+          note: 'Same as before: the _id index gives RecordId 8.',
+          code: "db.orders.updateOne({ _id: ObjectId('6551…') }, { $set: { customer_id: 733 } })",
+          active: ['op', 'idIdx'],
+          edges: ['op-id'],
+        },
+        {
+          title: 'Go to RecordId 8 in the collection',
+          note: 'Down the collection B-tree to key 8.',
+          active: ['idIdx', 'leaf'],
+          edges: ['id-leaf'],
+        },
+        {
+          title: 'A new version, same RecordId',
+          note: 'The new version (customer_id: 733) is written under RecordId 8; the old one is kept for readers that still need it.',
+          active: ['leaf', 'check'],
+          edges: ['leaf-check'],
+          subs: { leaf: 'RecordId 8 · paid · 733' },
+        },
+        {
+          title: 'Indexed field? ✗ indexed',
+          note: 'customer_id is in the customer_id index, so that index is now wrong.',
+          active: ['check', 'yes'],
+          edges: ['check-yes'],
+        },
+        {
+          title: 'Only that index changes',
+          note: 'The customer_id index removes 501 → 8 and adds 733 → 8. The _id index and any other index stay untouched, because the RecordId they store did not change. InnoDB behaves the same way with its primary key.',
+          active: ['yes', 'custIdx', 'idIdx'],
+          edges: ['yes-cust'],
+          subs: { custIdx: '733 → 8 (501 removed)' },
+        },
+      ],
+    },
+  ]}
+/>
+
 Since MongoDB 5.3 you can create a **clustered collection**, which is keyed by `_id` instead, like InnoDB. It is opt-in and fixed at creation.
 
 ## Finding a row through an index
