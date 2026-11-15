@@ -1,0 +1,117 @@
+---
+title: "Answers: Heap vs clustered tables"
+description: "Worked answers to the Concept 2 check questions, with the page counts, trade-offs and common mistakes."
+companion: "answers"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "storage", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/storage-hot.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-index-types.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-physical-structure.html"
+  - "https://www.mongodb.com/docs/manual/core/clustered-collections/"
+---
+
+<Tldr>
+Every answer comes back to one question: **what does an index point at?** PostgreSQL indexes point at a physical ctid, InnoDB secondary indexes point at the primary key, MongoDB indexes point at a `RecordId`. A physical pointer makes reads one hop but must change whenever the row moves; a logical pointer costs a second lookup but survives row moves.
+</Tldr>
+
+## Q1. Where PostgreSQL stores the row
+
+**Question:** a PostgreSQL table `orders` has a primary key on `id`. Where is the row data stored, and what does the primary key index contain?
+
+**The row** is stored in a **heap page**: any page with room (the page Postgres inserted into last, or one the free space map finds), **not** in `id` order.
+
+**The primary key index** is a separate B-tree whose entries are pairs **`id` → ctid**, e.g. `7 → (1,40)`, sorted by `id`. It holds no row data.
+
+| Part of the entry | Job |
+|---|---|
+| `id` (sorted) | Makes the search fast: about 3 pages down the B-tree to the right entry |
+| ctid `(page, slot)` | Says where the row physically is: the **only** way to reach it, because the heap has no order to search |
+
+The index also enforces uniqueness: a duplicate `id` fails at the index.
+
+> **Common mistake:** "the index stores the ctid for performance". The ctid is not an optimisation; without it the row cannot be found at all. The sorted key is what makes the search fast.
+
+## Q2. InnoDB lookups by primary key and by secondary index
+
+**Question:** an InnoDB table has a `BIGINT AUTO_INCREMENT` primary key and a secondary index on `email`. Which structures, and roughly how many pages, does `WHERE id = 42` read? And `WHERE email = 'a@x.com'`?
+
+| Query | Structures | Path | Pages (≈) |
+|---|---|---|---|
+| `WHERE id = 42` | Clustered index only | Root → … → leaf holding id 42; the full row is in that leaf | **3** |
+| `WHERE email = 'a@x.com'` | Secondary index, then clustered index | `email` B-tree → `'a@x.com' → 42` → clustered root → … → leaf holding id 42 | **3 + 3 = 6** |
+
+The secondary index stores the primary key value, not a page address, so InnoDB has to search the clustered index again from the root.
+
+| | InnoDB | PostgreSQL |
+|---|---|---|
+| By primary key | ≈ 3 (the leaf is the row) | ≈ 3 index + 1 heap = 4 |
+| By secondary index | ≈ 3 + 3 = 6 | ≈ 3 index + 1 heap = 4 |
+
+> **Common mistake:** describing only the secondary-index path and giving no page counts. The primary-key lookup is InnoDB's best case: one tree, no second step.
+
+## Q3. Why UUIDv4 hurts InnoDB more than PostgreSQL
+
+**Question:** why does a random UUIDv4 primary key hurt InnoDB more than PostgreSQL? Name the mechanism and two of its effects.
+
+**Why:** InnoDB stores the rows in primary-key order, so a random key belongs in a random leaf. PostgreSQL's heap ignores the key, so rows still go wherever there is room.
+
+**Mechanism: page splits.** When the target leaf is full and the new key belongs in its middle, InnoDB moves about half the page's rows to a new page. With random keys this is the **normal** case, all over the tree.
+
+| Effect | Why |
+|---|---|
+| Bigger table | Pages average about 69% full instead of 15/16: 100M rows of 150 B ≈ 22 GB instead of ≈ 16 GB |
+| More writes | Each split writes two pages plus the parent, and logs it |
+| Cache misses | Inserts hit random leaves, so most of the table must be in the buffer pool; a 50 GB table with an 8 GB pool means ≈ 84% of inserts read a page from disk first |
+| Fragmented range scans | Pages created by splits sit anywhere in the file, so leaf order stops matching file order |
+| Fatter secondary indexes | Every secondary index entry carries the 16 B (or 36 B as text) key |
+
+**PostgreSQL is not immune:** its primary-key index is a B-tree sorted by `id`, so it gets the same random inserts and splits. It suffers less because only small index entries move (≈ 4 GB of index for 100M rows, not a 22 GB table), and other indexes are unaffected. It also writes much more WAL: random inserts touch many index pages, and the first change to each page after a checkpoint writes the whole 8 KB page.
+
+**Fix:** a sequential `BIGINT` or a time-ordered UUIDv7 (`uuidv7()` in PostgreSQL 18), stored as `BINARY(16)` in MySQL.
+
+> **Common mistakes:** calling the split a "worst case" (with random keys it happens constantly), and naming the mechanism without its effects.
+
+## Q4. Primary key instead of page address
+
+**Question:** InnoDB secondary indexes store the primary key value instead of the row's page address. Give one benefit and one cost of that design.
+
+| | Explanation |
+|---|---|
+| **Benefit** | Rows move whenever pages split. The primary key does not change when a row moves, so no secondary index needs updating. With page addresses, every split would rewrite index entries in every secondary index |
+| **Cost 1** | Two tree searches per secondary lookup: ≈ 3 + 3 pages instead of PostgreSQL's 3 + 1 |
+| **Cost 2** | Every secondary index entry carries the primary key, so a wide key (UUID as text, multi-column) makes every index bigger |
+
+InnoDB pays on every secondary read so that row moves never touch secondary indexes. PostgreSQL makes the opposite choice: one-hop reads, but every index must change when a row gets a new ctid (Q5).
+
+> **Common mistake:** giving only the benefit. Every storage design is a trade-off; name both sides.
+
+## Q5. HOT vs non-HOT updates
+
+**Question:** a PostgreSQL table has 4 indexes, none on `status`. How many index entries does `UPDATE … SET status = 'shipped' WHERE id = 7` write (a) when the row's page has room, and (b) when it is full? Why the difference?
+
+Under MVCC, Postgres never overwrites the row; it writes a new version.
+
+| Case | HOT? | Index entries written | Why |
+|---|---|---|---|
+| (a) Page has room | ✓ HOT: same page, `status` not indexed | **0** | The old version `(1,40)` points to the new one `(1,41)` on the same page; indexes keep `7 → (1,40)` and follow the chain |
+| (b) Page is full | ✗ Not HOT: new version on another page, e.g. `(3,1)` | **4** | The ctid changed and every index stores ctids, so each index gets a new entry, even those on unchanged columns |
+
+When the page is full, the new version goes to **any page with room** (found through the free space map), not necessarily a new page. The dead version and the old index entries stay until VACUUM.
+
+**In practice:** `ALTER TABLE … SET (fillfactor = 90)` leaves room for HOT updates; avoid indexing frequently updated columns; check `n_tup_hot_upd` vs `n_tup_upd` in `pg_stat_user_tables`.
+
+> **Common mistakes:** describing the mechanism without the count (the point is 0 vs 4), and saying the new version always goes to a new page.
+
+## Q6. MongoDB find by _id
+
+**Question:** in MongoDB, how many structures does `find({ _id: x })` visit on a normal collection, and what changes for a clustered collection?
+
+| Collection | Structures | Path |
+|---|---|---|
+| Normal | **2**: `_id` index, collection B-tree | `_id` index → `x → RecordId 8` → collection B-tree keyed by RecordId → leaf with the document |
+| Clustered (5.3+) | **1**: collection B-tree keyed by `_id` | Straight down to the leaf holding `_id: x`; no separate `_id` index, no RecordId hop |
+
+A normal collection behaves like PostgreSQL (the primary key is just an index); a clustered collection behaves like InnoDB, including page splits when `_id` values are random.
+
+> **Common mistake:** giving the count without naming the structures or covering the clustered case.
