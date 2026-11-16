@@ -1,0 +1,647 @@
+---
+title: "UUIDv4 primary keys: what happens in each database"
+description: "Ten random inserts walked through step by step in InnoDB, PostgreSQL and MongoDB: where page splits happen, why the cache cliff appears, and why UUIDv7 fixes it."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "uuid", "primary-key", "page-split"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-physical-structure.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-information-schema-metrics-table.html"
+  - "https://www.postgresql.org/docs/current/btree-implementation.html"
+  - "https://www.postgresql.org/docs/current/pgstattuple.html"
+  - "https://www.postgresql.org/docs/current/functions-uuid.html"
+  - "https://www.mongodb.com/docs/manual/core/clustered-collections/"
+  - "https://www.rfc-editor.org/rfc/rfc9562"
+---
+
+<Tldr>
+A UUIDv4 is random, so each new key belongs at a **random place in a sorted B-tree**. Wherever a B-tree is sorted by that key, inserts hit random leaf pages and full pages **split**: pages end up about 69% full, writes multiply, and once the tree outgrows memory almost every insert first reads a page from disk. In **InnoDB** (and a MongoDB clustered collection) that B-tree is the whole table. In **PostgreSQL** and a normal MongoDB collection it is only the primary-key index, so the damage is smaller but real. A time-ordered **UUIDv7** always lands at the right edge and avoids all of it.
+</Tldr>
+
+## The example used in every animation
+
+To keep the steps readable, **one page holds 4 entries** (a real 16 KB InnoDB leaf holds about 100 rows; a real PostgreSQL index leaf holds a few hundred entries). Ten rows arrive in this order, with each UUIDv4 shortened to its first two hex characters:
+
+`7c, 2a, e1, 55, 91, 0f, 63, 3b, c4, 88`
+
+| Key type | Example values | Where a new key belongs in sorted order |
+|---|---|---|
+| `BIGINT AUTO_INCREMENT` | 1, 2, 3, … | Always after every existing key: the right edge |
+| UUIDv4 | `7c…`, `2a…`, `e1…` | Anywhere: 122 of its 128 bits are random |
+| UUIDv7 | `0192f3a1-…`, `0192f3a2-…` | (Almost) always the right edge: the first 48 bits are a millisecond timestamp |
+
+## InnoDB: the table itself splits
+
+| Term | Meaning |
+|---|---|
+| Leaf page (P1–P4) | A page of the clustered index holding **full rows**, sorted by primary key. P1–P4 are numbered in the order they were created, which is also their order in the file |
+| Room check | Is the leaf where the new key belongs already full? |
+| **✓ Room** | The row is added to that leaf, kept in key order inside the page |
+| **✗ Full** | Sequential key: start a new page on the right. Key in the middle of the page: **page split**, half the rows move to a new page |
+
+<Flow
+  title="InnoDB: ten inserts into the clustered index"
+  height={260}
+  nodes={[
+    { id: 'insert', label: 'INSERT', sub: 'next key', x: 20, y: 30, w: 150 },
+    { id: 'root', label: 'Root page', sub: 'all keys → P1', x: 230, y: 30, w: 170 },
+    { id: 'check', label: 'Room check', sub: 'target leaf full?', x: 460, y: 30, w: 150 },
+    { id: 'hit', label: '✓ Room', sub: 'add to leaf', x: 650, y: 10, w: 130, h: 44 },
+    { id: 'miss', label: '✗ Full', sub: 'new page / split', x: 650, y: 64, w: 130, h: 44 },
+    { id: 'p1', label: 'P1', sub: 'empty', x: 20, y: 190, w: 175, h: 56 },
+    { id: 'p2', label: 'P2', sub: 'not created', x: 215, y: 190, w: 175, h: 56 },
+    { id: 'p3', label: 'P3', sub: 'not created', x: 410, y: 190, w: 175, h: 56 },
+    { id: 'p4', label: 'P4', sub: 'not created', x: 605, y: 190, w: 175, h: 56 },
+  ]}
+  edges={[
+    { id: 'ins-root', from: 'insert', to: 'root', label: 'find leaf' },
+    { id: 'root-check', from: 'root', to: 'check', label: 'full?' },
+    { id: 'check-hit', from: 'check', to: 'hit' },
+    { id: 'check-miss', from: 'check', to: 'miss' },
+    { id: 'root-p1', from: 'root', to: 'p1', quiet: true },
+    { id: 'root-p2', from: 'root', to: 'p2', quiet: true },
+    { id: 'root-p3', from: 'root', to: 'p3', quiet: true },
+    { id: 'root-p4', from: 'root', to: 'p4', quiet: true },
+    { id: 'miss-p2', from: 'miss', to: 'p2', label: 'new page', quiet: true },
+    { id: 'miss-p3', from: 'miss', to: 'p3', label: 'new page', quiet: true },
+    { id: 'miss-p4', from: 'miss', to: 'p4', label: 'new page', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Sequential BIGINT (baseline)',
+      path: 'every key → rightmost leaf · ✗ full → new page on the right · 0 splits',
+      summary: 'ids 1 to 10. Every new id is the largest so far, so it always belongs in the rightmost leaf.',
+      steps: [
+        {
+          title: 'Inserts 1–4 fill P1',
+          note: 'P1 is the only leaf. Each id is larger than the last, so it is appended at the end of P1. Room check ✓ four times; after id 4, P1 is full.',
+          code: "INSERT INTO orders (customer_id) VALUES (501);  -- ids 1, 2, 3, 4",
+          active: ['insert', 'root', 'check', 'hit', 'p1'],
+          edges: ['ins-root', 'root-check', 'check-hit', 'root-p1'],
+          subs: { insert: 'ids 1–4', p1: '[1,2,3,4] · full' },
+        },
+        {
+          title: 'Insert 5: P1 is full',
+          note: '5 belongs after 4, in P1. Room check ✗: P1 has no space.',
+          active: ['insert', 'root', 'check', 'miss', 'p1'],
+          edges: ['ins-root', 'root-check', 'check-miss'],
+          subs: { insert: 'id 5' },
+        },
+        {
+          title: 'A new page on the right, nothing moves',
+          note: 'InnoDB sees ascending inserts, so instead of splitting P1 it starts P2 and puts 5 there. P1 keeps all its rows and stays full (in real pages about 15/16 full: InnoDB keeps 1/16 free for updates).',
+          active: ['miss', 'p2', 'p1', 'root'],
+          edges: ['miss-p2'],
+          subs: { p2: '[5]', root: '≤ 4 → P1 | rest → P2' },
+        },
+        {
+          title: 'Inserts 6–10',
+          note: '6, 7, 8 fill P2. 9 finds P2 full, so P3 is started the same way, and 10 joins it. Still no row has moved.',
+          active: ['root', 'p2', 'p3', 'miss'],
+          edges: ['root-p2', 'miss-p3'],
+          subs: { insert: 'ids 6–10', p2: '[5,6,7,8] · full', p3: '[9,10]', root: '≤ 4 P1 | ≤ 8 P2 | rest P3' },
+        },
+        {
+          title: 'Result: 3 pages, 0 splits',
+          note: 'Every page except the last is full, key order matches file order (P1 → P2 → P3), and only the rightmost page is ever written, so it is always in the buffer pool.',
+          active: ['p1', 'p2', 'p3'],
+        },
+      ],
+    },
+    {
+      title: 'UUIDv4 (random)',
+      path: 'keys → random leaves · ✗ full in the middle → page split ×3 · 4 pages, 62% full',
+      summary: 'The same ten rows with random keys: 7c, 2a, e1, 55, 91, 0f, 63, 3b, c4, 88.',
+      steps: [
+        {
+          title: 'Inserts 7c, 2a, e1, 55 fill P1',
+          note: 'P1 is the only leaf, so all four go there. Inside the page they are kept in key order, not arrival order: 2a, 55, 7c, e1. Room check ✓ four times; P1 is now full.',
+          code: "INSERT INTO orders (id, customer_id) VALUES (UUID_TO_BIN('7c…'), 501);  -- then 2a, e1, 55",
+          active: ['insert', 'root', 'check', 'hit', 'p1'],
+          edges: ['ins-root', 'root-check', 'check-hit', 'root-p1'],
+          subs: { insert: '7c, 2a, e1, 55', p1: '[2a,55,7c,e1] · full' },
+        },
+        {
+          title: 'Insert 91: P1 is full',
+          note: '91 belongs between 7c and e1, in the middle of P1. Room check ✗. A new page on the right would break key order, because e1 > 91 must stay after 91.',
+          active: ['insert', 'root', 'check', 'miss', 'p1'],
+          edges: ['ins-root', 'root-check', 'check-miss'],
+          subs: { insert: '91' },
+        },
+        {
+          title: 'Split 1: half of P1 moves to P2',
+          note: 'InnoDB allocates P2 and moves the upper half of P1 (7c, e1) into it, then inserts 91 into P2. Two rows were physically copied and the change was logged. P1 is now half empty.',
+          active: ['miss', 'p1', 'p2', 'root'],
+          edges: ['miss-p2'],
+          subs: { p1: '[2a,55] · 50%', p2: '[7c,91,e1]', root: '< 7c P1 | rest P2' },
+        },
+        {
+          title: 'Inserts 0f and 63 refill P1',
+          note: 'Both are below 7c, so both go to P1, which had room after the split. P1 is full again.',
+          active: ['insert', 'root', 'check', 'hit', 'p1'],
+          edges: ['ins-root', 'root-check', 'check-hit', 'root-p1'],
+          subs: { insert: '0f, 63', p1: '[0f,2a,55,63] · full' },
+        },
+        {
+          title: 'Insert 3b: P1 is full again',
+          note: '3b belongs between 2a and 55, in the middle of P1. Room check ✗.',
+          active: ['insert', 'root', 'check', 'miss', 'p1'],
+          edges: ['ins-root', 'root-check', 'check-miss'],
+          subs: { insert: '3b' },
+        },
+        {
+          title: 'Split 2: P3 sits between P1 and P2 in key order',
+          note: 'P3 takes the upper half of P1 (55, 63) and 3b goes into P1. P3 is the third page in the file, but in key order it sits between P1 and P2.',
+          active: ['miss', 'p1', 'p3', 'root'],
+          edges: ['miss-p3'],
+          subs: { p1: '[0f,2a,3b]', p3: '[55,63] · 50%', root: '< 55 P1 | < 7c P3 | rest P2' },
+        },
+        {
+          title: 'Insert c4 fills P2',
+          note: 'c4 is above 7c, so it goes to P2, which has room. P2 is now full.',
+          active: ['insert', 'root', 'check', 'hit', 'p2'],
+          edges: ['ins-root', 'root-check', 'check-hit', 'root-p2'],
+          subs: { insert: 'c4', p2: '[7c,91,c4,e1] · full' },
+        },
+        {
+          title: 'Insert 88: P2 is full',
+          note: '88 belongs between 7c and 91, in the middle of P2. Room check ✗.',
+          active: ['insert', 'root', 'check', 'miss', 'p2'],
+          edges: ['ins-root', 'root-check', 'check-miss'],
+          subs: { insert: '88' },
+        },
+        {
+          title: 'Split 3: P4 takes the top of P2',
+          note: 'P4 takes the upper half of P2 (c4, e1) and 88 goes into P2.',
+          active: ['miss', 'p2', 'p4', 'root'],
+          edges: ['miss-p4'],
+          subs: { p2: '[7c,88,91]', p4: '[c4,e1] · 50%', root: '< 55 P1 | < 7c P3 | < c4 P2 | rest P4' },
+        },
+        {
+          title: 'Result: 4 pages, 3 splits, 62% full',
+          note: 'The same 10 rows now take 4 pages instead of 3 (10 of 16 slots used). Key order is P1 → P3 → P2 → P4, but the file order is P1, P2, P3, P4, so a scan in key order jumps around the file. At real scale random inserts settle at about 69% full, against about 94% for sequential keys.',
+          active: ['p1', 'p2', 'p3', 'p4'],
+        },
+      ],
+    },
+    {
+      title: 'UUIDv7 (time-ordered)',
+      path: 'every key → rightmost leaf · ✗ full → new page on the right · 0 splits',
+      summary: 'UUIDv7 keys start with a millisecond timestamp, so each new key is larger than the previous one, just like 1, 2, 3.',
+      steps: [
+        {
+          title: 'Keys arrive in increasing order',
+          note: 'Ten rows inserted over a few milliseconds get keys like 0192f3a1-…, 0192f3a1-…, 0192f3a2-…: each one sorts after the last. Within the same millisecond the next bits keep the order.',
+          code: "INSERT INTO orders (id, customer_id) VALUES (UUID_TO_BIN('0192f3a1-…'), 501);",
+          active: ['insert', 'root', 'check', 'hit', 'p1'],
+          edges: ['ins-root', 'root-check', 'check-hit', 'root-p1'],
+          subs: { insert: 'v7 keys 1–4', p1: '[v1,v2,v3,v4] · full' },
+        },
+        {
+          title: 'Full rightmost leaf → new page',
+          note: 'The 5th key is the largest, so P1 being full only means P2 is started on the right. Nothing moves.',
+          active: ['check', 'miss', 'p2', 'root'],
+          edges: ['check-miss', 'miss-p2'],
+          subs: { p2: '[v5,v6,v7,v8] · full', p3: '[v9,v10]', root: '≤ v4 P1 | ≤ v8 P2 | rest P3' },
+        },
+        {
+          title: 'Result: identical to sequential ids',
+          note: '3 pages, 0 splits, full pages, one hot page. You keep what UUIDs give you (generated by the app, unique across systems) without the cost of random keys.',
+          active: ['p1', 'p2', 'p3'],
+        },
+      ],
+    },
+  ]}
+/>
+
+**Why it matters in InnoDB:** the clustered index *is* the table. Every split moves **whole rows**, the extra ~35% of pages is extra table, and every secondary index entry also carries the 16-byte key.
+
+## PostgreSQL: the heap is fine, the primary-key index splits
+
+| Term | Meaning |
+|---|---|
+| Heap page 0–2 | Where the **rows** go: any page with room, in arrival order. The key is ignored |
+| Index leaf L1–L4 | Leaf pages of `orders_pkey`, a B-tree of `id → ctid` entries sorted by `id` |
+| Room check | Is the index leaf where the new key belongs already full? |
+| **✓ Room** / **✗ Full** | Add the entry to that leaf / split the leaf (or start a new rightmost leaf if the key is the largest) |
+
+<Flow
+  title="PostgreSQL: ten inserts into a heap and its primary-key index"
+  height={400}
+  nodes={[
+    { id: 'h0', label: 'Heap page 0', sub: 'empty', x: 20, y: 30, w: 180, h: 56 },
+    { id: 'h1', label: 'Heap page 1', sub: 'empty', x: 220, y: 30, w: 180, h: 56 },
+    { id: 'h2', label: 'Heap page 2', sub: 'empty', x: 420, y: 30, w: 180, h: 56 },
+    { id: 'insert', label: 'INSERT', sub: 'next row', x: 20, y: 160, w: 150 },
+    { id: 'root', label: 'PK index root', sub: 'all keys → L1', x: 260, y: 160, w: 170 },
+    { id: 'check', label: 'Room check', sub: 'index leaf full?', x: 490, y: 160, w: 140 },
+    { id: 'hit', label: '✓ Room', sub: 'add entry', x: 660, y: 140, w: 120, h: 44 },
+    { id: 'miss', label: '✗ Full', sub: 'split leaf', x: 660, y: 194, w: 120, h: 44 },
+    { id: 'l1', label: 'Index leaf L1', sub: 'empty', x: 20, y: 330, w: 175, h: 56 },
+    { id: 'l2', label: 'Index leaf L2', sub: 'not created', x: 215, y: 330, w: 175, h: 56 },
+    { id: 'l3', label: 'Index leaf L3', sub: 'not created', x: 410, y: 330, w: 175, h: 56 },
+    { id: 'l4', label: 'Index leaf L4', sub: 'not created', x: 605, y: 330, w: 175, h: 56 },
+  ]}
+  edges={[
+    { id: 'ins-h0', from: 'insert', to: 'h0', label: 'row', quiet: true },
+    { id: 'ins-h1', from: 'insert', to: 'h1', label: 'row', quiet: true },
+    { id: 'ins-h2', from: 'insert', to: 'h2', label: 'row', quiet: true },
+    { id: 'ins-root', from: 'insert', to: 'root', label: 'key' },
+    { id: 'root-check', from: 'root', to: 'check', label: 'full?' },
+    { id: 'check-hit', from: 'check', to: 'hit' },
+    { id: 'check-miss', from: 'check', to: 'miss' },
+    { id: 'root-l1', from: 'root', to: 'l1', quiet: true },
+    { id: 'root-l2', from: 'root', to: 'l2', quiet: true },
+    { id: 'root-l3', from: 'root', to: 'l3', quiet: true },
+    { id: 'root-l4', from: 'root', to: 'l4', quiet: true },
+    { id: 'miss-l2', from: 'miss', to: 'l2', label: 'split', quiet: true },
+    { id: 'miss-l3', from: 'miss', to: 'l3', label: 'split', quiet: true },
+    { id: 'miss-l4', from: 'miss', to: 'l4', label: 'split', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Sequential BIGINT (baseline)',
+      path: 'heap: append · index: every key → rightmost leaf, ✗ full → new leaf · 0 splits',
+      summary: 'ids 1 to 10. The heap and the index both grow at the end.',
+      steps: [
+        {
+          title: 'Rows 1–4: heap page 0, index leaf L1',
+          note: 'Each row goes into heap page 0 as ctid (0,1) … (0,4). Each index entry is the largest key so far, so it is appended to L1. Room check ✓ four times.',
+          code: 'INSERT INTO orders (customer_id) VALUES (501);  -- ids 1–4',
+          active: ['insert', 'h0', 'root', 'check', 'hit', 'l1'],
+          edges: ['ins-h0', 'ins-root', 'root-check', 'check-hit', 'root-l1'],
+          subs: { insert: 'ids 1–4', h0: '1,2,3,4 · full', l1: '[1,2,3,4] · full' },
+        },
+        {
+          title: 'Row 5: new heap page, new index leaf',
+          note: 'Heap page 0 is full, so row 5 goes to page 1 as (1,1). In the index, 5 is the largest key and L1 is full (✗), so Postgres starts L2 on the right. In real pages it leaves L1 about 90% full (the B-tree fillfactor) instead of splitting it in half.',
+          active: ['insert', 'h1', 'root', 'check', 'miss', 'l2'],
+          edges: ['ins-h1', 'ins-root', 'root-check', 'check-miss', 'miss-l2'],
+          subs: { insert: 'id 5', h1: '5', l2: '[5]', root: '≤ 4 L1 | rest L2' },
+        },
+        {
+          title: 'Rows 6–10',
+          note: 'Rows 6–8 fill heap page 1 and L2; rows 9–10 go to heap page 2 and a new leaf L3. Nothing moves anywhere.',
+          active: ['h1', 'h2', 'l2', 'l3', 'root'],
+          edges: ['ins-h2', 'miss-l3'],
+          subs: { insert: 'ids 6–10', h1: '5,6,7,8 · full', h2: '9,10', l2: '[5,6,7,8] · full', l3: '[9,10]', root: '≤ 4 L1 | ≤ 8 L2 | rest L3' },
+        },
+        {
+          title: 'Result',
+          note: 'Heap: 3 pages, full. Index: 3 leaves, 0 splits, only the rightmost leaf is ever written.',
+          active: ['h0', 'h1', 'h2', 'l1', 'l2', 'l3'],
+        },
+      ],
+    },
+    {
+      title: 'UUIDv4 (random)',
+      path: 'heap: append, 0 splits · index: keys → random leaves, ✗ full → split ×3',
+      summary: 'Keys 7c, 2a, e1, 55, 91, 0f, 63, 3b, c4, 88. Watch the heap stay calm while the index splits.',
+      steps: [
+        {
+          title: 'Rows 7c, 2a, e1, 55',
+          note: 'Heap page 0 gets the rows in arrival order: 7c at (0,1), 2a at (0,2), e1 at (0,3), 55 at (0,4). The index stores the entries sorted by key in L1: 2a, 55, 7c, e1. L1 is full.',
+          code: "INSERT INTO orders (id, customer_id) VALUES ('7c…', 501);  -- then 2a, e1, 55",
+          active: ['insert', 'h0', 'root', 'check', 'hit', 'l1'],
+          edges: ['ins-h0', 'ins-root', 'root-check', 'check-hit', 'root-l1'],
+          subs: { insert: '7c, 2a, e1, 55', h0: '7c,2a,e1,55 · full', l1: '[2a,55,7c,e1] · full' },
+        },
+        {
+          title: 'Row 91: the heap does not care',
+          note: 'Heap page 0 is full, so the row goes to page 1 as (1,1). The heap never looks at the key, so a random key costs it nothing.',
+          active: ['insert', 'h1'],
+          edges: ['ins-h1'],
+          subs: { insert: '91', h1: '91' },
+        },
+        {
+          title: 'Index: 91 belongs in a full leaf',
+          note: 'The entry 91 → (1,1) belongs between 7c and e1, in L1. Room check ✗.',
+          active: ['insert', 'root', 'check', 'miss', 'l1'],
+          edges: ['ins-root', 'root-check', 'check-miss'],
+        },
+        {
+          title: 'Index split 1',
+          note: 'L2 takes the upper half of L1 (7c, e1) and the new entry 91 goes in. Only index entries move; the rows in the heap stay exactly where they are.',
+          active: ['miss', 'l1', 'l2', 'root'],
+          edges: ['miss-l2'],
+          subs: { l1: '[2a,55] · 50%', l2: '[7c,91,e1]', root: '< 7c L1 | rest L2' },
+        },
+        {
+          title: 'Rows 0f, 63, 3b',
+          note: 'Heap: they fill page 1 as (1,2), (1,3), (1,4). Index: 0f and 63 fit in L1, which is then full; 3b belongs between 2a and 55, so L1 splits again: L3 takes 55 and 63.',
+          active: ['h1', 'check', 'miss', 'l1', 'l3', 'root'],
+          edges: ['check-miss', 'miss-l3'],
+          subs: { insert: '0f, 63, 3b', h1: '91,0f,63,3b · full', l1: '[0f,2a,3b]', l3: '[55,63] · 50%', root: '< 55 L1 | < 7c L3 | rest L2' },
+        },
+        {
+          title: 'Rows c4, 88',
+          note: 'Heap: page 2 as (2,1) and (2,2). Index: c4 fills L2; 88 belongs between 7c and 91, so L2 splits: L4 takes c4 and e1.',
+          active: ['h2', 'check', 'miss', 'l2', 'l4', 'root'],
+          edges: ['ins-h2', 'check-miss', 'miss-l4'],
+          subs: { insert: 'c4, 88', h2: 'c4,88', l2: '[7c,88,91]', l4: '[c4,e1] · 50%', root: '< 55 L1 | < 7c L3 | < c4 L2 | rest L4' },
+        },
+        {
+          title: 'Result: heap untouched, index damaged',
+          note: 'Heap: 3 full pages, 0 splits, identical to sequential ids. Index: 4 leaves instead of 3, 3 splits, 62% full. The damage is real but limited to index entries of about 28 bytes; rows never move, and other indexes (customer_id → ctid) are unaffected.',
+          active: ['h0', 'h1', 'h2', 'l1', 'l2', 'l3', 'l4'],
+        },
+      ],
+    },
+  ]}
+/>
+
+**Why it matters in PostgreSQL:** the PK index grows about a third larger and needs to stay in memory to keep inserts fast. Random inserts also inflate the WAL: after each checkpoint, the first change to every page writes the whole 8 KB page into the WAL, and random keys touch thousands of different index pages instead of one.
+
+## MongoDB: depends on the collection type
+
+| Term | Meaning |
+|---|---|
+| Collection leaf | Where documents are stored in a normal collection, sorted by `RecordId` (which only grows) |
+| `_id` index leaf | A leaf of the `_id` index: `_id → RecordId` entries sorted by `_id` |
+| Clustered collection | A collection stored as a B-tree on `_id` itself (5.3+): its leaves hold the whole documents |
+| **✓ Room** / **✗ Full** | Add to the leaf / split it |
+
+<Flow
+  title="MongoDB: ten inserts with a UUIDv4 _id"
+  height={400}
+  nodes={[
+    { id: 'c0', label: 'Collection leaf 0', sub: 'empty', x: 20, y: 30, w: 180, h: 56 },
+    { id: 'c1', label: 'Collection leaf 1', sub: 'empty', x: 220, y: 30, w: 180, h: 56 },
+    { id: 'c2', label: 'Collection leaf 2', sub: 'empty', x: 420, y: 30, w: 180, h: 56 },
+    { id: 'insert', label: 'insertOne', sub: 'next document', x: 20, y: 160, w: 150 },
+    { id: 'root', label: '_id B-tree root', sub: 'all keys → leaf 1', x: 260, y: 160, w: 170 },
+    { id: 'check', label: 'Room check', sub: '_id leaf full?', x: 490, y: 160, w: 140 },
+    { id: 'hit', label: '✓ Room', sub: 'add to leaf', x: 660, y: 140, w: 120, h: 44 },
+    { id: 'miss', label: '✗ Full', sub: 'split leaf', x: 660, y: 194, w: 120, h: 44 },
+    { id: 'l1', label: '_id leaf 1', sub: 'empty', x: 20, y: 330, w: 175, h: 56 },
+    { id: 'l2', label: '_id leaf 2', sub: 'not created', x: 215, y: 330, w: 175, h: 56 },
+    { id: 'l3', label: '_id leaf 3', sub: 'not created', x: 410, y: 330, w: 175, h: 56 },
+    { id: 'l4', label: '_id leaf 4', sub: 'not created', x: 605, y: 330, w: 175, h: 56 },
+  ]}
+  edges={[
+    { id: 'ins-c0', from: 'insert', to: 'c0', label: 'append', quiet: true },
+    { id: 'ins-c1', from: 'insert', to: 'c1', label: 'append', quiet: true },
+    { id: 'ins-c2', from: 'insert', to: 'c2', label: 'append', quiet: true },
+    { id: 'ins-root', from: 'insert', to: 'root', label: '_id' },
+    { id: 'root-check', from: 'root', to: 'check', label: 'full?' },
+    { id: 'check-hit', from: 'check', to: 'hit' },
+    { id: 'check-miss', from: 'check', to: 'miss' },
+    { id: 'root-l1', from: 'root', to: 'l1', quiet: true },
+    { id: 'miss-l2', from: 'miss', to: 'l2', label: 'split', quiet: true },
+    { id: 'miss-l3', from: 'miss', to: 'l3', label: 'split', quiet: true },
+    { id: 'miss-l4', from: 'miss', to: 'l4', label: 'split', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Normal collection',
+      path: 'documents: append by RecordId · _id index: random leaves, split ×3',
+      summary: 'Like PostgreSQL: documents are stored by RecordId and only the _id index sees the random key.',
+      steps: [
+        {
+          title: 'Documents 7c, 2a, e1, 55',
+          note: 'They get RecordIds 1–4 and are appended to collection leaf 0 in arrival order. The _id index stores 2a, 55, 7c, e1 → RecordIds, sorted by _id, in _id leaf 1, which is now full.',
+          code: "db.orders.insertOne({ _id: UUID('7c…'), customer_id: 501 })  // then 2a, e1, 55",
+          active: ['insert', 'c0', 'root', 'check', 'hit', 'l1'],
+          edges: ['ins-c0', 'ins-root', 'root-check', 'check-hit', 'root-l1'],
+          subs: { insert: '7c, 2a, e1, 55', c0: 'RecordId 1–4 · full', l1: '[2a,55,7c,e1] · full' },
+        },
+        {
+          title: 'Document 91',
+          note: 'It gets RecordId 5 and is appended to collection leaf 1: no decision about the key. In the _id index, 91 belongs in the middle of the full leaf 1 (✗), so it splits: leaf 2 takes 7c and e1.',
+          active: ['insert', 'c1', 'check', 'miss', 'l1', 'l2'],
+          edges: ['ins-c1', 'check-miss', 'miss-l2'],
+          subs: { insert: '91', c1: 'RecordId 5', l1: '[2a,55] · 50%', l2: '[7c,91,e1]', root: '< 7c leaf 1 | rest leaf 2' },
+        },
+        {
+          title: 'Documents 0f, 63, 3b',
+          note: 'Appended to collection leaf 1 as RecordIds 6–8. In the _id index, 0f and 63 fill leaf 1 and 3b splits it: leaf 3 takes 55 and 63.',
+          active: ['c1', 'check', 'miss', 'l1', 'l3'],
+          edges: ['check-miss', 'miss-l3'],
+          subs: { insert: '0f, 63, 3b', c1: 'RecordId 5–8 · full', l1: '[0f,2a,3b]', l3: '[55,63] · 50%' },
+        },
+        {
+          title: 'Documents c4, 88',
+          note: 'Appended to collection leaf 2 as RecordIds 9 and 10. In the _id index, c4 fills leaf 2 and 88 splits it: leaf 4 takes c4 and e1.',
+          active: ['c2', 'check', 'miss', 'l2', 'l4'],
+          edges: ['ins-c2', 'check-miss', 'miss-l4'],
+          subs: { insert: 'c4, 88', c2: 'RecordId 9–10', l2: '[7c,88,91]', l4: '[c4,e1] · 50%' },
+        },
+        {
+          title: 'Result: same picture as PostgreSQL',
+          note: 'Documents: 3 leaves, never moved. _id index: 4 leaves, 3 splits, 62% full. With the default ObjectId, which starts with a timestamp, the _id index would append at its right edge instead.',
+          active: ['c0', 'c1', 'c2', 'l1', 'l2', 'l3', 'l4'],
+        },
+      ],
+    },
+    {
+      title: 'Clustered collection',
+      path: 'documents live in the _id B-tree · random leaves, split ×3 · whole documents move',
+      summary: 'Like InnoDB: the collection is the B-tree on _id, so the random key decides where each whole document goes.',
+      subs: {
+        c0: '(not used)',
+        c1: '(not used)',
+        c2: '(not used)',
+        l1: 'empty · holds documents',
+        l2: 'not created',
+        l3: 'not created',
+        l4: 'not created',
+      },
+      steps: [
+        {
+          title: 'Documents 7c, 2a, e1, 55',
+          note: 'There is no RecordId and no separate _id index: the documents themselves are stored in the _id B-tree, sorted by _id. Leaf 1 holds 2a, 55, 7c, e1 and is full.',
+          code: "db.createCollection('orders', { clusteredIndex: { key: { _id: 1 }, unique: true } })",
+          active: ['insert', 'root', 'check', 'hit', 'l1'],
+          edges: ['ins-root', 'root-check', 'check-hit', 'root-l1'],
+          subs: { insert: '7c, 2a, e1, 55', l1: '[2a,55,7c,e1] docs · full' },
+        },
+        {
+          title: 'Document 91: split moves whole documents',
+          note: '91 belongs in the middle of the full leaf 1 (✗). Leaf 2 takes the upper half: the whole documents 7c and e1 are copied, not just small index entries.',
+          active: ['insert', 'check', 'miss', 'l1', 'l2'],
+          edges: ['ins-root', 'check-miss', 'miss-l2'],
+          subs: { insert: '91', l1: '[2a,55] docs · 50%', l2: '[7c,91,e1] docs', root: '< 7c leaf 1 | rest leaf 2' },
+        },
+        {
+          title: 'Documents 3b and 88 split again',
+          note: 'Exactly as in InnoDB: 3b splits leaf 1 (leaf 3 takes 55, 63) and 88 splits leaf 2 (leaf 4 takes c4, e1).',
+          active: ['check', 'miss', 'l3', 'l4'],
+          edges: ['check-miss', 'miss-l3', 'miss-l4'],
+          subs: { insert: '0f … 88', l1: '[0f,2a,3b] docs', l2: '[7c,88,91] docs', l3: '[55,63] docs · 50%', l4: '[c4,e1] docs · 50%' },
+        },
+        {
+          title: 'Result: same picture as InnoDB',
+          note: 'The whole collection is spread over half-full leaves, and the WiredTiger cache must hold most of it to keep inserts fast. Use a clustered collection only with an increasing _id (ObjectId, UUIDv7, a timestamp).',
+          active: ['l1', 'l2', 'l3', 'l4'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Why it matters: the cache cliff
+
+The splits are only half the story. The bigger production problem is **which page each insert has to touch, and whether that page is in memory**.
+
+| Term | Meaning |
+|---|---|
+| Buffer pool | InnoDB's page cache in RAM (`shared_buffers` in PostgreSQL, the WiredTiger cache in MongoDB) |
+| **✓ In memory** | The leaf the insert needs is already cached: change it in RAM |
+| **✗ Not in memory** | The leaf must first be read from disk, and a cached page evicted to make room |
+
+<Flow
+  title="Is the leaf this insert needs already in memory?"
+  height={340}
+  nodes={[
+    { id: 'insert', label: 'INSERT', sub: 'target leaf', x: 20, y: 30, w: 160 },
+    { id: 'bp', label: 'Buffer pool', sub: '8 GB of pages', x: 260, y: 30, w: 180 },
+    { id: 'disk', label: 'Disk', sub: 'table / index', x: 560, y: 30, w: 180 },
+    { id: 'bpHit', label: '✓ In memory', sub: 'change in RAM', x: 245, y: 160, w: 100, h: 48 },
+    { id: 'bpMiss', label: '✗ Not in memory', sub: 'read it first', x: 355, y: 160, w: 120, h: 48 },
+    { id: 'write', label: 'Insert into the leaf', sub: 'page becomes dirty', x: 260, y: 270, w: 180 },
+    { id: 'evict', label: 'Evict a page', sub: 'write back if dirty', x: 560, y: 270, w: 180 },
+  ]}
+  edges={[
+    { id: 'ins-bp', from: 'insert', to: 'bp', label: 'leaf?' },
+    { id: 'bp-hit', from: 'bp', to: 'bpHit' },
+    { id: 'bp-miss', from: 'bp', to: 'bpMiss' },
+    { id: 'hit-write', from: 'bpHit', to: 'write' },
+    { id: 'miss-evict', from: 'bpMiss', to: 'evict', label: 'free a slot' },
+    { id: 'evict-disk', from: 'evict', to: 'disk', label: 'write 16 KB' },
+    { id: 'disk-bp', from: 'disk', to: 'bp', label: 'read 16 KB' },
+    { id: 'miss-write', from: 'bpMiss', to: 'write' },
+  ]}
+  cases={[
+    {
+      title: 'Sequential key',
+      path: 'target = rightmost leaf · ✓ in memory, always',
+      summary: 'Every insert touches the same rightmost leaf, which was written a moment ago.',
+      subs: { disk: 'table 50 GB' },
+      steps: [
+        {
+          title: 'Which leaf?',
+          note: 'A sequential key always belongs in the rightmost leaf, so the whole insert workload touches one page (plus a new one now and then).',
+          code: "INSERT INTO orders (customer_id) VALUES (501);",
+          active: ['insert', 'bp'],
+          edges: ['ins-bp'],
+          subs: { insert: 'rightmost leaf' },
+        },
+        {
+          title: '✓ In memory',
+          note: 'That page was used by the previous insert, so it is in the buffer pool. The table size does not matter: 5 GB or 500 GB, the hot page is always cached.',
+          active: ['bp', 'bpHit'],
+          edges: ['bp-hit'],
+        },
+        {
+          title: 'Insert in RAM',
+          note: 'The row is added in memory. The dirty page is flushed to disk later, once, after many inserts have filled it. Disk reads per insert: about 0.',
+          active: ['bpHit', 'write'],
+          edges: ['hit-write'],
+        },
+      ],
+    },
+    {
+      title: 'UUIDv4, table fits in memory',
+      path: 'target = random leaf · ✓ in memory (the whole table is cached)',
+      summary: 'Early in the product\'s life: a 5 GB table and an 8 GB buffer pool.',
+      subs: { disk: 'table 5 GB' },
+      steps: [
+        {
+          title: 'Which leaf?',
+          note: 'The random key belongs in a random leaf, any of about 300,000 leaf pages.',
+          code: "INSERT INTO orders (id, customer_id) VALUES (UUID_TO_BIN('7c…'), 501);",
+          active: ['insert', 'bp'],
+          edges: ['ins-bp'],
+          subs: { insert: 'random leaf' },
+        },
+        {
+          title: '✓ In memory',
+          note: 'The whole 5 GB table fits in the 8 GB buffer pool, so whichever leaf it is, it is cached.',
+          active: ['bp', 'bpHit'],
+          edges: ['bp-hit'],
+        },
+        {
+          title: 'Insert in RAM, so the problem is hidden',
+          note: 'Inserts are fast and nothing looks wrong. The splits are already making the table about a third bigger, so it outgrows memory sooner.',
+          active: ['bpHit', 'write'],
+          edges: ['hit-write'],
+        },
+      ],
+    },
+    {
+      title: 'UUIDv4, table larger than memory',
+      path: 'target = random leaf · ✗ not in memory ≈ 84% · evict → read from disk → insert',
+      summary: 'Months later: a 50 GB table and the same 8 GB buffer pool.',
+      subs: { disk: 'table 50 GB' },
+      steps: [
+        {
+          title: 'Which leaf?',
+          note: 'A random leaf among about 3 million. Only 8 GB of the 50 GB table is cached, so the chance it is in memory is about 8 / 50 = 16%.',
+          code: "INSERT INTO orders (id, customer_id) VALUES (UUID_TO_BIN('6d…'), 733);",
+          active: ['insert', 'bp'],
+          edges: ['ins-bp'],
+          subs: { insert: 'random leaf' },
+        },
+        {
+          title: '✗ Not in memory (about 84% of inserts)',
+          note: 'The leaf has to be loaded before the row can be added.',
+          active: ['bp', 'bpMiss'],
+          edges: ['bp-miss'],
+        },
+        {
+          title: 'Evict a page to make room',
+          note: 'The buffer pool is full, so InnoDB evicts the least recently used page. With random inserts that page is often dirty (an earlier insert changed it), so it must be written back first: a random 16 KB write.',
+          active: ['bpMiss', 'evict', 'disk'],
+          edges: ['miss-evict', 'evict-disk'],
+        },
+        {
+          title: 'Read the leaf from disk',
+          note: 'Then the target leaf is read: a random 16 KB read, about 100 µs on an SSD, much slower on network storage.',
+          active: ['disk', 'bp'],
+          edges: ['disk-bp'],
+        },
+        {
+          title: 'Only now insert the row',
+          note: 'Per insert: about 1 random read plus up to 1 random write, against about 0 for a sequential key. Insert throughput can drop by an order of magnitude when the table crosses the memory size. That is why teams notice UUIDv4 problems months after launch.',
+          active: ['bpMiss', 'write'],
+          edges: ['miss-write'],
+        },
+      ],
+    },
+  ]}
+/>
+
+The same flow applies to PostgreSQL and normal MongoDB collections, but for the **primary-key index only**. A 100M-row PK index is a few GB rather than a 50 GB table, so PostgreSQL and MongoDB hit the cliff much later than InnoDB.
+
+## Each database at a glance
+
+| | InnoDB | MongoDB clustered | PostgreSQL | MongoDB normal |
+|---|---|---|---|---|
+| What is sorted by the key | The table | The collection | Only the PK index | Only the `_id` index |
+| What moves in a split | Whole rows | Whole documents | Index entries (~28 B) | Index entries |
+| Page fill with UUIDv4 | ~69% instead of ~94% | ~69% | ~69% in the PK index | ~69% in the `_id` index |
+| Cache cliff | When the table outgrows memory | When the collection does | When the PK index does | When the `_id` index does |
+| Other indexes | Carry the 16 B key in every entry | Carry the key | Unaffected | Unaffected |
+| Severity | High | High | Medium (plus extra WAL) | Medium |
+
+## How to check an existing system
+
+| Engine | What to run | Sign of trouble |
+|---|---|---|
+| PostgreSQL | `CREATE EXTENSION pgstattuple;` then `SELECT avg_leaf_density FROM pgstatindex('orders_pkey');` | Leaf density near 70% instead of near 90% |
+| MySQL | `SET GLOBAL innodb_monitor_enable = 'index_page_splits';` then `SELECT name, count FROM information_schema.INNODB_METRICS WHERE name = 'index_page_splits';` | The count keeps climbing during normal inserts |
+| MongoDB | `db.orders.stats({ indexDetails: true })` and compare the `_id` index size with the number of documents | The `_id` index much larger than expected for its entry count |
+
+## The fix
+
+| Situation | Do this |
+|---|---|
+| New table, any engine | Use `BIGINT` identity / `AUTO_INCREMENT`, or a UUIDv7 if the app must generate ids |
+| PostgreSQL 18+ | `id uuid DEFAULT uuidv7()`; older versions generate UUIDv7 in the application |
+| MySQL | Store UUIDs as `BINARY(16)`, never `CHAR(36)`; generate UUIDv7 in the application, or use `UUID_TO_BIN(UUID(), 1)`, which reorders MySQL's time-based UUIDv1 so the timestamp comes first |
+| MongoDB | Keep the default `ObjectId` (time-ordered), or use UUIDv7; use clustered collections only with an increasing `_id` |
+| Existing UUIDv4 table | Switching keys is a migration; meanwhile, size memory so the PK index (PostgreSQL, MongoDB) or table (InnoDB) stays cached, and rebuild bloated indexes (`REINDEX CONCURRENTLY`, `OPTIMIZE TABLE`) |
+
+<Pitfall>
+UUIDv7 exposes the creation time of each row in its first 48 bits. If ids are shown to users and creation time is sensitive, keep a separate random public id and use the time-ordered key internally.
+</Pitfall>
