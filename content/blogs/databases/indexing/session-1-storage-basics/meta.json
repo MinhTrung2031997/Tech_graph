@@ -4,10 +4,10 @@
   "defaultOpen": false,
   "pages": [
     "concept-1-pages/index",
-    "concept-2-heap-vs-clustered/index"
+    "concept-2-heap-vs-clustered/index",
+    "concept-3-seq-scan/index"
   ],
   "planned": [
-    "Concept 3: Seq Scan — what a full scan does",
     "Concept 4: Sequential vs random I/O",
     "Lab and session quiz"
   ]
