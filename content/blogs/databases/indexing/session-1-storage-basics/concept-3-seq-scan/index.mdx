@@ -1,0 +1,824 @@
+---
+title: "Concept 3: Seq Scan — what a full scan does"
+description: "What a full table scan really reads: every page of the table, in order, whatever the query returns. How PostgreSQL, InnoDB and MongoDB do it, what it costs, and how each engine keeps a big scan from flushing its cache."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "storage", "seq-scan", "explain"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/using-explain.html"
+  - "https://www.postgresql.org/docs/current/runtime-config-query.html#RUNTIME-CONFIG-QUERY-CONSTANTS"
+  - "https://www.postgresql.org/docs/current/parallel-plans.html"
+  - "https://github.com/postgres/postgres/blob/master/src/backend/storage/buffer/README"
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/explain-output.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-buffer-pool.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-performance-read_ahead.html"
+  - "https://www.mongodb.com/docs/manual/reference/explain-results/"
+  - "https://www.mongodb.com/docs/manual/reference/parameters/"
+---
+
+<Tldr>
+With no usable index, the database answers a query by reading **every page of the table, in order**, and checking every row against the `WHERE` clause. That is a **Seq Scan** in PostgreSQL, `type: ALL` in MySQL and `COLLSCAN` in MongoDB. Its cost depends on **how many pages the table has**, not on how many rows the query returns: one matching row or a million, the scan reads the same 10,300 pages. Every index in this course is a way to avoid this.
+</Tldr>
+
+## What a full scan is
+
+| Engine | Name in EXPLAIN | What it walks | In what order |
+|---|---|---|---|
+| PostgreSQL | `Seq Scan` | Every page of the heap file | File order: page 0, 1, 2, … |
+| MySQL InnoDB | `type: ALL` ("Table scan") | Every leaf page of the clustered index | Primary-key order, following each leaf's "next page" pointer |
+| MongoDB | `COLLSCAN` | Every document in the collection B-tree | `RecordId` order (`_id` order for a clustered collection) |
+
+The running example is the `orders` table from Concept 1: **1M rows of about 80 bytes, ≈ 97 rows per page, ≈ 10,300 pages ≈ 80 MB**. `status = 'shipped'` matches 5% of the rows (50,000).
+
+## PostgreSQL: Seq Scan
+
+For each page, Postgres runs two checks on every row:
+
+| Term | Meaning |
+|---|---|
+| **Visible** | MVCC check: this row version belongs to the snapshot the query sees (Concept 2: an UPDATE leaves the old version behind) |
+| **✓ Visible / ✗ Dead** | A dead version (deleted, or replaced by a newer version) is skipped, but it was still read: it sits in the page |
+| **Filter** | The `WHERE` condition, checked on each visible row |
+| **✓ Match / ✗ No match** | A match goes to the result; a non-match is counted in `Rows Removed by Filter` |
+| **LIMIT reached** | With `LIMIT n`, the scan stops after the n-th match; otherwise it runs to the last page |
+
+<Flow
+  title="PostgreSQL: what a Seq Scan reads"
+  height={410}
+  nodes={[
+    { id: 'q', label: 'Seq Scan', sub: 'on orders', x: 10, y: 20, w: 160 },
+    { id: 'p0', label: 'page 0', sub: 'bytes 0–8,191', x: 200, y: 20, w: 115 },
+    { id: 'p1', label: 'page 1', sub: '8,192–16,383', x: 355, y: 20, w: 115 },
+    { id: 'p2', label: 'page 2', sub: '16,384–24,575', x: 510, y: 20, w: 115 },
+    { id: 'plast', label: 'page 10,299', sub: 'last page', x: 665, y: 20, w: 115 },
+    { id: 'cur', label: 'Current row', sub: 'ctid (page, slot)', x: 310, y: 140, w: 180 },
+    { id: 'dead', label: '✗ Dead', sub: 'skip, still read', x: 90, y: 140, w: 160 },
+    { id: 'vis', label: '✓ Visible', sub: 'check the filter', x: 325, y: 240, w: 150 },
+    { id: 'nomatch', label: '✗ No match', sub: 'removed: 0', x: 90, y: 240, w: 160 },
+    { id: 'match', label: '✓ Match', sub: 'send to result', x: 535, y: 240, w: 130 },
+    { id: 'out', label: 'Result', sub: '0 rows', x: 535, y: 340, w: 245 },
+    { id: 'stop', label: '■ Stop', sub: 'LIMIT reached', x: 325, y: 340, w: 150 },
+  ]}
+  edges={[
+    { id: 'q-p0', from: 'q', to: 'p0' },
+    { id: 'p0-p1', from: 'p0', to: 'p1' },
+    { id: 'p1-p2', from: 'p1', to: 'p2' },
+    { id: 'p2-pl', from: 'p2', to: 'plast' },
+    { id: 'p0-cur', from: 'p0', to: 'cur', quiet: true },
+    { id: 'p1-cur', from: 'p1', to: 'cur', quiet: true },
+    { id: 'pl-cur', from: 'plast', to: 'cur', quiet: true },
+    { id: 'cur-dead', from: 'cur', to: 'dead' },
+    { id: 'cur-vis', from: 'cur', to: 'vis' },
+    { id: 'vis-nomatch', from: 'vis', to: 'nomatch' },
+    { id: 'vis-match', from: 'vis', to: 'match' },
+    { id: 'match-out', from: 'match', to: 'out' },
+    { id: 'out-stop', from: 'out', to: 'stop' },
+  ]}
+  cases={[
+    {
+      title: 'Filter: a few rows match',
+      path: 'page 0 → 10,299 in order → each row: ✓ visible → ✓ match / ✗ no match → result',
+      summary: 'All 10,300 pages and all 1M rows are read to return 50,000 rows.',
+      steps: [
+        {
+          title: 'Start at page 0',
+          note: 'There is no index on status, so the only way to find the shipped rows is to look at every row. Postgres reads the heap in file order, starting at page 0 (byte 0). Each page goes through shared_buffers exactly as in Concept 1: a hit, or a read from the OS.',
+          code: "SELECT * FROM orders WHERE status = 'shipped';",
+          active: ['q', 'p0'],
+          edges: ['q-p0'],
+        },
+        {
+          title: 'Row (0,1): ✓ visible',
+          note: 'Postgres follows line pointer [1] to the row at bytes 8,112–8,191 and checks MVCC visibility first: this version is live.',
+          active: ['p0', 'cur', 'vis'],
+          edges: ['p0-cur', 'cur-vis'],
+          subs: { cur: '(0,1) · id 1 · paid' },
+        },
+        {
+          title: 'Row (0,1): ✗ no match',
+          note: "status is 'paid', not 'shipped'. The row is dropped and counted in Rows Removed by Filter. The work is already done: the page was read and the row was checked.",
+          active: ['vis', 'nomatch'],
+          edges: ['vis-nomatch'],
+          subs: { nomatch: 'removed: 1' },
+        },
+        {
+          title: 'Row (0,2): ✓ visible, ✓ match',
+          note: "Row (0,2) is live and its status is 'shipped', so it goes to the result. Postgres then checks rows (0,3) to (0,97) the same way.",
+          active: ['cur', 'vis', 'match', 'out'],
+          edges: ['cur-vis', 'vis-match', 'match-out'],
+          subs: { cur: '(0,2) · id 2 · shipped', out: '1 row' },
+        },
+        {
+          title: 'Page 0 done, on to page 1',
+          note: 'All 97 rows of page 0 have been checked. The scan moves to the next page in the file, page 1 at byte 8,192, and repeats the same checks.',
+          active: ['p0', 'p1', 'cur'],
+          edges: ['p0-p1', 'p1-cur'],
+          subs: { p0: '97 rows checked', cur: '(1,1)' },
+        },
+        {
+          title: 'Every page to the end of the file',
+          note: 'Page 2, page 3, … page 10,299. The scan does not know where the shipped rows are, so it cannot skip any page.',
+          active: ['p1', 'p2', 'plast', 'cur'],
+          edges: ['p1-p2', 'p2-pl', 'pl-cur'],
+          subs: { cur: '(10299, 97)' },
+        },
+        {
+          title: 'Total: 10,300 pages for 50,000 rows',
+          note: 'EXPLAIN ANALYZE shows rows=50000 and Rows Removed by Filter: 950000. Pages touched (hit + read) = 10,300, the whole table. A query for one row would have read exactly the same 10,300 pages.',
+          active: ['plast', 'out', 'nomatch'],
+          subs: { out: '≈ 50,000 rows', nomatch: 'removed ≈ 950,000' },
+        },
+      ],
+    },
+    {
+      title: 'LIMIT 1: a match early',
+      path: 'page 0 → row (0,1) ✗ → row (0,2) ✓ match → LIMIT reached → stop',
+      summary: 'The scan stops at the first match: 1 page read instead of 10,300.',
+      steps: [
+        {
+          title: 'Start at page 0',
+          note: 'Same scan, but the query only wants one row.',
+          code: "SELECT * FROM orders WHERE status = 'shipped' LIMIT 1;",
+          active: ['q', 'p0'],
+          edges: ['q-p0'],
+        },
+        {
+          title: 'Row (0,1): ✗ no match',
+          note: "Visible, but status is 'paid'.",
+          active: ['p0', 'cur', 'vis', 'nomatch'],
+          edges: ['p0-cur', 'cur-vis', 'vis-nomatch'],
+          subs: { cur: '(0,1) · id 1 · paid', nomatch: 'removed: 1' },
+        },
+        {
+          title: 'Row (0,2): ✓ match',
+          note: 'The first shipped row goes to the result.',
+          active: ['cur', 'vis', 'match', 'out'],
+          edges: ['cur-vis', 'vis-match', 'match-out'],
+          subs: { cur: '(0,2) · id 2 · shipped', out: '1 row' },
+        },
+        {
+          title: 'LIMIT reached: stop',
+          note: 'The Limit node above the Seq Scan has its one row and stops asking for more. Pages read: 1. The speed came from where the first match happened to be, not from anything clever.',
+          active: ['out', 'stop'],
+          edges: ['out-stop'],
+          subs: { stop: 'after 1 page' },
+        },
+      ],
+    },
+    {
+      title: 'LIMIT 1: no row matches',
+      path: 'page 0 → 10,299 → every row ✗ no match → LIMIT never reached → whole table read',
+      summary: "No row is 'refunded', so the LIMIT never stops the scan: all 10,300 pages for 0 rows.",
+      steps: [
+        {
+          title: 'Start at page 0',
+          note: "The same LIMIT 1 query, but for a status no row has.",
+          code: "SELECT * FROM orders WHERE status = 'refunded' LIMIT 1;",
+          active: ['q', 'p0'],
+          edges: ['q-p0'],
+        },
+        {
+          title: 'Every row: ✗ no match',
+          note: "Row (0,1) is visible but not 'refunded'; neither is any other row on page 0.",
+          active: ['p0', 'cur', 'vis', 'nomatch'],
+          edges: ['p0-cur', 'cur-vis', 'vis-nomatch'],
+          subs: { cur: '(0,1) · id 1 · paid', nomatch: 'removed: 97' },
+        },
+        {
+          title: 'On through every page',
+          note: 'The LIMIT is still waiting for its first row, so the scan continues page after page to the end of the file.',
+          active: ['p0', 'p1', 'p2', 'plast', 'cur'],
+          edges: ['p0-p1', 'p1-p2', 'p2-pl', 'pl-cur'],
+          subs: { cur: '(10299, 97)' },
+        },
+        {
+          title: 'End of file: 0 rows',
+          note: 'The scan ends because it ran out of pages, not because of the LIMIT. Same query shape, 10,300× the pages of the previous case. LIMIT only helps when matches are found early.',
+          active: ['plast', 'out', 'nomatch'],
+          subs: { out: '0 rows', nomatch: 'removed: 1,000,000' },
+        },
+      ],
+    },
+    {
+      title: 'Dead rows after updates',
+      path: 'page 0 → row (0,1) ✗ dead (read, skipped) → row (0,3) ✓ visible → filter',
+      summary: 'Old row versions left by UPDATEs still sit in the pages, so the scan reads them and throws them away.',
+      subs: { p0: '40 / 97 dead' },
+      steps: [
+        {
+          title: 'Start at page 0',
+          note: 'A batch job updated many rows on page 0. Each non-HOT or HOT update left the old version in place (Concept 2), and VACUUM has not run yet.',
+          code: "SELECT * FROM orders WHERE status = 'shipped';",
+          active: ['q', 'p0'],
+          edges: ['q-p0'],
+        },
+        {
+          title: 'Row (0,1): ✗ dead',
+          note: 'Row (0,1) is an old version of id 1, replaced by a newer one. The visibility check rejects it before the filter is even evaluated, but its bytes were read with the page.',
+          active: ['p0', 'cur', 'dead'],
+          edges: ['p0-cur', 'cur-dead'],
+          subs: { cur: '(0,1) · id 1 · old' },
+        },
+        {
+          title: 'Row (0,3): ✓ visible',
+          note: 'Row (0,3) is the current version of id 1. It goes on to the filter as usual.',
+          active: ['cur', 'vis', 'match', 'out'],
+          edges: ['cur-vis', 'vis-match', 'match-out'],
+          subs: { cur: '(0,3) · id 1 · shipped', out: '1 row' },
+        },
+        {
+          title: 'Dead rows cost pages',
+          note: 'With 40 of 97 slots dead on every page, the table needs about 70% more pages for the same live rows, and the scan reads all of them. VACUUM makes the space reusable for new rows; it does not shrink the pages already there (see the real-world scenario below).',
+          active: ['p0', 'dead'],
+          subs: { dead: '≈ 40 per page' },
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+"It's fast, it has a `LIMIT`" is not a plan. `LIMIT` only stops a Seq Scan early when matches come early. For a rare value, or a value that appears only at the end of the table, the same query reads the whole table.
+</Pitfall>
+
+### Reading a Seq Scan in EXPLAIN
+
+```sql
+SET max_parallel_workers_per_gather = 0;  -- show the plain plan, without parallel workers
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders WHERE status = 'shipped';
+```
+
+```text
+Seq Scan on orders  (cost=0.00..22800.00 rows=50000 width=56) (actual time=0.021..98.4 rows=49870 loops=1)
+  Filter: (status = 'shipped'::text)
+  Rows Removed by Filter: 950130
+  Buffers: shared read=10300
+```
+
+| Part | Meaning |
+|---|---|
+| `cost=0.00..22800.00` | Planner's estimate in arbitrary units: cost to the first row (0, a scan can return a row at once) and to the last row |
+| `rows=50000 width=56` | Estimated rows returned and average row width in bytes (data only, without the 24 B row header) |
+| `actual … rows=49870` | Rows really returned |
+| `Rows Removed by Filter: 950130` | Rows read and thrown away. 49,870 + 950,130 = 1,000,000: every row was checked |
+| `Buffers: shared read=10300` | Pages touched: the whole table |
+
+**The red flag:** `Rows Removed by Filter` much larger than `rows`. Here 95% of the work is thrown away, which is what an index would avoid (Session 3 shows how the planner decides).
+
+### How the planner prices a Seq Scan
+
+The cost is per page plus per row. With the default settings:
+
+| Part | Formula | `orders` |
+|---|---|---|
+| Read the pages | pages × `seq_page_cost` (1.0) | 10,300 × 1.0 = **10,300** |
+| Process each row | rows × `cpu_tuple_cost` (0.01) | 1,000,000 × 0.01 = **10,000** |
+| Evaluate the filter | rows × operators × `cpu_operator_cost` (0.0025) | 1,000,000 × 1 × 0.0025 = **2,500** |
+| **Total** | | **22,800** |
+
+The unit is "one sequential page read = 1.0", not milliseconds. Notice that nothing in the formula depends on how many rows match: the estimate for one matching row is the same 22,800. The page and row counts come from `pg_class.relpages` and `reltuples`, which `ANALYZE` and `VACUUM` keep up to date.
+
+### Parallel Seq Scan
+
+On a table larger than `min_parallel_table_scan_size` (8 MB by default), the planner may split the scan across worker processes: `Gather` → `Parallel Seq Scan`. Each worker takes the next chunk of pages, so the **pages read are the same**; only the elapsed time is shared out. That is why the example above turns parallelism off to show the plain plan.
+
+## Keeping a big scan from flushing the cache
+
+A full scan reads every page once and rarely needs it again. If those pages pushed out the pages other queries use all the time, one report could make everything else slow. PostgreSQL and InnoDB both guard against this, in different ways.
+
+### PostgreSQL: the ring buffer
+
+| Term | Meaning |
+|---|---|
+| `shared_buffers` | Postgres's page cache (Concept 1). The default is 128 MB = 16,384 slots of 8 KB |
+| **Ring buffer** | A small set of slots (256 KB = 32 pages) that a big scan reuses in turn instead of taking slots from everyone else |
+| **✓ ≤ ¼ shared_buffers** | The table is small enough: its pages go into normal slots and stay cached |
+| **✗ > ¼ shared_buffers** | The table is big: the scan uses the ring, so its pages do not stay cached |
+
+<Flow
+  title="PostgreSQL: where a Seq Scan puts its pages"
+  height={340}
+  nodes={[
+    { id: 'scan', label: 'Seq Scan', sub: 'orders: 80 MB', x: 20, y: 30, w: 180 },
+    { id: 'big', label: '✗ > ¼ shared_buffers', sub: '80 MB > 32 MB', x: 300, y: 30, w: 180 },
+    { id: 'ring', label: 'Ring buffer', sub: '32 slots = 256 KB', x: 560, y: 30, w: 220 },
+    { id: 'small', label: '✓ ≤ ¼ shared_buffers', sub: '80 MB ≤ 256 MB', x: 20, y: 150, w: 180 },
+    { id: 'os', label: 'OS page cache / disk', sub: 'one 8 KB page per read', x: 560, y: 150, w: 220 },
+    { id: 'sb', label: 'shared_buffers', sub: 'normal slots', x: 20, y: 270, w: 180 },
+    { id: 'hot', label: "Other tables' pages", sub: 'hot, used all day', x: 300, y: 270, w: 180 },
+  ]}
+  edges={[
+    { id: 'scan-big', from: 'scan', to: 'big', label: 'size?' },
+    { id: 'scan-small', from: 'scan', to: 'small' },
+    { id: 'os-ring', from: 'os', to: 'ring', label: 'read' },
+    { id: 'big-ring', from: 'big', to: 'ring' },
+    { id: 'small-sb', from: 'small', to: 'sb' },
+    { id: 'os-sb', from: 'os', to: 'sb', label: 'read' },
+  ]}
+  cases={[
+    {
+      title: 'Big table: the ring',
+      path: 'size ✗ > ¼ shared_buffers → pages cycle through 32 ring slots → hot pages untouched → run 2 reads again',
+      summary: 'shared_buffers = 128 MB, orders = 80 MB: the scan reuses 32 slots, so it cannot evict anyone else.',
+      subs: { sb: '128 MB', hot: 'cached' },
+      steps: [
+        {
+          title: 'Is the table bigger than ¼ of shared_buffers?',
+          note: 'orders has 10,300 pages × 8 KB ≈ 80 MB. A quarter of 128 MB is 32 MB. 80 > 32, so the scan gets a ring buffer.',
+          code: 'SELECT count(*) FROM orders;',
+          active: ['scan', 'big'],
+          edges: ['scan-big'],
+        },
+        {
+          title: 'Pages 0–31 fill the ring',
+          note: 'Each page the scan needs (and that is not already cached) is read from the OS into the next ring slot: page 0 into slot 1, page 1 into slot 2, … page 31 into slot 32.',
+          active: ['big', 'ring', 'os'],
+          edges: ['big-ring', 'os-ring'],
+          subs: { ring: 'slots 1–32: pages 0–31' },
+        },
+        {
+          title: 'Page 32 reuses slot 1',
+          note: 'The ring is full, so page 32 goes into slot 1 and page 0 is dropped from shared_buffers. The scan keeps cycling through the same 32 slots.',
+          active: ['ring', 'os'],
+          edges: ['os-ring'],
+          subs: { ring: 'slot 1: page 32 (page 0 gone)' },
+        },
+        {
+          title: 'End of scan: hot pages untouched',
+          note: "The scan read 80 MB through 256 KB of buffers. The other tables' pages in shared_buffers were never evicted.",
+          active: ['ring', 'hot'],
+          subs: { ring: 'pages 10,268–10,299', hot: 'still cached ✓' },
+        },
+        {
+          title: 'Run 2 reads almost everything again',
+          note: 'Only the last 32 pages are still in shared_buffers, so run 2 shows roughly shared hit=32 read=10,268. The reads are probably fast (the OS page cache likely still has the file), but Postgres counts them as reads. This is the Concept 1 Q4 case: a second run that still shows reads.',
+          active: ['ring', 'os'],
+          edges: ['os-ring'],
+        },
+      ],
+    },
+    {
+      title: 'Small table: normal buffers',
+      path: 'size ✓ ≤ ¼ shared_buffers → pages go into normal slots → run 2 is all hits',
+      summary: 'shared_buffers = 1 GB, orders = 80 MB: the pages are cached like any other.',
+      subs: { sb: '1 GB', hot: 'cached' },
+      steps: [
+        {
+          title: 'Is the table bigger than ¼ of shared_buffers?',
+          note: 'A quarter of 1 GB is 256 MB. 80 MB ≤ 256 MB, so the scan uses normal buffers.',
+          code: 'SELECT count(*) FROM orders;',
+          active: ['scan', 'small'],
+          edges: ['scan-small'],
+        },
+        {
+          title: 'Pages go into normal slots',
+          note: 'Each page read from the OS takes a normal shared_buffers slot and stays there.',
+          active: ['small', 'sb', 'os'],
+          edges: ['small-sb', 'os-sb'],
+          subs: { sb: 'pages 0–10,299 cached' },
+        },
+        {
+          title: 'Run 2: all hits',
+          note: 'All 10,300 pages are still in shared_buffers: shared hit=10300 read=0. The cost: 80 MB of slots are now taken by orders. If shared_buffers had been full, the clock sweep would have evicted the least-used pages to make room, possibly hot pages of other tables.',
+          active: ['sb', 'hot'],
+          subs: { hot: 'may be evicted if full' },
+        },
+      ],
+    },
+  ]}
+/>
+
+### InnoDB: the old sublist
+
+InnoDB's buffer pool is one LRU list split in two. New pages enter in the middle, and only pages used again later move to the front.
+
+| Term | Meaning |
+|---|---|
+| **Young sublist** | The front ⅝ of the list: pages that have proved they are used repeatedly |
+| **Old sublist** | The back ⅜ (`innodb_old_blocks_pct = 37`): where every newly read page starts, at its head (the "midpoint") |
+| `innodb_old_blocks_time` | 1,000 ms by default: a page must be touched again **at least 1 s after its first access** to move to the young sublist |
+| **✓ Touched again after 1 s** | The page is moved to the head of the young sublist |
+| **✗ Not touched after 1 s** | The page drifts to the tail of the old sublist and is evicted first |
+
+<Flow
+  title="InnoDB: where a page read by a scan goes"
+  height={340}
+  nodes={[
+    { id: 'reader', label: 'Query reads a page', sub: 'page not in pool', x: 20, y: 30, w: 180 },
+    { id: 'young', label: 'Young sublist', sub: '⅝: hot pages', x: 280, y: 30, w: 180 },
+    { id: 'again', label: '✓ Touched after 1 s', sub: 'promote to young', x: 560, y: 30, w: 220 },
+    { id: 'disk', label: 'orders.ibd', sub: 'data file, 16 KB pages', x: 20, y: 150, w: 180 },
+    { id: 'old', label: 'Old sublist', sub: '⅜: new arrivals', x: 280, y: 150, w: 180 },
+    { id: 'once', label: '✗ Not touched after 1 s', sub: 'drifts to the tail', x: 560, y: 150, w: 220 },
+    { id: 'evict', label: 'Evicted', sub: 'tail of the old sublist', x: 560, y: 270, w: 220 },
+  ]}
+  edges={[
+    { id: 'reader-disk', from: 'reader', to: 'disk' },
+    { id: 'disk-old', from: 'disk', to: 'old', label: 'read' },
+    { id: 'old-again', from: 'old', to: 'again' },
+    { id: 'old-once', from: 'old', to: 'once' },
+    { id: 'once-evict', from: 'once', to: 'evict' },
+    { id: 'again-young', from: 'again', to: 'young', label: 'move' },
+  ]}
+  cases={[
+    {
+      title: 'Page read by a full scan',
+      path: 'disk → head of old sublist → ✗ not touched after 1 s → evicted; young sublist untouched',
+      summary: 'Scan pages enter the old sublist and leave from it, so the hot pages stay.',
+      subs: { reader: 'full scan of orders', young: 'hot pages' },
+      steps: [
+        {
+          title: 'The scan needs leaf page 4',
+          note: 'It is not in the buffer pool, so InnoDB reads the 16 KB page from orders.ibd.',
+          code: "SELECT * FROM orders WHERE status = 'shipped';",
+          active: ['reader', 'disk'],
+          edges: ['reader-disk'],
+        },
+        {
+          title: 'It enters at the midpoint',
+          note: 'The new page goes to the head of the old sublist, not the front of the whole list. The scan then reads all the rows on page 4 within a few milliseconds. Those touches are within 1 s of the first, so they do not count.',
+          active: ['disk', 'old'],
+          edges: ['disk-old'],
+          subs: { old: 'page 4 at the head' },
+        },
+        {
+          title: '✗ Never touched again after 1 s',
+          note: 'The scan has moved on to page 5, 6, … and will not come back. Page 4 drifts towards the tail as newer pages enter at the midpoint.',
+          active: ['old', 'once'],
+          edges: ['old-once'],
+        },
+        {
+          title: 'Evicted from the tail',
+          note: 'When InnoDB needs a free page, it takes one from the tail of the old sublist: page 4. The young sublist, with the pages real workloads use all the time, was never touched.',
+          active: ['once', 'evict', 'young'],
+          edges: ['once-evict'],
+          subs: { evict: 'page 4', young: 'hot pages kept ✓' },
+        },
+      ],
+    },
+    {
+      title: 'Page used by a real workload',
+      path: 'disk → head of old sublist → ✓ touched again after 1 s → head of young sublist',
+      summary: 'A page that queries keep coming back to is promoted and stays cached.',
+      subs: { reader: 'SELECT … WHERE id = 42', young: 'hot pages' },
+      steps: [
+        {
+          title: 'A lookup needs leaf page 9',
+          note: 'A query by primary key needs the leaf holding id 42. The page is not cached, so InnoDB reads it.',
+          code: 'SELECT * FROM orders WHERE id = 42;',
+          active: ['reader', 'disk'],
+          edges: ['reader-disk'],
+        },
+        {
+          title: 'It enters at the midpoint',
+          note: 'Like every new page, it starts at the head of the old sublist.',
+          active: ['disk', 'old'],
+          edges: ['disk-old'],
+          subs: { old: 'page 9 at the head' },
+        },
+        {
+          title: '✓ Touched again 3 s later',
+          note: 'Another query reads id 43 on the same page, 3 s after the first access: more than innodb_old_blocks_time (1 s).',
+          active: ['old', 'again'],
+          edges: ['old-again'],
+        },
+        {
+          title: 'Moved to the young sublist',
+          note: 'Page 9 moves to the head of the young sublist and is now protected from scans.',
+          active: ['again', 'young'],
+          edges: ['again-young'],
+          subs: { young: 'page 9 at the head' },
+        },
+      ],
+    },
+  ]}
+/>
+
+| | PostgreSQL ring buffer | InnoDB old sublist |
+|---|---|---|
+| When it applies | Only to scans of tables bigger than ¼ of `shared_buffers` | To every page read |
+| How it protects the cache | The scan only ever uses its own 32 slots | Scan pages enter the old ⅜ and leave from it |
+| Side effect | A second scan of a big table reads again from the OS | A page read twice within 1 s stays in the old sublist |
+
+MongoDB documents no equivalent rule for the WiredTiger cache, so treat a large `COLLSCAN` as something that can push other data out.
+
+## MySQL InnoDB: full table scan
+
+InnoDB's table is the clustered index (Concept 2), so a full scan walks its leaf pages. Each leaf stores the page numbers of the previous and next leaf, so after descending once to the **leftmost leaf**, InnoDB follows the "next" pointers to the end.
+
+| Term | Meaning |
+|---|---|
+| Leftmost leaf | The leaf holding the smallest primary keys: where the scan starts, after a descent from the root |
+| Next pointer | Each leaf page's header holds the page number of the next leaf in key order |
+| **Linear read-ahead** | When InnoDB sees pages of one 1 MB extent (64 pages) read in order (`innodb_read_ahead_threshold`, 56 pages by default), it reads the **whole next extent** in the background |
+| **✓ Leaves in file order** | The next leaf is the next page in the file, so read-ahead works |
+| **✗ Leaves scattered** | The next leaf is somewhere else in the file, so each leaf is a separate random read |
+
+<Flow
+  title="InnoDB: what a full table scan reads"
+  height={350}
+  nodes={[
+    { id: 'q', label: 'Full table scan', sub: 'EXPLAIN type: ALL', x: 20, y: 20, w: 160 },
+    { id: 'root', label: 'Root page', sub: 'page 3', x: 320, y: 20, w: 160 },
+    { id: 'l1', label: 'Leaf A', sub: 'leftmost', x: 20, y: 140, w: 140 },
+    { id: 'l2', label: 'Leaf B', sub: '', x: 220, y: 140, w: 140 },
+    { id: 'l3', label: 'Leaf C', sub: '', x: 420, y: 140, w: 140 },
+    { id: 'l4', label: 'Leaf D', sub: 'rightmost', x: 620, y: 140, w: 140 },
+    { id: 'ra', label: '✓ Leaves in file order', sub: 'read-ahead: 1 MB at once', x: 120, y: 270, w: 220 },
+    { id: 'nora', label: '✗ Leaves scattered', sub: 'one 16 KB read per leaf', x: 460, y: 270, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-root', from: 'q', to: 'root' },
+    { id: 'root-l1', from: 'root', to: 'l1', label: 'leftmost' },
+    { id: 'l1-l2', from: 'l1', to: 'l2', both: true },
+    { id: 'l2-l3', from: 'l2', to: 'l3', both: true },
+    { id: 'l3-l4', from: 'l3', to: 'l4', both: true },
+    { id: 'l2-ra', from: 'l2', to: 'ra' },
+    { id: 'l3-nora', from: 'l3', to: 'nora' },
+  ]}
+  cases={[
+    {
+      title: 'Sequential primary key',
+      path: 'root → leftmost leaf → next → next → … ✓ leaves in file order → read-ahead',
+      summary: 'AUTO_INCREMENT filled the leaves left to right, so key order and file order match.',
+      subs: { l1: 'ids 1–150 · page 4', l2: 'ids 151–300 · page 5', l3: 'ids 301–450 · page 6', l4: 'ids 451–600 · page 7' },
+      steps: [
+        {
+          title: 'Descend to the leftmost leaf',
+          note: 'InnoDB reads the root page and follows its first pointer down to the leaf with the smallest ids. In a real table this is 2–3 levels, a handful of pages; the rest of the scan never goes back up.',
+          code: "SELECT * FROM orders WHERE status = 'shipped';",
+          active: ['q', 'root', 'l1'],
+          edges: ['q-root', 'root-l1'],
+        },
+        {
+          title: 'Read every row of leaf A',
+          note: "Rows in a leaf are in primary-key order: id 1, 2, … 150. Each is checked against status = 'shipped', exactly like Postgres's filter.",
+          active: ['l1'],
+        },
+        {
+          title: 'Next pointer: page 5',
+          note: "Leaf A's header says the next leaf is page 5, the page right after it in the file.",
+          active: ['l1', 'l2'],
+          edges: ['l1-l2'],
+        },
+        {
+          title: '✓ In file order: read-ahead',
+          note: 'Pages 4, 5, 6 … are being read in order. Once 56 pages of an extent have been read this way, InnoDB reads the whole next extent (64 pages, 1 MB) in the background, so most later leaves are already in memory when the scan reaches them.',
+          active: ['l2', 'ra'],
+          edges: ['l2-ra'],
+        },
+        {
+          title: 'On to the rightmost leaf',
+          note: "Leaf C, leaf D … until a leaf whose next pointer is empty. The result: every leaf read once, in key order, mostly in large sequential reads.",
+          active: ['l2', 'l3', 'l4'],
+          edges: ['l2-l3', 'l3-l4'],
+        },
+      ],
+    },
+    {
+      title: 'UUIDv4 primary key',
+      path: 'root → leftmost leaf → next pointers jump around the file ✗ leaves scattered → no read-ahead',
+      summary: 'Page splits put new leaves wherever there was a free page, so key order no longer matches file order.',
+      subs: { l1: '0f–2a · page 4', l2: '3b–63 · page 9', l3: '7c–91 · page 5', l4: 'c4–e1 · page 12' },
+      steps: [
+        {
+          title: 'Descend to the leftmost leaf',
+          note: 'Same start: root, then the leaf with the smallest keys, page 4.',
+          code: "SELECT * FROM orders WHERE status = 'shipped';",
+          active: ['q', 'root', 'l1'],
+          edges: ['q-root', 'root-l1'],
+        },
+        {
+          title: 'Next pointer: page 9',
+          note: 'Leaf B was created by a page split (UUIDv4 deep dive in Concept 2), so it sits at page 9, wherever a free page was. The scan jumps forward in the file.',
+          active: ['l1', 'l2'],
+          edges: ['l1-l2'],
+        },
+        {
+          title: '✗ Scattered: no read-ahead',
+          note: 'The next leaf is page 5: the scan jumps back. Reads like 4, 9, 5, 12 do not look sequential, so linear read-ahead does not trigger and each leaf is a separate 16 KB read.',
+          active: ['l2', 'l3', 'nora'],
+          edges: ['l2-l3', 'l3-nora'],
+        },
+        {
+          title: 'More leaves, read one by one',
+          note: 'The same rows also need more leaves: pages after random splits are about 69% full instead of 15/16, so ≈ 1.35× as many pages. If the table is in the buffer pool, none of this matters; on disk, it is more pages and slower reads.',
+          active: ['l3', 'l4'],
+          edges: ['l3-l4'],
+        },
+      ],
+    },
+  ]}
+/>
+
+What EXPLAIN shows:
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE status = 'shipped';
+-- type: ALL    key: NULL    rows: 998000    filtered: 10.00    Extra: Using where
+```
+
+| Column | Meaning |
+|---|---|
+| `type: ALL` | Full table scan: every row of the clustered index |
+| `key: NULL` | No index used |
+| `rows: 998000` | Estimated rows to read, the whole table |
+| `filtered: 10.00` | Estimated % kept by the `WHERE`. 10% is MySQL's default guess for `=` on a column with no index or histogram |
+| `Using where` | Rows are filtered after being read, like Postgres's `Filter` |
+
+`EXPLAIN ANALYZE` (MySQL 8.0.18+) shows the same as a tree: `Filter: (orders.status = 'shipped')` above `Table scan on orders`, each with actual rows.
+
+## MongoDB: COLLSCAN
+
+| Term | Meaning |
+|---|---|
+| `COLLSCAN` | Collection scan: every document is read, in `RecordId` order |
+| `RecordId` | The internal, ever-growing key the collection B-tree is sorted by (Concept 2); roughly insertion order |
+| **✓ Match / ✗ No match** | Each document is checked against the query filter |
+| `totalDocsExamined` / `nReturned` | Documents read vs documents returned: the same red flag as `Rows Removed by Filter` |
+
+<Flow
+  title="MongoDB: what a COLLSCAN reads"
+  height={430}
+  nodes={[
+    { id: 'q', label: 'COLLSCAN', sub: 'find({ status: "shipped" })', x: 20, y: 20, w: 200 },
+    { id: 'root', label: 'Collection B-tree', sub: 'keyed by RecordId', x: 300, y: 20, w: 200 },
+    { id: 'l1', label: 'Leaf 1', sub: 'RecordId 1–90', x: 20, y: 140, w: 140 },
+    { id: 'l2', label: 'Leaf 2', sub: 'RecordId 91–180', x: 220, y: 140, w: 140 },
+    { id: 'l3', label: 'Leaf 3', sub: 'RecordId 181–270', x: 420, y: 140, w: 140 },
+    { id: 'l4', label: 'Last leaf', sub: 'up to RecordId 1M', x: 620, y: 140, w: 140 },
+    { id: 'cur', label: 'Current document', sub: 'RecordId', x: 320, y: 260, w: 160 },
+    { id: 'nomatch', label: '✗ No match', sub: 'examined, dropped', x: 80, y: 260, w: 180 },
+    { id: 'match', label: '✓ Match', sub: 'send to result', x: 540, y: 260, w: 160 },
+    { id: 'out', label: 'Result', sub: 'nReturned: 0', x: 540, y: 370, w: 160 },
+    { id: 'stop', label: '■ Stop', sub: 'limit reached', x: 320, y: 370, w: 160 },
+  ]}
+  edges={[
+    { id: 'q-root', from: 'q', to: 'root' },
+    { id: 'root-l1', from: 'root', to: 'l1', label: 'first leaf' },
+    { id: 'root-l2', from: 'root', to: 'l2', quiet: true },
+    { id: 'root-l3', from: 'root', to: 'l3', quiet: true },
+    { id: 'root-l4', from: 'root', to: 'l4', quiet: true },
+    { id: 'l1-cur', from: 'l1', to: 'cur', quiet: true },
+    { id: 'l2-cur', from: 'l2', to: 'cur', quiet: true },
+    { id: 'l4-cur', from: 'l4', to: 'cur', quiet: true },
+    { id: 'cur-nomatch', from: 'cur', to: 'nomatch' },
+    { id: 'cur-match', from: 'cur', to: 'match' },
+    { id: 'match-out', from: 'match', to: 'out' },
+    { id: 'out-stop', from: 'out', to: 'stop' },
+  ]}
+  cases={[
+    {
+      title: 'Filter: a few documents match',
+      path: 'every leaf in RecordId order → each document ✓ match / ✗ no match → result',
+      summary: 'All 1M documents are examined to return 50,000.',
+      steps: [
+        {
+          title: 'Plan: COLLSCAN',
+          note: 'There is no index on status, so the only plan is a collection scan. The cursor starts at the leaf with the smallest RecordId.',
+          code: 'db.orders.find({ status: "shipped" })',
+          active: ['q', 'root', 'l1'],
+          edges: ['q-root', 'root-l1'],
+        },
+        {
+          title: 'RecordId 1: ✗ no match',
+          note: "The document's status is 'paid'. It counts towards totalDocsExamined but not nReturned.",
+          active: ['l1', 'cur', 'nomatch'],
+          edges: ['l1-cur', 'cur-nomatch'],
+          subs: { cur: 'RecordId 1 · paid', nomatch: 'examined: 1' },
+        },
+        {
+          title: 'RecordId 2: ✓ match',
+          note: 'This document is shipped, so it goes to the result.',
+          active: ['cur', 'match', 'out'],
+          edges: ['cur-match', 'match-out'],
+          subs: { cur: 'RecordId 2 · shipped', out: 'nReturned: 1' },
+        },
+        {
+          title: 'Leaf after leaf',
+          note: 'The cursor moves to the next leaf in RecordId order and checks every document the same way.',
+          active: ['root', 'l2', 'l3', 'cur'],
+          edges: ['root-l2', 'root-l3', 'l2-cur'],
+          subs: { cur: 'RecordId 91' },
+        },
+        {
+          title: 'Last leaf: the totals',
+          note: 'explain("executionStats") shows stage COLLSCAN, totalKeysExamined: 0 (no index), totalDocsExamined: 1,000,000, nReturned: 50,000. 95% of the documents read were thrown away.',
+          active: ['root', 'l4', 'cur', 'out', 'nomatch'],
+          edges: ['root-l4', 'l4-cur'],
+          subs: { cur: 'RecordId 1,000,000', out: 'nReturned: 50,000', nomatch: 'examined: 1,000,000' },
+        },
+      ],
+    },
+    {
+      title: 'limit(1): a match early',
+      path: 'leaf 1 → RecordId 1 ✗ → RecordId 2 ✓ match → limit reached → stop',
+      summary: 'As in PostgreSQL, the scan stops at the first match: 2 documents examined.',
+      steps: [
+        {
+          title: 'Plan: COLLSCAN with a LIMIT stage',
+          note: 'The same scan, with a LIMIT stage above it.',
+          code: 'db.orders.find({ status: "shipped" }).limit(1)',
+          active: ['q', 'root', 'l1'],
+          edges: ['q-root', 'root-l1'],
+        },
+        {
+          title: 'RecordId 1: ✗ no match',
+          note: "status is 'paid'.",
+          active: ['l1', 'cur', 'nomatch'],
+          edges: ['l1-cur', 'cur-nomatch'],
+          subs: { cur: 'RecordId 1 · paid', nomatch: 'examined: 1' },
+        },
+        {
+          title: 'RecordId 2: ✓ match',
+          note: 'The first shipped document goes to the result.',
+          active: ['cur', 'match', 'out'],
+          edges: ['cur-match', 'match-out'],
+          subs: { cur: 'RecordId 2 · shipped', out: 'nReturned: 1' },
+        },
+        {
+          title: 'Limit reached: stop',
+          note: 'totalDocsExamined: 2. With a status no document has, the scan would examine all 1M, exactly like the PostgreSQL LIMIT case.',
+          active: ['out', 'stop'],
+          edges: ['out-stop'],
+        },
+      ],
+    },
+  ]}
+/>
+
+For a **clustered collection**, the documents live in a B-tree keyed by `_id`, so a `COLLSCAN` returns them in `_id` order; the cost is the same, every document. To catch accidental collection scans in development, start `mongod` with the `notablescan` parameter: queries that would need a `COLLSCAN` then fail instead of running.
+
+## When a full scan is the right plan
+
+A full scan is not always bad. Session 3 shows how the planner chooses; the short version:
+
+| Situation | Why a full scan wins |
+|---|---|
+| Small table (a few pages) | Reading 5 pages in order beats descending an index and then visiting the table |
+| The query returns a large share of the rows | An index would visit table pages one at a time and many of them repeatedly; reading all pages in order once is cheaper (Concept 4: sequential vs random I/O) |
+| The whole table is needed anyway | `SELECT count(*)`, reports, exports, `pg_dump` |
+| No usable index | The only option, which is what Sessions 2–5 fix |
+
+## Real-world scenario: the purge that did not speed anything up
+
+A team keeps 30 days of `events`. The table has grown to 10M rows of about 120 B (≈ 65 rows per page, ≈ 154,000 pages ≈ 1.2 GB). They delete the 9M oldest rows and VACUUM runs. A report that scans the table is just as slow as before.
+
+| | Before the purge | After DELETE + VACUUM |
+|---|---|---|
+| Live rows | 10M | 1M |
+| Pages in the file | ≈ 154,000 | **≈ 154,000** |
+| Rows per page | ≈ 65 | ≈ 6.5 (most pages nearly empty) |
+| Pages a Seq Scan reads | ≈ 154,000 | **≈ 154,000** |
+
+**Why:** VACUUM makes the space of dead rows **reusable** for future inserts, but it only shrinks the file by cutting off **completely empty pages at the end**. The deleted rows were the oldest, at the start of the file, so nothing was cut off. A Seq Scan reads every page in the file, empty or not.
+
+**How to check:**
+
+```sql
+-- Live rows per page: about 65 is healthy here; about 6.5 means the table is mostly empty space
+SELECT relpages, reltuples, reltuples / NULLIF(relpages, 0) AS rows_per_page
+FROM pg_class WHERE relname = 'events';
+```
+
+**Fixes, by impact:**
+
+| Fix | Effect | Cost |
+|---|---|---|
+| `VACUUM FULL events` | Rewrites the table compactly: ≈ 15,400 pages (120 MB) | Locks the table against reads and writes while it runs |
+| `pg_repack` (extension) | The same rewrite, online | Needs about twice the table's space during the rewrite |
+| Partition by day or month, drop old partitions | Dropping a partition removes its file instantly; no dead rows, no bloat | Changes the schema; queries should filter on the partition key |
+| Do nothing | New inserts refill the empty pages through the free space map, so the table stops growing for a while | Scans stay slow until it refills |
+
+**In the other engines:** InnoDB merges a leaf with its neighbour when it falls below half full, so its scan walks fewer leaves after a big delete, but the `.ibd` file keeps its size until `OPTIMIZE TABLE` rebuilds it. MongoDB likewise keeps the space for reuse; `compact` releases it.
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 2: B-tree internals | An index exists to turn "read 10,300 pages" into "read 3–4 pages" |
+| Session 3: query planner | The planner compares this Seq Scan cost (22,800) with the cost of an index plan and picks the cheaper one |
+| Concept 4: sequential vs random I/O | Why reading every page in order can beat an index that reads fewer pages out of order |
+| Session 8: when indexes hurt | Sometimes the full scan is the right plan, and an index only adds write cost |
+
+## Key takeaways
+
+1. A full scan reads **every page** of the table (PostgreSQL heap pages, InnoDB clustered-index leaves, MongoDB collection B-tree), whatever the query returns.
+2. Its cost follows **pages in the table**, not rows returned: one row or 50,000, the same 10,300 pages.
+3. `LIMIT` stops a scan only when a match is found; with no match, the whole table is read.
+4. The red flag in a plan is **rows thrown away ≫ rows returned**: `Rows Removed by Filter`, `filtered`, or `totalDocsExamined` vs `nReturned`.
+5. PostgreSQL prices a Seq Scan as pages × 1.0 + rows × 0.01 + rows × 0.0025 per operator.
+6. Big scans do not flush the cache: PostgreSQL uses a 32-slot ring for tables over ¼ of `shared_buffers`; InnoDB keeps scan pages in the old sublist.
+7. Deleting rows does not make a PostgreSQL Seq Scan faster until the table is rewritten: the empty pages are still read.
+
+## Check questions
+
+1. `orders` has 1M rows in 10,300 pages and no indexes. How many pages does a Seq Scan read for `WHERE id = 7` (one row), and for `WHERE status = 'shipped'` (50,000 rows)? Why?
+2. With the default cost settings, compute the planner's total cost for that Seq Scan with the `status` filter. Which part is the I/O cost and which is the CPU cost?
+3. `SELECT * FROM orders WHERE status = 'refunded' LIMIT 1` takes 0.1 ms one day and 90 ms the next, with the same plan and the same table size. Give a likely reason.
+4. `shared_buffers` is 128 MB and `orders` is 80 MB. You run `SELECT count(*) FROM orders` twice, and run 2 still shows mostly `shared read`. Why? What changes if `shared_buffers` is 1 GB?
+5. A PostgreSQL table had 10M rows (1.2 GB). A job deleted the oldest 9M rows and VACUUM ran. Is a Seq Scan now about 10× faster? Why or why not, and what would make it so?
+6. An InnoDB table with a UUIDv4 primary key and the same table with `AUTO_INCREMENT` hold the same rows. Why can a full scan of the UUIDv4 table be slower when the data is on disk? Give two reasons.
+7. A MongoDB `explain("executionStats")` shows `COLLSCAN`, `nReturned: 12`, `totalDocsExamined: 2000000`. What does it tell you, and what is the PostgreSQL equivalent of the same signal?
