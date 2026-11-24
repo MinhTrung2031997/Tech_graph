@@ -2,13 +2,12 @@
   "title": "Session 4: Composite indexes",
   "collapsible": true,
   "defaultOpen": false,
-  "pages": [],
-  "planned": [
-    "Concept 1: How multi-column keys are sorted",
-    "Concept 2: The leftmost-prefix rule",
-    "Concept 3: Equality before range",
-    "Concept 4: Index + ORDER BY + LIMIT",
-    "Concept 5: MongoDB ESR rule",
-    "Lab and session quiz"
+  "pages": [
+    "concept-1-multi-column-sort/index",
+    "concept-2-leftmost-prefix/index",
+    "concept-3-equality-before-range/index",
+    "concept-4-order-by-limit/index",
+    "concept-5-esr-rule/index",
+    "lab/index"
   ]
 }

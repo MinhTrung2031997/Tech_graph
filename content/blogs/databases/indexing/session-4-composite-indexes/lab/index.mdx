@@ -1,0 +1,196 @@
+---
+title: "Lab and session quiz: Composite indexes"
+description: "Build composite indexes in different column orders and measure what each order can do: leftmost prefixes, skip scan, equality before range, ORDER BY with LIMIT, and MongoDB's ESR rule."
+type: "how-to"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "composite-index", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-multicolumn.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/range-optimization.html#range-access-skip-scan"
+  - "https://www.mongodb.com/docs/manual/tutorial/equality-sort-range-guideline/"
+---
+
+<Tldr>
+Uses the containers and data from the [Session 1 lab](/blogs/databases/indexing/session-1-storage-basics/lab). Several exercises compare two indexes on the same columns in different orders; in PostgreSQL the trick is to drop one inside a transaction and `ROLLBACK`, so both stay available for the next experiment.
+</Tldr>
+
+## Setup
+
+Start from only the primary key plus the indexes each exercise creates. If earlier labs left single-column indexes, drop them so the planner cannot pick them instead:
+
+```sql
+-- pg
+DROP INDEX IF EXISTS orders_status_idx, orders_created_idx;
+CREATE INDEX orders_status_created_idx ON orders (status, created_at);
+CREATE INDEX orders_created_status_idx ON orders (created_at, status);
+CREATE INDEX orders_cust_created_idx   ON orders (customer_id, created_at);
+ANALYZE orders;
+```
+
+```sql
+-- my
+DROP INDEX orders_status_idx ON orders;      -- ignore errors for indexes that do not exist
+DROP INDEX orders_created_idx ON orders;
+CREATE INDEX orders_status_created_idx ON orders (status, created_at);
+ANALYZE TABLE orders;
+```
+
+```js
+// mg
+db.orders.dropIndexes(['status_1', 'created_at_1']);   // ignore errors
+db.orders.createIndex({ status: 1, created_at: -1, amount: 1 }, { name: 'esr' });
+db.orders.createIndex({ status: 1, amount: 1, created_at: -1 }, { name: 'ers' });
+db.orders.createIndex({ status: 1, created_at: -1 }, { name: 'es' });
+db.orders.createIndex({ amount: 1, status: 1, created_at: -1 }, { name: 'res' });
+```
+
+## Exercise 1: the sort order and the size (Concept 1)
+
+```sql
+-- pg: the index order is exactly this ORDER BY
+SELECT status, created_at FROM orders ORDER BY status, created_at LIMIT 3;
+SELECT c.relname, s.leaf_pages FROM pg_class c, pgstatindex(c.oid::regclass) s
+WHERE c.relname IN ('orders_status_created_idx', 'orders_cust_created_idx', 'orders_pkey');
+```
+
+```text
+ cancelled | 2025-01-01 00:00:31.536+00
+ cancelled | 2025-01-01 00:11:02.256+00
+ cancelled | 2025-01-01 00:21:32.976+00
+
+ orders_status_created_idx | 4270
+ orders_cust_created_idx   | 3832
+ orders_pkey               | 2733
+```
+
+## Exercise 2: leftmost prefix and skip scan (Concept 2)
+
+```sql
+-- pg: only (status, created_at) may be used, so hide (created_at, status) in a transaction
+BEGIN;
+DROP INDEX orders_created_status_idx;
+EXPLAIN ANALYZE SELECT * FROM orders WHERE status = 'shipped';                                         -- Bitmap on the composite
+EXPLAIN ANALYZE SELECT * FROM orders WHERE created_at >= '2025-06-01' AND created_at < '2025-06-08';   -- Seq Scan
+ROLLBACK;
+```
+
+```sql
+-- my
+EXPLAIN SELECT status, created_at FROM orders WHERE created_at >= '2025-06-01' AND created_at < '2025-06-02';
+-- type: range, key: orders_status_created_idx, Extra: Using where; Using index for skip scan
+EXPLAIN ANALYZE SELECT status, created_at FROM orders WHERE created_at >= '2025-06-01' AND created_at < '2025-06-02';  -- ≈ 2 ms
+EXPLAIN SELECT * FROM orders WHERE created_at >= '2025-06-01' AND created_at < '2025-06-02';
+-- type: ALL (skip scan needs a covering query)
+```
+
+```js
+// mg
+const d = { created_at: { $gte: ISODate('2025-06-01'), $lt: ISODate('2025-06-02') } };
+db.orders.find(d).explain('executionStats').queryPlanner.winningPlan.stage;            // 'COLLSCAN'
+db.orders.find(d).hint('es').explain('executionStats').executionStats.totalKeysExamined; // 1000000
+```
+
+## Exercise 3: equality before range (Concept 3)
+
+```sql
+-- pg: compare the two orders for the same query
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders
+WHERE status = 'shipped' AND created_at >= '2025-06-01' AND created_at < '2025-07-01';
+-- Bitmap Index Scan on orders_status_created_idx: Buffers 19 (index part); 4,110 rows
+
+BEGIN;
+DROP INDEX orders_status_created_idx;
+SET LOCAL enable_bitmapscan = off; SET LOCAL enable_seqscan = off;
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders
+WHERE status = 'shipped' AND created_at >= '2025-06-01' AND created_at < '2025-07-01';
+-- Index Scan using orders_created_status_idx: Buffers 1,186 = 355 index + 831 heap
+ROLLBACK;
+```
+
+```sql
+-- my: page requests for the same count through each order (the @b pattern from Session 1)
+CREATE INDEX orders_created_status_idx ON orders (created_at, status);
+-- FORCE INDEX (orders_status_created_idx): 30 page requests · FORCE INDEX (orders_created_status_idx): 257
+DROP INDEX orders_created_status_idx ON orders;
+```
+
+```js
+// mg
+for (const h of ['ers', 'res']) print(h, db.orders.find({ status: 'paid', amount: { $gt: 400 } }).hint(h)
+  .explain('executionStats').executionStats.totalKeysExamined);
+// ers 70000 · res 76499
+```
+
+## Exercise 4: ORDER BY + LIMIT (Concept 4)
+
+```sql
+-- pg
+BEGIN;
+DROP INDEX orders_created_status_idx;
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE status = 'paid' ORDER BY created_at DESC LIMIT 20;
+-- Index Scan Backward using orders_status_created_idx · 4 buffers
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE status IN ('paid','shipped') ORDER BY created_at DESC LIMIT 20;
+-- Seq Scan + top-N heapsort · ≈ 65 ms
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders ORDER BY created_at DESC LIMIT 20;
+-- Seq Scan + top-N heapsort · ≈ 66 ms
+ROLLBACK;
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE customer_id = 7 ORDER BY created_at DESC LIMIT 5;
+-- Index Scan Backward using orders_cust_created_idx · 8 buffers
+```
+
+```sql
+-- my
+EXPLAIN SELECT * FROM orders WHERE status = 'paid' ORDER BY created_at DESC LIMIT 20;        -- ref, Backward index scan
+EXPLAIN ANALYZE SELECT * FROM orders IGNORE INDEX (orders_status_created_idx)
+WHERE status = 'paid' ORDER BY created_at DESC LIMIT 20;                                      -- filesort, ≈ 135 ms
+EXPLAIN SELECT * FROM orders WHERE status IN ('paid','shipped') ORDER BY created_at DESC LIMIT 20;  -- ALL, Using filesort
+```
+
+```js
+// mg
+const st = c => { const s = []; let x = c.explain('executionStats').executionStats.executionStages; while (x) { s.push(x.stage); x = x.inputStage || (x.inputStages && x.inputStages[0]); } return s.join(' <- '); };
+st(db.orders.find({ status: 'paid' }).sort({ created_at: -1 }).limit(20).hint('es'));                         // LIMIT <- FETCH <- IXSCAN
+st(db.orders.find({ status: { $in: ['paid', 'shipped'] } }).sort({ created_at: -1 }).limit(20).hint('es'));  // LIMIT <- FETCH <- SORT_MERGE <- IXSCAN
+st(db.orders.find().sort({ created_at: -1 }).limit(20).hint('es'));                                           // FETCH <- SORT <- IXSCAN
+```
+
+## Exercise 5: ESR (Concept 5)
+
+```js
+// mg
+const q = { status: 'paid', amount: { $gt: 400 } };
+for (const h of ['esr', 'es', 'ers', 'res']) {
+  const s = db.orders.find(q).sort({ created_at: -1 }).limit(20).hint(h).explain('executionStats').executionStats;
+  print(h, 'keys', s.totalKeysExamined, 'docs', s.totalDocsExamined, 'ms', s.executionTimeMillis);
+}
+// esr keys 114 docs 20 · es keys 114 docs 114 · ers keys 70000 docs 20 (SORT) · res keys 76499 docs 20 (SORT)
+```
+
+```sql
+-- pg
+CREATE INDEX orders_esr ON orders (status, created_at, amount);
+CREATE INDEX orders_ers ON orders (status, amount, created_at);
+BEGIN; DROP INDEX orders_ers, orders_status_created_idx, orders_created_status_idx;
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE status = 'paid' AND amount > 400 ORDER BY created_at DESC LIMIT 20;
+-- Index Scan Backward using orders_esr, 6 buffers
+ROLLBACK;
+BEGIN; DROP INDEX orders_esr, orders_status_created_idx, orders_created_status_idx;
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE status = 'paid' AND amount > 400 ORDER BY created_at DESC LIMIT 20;
+-- Bitmap Heap Scan on orders_ers + Sort, ≈ 10,400 buffers, ≈ 14 ms
+ROLLBACK;
+DROP INDEX orders_esr, orders_ers;
+```
+
+## Session quiz
+
+1. An index is on `(customer_id, status, created_at)`. For each query, say which prefix seeks and whether a sort is needed: (a) `customer_id = 7`; (b) `customer_id = 7 AND created_at > '2025-06-01'`; (c) `customer_id = 7 AND status = 'paid' ORDER BY created_at DESC LIMIT 10`; (d) `status = 'paid'`.
+2. Why does `(customer_id, status, created_at)` handle query (b) of Q1 less well than `(customer_id, created_at)`?
+3. In Exercise 2, why does MySQL's skip scan work for `SELECT status, created_at` but not `SELECT *`?
+4. Explain the 30 vs 257 page requests in Exercise 3 in terms of which entries each index walks.
+5. In Exercise 4, PostgreSQL sorted 400,000 rows for `status IN ('paid','shipped')` but MongoDB examined 21 keys. What does MongoDB do that PostgreSQL 17 does not, and how can you emulate it in SQL?
+6. In Exercise 5, `es` and `esr` both examined 114 keys. Which is better on a large, uncached collection, and why?
+7. A query is `WHERE merchant_id = ? AND created_at >= ? AND created_at < ? ORDER BY amount DESC LIMIT 10`. Which index order would you choose, and what trade-off are you accepting?
+8. You have `(status)`, `(status, created_at)` and `(created_at, status)`. Which can you drop without losing any plan from this session's exercises?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-4-composite-indexes/lab/answers">Answers to the session quiz</DeepDive>

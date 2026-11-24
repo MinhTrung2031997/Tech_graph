@@ -1,0 +1,75 @@
+---
+title: "Answers: How multi-column keys are sorted"
+description: "Worked answers to the Session 4 Concept 1 check questions."
+companion: "answers"
+tags: ["indexing", "composite-index", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-multicolumn.html"
+  - "https://www.mongodb.com/docs/manual/core/indexes/index-types/index-compound/"
+---
+
+<Tldr>
+Sorted by the first column, then the second within ties. A query is efficient on a composite index when its matches form one contiguous stretch of that order.
+</Tldr>
+
+## Q1. The storage order
+
+**Question:** in what order are entries of an index on `(status, created_at)` stored? Describe the first few thousand.
+
+In `ORDER BY status, created_at` order. Status values sort alphabetically: `cancelled` < `delivered` < `paid` < `pending` < `shipped`. So the first ≈ 50,000 entries are all `cancelled` orders from 1 January onwards, by date; the first few thousand are the cancelled orders of early January. Each entry also holds the row pointer.
+
+> **Common mistake:** "sorted by created_at, grouped by status". The first column dominates: no delivered entry appears until every cancelled entry has.
+
+## Q2. Which conditions are one stretch
+
+**Question:** which of these select one contiguous stretch of `(status, created_at)`: `status = 'paid'`; `created_at > '2025-12-01'`; `status = 'paid' AND created_at > '2025-12-01'`; `status IN ('paid', 'pending')`?
+
+| Condition | Stretches |
+|---|---|
+| `status = 'paid'` | **1**: the paid section |
+| `created_at > '2025-12-01'` | **5**: the December tail of each status section |
+| `status = 'paid' AND created_at > '2025-12-01'` | **1**: the December tail of the paid section |
+| `status IN ('paid', 'pending')` | **2**, but adjacent in this case (paid and pending sort next to each other), so still efficient: two descents or one walk |
+
+> **Common mistake:** treating `IN` like a range. It is a list of equalities: one stretch per value.
+
+## Q3. The Seq Scan for created_at
+
+**Question:** why did PostgreSQL 17 choose a Seq Scan for `created_at` in June 1–7 when the only index was `(status, created_at)`?
+
+June entries are spread over five sections of the index, between all other dates of each status. PostgreSQL 17 has no skip scan, so the only way to use the index would be to read all of it (≈ 4,270 leaves) and filter, then visit the heap for 19,178 matches. Reading the 10,102-page table once was estimated cheaper. PostgreSQL 18's skip scan can instead jump to June inside each of the five status sections.
+
+> **Common mistake:** "the planner forgot the index". It cannot seek to a column that is not the leading one.
+
+## Q4. The InnoDB entry
+
+**Question:** what does an InnoDB secondary index on `(status, created_at)` really store per entry, and what does that allow?
+
+`(status, created_at, id)`: the primary key is appended as the last column. It is both the row pointer and part of the sort order, so `WHERE status = ? ORDER BY created_at, id` is served directly from the index (no filesort), and a query that needs only `status`, `created_at` and `id` is covered by the index.
+
+> **Common mistake:** adding `id` explicitly as a third column; InnoDB already has it.
+
+## Q5. Why the composite is bigger
+
+**Question:** why is `(status, created_at)` bigger than `(status)` alone in PostgreSQL?
+
+`(status)` has only 5 distinct keys, so deduplication stores each key once with long posting lists (848 leaves). In `(status, created_at)` almost every pair is unique, so there is nothing to deduplicate, and each entry holds both columns: 4,270 leaves.
+
+> **Common mistake:** "two columns, so twice the size". The difference here comes mostly from deduplication, not from the second column.
+
+## Q6. MongoDB's bounds
+
+**Question:** what do MongoDB's `indexBounds` for `{ status: "paid" }` on `{ status: 1, created_at: -1 }` tell you?
+
+`status: ["paid", "paid"]` fixes the first field: one stretch. `created_at: [MaxKey, MinKey]` means every date, walked from the largest to the smallest because the field is indexed descending. So the scan starts at the newest paid order, which is what `sort({ created_at: -1 })` wants.
+
+> **Common mistake:** reading `[MaxKey, MinKey]` as "the index is not used". It means no restriction on that field, inside the fixed status.
+
+## Q7. One index for two queries
+
+**Question:** which single composite index would serve both `WHERE merchant_id = ?` and `WHERE merchant_id = ? AND created_at > ?`?
+
+`(merchant_id, created_at)`. The first query uses its prefix `merchant_id`; the second fixes `merchant_id` and takes a range on `created_at` inside that stretch.
+
+> **Common mistake:** `(created_at, merchant_id)`, which serves neither well: the first query has no `created_at`, and the second would scan every merchant's recent rows.

@@ -1,0 +1,75 @@
+---
+title: "Answers: Index + ORDER BY + LIMIT"
+description: "Worked answers to the Session 4 Concept 4 check questions."
+companion: "answers"
+tags: ["indexing", "composite-index", "order-by", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-ordering.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/order-by-optimization.html"
+  - "https://www.mongodb.com/docs/manual/tutorial/sort-results-with-indexes/"
+---
+
+<Tldr>
+Equality columns, then the ORDER BY columns: the index delivers rows in order and LIMIT stops the walk. Anything that splits the matches into several stretches (IN lists, a missing leading column) brings the sort back, except in MongoDB's SORT_MERGE.
+</Tldr>
+
+## Q1. 4 pages vs 10,105
+
+**Question:** why does `WHERE status = 'paid' ORDER BY created_at DESC LIMIT 20` read only 4 pages with `(status, created_at)`, but 10,105 without it?
+
+With the index, the paid entries form one stretch already sorted by `created_at`. The scan descends to its newest end, walks backwards 20 entries and stops: ≈ 3 index pages plus 1 heap page. Without it, the newest 20 paid orders can only be found by reading all 350,000 paid rows (a Seq Scan of 10,102 pages) and keeping the top 20 in a heap sort.
+
+> **Common mistake:** "LIMIT makes any query fast". LIMIT only stops early when the rows arrive in the right order.
+
+## Q2. Index for a customer's latest orders
+
+**Question:** which index would serve `WHERE customer_id = ? ORDER BY created_at DESC LIMIT 5`, and why not `(created_at, customer_id)`?
+
+`(customer_id, created_at)`: the equality fixes `customer_id`, and that customer's entries are sorted by `created_at`; walk backwards 5 entries (measured: 8 buffers). With `(created_at, customer_id)`, the index is sorted by date across all customers: walking it backwards from the newest finds this customer's orders only occasionally, so the scan may read a large part of the index before it has 5.
+
+> **Common mistake:** "both columns are in the index". The equality column must come first so its rows are contiguous.
+
+## Q3. IN lists
+
+**Question:** why can't PostgreSQL 17 use `(status, created_at)` to avoid the sort in `status IN ('paid', 'shipped') ORDER BY created_at LIMIT 20`? How does MongoDB handle the same query?
+
+The index holds (paid, all dates in order) and then (shipped, all dates in order). Each stretch is sorted, but their union is not, so a single walk cannot deliver rows in `created_at` order. PostgreSQL 17 read all 400,000 rows and sorted (65 ms); MySQL did the same (filesort). MongoDB runs one IXSCAN per value and merges them with **SORT_MERGE**, taking the newer of the two current heads each time: 21 keys for 20 results. In SQL, the manual equivalent is a `UNION ALL` of two `LIMIT 20` subqueries, then sort the 40 rows.
+
+> **Common mistake:** assuming all engines handle `IN` + `ORDER BY` the same way.
+
+## Q4. Directions
+
+**Question:** can `(status, created_at)` serve `WHERE status = 'paid' ORDER BY created_at ASC`? And `ORDER BY created_at ASC, id DESC`?
+
+| ORDER BY | Served? |
+|---|---|
+| `created_at ASC` | ✓ Read the paid stretch forwards |
+| `created_at DESC` | ✓ Read it backwards |
+| `created_at ASC, id DESC` | Partly: the index gives `created_at` order, but not `id DESC` within equal dates. PostgreSQL adds an Incremental Sort per group (cheap here, 13 buffers); a fully ordered read needs `(status, created_at, id DESC)` |
+
+> **Common mistake:** creating a separate `DESC` index for single-column descending sorts; reading backwards is free.
+
+## Q5. Top-N heapsort
+
+**Question:** what is a top-N heapsort, and why is it still expensive with a small LIMIT?
+
+It is a sort that keeps only the best N rows seen so far in a small heap, so it needs little memory (28 kB in the lab) and never sorts the full set. But it must still **see every candidate row**: to know the 20 newest paid orders, all 350,000 paid rows are read and compared. The memory is small; the read is not.
+
+> **Common mistake:** "Sort Memory: 28kB means the sort is cheap". Look at the rows and buffers under the Sort node.
+
+## Q6. The power-user feed
+
+**Question:** a feed query is fast for normal users and slow for power users. What index and pagination change makes it uniform?
+
+Index `(user_id, created_at)` so each user's events are contiguous and ordered: page 1 walks 30 entries backwards from the newest, however many events the user has. Then replace `OFFSET` with keyset pagination, `AND created_at < :last_seen ORDER BY created_at DESC LIMIT 30`, so page 100 also costs one descent plus 30 entries. (Add a tiebreaker such as `id` to both the index and the condition if timestamps can repeat.)
+
+> **Common mistake:** adding the index but keeping `OFFSET`, which still walks and discards every earlier row.
+
+## Q7. (created_at, status) and rare statuses
+
+**Question:** with `(created_at, status)`, why can "newest 20 orders with status = X" be fast for one status and slow for another?
+
+The index is in date order across all statuses, so the plan walks backwards from the newest entry and skips entries with the wrong status until it has 20. For `paid` (35% of rows) it finds 20 within ≈ 60 entries. For a status that is rare or absent among recent orders, it may walk a large part of the index first. The cost depends on the data, not the query shape. `(status, created_at)` makes it 20 entries for every status.
+
+> **Common mistake:** testing only with a common value and concluding the index is fine.

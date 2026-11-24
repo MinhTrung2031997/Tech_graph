@@ -1,0 +1,277 @@
+---
+title: "Concept 5: MongoDB's ESR rule"
+description: "Equality, Sort, Range: MongoDB's guideline for ordering compound index fields, and why it puts the sort field before the range field. Four index orders measured on the same query, and the same rule applied to PostgreSQL and MySQL."
+type: "concept"
+tags: ["indexing", "mongodb", "postgresql", "mysql", "composite-index", "esr"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/tutorial/equality-sort-range-guideline/"
+  - "https://www.mongodb.com/docs/manual/tutorial/sort-results-with-indexes/"
+  - "https://www.postgresql.org/docs/current/indexes-ordering.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/order-by-optimization.html"
+---
+
+<Tldr>
+For a query with equalities, a sort and a range, order the index fields **Equality → Sort → Range**. Concept 3 said "range last"; ESR adds that the **sort field goes before the range field**, because a range in front of the sort field destroys the order and forces a blocking sort. For "paid orders over 400, newest 20", the ESR index `{ status, created_at, amount }` examined **114 keys in 1 ms**; `{ status, amount, created_at }` (E-R-S) examined **70,000 keys plus an in-memory SORT, 24 ms**. The same rule held in PostgreSQL (6 buffers vs 13.8 ms) and MySQL (0.41 ms vs 87 ms).
+</Tldr>
+
+## The three kinds of field
+
+| Letter | Field kind | Example | Why this position |
+|---|---|---|---|
+| **E** | Equality (`status: 'paid'`, `$in` with few values) | `status` | Fixes one stretch (Concept 1) |
+| **S** | Sort (`sort({ created_at: -1 })`) | `created_at` | Inside the stretch, entries are already in sort order (Concept 4) |
+| **R** | Range (`$gt`, `$lt`, `$ne`, regex) | `amount` | Checked on each key while walking in sort order; does not break the order |
+
+The trade-off: with S before R, the range no longer narrows the seek (it becomes a per-key check), so the scan may read more keys than match. With R before S, the seek is tight but the order is lost, so **every** matching key must be read and sorted before the first result. With a `LIMIT`, stopping early almost always wins.
+
+## Four index orders, one query
+
+`db.orders.find({ status: "paid", amount: { $gt: 400 } }).sort({ created_at: -1 }).limit(20)`: 70,000 documents match.
+
+| Index (hinted) | Order | Stages | Keys examined | Docs examined | Time |
+|---|---|---|---|---|---|
+| `{ status: 1, created_at: -1, amount: 1 }` | **E S R** | LIMIT ← FETCH ← IXSCAN | 114 | 20 | 1 ms |
+| `{ status: 1, created_at: -1 }` | E S (range checked on the document) | LIMIT ← FETCH ← IXSCAN | 114 | 114 | 0 ms |
+| `{ status: 1, amount: 1, created_at: -1 }` | E R S | FETCH ← SORT ← IXSCAN | 70,000 | 20 | 24 ms |
+| `{ amount: 1, status: 1, created_at: -1 }` | R E S | FETCH ← SORT ← IXSCAN | 76,499 | 20 | 42 ms |
+
+With `limit(1000)`: ESR 5,000 keys, 2 ms; ERS still 70,000 keys, 24 ms. The ERS cost does not depend on the limit: it always reads every match.
+
+| Term | Meaning |
+|---|---|
+| Blocking SORT | Must consume all input before emitting the first document; memory-limited (100 MB) |
+| Non-blocking | Documents flow out as they are found; LIMIT stops the scan |
+| **✓ ESR order** | Sort comes from the index; the range is checked per key |
+| **✗ Range before sort** | Tight seek, but a blocking SORT over all matches |
+
+<Flow
+  title="MongoDB: E-S-R vs E-R-S for paid, amount > 400, newest 20"
+  height={340}
+  nodes={[
+    { id: 'q', label: "status: 'paid'", sub: 'amount > 400, sort, limit 20', x: 20, y: 20, w: 260 },
+    { id: 'esr', label: '✓ ESR order', sub: '{ status, created_at, amount }', x: 340, y: 20, w: 240 },
+    { id: 'ers', label: '✗ Range before sort', sub: '{ status, amount, created_at }', x: 340, y: 150, w: 240 },
+    { id: 'walk', label: 'Walk newest first', sub: 'check amount per key', x: 630, y: 20, w: 150 },
+    { id: 'sort', label: 'Blocking SORT', sub: 'all 70,000 keys', x: 630, y: 150, w: 150 },
+    { id: 'out', label: 'LIMIT 20', sub: '', x: 340, y: 270, w: 240 },
+  ]}
+  edges={[
+    { id: 'q-esr', from: 'q', to: 'esr' },
+    { id: 'q-ers', from: 'q', to: 'ers' },
+    { id: 'esr-walk', from: 'esr', to: 'walk' },
+    { id: 'ers-sort', from: 'ers', to: 'sort' },
+    { id: 'sort-out', from: 'sort', to: 'out' },
+  ]}
+  cases={[
+    {
+      title: 'E-S-R',
+      path: 'seek to paid, newest → walk keys in created_at order, skip amount ≤ 400 → 20 found after 114 keys → stop',
+      summary: 'Measured: keys 114, docs 20, 1 ms.',
+      subs: { out: '114 keys, 20 docs' },
+      steps: [
+        {
+          title: 'Seek to the newest paid key',
+          note: 'Bounds: status ["paid", "paid"], created_at [MaxKey, MinKey], amount (400, ∞]. The scan starts at the newest paid order.',
+          code: 'db.orders.find({ status: "paid", amount: { $gt: 400 } }).sort({ created_at: -1 }).limit(20).hint({ status: 1, created_at: -1, amount: 1 })',
+          active: ['q', 'esr'],
+          edges: ['q-esr'],
+        },
+        {
+          title: 'Walk in sort order, check the range per key',
+          note: 'Keys come out newest first. amount is in the key, so keys with amount ≤ 400 are skipped without fetching the document. About 1 in 5 paid orders is over 400.',
+          active: ['esr', 'walk'],
+          edges: ['esr-walk'],
+        },
+        {
+          title: 'Stop at 20',
+          note: 'After 114 keys, 20 have matched; LIMIT ends the scan. Only those 20 documents are fetched.',
+          active: ['walk', 'out'],
+        },
+      ],
+    },
+    {
+      title: 'E-R-S',
+      path: 'seek to (paid, 400) → read all 70,000 matching keys → blocking SORT by created_at → take 20',
+      summary: 'Measured: keys 70,000, docs 20, 24 ms; with limit 1000 still 70,000 keys.',
+      subs: { out: '70,000 keys, then 20 docs' },
+      steps: [
+        {
+          title: 'Tight seek on the range',
+          note: 'Bounds status ["paid"], amount (400, ∞]: exactly the 70,000 matches, no wasted keys.',
+          code: 'db.orders.find({ status: "paid", amount: { $gt: 400 } }).sort({ created_at: -1 }).limit(20).hint({ status: 1, amount: 1, created_at: -1 })',
+          active: ['q', 'ers'],
+          edges: ['q-ers'],
+        },
+        {
+          title: '✗ Wrong order: blocking SORT',
+          note: 'Within the stretch, keys are ordered by amount, not created_at. The SORT stage must read all 70,000 keys before it knows which 20 are newest.',
+          active: ['ers', 'sort'],
+          edges: ['ers-sort'],
+        },
+        {
+          title: 'Then 20',
+          note: 'Only 20 documents are fetched in the end (the sort works on keys), but the 70,000-key read and sort happen on every call, whatever the limit.',
+          active: ['sort', 'out'],
+          edges: ['sort-out'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## The same rule in PostgreSQL and MySQL
+
+`WHERE status = 'paid' AND amount > 400 ORDER BY created_at DESC LIMIT 20`:
+
+| | Index `(status, created_at, amount)` (E-S-R) | Index `(status, amount, created_at)` (E-R-S) |
+|---|---|---|
+| PostgreSQL 17 | Index Scan Backward, `Index Cond` includes `amount > 400`: 6 buffers, 0.04 ms | Bitmap of 69,674 rows + top-N sort: 10,448 buffers, 13.8 ms |
+| MySQL 8.4 | `ref`, Backward index scan: 0.41 ms | `range`, Using filesort: 87 ms |
+
+<Flow
+  title="PostgreSQL: E-S-R vs E-R-S"
+  height={300}
+  nodes={[
+    { id: 'q', label: "status = 'paid'", sub: 'amount > 400, ORDER BY, LIMIT', x: 20, y: 20, w: 260 },
+    { id: 'esr', label: '✓ (status, created_at, amount)', sub: '', x: 340, y: 20, w: 260 },
+    { id: 'ers', label: '✗ (status, amount, created_at)', sub: '', x: 340, y: 150, w: 260 },
+    { id: 'a', label: '6 buffers', sub: '0.04 ms', x: 650, y: 20, w: 130 },
+    { id: 'b', label: 'Sort', sub: '13.8 ms', x: 650, y: 150, w: 130 },
+  ]}
+  edges={[
+    { id: 'q-esr', from: 'q', to: 'esr' },
+    { id: 'q-ers', from: 'q', to: 'ers' },
+    { id: 'esr-a', from: 'esr', to: 'a' },
+    { id: 'ers-b', from: 'ers', to: 'b' },
+  ]}
+  cases={[
+    {
+      title: 'E-S-R',
+      path: '✓ Index Scan Backward, amount checked in the index → Limit 20',
+      summary: 'Index Cond: status = paid AND amount > 400; no Sort node.',
+      steps: [
+        {
+          title: 'Walk newest first, filter amount in the index',
+          note: 'Index Scan Backward using orders_esr. amount > 400 appears in Index Cond: checked on each entry, not used to seek. 20 rows after a handful of pages.',
+          code: "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders\nWHERE status = 'paid' AND amount > 400 ORDER BY created_at DESC LIMIT 20;",
+          active: ['q', 'esr', 'a'],
+          edges: ['q-esr', 'esr-a'],
+        },
+      ],
+    },
+    {
+      title: 'E-R-S',
+      path: '✗ Bitmap of all 69,674 matches → top-N heapsort',
+      summary: '10,448 buffers.',
+      steps: [
+        {
+          title: 'All matches, then sort',
+          note: 'The planner reads every match through a bitmap and sorts. Same shape as MongoDB\'s blocking SORT.',
+          code: '-- with only (status, amount, created_at) available',
+          active: ['q', 'ers', 'b'],
+          edges: ['q-ers', 'ers-b'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Flow
+  title="MySQL: E-S-R vs E-R-S"
+  height={300}
+  nodes={[
+    { id: 'q', label: "status = 'paid'", sub: 'amount > 400, ORDER BY, LIMIT', x: 20, y: 20, w: 260 },
+    { id: 'esr', label: '✓ (status, created_at, amount)', sub: '', x: 340, y: 20, w: 260 },
+    { id: 'ers', label: '✗ (status, amount, created_at)', sub: '', x: 340, y: 150, w: 260 },
+    { id: 'a', label: '0.41 ms', sub: 'backward scan', x: 650, y: 20, w: 130 },
+    { id: 'b', label: '87 ms', sub: 'Using filesort', x: 650, y: 150, w: 130 },
+  ]}
+  edges={[
+    { id: 'q-esr', from: 'q', to: 'esr' },
+    { id: 'q-ers', from: 'q', to: 'ers' },
+    { id: 'esr-a', from: 'esr', to: 'a' },
+    { id: 'ers-b', from: 'ers', to: 'b' },
+  ]}
+  cases={[
+    {
+      title: 'E-S-R',
+      path: '✓ ref on status, backward index scan, amount checked per entry → 20 rows',
+      summary: 'EXPLAIN: type ref, Using where; Backward index scan.',
+      steps: [
+        {
+          title: 'Read in order, stop at 20',
+          note: '0.41 ms with FORCE INDEX (orders_esr).',
+          code: "EXPLAIN ANALYZE SELECT * FROM orders FORCE INDEX (orders_esr)\nWHERE status = 'paid' AND amount > 400 ORDER BY created_at DESC LIMIT 20;",
+          active: ['q', 'esr', 'a'],
+          edges: ['q-esr', 'esr-a'],
+        },
+      ],
+    },
+    {
+      title: 'E-R-S',
+      path: '✗ range on (status, amount) → filesort of all matches',
+      summary: 'EXPLAIN: type range, Using index condition; Using filesort.',
+      steps: [
+        {
+          title: 'Range, then filesort',
+          note: '87 ms with FORCE INDEX (orders_ers): about 200× slower.',
+          code: "EXPLAIN ANALYZE SELECT * FROM orders FORCE INDEX (orders_ers)\nWHERE status = 'paid' AND amount > 400 ORDER BY created_at DESC LIMIT 20;",
+          active: ['q', 'ers', 'b'],
+          edges: ['q-ers', 'ers-b'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## When ESR is not the answer
+
+| Situation | Better choice |
+|---|---|
+| The range is extremely selective (a few matches) and there is no LIMIT | E-R-S: the tight seek reads only those matches; sorting a few is cheap |
+| No sort in the query | E-R (Concept 3): equality, then range |
+| `$in` with many values on the "E" field | Each value is a separate stretch; with a sort, MongoDB must merge or sort; consider treating it as a range |
+| `$ne`, `$nin`, unanchored regex | These are ranges (or worse); put them last |
+
+<Pitfall>
+MongoDB's planner does not apply ESR for you. In the lab it picked `{ status, created_at }` (E-S, with the range checked on each document) over the ESR index after a trial; both were fast here, but the planner only chooses among indexes you created. Design the index with ESR, then check `explain()` for a `SORT` stage and for `totalKeysExamined` far above `nReturned`.
+</Pitfall>
+
+## Real-world scenario: an order search screen
+
+A seller searches their orders: status filter, minimum amount, newest first, 50 per page. The collection has `{ seller_id: 1, status: 1, amount: 1 }` and the screen times out for big sellers.
+
+| Index | Big seller, 2M orders, 600k matching |
+|---|---|
+| `{ seller_id, status, amount }` (E E R, then sort) | Reads 600k keys, blocking SORT, may exceed the 100 MB sort limit |
+| `{ seller_id, status, created_at, amount }` (E E S R) | Walks newest first, checks amount per key, stops after 50 matches |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 5: covering indexes | Add projected fields after E-S-R to avoid FETCH |
+| Session 6: reading explain() in MongoDB | `SORT` stages and keys/returned ratios are the signals |
+| Session 8: index-design checklist | ESR is one of its core rules |
+
+## Key takeaways
+
+1. ESR: equality fields first, then sort fields, then range fields.
+2. Sort before range keeps index order, so LIMIT can stop early; the range becomes a per-key check.
+3. Range before sort gives a tight seek but a blocking SORT over every match, whatever the limit.
+4. Measured: 114 keys / 1 ms (ESR) vs 70,000 keys + SORT / 24 ms (ERS) in MongoDB; 6 buffers vs 13.8 ms in PostgreSQL; 0.41 ms vs 87 ms in MySQL.
+5. ESR applies to SQL engines too: it is Concepts 3 and 4 combined.
+6. Exceptions: tiny result sets without LIMIT, queries without a sort, many-valued `$in`.
+
+## Check questions
+
+1. What do E, S and R stand for, and what kind of query condition belongs to each?
+2. Why does putting the sort field before the range field help, even though the range then no longer narrows the seek?
+3. The ERS index examined exactly 70,000 keys, all matches, yet was slower than ESR's 114. Explain.
+4. Why did ERS read 70,000 keys for both `limit(20)` and `limit(1000)`, while ESR read 114 and 5,000?
+5. `{ status: 1, created_at: -1 }` (without `amount`) also examined 114 keys but 114 documents. What is the difference from the ESR index?
+6. When would E-R-S be the better order?
+7. Translate ESR into a PostgreSQL index for `WHERE seller_id = ? AND status = ? AND amount > ? ORDER BY created_at DESC LIMIT 50`.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-4-composite-indexes/concept-5-esr-rule/answers">Worked answers to Q1–Q7</DeepDive>
