@@ -1,0 +1,287 @@
+---
+title: "Concept 4: GiST and trigram indexes"
+description: "Two PostgreSQL tools for what B-trees cannot do: trigram indexes (pg_trgm) make LIKE '%…%' and similarity searches indexable, and GiST indexes ranges and geometry, including exclusion constraints that forbid overlapping bookings. Measured, with what MySQL and MongoDB offer instead."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "gist", "trigram", "pg_trgm", "exclusion-constraint"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pgtrgm.html"
+  - "https://www.postgresql.org/docs/current/gist.html"
+  - "https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-CONSTRAINT"
+  - "https://dev.mysql.com/doc/refman/8.4/en/fulltext-search-ngram.html"
+  - "https://www.mongodb.com/docs/manual/core/indexes/index-types/geospatial/2dsphere/"
+---
+
+<Tldr>
+A **leading wildcard** (`LIKE '%00123'`) defeats every B-tree (Session 3). The `pg_trgm` extension splits text into **trigrams** (`SKU-000123` → `" sk"`, `sku`, `000`, `123`, …) and a GIN index on them turns the search into "rows containing all the pattern's trigrams": the lab query went from a Seq Scan of **10,205 buffers to 291**. **GiST** is a framework for indexes over things that overlap or contain each other, ranges and geometry, rather than things that sort. Its showcase is the **exclusion constraint**: `EXCLUDE USING gist (room WITH =, during WITH &&)` rejected an overlapping booking at insert time. MySQL has no trigram or exclusion support (FULLTEXT ngram, application locks); MongoDB scans the whole index for unanchored regexes and has 2dsphere for geometry.
+</Tldr>
+
+## Trigrams
+
+`show_trgm('SKU-000123')` returns the trigrams PostgreSQL indexes for that value: `"  0"`, `"  s"`, `" 00"`, `" sk"`, `000`, `001`, `012`, `123`, `"23 "`, `"ku "`, `sku`. A pattern `'%00123'` contains the trigrams `001`, `012`, `123`, `"23 "`: only rows containing all of them can match.
+
+| Term | Meaning |
+|---|---|
+| Trigram | Three consecutive characters (the value is padded with spaces at both ends) |
+| `gin_trgm_ops` / `gist_trgm_ops` | Operator classes to index trigrams with GIN (faster lookups) or GiST (supports similarity ordering) |
+| Similarity (`%`, `<->`) | Fraction of shared trigrams; for fuzzy matching and "did you mean" |
+| **✓ Trigrams narrow it / ✗ No trigrams** | Patterns with at least one full trigram can use the index; very short patterns cannot |
+
+<Flow
+  title="PostgreSQL: LIKE '%00123' with a trigram index"
+  height={330}
+  nodes={[
+    { id: 'q', label: "sku LIKE '%00123'", sub: '', x: 20, y: 20, w: 240 },
+    { id: 'tri', label: 'Pattern trigrams', sub: '001, 012, 123, "23 "', x: 320, y: 20, w: 220 },
+    { id: 'gin', label: 'GIN (gin_trgm_ops)', sub: 'trigram → rows', x: 600, y: 20, w: 180 },
+    { id: 'yes', label: '✓ Trigrams narrow it', sub: 'intersect lists', x: 600, y: 150, w: 180 },
+    { id: 'no', label: '✗ No usable index', sub: 'Seq Scan', x: 20, y: 150, w: 240 },
+    { id: 'heap', label: 'Heap + recheck', sub: 'real LIKE test', x: 320, y: 270, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-tri', from: 'q', to: 'tri' },
+    { id: 'tri-gin', from: 'tri', to: 'gin' },
+    { id: 'gin-yes', from: 'gin', to: 'yes' },
+    { id: 'q-no', from: 'q', to: 'no' },
+    { id: 'yes-heap', from: 'yes', to: 'heap' },
+  ]}
+  cases={[
+    {
+      title: 'Without the index',
+      path: '✗ B-tree cannot help a leading wildcard → Seq Scan, 999,793 rows removed',
+      summary: 'Measured: 10,205 buffers for 207 rows.',
+      steps: [
+        {
+          title: '✗ Every row tested',
+          note: 'No B-tree can seek to "ends with 00123". The plan reads the whole table: Rows Removed by Filter 999,793.',
+          code: "EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM orders WHERE sku LIKE '%00123';",
+          active: ['q', 'no'],
+          edges: ['q-no'],
+        },
+      ],
+    },
+    {
+      title: 'With a trigram GIN index',
+      path: 'pattern → 4 trigrams → ✓ intersect their posting lists → 203 heap pages → 207 rows',
+      summary: 'Measured: 291 buffers. Index 18 MB, built in 825 ms.',
+      subs: { heap: '203 pages' },
+      steps: [
+        {
+          title: 'Break the pattern into trigrams',
+          note: "'%00123' yields 001, 012, 123 and \"23 \" (the end of the string). Any matching sku must contain all four.",
+          code: "CREATE EXTENSION pg_trgm;\nCREATE INDEX orders_sku_trgm ON orders USING gin (sku gin_trgm_ops);",
+          active: ['q', 'tri'],
+          edges: ['q-tri'],
+        },
+        {
+          title: '✓ Intersect the trigram lists',
+          note: 'Like any GIN query (Concept 1), the posting lists of the four trigrams are intersected in the index.',
+          active: ['tri', 'gin', 'yes'],
+          edges: ['tri-gin', 'gin-yes'],
+        },
+        {
+          title: 'Recheck on the heap',
+          note: 'Trigram matches are candidates (trigrams can appear in a different order), so each row is rechecked with the real LIKE: 203 heap pages, 207 rows, 291 buffers vs 10,205. ILIKE \'%u-00012%\' (case-insensitive, both sides wild) also used it: 1,988 rows, 202 removed by recheck.',
+          active: ['yes', 'heap'],
+          edges: ['yes-heap'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## GiST and exclusion constraints
+
+A B-tree needs a total order. Ranges, rectangles and points do not have one that helps "does this overlap that?". **GiST** (Generalized Search Tree) stores bounding boxes or covering ranges at each level, so a search descends only into subtrees whose bounding range overlaps the query.
+
+| Term | Meaning |
+|---|---|
+| `tstzrange` | A range of timestamps, e.g. `[2025-06-01 14:00, 2025-06-03 11:00)` |
+| `&&` | Overlaps |
+| Exclusion constraint | Generalised uniqueness: no two rows may satisfy all the listed operators against each other |
+| `btree_gist` | Extension letting GiST handle plain equality (`room WITH =`) alongside ranges |
+| **✓ No conflict / ✗ Overlap found** | Insert accepted or rejected |
+
+<Flow
+  title="PostgreSQL: an exclusion constraint on bookings"
+  height={320}
+  nodes={[
+    { id: 'ins', label: 'INSERT booking', sub: '', x: 20, y: 20, w: 240 },
+    { id: 'gist', label: 'GiST index', sub: 'room =, during &&', x: 320, y: 20, w: 220 },
+    { id: 'ok', label: '✓ No conflict', sub: 'insert', x: 600, y: 20, w: 180 },
+    { id: 'bad', label: '✗ Overlap found', sub: 'ERROR', x: 600, y: 150, w: 180 },
+    { id: 'look', label: 'Lookup', sub: 'overlapping ranges', x: 320, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'ins-gist', from: 'ins', to: 'gist' },
+    { id: 'gist-ok', from: 'gist', to: 'ok' },
+    { id: 'gist-bad', from: 'gist', to: 'bad' },
+    { id: 'look-gist', from: 'look', to: 'gist', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Overlapping booking',
+      path: 'room 101, 2–4 June vs existing 1–3 June → ✗ overlap → ERROR',
+      summary: 'Double booking made impossible by the database.',
+      subs: { ins: 'room 101, 2–4 June' },
+      steps: [
+        {
+          title: 'The constraint',
+          note: 'No two rows may have the same room AND overlapping periods. The constraint creates a GiST index on (room, during).',
+          code: "CREATE EXTENSION btree_gist;\nCREATE TABLE bookings (room int, during tstzrange,\n  EXCLUDE USING gist (room WITH =, during WITH &&));\nINSERT INTO bookings VALUES (101, '[2025-06-01 14:00, 2025-06-03 11:00)');",
+          active: ['ins', 'gist'],
+          edges: ['ins-gist'],
+        },
+        {
+          title: '✗ Overlap found',
+          note: 'ERROR: conflicting key value violates exclusion constraint "bookings_room_during_excl". DETAIL: (101, [06-02 14:00, 06-04 11:00)) conflicts with (101, [06-01 14:00, 06-03 11:00)). Concurrent inserts wait for each other as with unique indexes (Session 5).',
+          code: "INSERT INTO bookings VALUES (101, '[2025-06-02 14:00, 2025-06-04 11:00)');",
+          active: ['gist', 'bad'],
+          edges: ['gist-bad'],
+        },
+      ],
+    },
+    {
+      title: 'Allowed bookings',
+      path: 'another room, or a stay starting exactly at checkout → ✓ no conflict',
+      summary: 'Half-open ranges [start, end) let one stay end where the next begins.',
+      subs: { ins: 'room 102 / 101 from 3 June 11:00' },
+      steps: [
+        {
+          title: '✓ Different room, or adjacent',
+          note: "Room 102 for the same dates: accepted (room differs). Room 101 from [2025-06-03 11:00, 2025-06-05 11:00): accepted, because [ … , 11:00) and [11:00, … ) do not overlap.",
+          code: "INSERT INTO bookings VALUES (101, '[2025-06-03 11:00, 2025-06-05 11:00)');",
+          active: ['ins', 'gist', 'ok'],
+          edges: ['ins-gist', 'gist-ok'],
+        },
+      ],
+    },
+    {
+      title: 'Overlap query',
+      path: 'room 1042 during 1 March → GiST lookup → 1 row, 5 buffers',
+      summary: 'The constraint\'s index also serves overlap queries (100,000 bookings, index 7.9 MB).',
+      subs: { look: 'room 1042, 1 March' },
+      steps: [
+        {
+          title: 'Find overlapping ranges',
+          note: "WHERE during && tstzrange('2025-03-01','2025-03-02') AND room = 1042: Bitmap Index Scan on bookings_room_during_excl, 4 index pages, 1 heap page.",
+          code: "SELECT * FROM bookings WHERE during && tstzrange('2025-03-01', '2025-03-02') AND room = 1042;",
+          active: ['look', 'gist', 'ok'],
+          edges: ['look-gist', 'gist-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL and MongoDB
+
+| Need | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| `LIKE '%…%'` / substring | Trigram GIN or GiST | No index; FULLTEXT with the `ngram` parser indexes n-grams for word-like search (mainly CJK) | Unanchored regex scans the whole index (Session 3) |
+| Fuzzy / similarity | `pg_trgm` `%`, `<->` | — | Atlas Search |
+| No overlapping ranges | Exclusion constraint (GiST) | Not supported: application locking (`SELECT … FOR UPDATE`) or triggers | Not supported: application logic or transactions |
+| Geometry | GiST (PostGIS) | Spatial R-tree index | `2dsphere` / `2d` indexes |
+
+<Flow
+  title="MySQL: substring search without trigrams"
+  height={260}
+  nodes={[
+    { id: 'q', label: "sku LIKE '%00123'", sub: '', x: 20, y: 20, w: 240 },
+    { id: 'all', label: '✗ type: ALL', sub: 'B-tree cannot seek', x: 320, y: 20, w: 220 },
+    { id: 'ng', label: 'FULLTEXT ngram', sub: 'n-gram tokens', x: 600, y: 20, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-all', from: 'q', to: 'all' },
+    { id: 'all-ng', from: 'all', to: 'ng', label: 'option' },
+  ]}
+  cases={[
+    {
+      title: 'Leading wildcard',
+      path: '✗ full scan; the ngram FULLTEXT parser is the closest option',
+      summary: 'Session 3 measured type ALL for this pattern.',
+      steps: [
+        {
+          title: '✗ No trigram index in MySQL',
+          note: "LIKE '%00123' is a full table scan. A FULLTEXT index WITH PARSER ngram splits text into n-grams (default 2) and MATCH … AGAINST can search them, designed for languages without spaces; it is not a drop-in LIKE replacement.",
+          code: "CREATE FULLTEXT INDEX ft_sku ON orders (sku) WITH PARSER ngram;\nSELECT * FROM orders WHERE MATCH(sku) AGAINST ('00123' IN BOOLEAN MODE);",
+          active: ['q', 'all', 'ng'],
+          edges: ['q-all', 'all-ng'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Flow
+  title="MongoDB: substring search without trigrams"
+  height={260}
+  nodes={[
+    { id: 'q', label: '{ sku: /00123$/ }', sub: '', x: 20, y: 20, w: 240 },
+    { id: 'ix', label: '✗ Whole index scanned', sub: '1,000,000 keys', x: 320, y: 20, w: 220 },
+    { id: 'alt', label: 'Atlas Search', sub: 'or a stored field', x: 600, y: 20, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-ix', from: 'q', to: 'ix' },
+    { id: 'ix-alt', from: 'ix', to: 'alt', label: 'option' },
+  ]}
+  cases={[
+    {
+      title: 'Unanchored regex',
+      path: '✗ every key tested (Session 3) → search engine or a derived field',
+      summary: 'Measured in Session 3: 1,000,000 keys for 200 results.',
+      steps: [
+        {
+          title: '✗ No trigram support',
+          note: 'Community MongoDB has no trigram index. Options: an anchored regex on a stored reversed or suffix field, or Atlas Search (Lucene) with n-gram analyzers.',
+          code: 'db.orders.find({ sku: /00123$/ })',
+          active: ['q', 'ix', 'alt'],
+          edges: ['q-ix', 'ix-alt'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+Trigram indexes are large (18 MB for a short `sku` column; often bigger than the table column itself for long text) and slow to update, and patterns shorter than three characters cannot use them. Use them for genuine substring search on columns users type into, not as a general replacement for B-trees.
+</Pitfall>
+
+## Real-world scenario: search-as-you-type on product names
+
+A back-office search box filters products by any part of the name (`ILIKE '%' || $1 || '%'`). It is fast in testing and scans 5M rows in production.
+
+| Option | Effect |
+|---|---|
+| B-tree on `name` | Unused: leading wildcard |
+| `CREATE INDEX ON products USING gin (name gin_trgm_ops)` | Substring and ILIKE searches become index scans; fuzzy matching with `%` |
+| Full-text (`tsvector` GIN) | Word search with stemming, but no partial words |
+| External search engine | Ranking, typo tolerance, facets at scale |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 8: write amplification | GIN and GiST indexes are expensive to maintain |
+| Session 8: index-design checklist | Pick the index type by the operator, not the column |
+
+## Key takeaways
+
+1. `pg_trgm` indexes trigrams; a GIN trigram index serves `LIKE`/`ILIKE` with wildcards on both sides (10,205 → 291 buffers in the lab).
+2. Trigram matches are candidates rechecked on the heap; patterns need at least one full trigram.
+3. GiST indexes overlap and containment: ranges, geometry, similarity ordering.
+4. Exclusion constraints use GiST to forbid overlapping ranges per key, like a generalised unique index.
+5. MySQL has no trigram or exclusion support; FULLTEXT ngram and spatial R-trees cover other needs.
+6. MongoDB scans the whole index for unanchored regexes; 2dsphere covers geometry; substring search needs Atlas Search or derived fields.
+
+## Check questions
+
+1. What trigrams does PostgreSQL extract for `SKU-000123`, and which does the pattern `'%00123'` require?
+2. Why does a trigram index need a recheck on the heap?
+3. Why can't `LIKE '%ab%'` use a trigram index effectively?
+4. What problem does GiST solve that a B-tree cannot?
+5. What does `EXCLUDE USING gist (room WITH =, during WITH &&)` guarantee, and why was a booking from 3 June 11:00 accepted?
+6. How would you prevent double bookings in MySQL or MongoDB without exclusion constraints?
+7. When would you choose full-text search over a trigram index?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-7-specialist-indexes/concept-4-gist-trigram/answers">Worked answers to Q1–Q7</DeepDive>

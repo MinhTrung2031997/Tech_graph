@@ -2,12 +2,11 @@
   "title": "Session 7: Specialist indexes",
   "collapsible": true,
   "defaultOpen": false,
-  "pages": [],
-  "planned": [
-    "Concept 1: GIN for jsonb, arrays and full-text",
-    "Concept 2: BRIN for time-series and logs",
-    "Concept 3: MongoDB TTL, wildcard, text and hashed indexes",
-    "Concept 4: GiST and trigram indexes",
-    "Lab and session quiz"
+  "pages": [
+    "concept-1-gin/index",
+    "concept-2-brin/index",
+    "concept-3-mongodb-special/index",
+    "concept-4-gist-trigram/index",
+    "lab/index"
   ]
 }

@@ -1,0 +1,132 @@
+---
+title: "Lab and session quiz: Specialist indexes"
+description: "Build GIN indexes on arrays, jsonb and full-text, compare a BRIN with a B-tree, try MongoDB's TTL, wildcard, text and hashed indexes, make substring search indexable with pg_trgm, and forbid double bookings with a GiST exclusion constraint."
+type: "how-to"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "gin", "brin", "gist", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/gin.html"
+  - "https://www.postgresql.org/docs/current/brin.html"
+  - "https://www.postgresql.org/docs/current/pgtrgm.html"
+  - "https://www.mongodb.com/docs/manual/core/index-ttl/"
+---
+
+<Tldr>
+Uses the containers from the [Session 1 lab](/blogs/databases/indexing/session-1-storage-basics/lab). Exercises 1 and 3 create their own `products` / `items` data; Exercises 2 and 4 use `orders`.
+</Tldr>
+
+## Exercise 1: GIN (Concept 1)
+
+```sql
+-- pg
+CREATE TABLE products (id int PRIMARY KEY, price numeric(8,2), tags text[], attrs jsonb, description text);
+INSERT INTO products
+SELECT i, (i % 500) + 0.99,
+  (SELECT array_agg(t) FROM (SELECT (ARRAY['red','blue','green','sale','new','eco','kids','sport','home','gift'])[1 + ((i*7 + j*3) % 10)] AS t
+                            FROM generate_series(0, 2 + i % 3) j) s),
+  jsonb_build_object('color', (ARRAY['red','blue','green','black'])[1 + i % 4], 'size', (ARRAY['S','M','L','XL'])[1 + i % 4],
+                     'brand', 'brand' || (i % 200), 'warranty', (i % 3 = 0)),
+  'Product ' || i || ' ' || (ARRAY['soft cotton shirt','waterproof hiking boots','stainless steel bottle',
+     'wireless noise cancelling headphones','organic green tea'])[1 + i % 5] || ' for ' || (ARRAY['kids','adults','sport','travel'])[1 + i % 4]
+FROM generate_series(1, 100000) i;
+UPDATE products SET tags = array_append(tags, 'clearance') WHERE id % 200 = 0;
+VACUUM ANALYZE products;
+
+EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM products WHERE tags @> ARRAY['clearance','gift'];   -- Seq Scan, ≈ 4,800 buffers
+CREATE INDEX products_tags_gin ON products USING gin (tags);
+EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM products WHERE tags @> ARRAY['clearance','gift'];   -- Bitmap: 7 index + 22 heap pages
+
+CREATE INDEX products_attrs_pathops ON products USING gin (attrs jsonb_path_ops);
+EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM products WHERE attrs @> '{"brand": "brand7", "color": "black"}';  -- 13 index pages, 500 rows
+
+ALTER TABLE products ADD COLUMN fts tsvector GENERATED ALWAYS AS (to_tsvector('english', description)) STORED;
+CREATE INDEX products_fts ON products USING gin (fts);
+EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM products WHERE fts @@ to_tsquery('english', 'waterproof & boots & travel');  -- 42 index pages
+```
+
+```sql
+-- my
+CREATE TABLE products (id INT PRIMARY KEY, tags JSON);
+-- … fill 100,000 rows, every 200th with JSON_ARRAY('red','sale','clearance') …
+CREATE INDEX tags_mv ON products ((CAST(tags->'$' AS CHAR(12) ARRAY)));
+EXPLAIN SELECT id FROM products WHERE 'clearance' MEMBER OF (tags);       -- ALL: different expression
+EXPLAIN SELECT id FROM products WHERE 'clearance' MEMBER OF (tags->'$');  -- ref, tags_mv, rows 500
+```
+
+## Exercise 2: BRIN vs B-tree (Concept 2)
+
+```sql
+-- pg
+CREATE INDEX orders_created_brin  ON orders USING brin (created_at);
+CREATE INDEX orders_customer_brin ON orders USING brin (customer_id);
+SELECT relname, pg_size_pretty(pg_relation_size(oid)) FROM pg_class WHERE relname LIKE 'orders_%brin';   -- 24 kB each
+SELECT attname, correlation FROM pg_stats WHERE tablename = 'orders' AND attname IN ('created_at', 'customer_id');
+
+SET max_parallel_workers_per_gather = 0; SET enable_indexscan = off;   -- let the BRIN show itself
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*), sum(amount) FROM orders
+WHERE created_at >= '2025-03-01' AND created_at < '2025-03-02';
+-- Bitmap Heap Scan · Heap Blocks: lossy ≈ 349 · Rows Removed by Index Recheck ≈ 31,000
+RESET ALL;
+
+SELECT blknum, value FROM brin_page_items(get_raw_page('orders_created_brin', 2), 'orders_created_brin') LIMIT 2;
+SELECT blknum, value FROM brin_page_items(get_raw_page('orders_customer_brin', 2), 'orders_customer_brin') LIMIT 2;
+-- created_at ranges cover ≈ 4.5 days each · customer_id ranges cover 5 … 100000
+```
+
+## Exercise 3: MongoDB's special indexes (Concept 3)
+
+```js
+// mg
+const descs = ['soft cotton shirt', 'waterproof hiking boots', 'stainless steel bottle', 'wireless noise cancelling headphones', 'organic green tea'];
+const docs = [];
+for (let i = 1; i <= 100000; i++) docs.push({ _id: i, description: 'Product ' + i + ' ' + descs[i % 5] + ' for ' + ['kids', 'adults', 'sport', 'travel'][i % 4],
+  attrs: { color: ['red', 'blue', 'green', 'black'][i % 4], brand: 'brand' + (i % 200) }, user_id: i % 5000 });
+db.items.insertMany(docs);
+db.items.createIndex({ description: 'text' });
+db.items.createIndex({ 'attrs.$**': 1 });
+db.items.createIndex({ user_id: 'hashed' });
+
+const s = c => { const e = c.explain('executionStats').executionStats; return { keys: e.totalKeysExamined, docs: e.totalDocsExamined, n: e.nReturned }; };
+s(db.items.find({ $text: { $search: '"waterproof" "travel"' } }));   // keys 45000, docs 40000, n 5000
+s(db.items.find({ 'attrs.brand': 'brand7' }));                         // keys 500, docs 500
+s(db.items.find({ user_id: 42 }));                                     // keys 20
+s(db.items.find({ user_id: { $gt: 4990 } }));                          // COLLSCAN: docs 100000
+
+db.ttl.createIndex({ created_at: 1 }, { expireAfterSeconds: 5 });
+db.ttl.insertMany([{ created_at: new Date() }, { created_at: new Date(Date.now() - 3600e3) }, { created_at: 'not a date' }]);
+// wait ≈ 70 s
+db.ttl.find();   // only { created_at: 'not a date' } remains
+```
+
+## Exercise 4: trigrams and exclusion constraints (Concept 4)
+
+```sql
+-- pg
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM orders WHERE sku LIKE '%00123';   -- Seq Scan, ≈ 10,200 buffers
+CREATE INDEX orders_sku_trgm ON orders USING gin (sku gin_trgm_ops);              -- ≈ 0.8 s, 18 MB
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM orders WHERE sku LIKE '%00123';   -- Bitmap, ≈ 290 buffers
+SELECT show_trgm('SKU-000123');
+
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE TABLE bookings (room int, during tstzrange, EXCLUDE USING gist (room WITH =, during WITH &&));
+INSERT INTO bookings VALUES (101, '[2025-06-01 14:00, 2025-06-03 11:00)');
+INSERT INTO bookings VALUES (102, '[2025-06-01 14:00, 2025-06-03 11:00)');   -- OK: another room
+INSERT INTO bookings VALUES (101, '[2025-06-02 14:00, 2025-06-04 11:00)');   -- ERROR: conflicting key value violates exclusion constraint
+INSERT INTO bookings VALUES (101, '[2025-06-03 11:00, 2025-06-05 11:00)');   -- OK: starts at checkout
+DROP TABLE bookings;
+```
+
+## Session quiz
+
+1. For each query, name the best PostgreSQL index type: (a) `tags @> '{sale}'`; (b) `created_at` range on an append-only log; (c) `name ILIKE '%phone%'`; (d) "no two reservations of a room overlap"; (e) `description` matches "waterproof boots".
+2. Why did the GIN array query read 22 heap pages, while the jsonb query read 500?
+3. The created_at BRIN is 24 kB and the B-tree 21 MB. Why would you still keep the B-tree on `orders`?
+4. Why did the text search in Exercise 3 fetch 40,000 documents, and how would PostgreSQL's full-text GIN differ?
+5. A team uses a hashed index on `created_at` to "speed up date filters". What happens to their range queries?
+6. Why did the TTL monitor leave one document behind?
+7. Why does the trigram index need at least three characters, and what happens with `LIKE '%12%'`?
+8. Which of this session's features have no direct equivalent in MySQL, and what would you use instead for each?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-7-specialist-indexes/lab/answers">Answers to the session quiz</DeepDive>

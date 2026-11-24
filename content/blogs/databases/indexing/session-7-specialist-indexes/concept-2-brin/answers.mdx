@@ -1,0 +1,70 @@
+---
+title: "Answers: BRIN for time-series and logs"
+description: "Worked answers to the Session 7 Concept 2 check questions."
+companion: "answers"
+tags: ["indexing", "brin", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/brin.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-range.html"
+---
+
+<Tldr>
+BRIN trades precision for size: min/max per block range. It is only as good as the physical order of the column.
+</Tldr>
+
+## Q1. One BRIN entry
+
+**Question:** what does one BRIN entry store, and why is the index so small?
+
+The minimum and maximum value of the column across one block range (128 heap pages by default), plus flags. One entry summarises ≈ 12,700 rows of `orders`, so 1M rows need ≈ 80 entries: 24 kB in total, against 21 MB for a B-tree with one entry per row.
+
+> **Common mistake:** thinking BRIN stores row pointers; it stores page ranges.
+
+## Q2. 349 pages for 2,740 rows
+
+**Question:** why did the one-day query read 349 pages and recheck 31,273 rows to return 2,740?
+
+BRIN can only say "this range may contain 1 March". The ranges whose min–max overlap the day were kept whole: 349 pages (about three ranges). Every row on them was checked against the condition; 31,273 were outside the day and removed, 2,740 matched. It is lossy by design.
+
+> **Common mistake:** reading `Rows Removed by Index Recheck` as a bug.
+
+## Q3. BRIN on customer_id
+
+**Question:** why is a BRIN on `customer_id` useless, and which statistic tells you so in advance?
+
+Customers are spread evenly across the table, so every range contains almost every customer id: summaries like 5 … 100,000 exclude nothing. Forced, it read 6,528 pages for 7 rows. `pg_stats.correlation` for `customer_id` is −0.005 (no relation to physical order); BRIN needs values close to ±1.
+
+> **Common mistake:** choosing BRIN by size alone.
+
+## Q4. Non-HOT updates
+
+**Question:** what happens to a BRIN index when many old rows are updated in a non-HOT way?
+
+New row versions go to whatever page has room, often recent pages or freed space in old ones. A range then contains values from very different times, so its min–max widens and it overlaps more queries; more pages are read and rechecked. Correlation drops (1.0 → 0.98 after the Session 5 updates). Ranges are not narrowed again until re-summarised (`brin_desummarize_range` + summarise) or the table is rewritten.
+
+> **Common mistake:** expecting BRIN to stay as precise as on day one on an updated table.
+
+## Q5. pages_per_range
+
+**Question:** when would you lower `pages_per_range`, and what does it cost?
+
+When queries ask for narrow windows relative to a range's span (an hour when each range covers days): smaller ranges (e.g. 32) mean fewer lossy pages and rows rechecked per query. The cost is a bigger index (4× more entries for 32 vs 128, still tiny) and slightly more summarisation work.
+
+> **Common mistake:** setting it to 1, which makes BRIN pointlessly big without becoming exact.
+
+## Q6. Partition pruning vs BRIN
+
+**Question:** how does MySQL partition pruning resemble BRIN, and how does it differ?
+
+Both skip whole chunks of the table whose value range cannot match. Differences: partitions are declared in the schema with fixed boundaries, each is a separate table with its own indexes, rows are routed by the partition key on insert (so ranges never blur), and dropping a partition deletes its data instantly. BRIN is automatic, tiny, and depends on physical order staying correlated.
+
+> **Common mistake:** "partitioning is just indexing": it changes storage, primary keys and maintenance.
+
+## Q7. Log table vs orders table
+
+**Question:** why is BRIN a good fit for an append-only log table but a poor fit for an orders table with frequent status updates?
+
+In an append-only log, rows are written in time order and never move, so each range covers a narrow, non-overlapping time window forever. In an orders table, status updates create new versions that land on other pages, scattering old timestamps into recent ranges; the summaries widen and BRIN loses selectivity. Use a B-tree there, or BRIN only on columns that stay correlated.
+
+> **Common mistake:** applying "BRIN for timestamps" without asking whether rows move.

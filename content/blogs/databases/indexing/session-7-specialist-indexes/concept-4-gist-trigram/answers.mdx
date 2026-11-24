@@ -1,0 +1,70 @@
+---
+title: "Answers: GiST and trigram indexes"
+description: "Worked answers to the Session 7 Concept 4 check questions."
+companion: "answers"
+tags: ["indexing", "gist", "trigram", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pgtrgm.html"
+  - "https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-CONSTRAINT"
+---
+
+<Tldr>
+Trigrams turn substrings into elements GIN can intersect; GiST indexes things that overlap. Both return candidates that are rechecked.
+</Tldr>
+
+## Q1. Trigrams of SKU-000123
+
+**Question:** what trigrams does PostgreSQL extract for `SKU-000123`, and which does the pattern `'%00123'` require?
+
+`show_trgm('SKU-000123')`: `"  0"`, `"  s"`, `" 00"`, `" sk"`, `000`, `001`, `012`, `123`, `"23 "`, `"ku "`, `sku` (lower-cased; non-alphanumeric characters split words, and each word is padded with spaces). `'%00123'` requires `001`, `012`, `123` and `"23 "` (the pattern is anchored at the end, so the trailing padded trigram counts).
+
+> **Common mistake:** expecting trigrams to keep case or punctuation.
+
+## Q2. Why recheck
+
+**Question:** why does a trigram index need a recheck on the heap?
+
+Containing all of a pattern's trigrams is necessary but not sufficient: the trigrams may occur in a different order or in different words (`'123-012'` contains `012` and `123` too). The index returns candidates; PostgreSQL applies the real `LIKE` to each candidate row and discards false positives (202 removed for the ILIKE example).
+
+> **Common mistake:** treating index matches as final results.
+
+## Q3. LIKE '%ab%'
+
+**Question:** why can't `LIKE '%ab%'` use a trigram index effectively?
+
+A two-character pattern contains no complete trigram, so there is nothing to look up; the index would have to return every row. PostgreSQL falls back to a full scan (or a full index scan). Searches typically require at least three characters for this reason.
+
+> **Common mistake:** enabling search-as-you-type from the first keystroke on a trigram index.
+
+## Q4. What GiST solves
+
+**Question:** what problem does GiST solve that a B-tree cannot?
+
+A B-tree relies on a total order where "close in order" means "close in value". For ranges, rectangles or points, the useful questions are "overlaps", "contains", "is near", and no single order answers them. GiST keeps a bounding range or box for each subtree and descends only into subtrees whose bound can match, which works for any data with such bounds.
+
+> **Common mistake:** "GiST is a slower B-tree". It answers different questions.
+
+## Q5. The exclusion constraint
+
+**Question:** what does `EXCLUDE USING gist (room WITH =, during WITH &&)` guarantee, and why was a booking from 3 June 11:00 accepted?
+
+No two rows can have the same `room` **and** overlapping `during` ranges: double bookings are rejected at insert or update, even under concurrency. The existing booking is `[2025-06-01 14:00, 2025-06-03 11:00)`, half-open: it ends just before 11:00. A new range `[2025-06-03 11:00, …)` starts at 11:00, so the two touch but do not overlap.
+
+> **Common mistake:** using closed ranges `[ ]`, which would make back-to-back bookings conflict.
+
+## Q6. Double bookings elsewhere
+
+**Question:** how would you prevent double bookings in MySQL or MongoDB without exclusion constraints?
+
+Serialise conflicting writes yourself. MySQL: in a transaction, `SELECT … FROM bookings WHERE room = ? AND start < ? AND end > ? FOR UPDATE` (with an index on `(room, start)`), or lock a per-room row, then insert if nothing was found. MongoDB: a transaction that checks and inserts while updating a per-room document (forcing a write conflict between concurrent bookings), or model time slots as documents with a unique index on `(room, slot)`. Plain check-then-insert without locking races (Session 5, Concept 5).
+
+> **Common mistake:** checking availability in one request and inserting in another.
+
+## Q7. Full-text vs trigram
+
+**Question:** when would you choose full-text search over a trigram index?
+
+When users search for **words** in natural-language text and expect stemming (boots → boot), stop words, ranking and phrase queries: full-text (`tsvector` + GIN). Choose trigrams for **substrings** and fuzzy matches in identifiers, codes and names (SKUs, emails, partial words), where word boundaries and stemming do not apply.
+
+> **Common mistake:** using trigrams for long documents: large indexes and poor relevance.

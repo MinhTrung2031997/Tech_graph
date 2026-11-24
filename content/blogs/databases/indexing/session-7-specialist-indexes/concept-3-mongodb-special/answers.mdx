@@ -1,0 +1,73 @@
+---
+title: "Answers: MongoDB TTL, wildcard, text and hashed indexes"
+description: "Worked answers to the Session 7 Concept 3 check questions."
+companion: "answers"
+tags: ["indexing", "mongodb", "ttl", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/index-ttl/"
+  - "https://www.mongodb.com/docs/manual/core/indexes/index-types/index-text/"
+---
+
+<Tldr>
+Each special index trades generality for one job: expiry, unknown fields, words, or distribution.
+</Tldr>
+
+## Q1. What TTL deletes
+
+**Question:** how does a TTL index decide what to delete, and why did one document never expire in the lab?
+
+The TTL monitor periodically walks the index on the date field and deletes documents whose value is older than now − `expireAfterSeconds` (for an array of dates, the earliest counts). The document with `created_at: "not a date"` has a string, not a date, so it is never considered expired.
+
+> **Common mistake:** storing timestamps as strings or numbers and expecting TTL to work.
+
+## Q2. Not instant
+
+**Question:** why is deletion through a TTL index not instant, and what problem appears with very high expiry volumes?
+
+The monitor runs about every 60 seconds, and on a replica set only on the primary, deleting in batches; under load it can fall behind. Each deletion is an ordinary delete: index entries removed, oplog entries replicated. With millions of expiries a day this becomes a heavy, continuous delete workload. Dropping whole time-bucketed collections, or using time-series collections whose expiry drops whole buckets, is cheaper.
+
+> **Common mistake:** relying on TTL for exact-time expiry (e.g. security tokens); check expiry in the query too.
+
+## Q3. Wildcard indexes
+
+**Question:** when is a wildcard index the right choice, and what can it not do?
+
+When documents have varied, unpredictable field names (user-defined attributes, product specs) and queries filter on one of them at a time. It cannot serve one query's conditions on several fields as a single tight range, cannot support sorts across fields, and indexes everything under the path (write cost and size for fields nobody queries). For known, frequent query shapes, normal compound indexes are better.
+
+> **Common mistake:** using `$**` on the whole document "to be safe".
+
+## Q4. 40,000 documents for 5,000
+
+**Question:** why did the text search examine 40,000 documents to return 5,000?
+
+The text index scans each search term separately (OR), producing every document that contains either word, then fetches them and TEXT_MATCH keeps those containing both phrases. Documents with only one of the words are fetched and discarded. PostgreSQL's GIN would intersect the two words' posting lists before fetching.
+
+> **Common mistake:** assuming a phrase search only touches matching documents.
+
+## Q5. Hashed and ranges
+
+**Question:** why can a hashed index serve `user_id = 42` but not `user_id > 4990`?
+
+The index stores hash(user_id), sorted by hash. Equality computes hash(42) and seeks to it. A range has no single hash: hash(4991) and hash(4992) are far apart, so values above 4990 are scattered across the whole index; MongoDB uses a COLLSCAN.
+
+> **Common mistake:** choosing a hashed shard key for a collection queried mostly by ranges.
+
+## Q6. Expiry in PostgreSQL
+
+**Question:** how would you implement "delete events older than 90 days" in PostgreSQL without TTL, and why is dropping partitions better than DELETE?
+
+Partition `events` by range on `created_at` (daily or monthly) and have a scheduled job (cron, `pg_cron`) drop partitions older than 90 days and create upcoming ones. Dropping removes the partition's files instantly: no dead tuples, no index entries to vacuum, no table bloat. A `DELETE` of the same rows marks them dead, leaves index entries, needs VACUUM, and does not shrink the table (Session 1, Concept 3).
+
+> **Common mistake:** a nightly `DELETE` of millions of rows in one transaction.
+
+## Q7. PostgreSQL counterparts
+
+**Question:** which PostgreSQL feature corresponds to each of MongoDB's wildcard and text indexes?
+
+| MongoDB | PostgreSQL |
+|---|---|
+| Wildcard `{ "attrs.$**": 1 }` | GIN on the jsonb column (`jsonb_ops` or `jsonb_path_ops`) |
+| Text index | GIN on a `tsvector` column (full-text search), queried with `@@` |
+
+> **Common mistake:** using `LIKE '%word%'` in PostgreSQL as a text search substitute.
