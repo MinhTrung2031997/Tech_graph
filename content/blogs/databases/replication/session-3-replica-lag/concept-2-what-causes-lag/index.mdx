@@ -1,0 +1,297 @@
+---
+title: "Concept 2: What makes a replica fall behind"
+description: "On an idle laptop the replicas keep up easily: a PostgreSQL standby replayed 192–205 MB of WAL in 0.60–0.67 s (the primary needed 1.95 s to generate it), and a MySQL replica applied a 300,000-row transaction in 0.87 s. Lag comes from interruptions: a standby that stops receiving (9.9 MB retained after 70 s), an applier blocked by a lock on the replica (one locked row held 6 transactions and pushed Seconds_Behind_Source to 17 s), a frozen MongoDB secondary (30 s), a reconnect that waits for a 60 s retry, and delays configured on purpose."
+type: "concept"
+tags: ["replication", "lag", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-RECOVERY-CONTROL"
+  - "https://www.postgresql.org/docs/17/runtime-config-replication.html#GUC-RECOVERY-MIN-APPLY-DELAY"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-threads-monitor.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-options-replica.html#sysvar_replica_preserve_commit_order"
+  - "https://www.mongodb.com/docs/manual/reference/method/db.fsyncLock/"
+  - "https://www.mongodb.com/docs/manual/core/replica-set-delayed-member/"
+---
+
+<Tldr>
+Applying changes is cheaper than producing them: the standby replayed **192–205 MB of WAL in 0.60–0.67 s**, three times faster than the primary generated it, because replay does no query work. So steady-state lag is small; lag comes from the replica being **stopped**. Three kinds of stop were measured. **Not receiving**: a frozen PostgreSQL standby left 9.9 MB in the slot after 70 s and caught up in about 0.1 s once unfrozen; a MySQL replica that lost the network caught up only 28 s after the network came back, because the I/O thread retries every 60 s. **Not applying**: one row locked by `SELECT … FOR UPDATE` on the MySQL replica blocked the applier for 20 s, and with `replica_preserve_commit_order = 1` five unrelated transactions waited behind it ("Waiting for preceding transaction to commit"), `Seconds_Behind_Source` 1 → 17. A MongoDB secondary under `fsyncLock` fell 30 s behind while `w: "majority"` writes still succeeded through the other secondary. **Delayed on purpose**: `recovery_min_apply_delay`, `SOURCE_DELAY`, `secondaryDelaySecs`.
+</Tldr>
+
+## Producing vs applying
+
+| Term | Meaning |
+|---|---|
+| Receive | The replica gets the log over the network (PostgreSQL walreceiver, MySQL I/O thread, MongoDB oplog fetcher) |
+| Apply / replay | The replica changes its data from the log (PostgreSQL startup process, MySQL applier workers, MongoDB oplog applier) |
+| Backlog | Log received but not yet applied, or not yet received |
+| **✓ / ✗** | The step runs / is stopped |
+
+| Workload | Primary / source | Replica |
+|---|---|---|
+| PostgreSQL: 8 × UPDATE of 100,000 rows, 192–205 MB WAL, replay paused then resumed | 1.95 s to generate | **0.60–0.67 s** to replay the backlog (3 runs) |
+| PostgreSQL: one UPDATE of 100,000 rows, 25 MB WAL | 0.21–0.31 s | replayed 43–92 ms after the commit returned (`replay_lag`) |
+| MySQL: one transaction, 3 × UPDATE of 100,000 rows | 514 ms | applied in 0.87 s, starting 25 ms after the source commit |
+| MongoDB: single-document update, w:1 | 0.51 ms ack | visible on a secondary after 1.04 ms (median of 20) |
+
+Two consequences. A replica on equal hardware keeps up with normal traffic, so if it is behind, look for something that **stopped** it. And a replica applies a transaction only after the source commits it: a statement that runs for an hour on the source arrives as a one-hour job on the replica, and the replica is behind by at least that long while it applies it (MySQL also applies row events serially within one transaction).
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: a standby that stops receiving vs stops replaying"
+  height={360}
+  nodes={[
+    { id: 'pri', label: 'Primary rpb-pg1', sub: 'writes WAL', x: 20, y: 20, w: 220 },
+    { id: 'slot', label: 'Slot standby1', sub: 'keeps WAL until received', x: 20, y: 160, w: 220 },
+    { id: 'recv', label: 'walreceiver', sub: 'receives WAL', x: 300, y: 20, w: 200 },
+    { id: 'replay', label: 'Startup process', sub: 'replays WAL', x: 560, y: 20, w: 220 },
+    { id: 'recvv', label: 'Receive', sub: 'state', x: 300, y: 160, w: 200 },
+    { id: 'replayv', label: 'Replay', sub: 'state', x: 560, y: 160, w: 220 },
+    { id: 'catch', label: 'Catch-up', sub: 'after the stop ends', x: 300, y: 280, w: 200 },
+  ]}
+  edges={[
+    { id: 'pri-recv', from: 'pri', to: 'recv', label: 'WAL' },
+    { id: 'recv-replay', from: 'recv', to: 'replay' },
+    { id: 'pri-slot', from: 'pri', to: 'slot' },
+    { id: 'recv-v', from: 'recv', to: 'recvv' },
+    { id: 'replay-v', from: 'replay', to: 'replayv' },
+    { id: 'recvv-catch', from: 'recvv', to: 'catch' },
+  ]}
+  cases={[
+    {
+      title: 'Replay stopped (pg_wal_replay_pause)',
+      path: 'walreceiver ✓ receives → startup process ✗ paused → backlog 192–205 MB → resume: replayed in 0.60–0.67 s',
+      summary: 'Stands in for anything that stops replay: a recovery conflict wait, a paused standby, a delay.',
+      steps: [
+        {
+          title: 'Pause replay and write 8 big UPDATEs',
+          note: 'The standby keeps receiving: pg_last_wal_receive_lsn() advances, pg_last_wal_replay_lsn() does not. 192–205 MB of WAL piles up on the standby\'s disk.',
+          code: "SELECT pg_wal_replay_pause();                 -- standby\nUPDATE orders SET amount = amount + 0.01;     -- primary, 8 times, 1.95 s",
+          active: ['pri', 'recv', 'replay', 'recvv', 'replayv'],
+          edges: ['pri-recv', 'recv-v', 'replay-v'],
+          subs: { recvv: '✓ receiving', replayv: '✗ paused, 200 MB behind' },
+        },
+        {
+          title: 'Resume',
+          note: 'pg_wal_replay_resume(), then polling until the replay LSN passed the primary\'s LSN: 600, 628 and 667 ms. Replay of a backlog is fast; the question is what stopped it.',
+          code: 'SELECT pg_wal_replay_resume();',
+          active: ['recv', 'replay', 'replayv', 'recvv', 'catch'],
+          edges: ['recv-replay', 'replay-v', 'recv-v', 'recvv-catch'],
+          subs: { replayv: '✓ replaying', catch: '0.60–0.67 s' },
+        },
+      ],
+    },
+    {
+      title: 'Standby frozen (not receiving)',
+      path: 'walreceiver ✗ frozen → slot keeps WAL (9.9 MB after 70 s) → unfreeze: caught up in about 0.1 s',
+      summary: 'The primary is the one holding the backlog, in the slot.',
+      steps: [
+        {
+          title: 'docker pause rpb-pg2 for 80 s',
+          note: 'One UPDATE of 5,000 rows every 10 s. The primary keeps the WAL for the slot: 1.2 MB, 2.4 MB … 9.9 MB. Without a slot, WAL older than wal_keep_size could be recycled and the standby would need a new base backup (from the documentation).',
+          active: ['pri', 'slot', 'recv', 'recvv'],
+          edges: ['pri-slot', 'recv-v'],
+          subs: { recvv: '✗ frozen', slot: 'retains 9.9 MB' },
+        },
+        {
+          title: 'docker unpause',
+          note: 'The walreceiver reconnected and the standby passed the primary\'s LSN 157 ms after the unpause, of which about 50 ms is the polling command itself.',
+          active: ['recv', 'replay', 'recvv', 'catch'],
+          edges: ['recv-replay', 'recv-v', 'recvv-catch'],
+          subs: { recvv: '✓ reconnected', catch: 'about 0.1 s' },
+        },
+      ],
+    },
+  ]}
+/>
+
+Something else stops replay on a busy standby: a query that needs row versions the WAL wants to remove. While measuring, a polling query on the standby was cancelled with `ERROR: canceling statement due to conflict with recovery` / `DETAIL: User query might have needed to see row versions that must be removed.` Replay waits up to `max_standby_streaming_delay` (30 s here) for such queries before cancelling them; that wait is lag (Session 6 covers it).
+
+## MySQL InnoDB
+
+<Flow
+  title="MySQL: one locked row on the replica stops the applier"
+  height={360}
+  nodes={[
+    { id: 'src', label: 'Source rpb-my1', sub: 'commits 6 transactions', x: 20, y: 20, w: 220 },
+    { id: 'w1', label: 'Worker A', sub: 'UPDATE id 10', x: 300, y: 20, w: 200 },
+    { id: 'w2', label: 'Workers B–D', sub: 'UPDATE ids 21–25', x: 560, y: 20, w: 220 },
+    { id: 'lock', label: 'Replica session', sub: 'SELECT … FOR UPDATE id 10', x: 20, y: 160, w: 220 },
+    { id: 'w1v', label: 'Worker A state', sub: 'state', x: 300, y: 160, w: 200 },
+    { id: 'w2v', label: 'Workers B–D state', sub: 'state', x: 560, y: 160, w: 220 },
+    { id: 'sbs', label: 'Seconds_Behind_Source', sub: 'value', x: 300, y: 280, w: 220 },
+  ]}
+  edges={[
+    { id: 'src-w1', from: 'src', to: 'w1' },
+    { id: 'w1-w2', from: 'w1', to: 'w2', label: 'order' },
+    { id: 'lock-w1v', from: 'lock', to: 'w1v', label: 'holds lock' },
+    { id: 'w1-v', from: 'w1', to: 'w1v' },
+    { id: 'w2-v', from: 'w2', to: 'w2v' },
+    { id: 'w1v-sbs', from: 'w1v', to: 'sbs' },
+  ]}
+  cases={[
+    {
+      title: 'Lock held 20 s on the replica',
+      path: 'worker A ✗ lock wait on id 10 → workers B–D ✗ wait for commit order → SBS 1 → 17 s → lock released: ✓ all applied',
+      summary: 'Parallel workers do not help when commits must keep the source\'s order.',
+      steps: [
+        {
+          title: 't0: a report on the replica locks one row',
+          note: 'A session on the replica runs BEGIN; SELECT id FROM shop.orders WHERE id = 10 FOR UPDATE; and keeps the transaction open for 20 s. read_only was off on this lab replica; root ignores read_only anyway.',
+          code: "BEGIN;\nSELECT id FROM shop.orders WHERE id = 10 FOR UPDATE;\nSELECT SLEEP(20); COMMIT;",
+          active: ['lock', 'w1v'],
+          edges: ['lock-w1v'],
+          subs: { w1v: 'row 10 locked' },
+        },
+        {
+          title: 't1: the source updates row 10, then 5 other rows',
+          note: 'Worker A applies the change to row 10 and waits for the row lock: "Applying batch of row changes (update)". Workers B–D have the other 5 transactions ready but replica_preserve_commit_order = 1 makes them wait: "Waiting for preceding transaction to commit".',
+          active: ['src', 'w1', 'w2', 'w1v', 'w2v'],
+          edges: ['src-w1', 'w1-w2', 'w1-v', 'w2-v'],
+          subs: { w1v: '✗ lock wait', w2v: '✗ waiting for order' },
+        },
+        {
+          title: 'SBS while it waits',
+          note: 'Missing GTIDs stayed …:29-34 (6 transactions). Seconds_Behind_Source: 1, 5, 9, 13, 17. When the replica session committed, all 6 applied at once and SBS returned to 0. Had the lock been held past innodb_lock_wait_timeout (50 s), the applier would have retried, up to replica_transaction_retries = 10 times (from the documentation).',
+          active: ['w1v', 'sbs'],
+          edges: ['w1v-sbs'],
+          subs: { sbs: '1 → 17 s' },
+        },
+      ],
+    },
+    {
+      title: 'Replica off the network',
+      path: 'I/O thread ✗ silent 50 s → Connecting → reconnect after the network returns: ✓ caught up 28 s later',
+      summary: 'The catch-up waited for the reconnect timer, not for apply work.',
+      steps: [
+        {
+          title: 'Reconnect timing',
+          note: 'After docker network connect, the 8 missing transactions were applied 28.0 s later: Connect_Retry = 60 s, so the I/O thread was sleeping until its next attempt. Applying them took milliseconds.',
+          active: ['src', 'w1', 'w1v', 'sbs'],
+          edges: ['src-w1', 'w1-v', 'w1v-sbs'],
+          subs: { w1v: '✓ applied after reconnect', sbs: 'NULL → 0' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: one frozen secondary"
+  height={340}
+  nodes={[
+    { id: 'pri', label: 'Primary rpb-mongo1', sub: 'oplog', x: 20, y: 20, w: 220 },
+    { id: 'm2', label: 'rpb-mongo2', sub: 'secondary', x: 300, y: 20, w: 200 },
+    { id: 'm3', label: 'rpb-mongo3', sub: 'secondary', x: 560, y: 20, w: 220 },
+    { id: 'm2v', label: 'rpb-mongo2 lag', sub: 'value', x: 300, y: 160, w: 200 },
+    { id: 'm3v', label: 'rpb-mongo3 lag', sub: 'value', x: 560, y: 160, w: 220 },
+    { id: 'maj', label: 'w: "majority"', sub: '2 of 3 members', x: 20, y: 160, w: 220 },
+    { id: 'majv', label: 'Majority write', sub: 'result', x: 20, y: 270, w: 220 },
+  ]}
+  edges={[
+    { id: 'pri-m2', from: 'pri', to: 'm2' },
+    { id: 'm2-v', from: 'm2', to: 'm2v' },
+    { id: 'm3-v', from: 'm3', to: 'm3v' },
+    { id: 'pri-maj', from: 'pri', to: 'maj' },
+    { id: 'maj-v', from: 'maj', to: 'majv' },
+  ]}
+  cases={[
+    {
+      title: 'fsyncLock on rpb-mongo3',
+      path: 'rpb-mongo2 ✓ keeps up → rpb-mongo3 ✗ 8 → 30 s behind → w:"majority" ✓ 6 ms (primary + rpb-mongo2)',
+      summary: 'A majority does not need every member, so nothing on the write path notices.',
+      steps: [
+        {
+          title: 'Freeze one secondary',
+          note: 'db.fsyncLock() on rpb-mongo3 blocks writes on that node, including oplog application. One w:1 update every 5 s: rpb-mongo3 lag 8, 13, 19, 24, 30 s; rpb-mongo2 stayed current.',
+          code: 'db.fsyncLock()   // on rpb-mongo3',
+          active: ['pri', 'm2', 'm3', 'm2v', 'm3v'],
+          edges: ['pri-m2', 'm2-v', 'm3-v'],
+          subs: { m2v: '✓ current', m3v: '✗ 30 s' },
+        },
+        {
+          title: 'Writes do not notice',
+          note: 'w:1 acknowledged in 5 ms and w:"majority" in 6 ms: the primary and rpb-mongo2 are 2 of 3. Only a write concern that needs rpb-mongo3 notices: w:3 with wtimeout 2000 failed after 2015 ms (Concept 4).',
+          active: ['pri', 'maj', 'majv'],
+          edges: ['pri-maj', 'maj-v'],
+          subs: { majv: '✓ 6 ms' },
+        },
+        {
+          title: 'Unfreeze',
+          note: 'db.fsyncUnlock(): within a second all three members showed the same optime. A frozen or slow member is invisible to writers and very visible to anyone reading from it.',
+          code: 'db.fsyncUnlock()',
+          active: ['m3', 'm3v'],
+          edges: ['m3-v'],
+          subs: { m3v: '✓ 0 s' },
+        },
+      ],
+    },
+    {
+      title: 'Delayed on purpose',
+      path: 'secondaryDelaySecs 10 → rpb-mongo3 ✗ 10 s behind, every write → w:"majority" ✓ 3–12 ms',
+      summary: 'A delayed member is a safety net against bad writes, and always stale.',
+      steps: [
+        {
+          title: 'rs.reconfig with a delay',
+          note: 'members[2].priority = 0, secondaryDelaySecs = 10. Each update appeared on rpb-mongo3 after 10.02–10.22 s; majority writes still took 3–12 ms. printSecondaryReplicationInfo: "10 secs (0 hrs) behind the primary". PostgreSQL (recovery_min_apply_delay) and MySQL (SOURCE_DELAY) have the same option; Concept 3 uses them.',
+          code: "const c = rs.conf(); c.members[2].priority = 0; c.members[2].secondaryDelaySecs = 10; rs.reconfig(c);",
+          active: ['pri', 'm3', 'm3v', 'maj', 'majv'],
+          edges: ['m3-v', 'pri-maj', 'maj-v'],
+          subs: { m3v: '✗ 10 s by design', majv: '✓ 3–12 ms' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Comparison
+
+| Cause | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| Replica not receiving | slot keeps WAL on the primary; caught up in about 0.1 s | reconnect waits for `Connect_Retry` (60 s): 28 s here | (not measured) |
+| Replica not applying | replay paused or waiting on a query conflict | applier blocked by a replica-side lock; commit order makes others wait | `fsyncLock`, or a slow disk |
+| Big transaction | replayed after commit (25 MB: 43–92 ms) | applied after commit, row events in order (300k rows: 0.87 s) | many oplog entries, applied in batches (from the documentation) |
+| Delayed on purpose | `recovery_min_apply_delay` | `SOURCE_DELAY` | `secondaryDelaySecs` (priority 0) |
+
+<Pitfall>
+Pointing reporting or "read-only" application traffic at a replica is not free: on MySQL a single `SELECT … FOR UPDATE` held for 20 s on the replica made it 17 s stale for **everyone**, because the applier waited for the row and the other workers waited for commit order. In PostgreSQL a long query on a standby makes replay wait up to `max_standby_streaming_delay` (Session 6). Treat the replica's own workload as a cause of lag.
+</Pitfall>
+
+## Real-world scenario: the 2 a.m. backfill
+
+A data team backfills `seller_id` on 50 million orders with one `UPDATE` at 02:00. On the source it runs 40 minutes. Nothing reaches the MySQL replicas until it commits at 02:40; then the replicas spend a similar time applying it (in the lab, 300,000 rows took 0.51 s on the source and 0.87 s on the replica), while every order placed after 02:40 queues behind it. From 02:40 the product pages served from replicas show data that is up to 40 minutes old.
+
+| Fix | Effect |
+|---|---|
+| Backfill in batches of a few thousand rows, committed separately | The replica applies small transactions interleaved with normal traffic |
+| Throttle on measured position lag (stop when the replica is more than N transactions behind) | Lag stays bounded |
+| Run the backfill when replica reads can go to the primary | Stale reads are not visible |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 1 | How to see each of these causes in the numbers |
+| Concept 3 | What users see while a replica is behind |
+| [Transactions Session 8, Concept 3](/blogs/databases/transactions/session-8-when-transactions-hurt/concept-3-big-transactions) | Why big transactions hurt on the primary too |
+
+## Key takeaways
+
+1. Applying is cheaper than producing: 192–205 MB of WAL replayed in 0.60–0.67 s. If a replica is behind, something stopped it.
+2. A frozen PostgreSQL standby leaves the backlog in the primary's slot; catch-up took about 0.1 s.
+3. A MySQL replica that loses the network can stay behind for up to `Connect_Retry` (60 s) after the network returns.
+4. One row lock on a MySQL replica stopped every later transaction because of commit ordering: SBS 17 s after 20 s.
+5. In MongoDB a frozen or delayed member does not slow majority writes; it only serves stale data.
+
+## Check questions
+
+1. Why did the standby replay 200 MB of WAL three times faster than the primary produced it?
+2. The standby was frozen for 80 s. Where was the backlog, and what would have happened without a slot?
+3. Why did transactions on rows 21–25 wait for a lock on row 10 on the MySQL replica?
+4. After the network came back, why did the MySQL replica need 28 s to catch up?
+5. A MongoDB secondary is 30 s behind. Why did no write fail or slow down?
+6. A backfill runs as one 40-minute UPDATE. Describe the replica's lag over time.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-3-replica-lag/concept-2-what-causes-lag/answers">Worked answers to Q1–Q6</DeepDive>

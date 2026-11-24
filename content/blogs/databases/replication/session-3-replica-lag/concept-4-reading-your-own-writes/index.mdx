@@ -1,0 +1,334 @@
+---
+title: "Concept 4: Reading your own writes"
+description: "Three ways to let a client see its own write while still using replicas, measured. Wait for the write's position on the replica: a PostgreSQL wait_for_lsn() function returned in 1 ms on a healthy standby and after 4.93–4.96 s on one 5 s behind (or gave up at 206–217 ms with a 200 ms limit); MySQL's WAIT_FOR_EXECUTED_GTID_SET returned 0 ms, 5.56–5.63 s, or timed out at 201–203 ms. Make the write wait for every replica: MongoDB w:3 cost 2.25 ms instead of 0.51 ms, 10 s with a delayed member, and with a frozen member failed after 2015 ms although the write stayed on the primary. Or read from the primary for a while after writing."
+type: "concept"
+tags: ["replication", "consistency", "read-your-writes", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-RECOVERY-INFO-TABLE"
+  - "https://www.postgresql.org/docs/17/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT"
+  - "https://dev.mysql.com/doc/refman/8.4/en/gtid-functions.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html#sysvar_session_track_gtids"
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+---
+
+<Tldr>
+Read-your-writes on replicas needs one of three things. **Route** the user's reads to the primary for a short time after they write: always correct, costs primary capacity. **Wait** on the replica until it has applied the write's position, with a time limit and a fallback to the primary: PostgreSQL 17 has no built-in wait (no `pg_wal_replay_wait`), so the lab used a small `wait_for_lsn()` function: **1 ms** on a healthy standby, **4.93–4.96 s** on a standby 5 s behind, or `false` after **206–217 ms** with a 200 ms limit. MySQL's `WAIT_FOR_EXECUTED_GTID_SET` gave 0 ms, 5.56–5.63 s, or a timeout after 201–203 ms. **Make the write wait** until every replica has it: MongoDB `w: 3` took 2.25 ms instead of 0.51 ms on a healthy set, **10.0 s** with a member delayed 10 s, and with a frozen member failed with `WriteConcernFailed` after 2015 ms **while the write stayed on the primary**. PostgreSQL's equivalent, `synchronous_commit = remote_apply`, made commits take 5.0 s against a standby 5 s behind. MongoDB's causally consistent sessions do the waiting automatically (Session 4).
+</Tldr>
+
+## Three strategies
+
+| Term | Meaning |
+|---|---|
+| Position | Where the write is in the log: PostgreSQL LSN, MySQL GTID set, MongoDB operationTime |
+| Wait-for-position | Before reading on a replica, wait until it has applied at least that position |
+| Sticky primary | Send a user's reads to the primary for N seconds after their last write |
+| Fallback | If the wait times out, read from the primary instead of returning stale data |
+| **✓ / ✗** | Caught up within the limit / gave up |
+
+| Strategy | Who waits | Fresh guaranteed | Cost |
+|---|---|---|---|
+| Sticky primary | nobody | yes | primary load for recent writers |
+| Wait-for-position on the replica | the reader, bounded by a timeout | yes (or falls back) | position must travel from writer to reader |
+| Synchronous apply on every replica | the writer, on every write | yes | every write pays the slowest replica |
+
+## PostgreSQL
+
+PostgreSQL 17 has no function that waits for replay (checked: `pg_proc` has only `pg_last_wal_replay_lsn`, `pg_wal_replay_pause/resume`, `pg_is_wal_replay_paused`, `pg_get_wal_replay_pause_state`). A plain PL/pgSQL loop does the job:
+
+```sql
+-- Created on the primary; replicated to the standby like any function.
+CREATE OR REPLACE FUNCTION wait_for_lsn(target pg_lsn, timeout_ms int DEFAULT 1000) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE deadline timestamptz := clock_timestamp() + timeout_ms * interval '1 millisecond';
+BEGIN
+  IF NOT pg_is_in_recovery() THEN RETURN true; END IF;     -- on a primary there is nothing to wait for
+  WHILE pg_last_wal_replay_lsn() < target LOOP
+    IF clock_timestamp() > deadline THEN RETURN false; END IF;
+    PERFORM pg_sleep(0.005);
+  END LOOP;
+  RETURN true;
+END $$;
+```
+
+The writer captures the position right after its commit, in the same session: `SELECT pg_current_wal_insert_lsn();` (at or after the commit record).
+
+<Flow
+  title="PostgreSQL: wait for the write's LSN on the standby"
+  height={360}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'keeps the LSN', x: 20, y: 20, w: 200 },
+    { id: 'pri', label: 'Primary rpb-pg1', sub: 'COMMIT, insert LSN', x: 300, y: 20, w: 200 },
+    { id: 'stb', label: 'Standby rpb-pg2', sub: 'wait_for_lsn(lsn, limit)', x: 560, y: 20, w: 220 },
+    { id: 'ok', label: '✓ Caught up', sub: 'read on standby', x: 560, y: 170, w: 220 },
+    { id: 'timeout', label: '✗ Timed out', sub: 'returns false', x: 300, y: 170, w: 200 },
+    { id: 'fallback', label: 'Read on primary', sub: 'fallback', x: 300, y: 290, w: 200 },
+  ]}
+  edges={[
+    { id: 'app-pri', from: 'app', to: 'pri', label: 'write' },
+    { id: 'pri-stb', from: 'pri', to: 'stb', label: 'LSN' },
+    { id: 'stb-ok', from: 'stb', to: 'ok' },
+    { id: 'stb-timeout', from: 'stb', to: 'timeout' },
+    { id: 'timeout-fb', from: 'timeout', to: 'fallback' },
+  ]}
+  cases={[
+    {
+      title: 'Healthy standby',
+      path: 'COMMIT → LSN → wait_for_lsn ✓ true after 1 ms → read on the standby',
+      summary: 'When the standby is current, the wait is a single comparison.',
+      steps: [
+        {
+          title: 'Write and capture the position',
+          note: 'UPDATE one row, then pg_current_wal_insert_lsn() in the same session. The application passes the LSN to whatever serves the next read (session, cookie, request header).',
+          code: "UPDATE orders SET amount = amount + 0.01 WHERE id = 4;\nSELECT pg_current_wal_insert_lsn();",
+          active: ['app', 'pri'],
+          edges: ['app-pri'],
+        },
+        {
+          title: 'Wait on the standby',
+          note: 'wait_for_lsn(lsn, 200) and wait_for_lsn(lsn, 10000): true after 1 ms, 6 of 6 runs. The read arrived about 50 ms after the write, by which time replay had already passed the LSN.',
+          code: "SELECT wait_for_lsn('0/9B9BB98', 200);   -- true, 1 ms",
+          active: ['pri', 'stb', 'ok'],
+          edges: ['pri-stb', 'stb-ok'],
+          subs: { ok: '✓ 1 ms' },
+        },
+      ],
+    },
+    {
+      title: 'Standby 5 s behind, 200 ms limit',
+      path: 'wait_for_lsn ✗ false after 206–217 ms → read on the primary',
+      summary: 'A short limit keeps latency bounded; the fallback keeps the read fresh.',
+      steps: [
+        {
+          title: 'recovery_min_apply_delay = 5s',
+          note: 'Three runs: false after 217, 206 and 206 ms. The application then reads from the primary. Worst case for the user: about 0.2 s extra.',
+          active: ['pri', 'stb', 'timeout', 'fallback'],
+          edges: ['pri-stb', 'stb-timeout', 'timeout-fb'],
+          subs: { timeout: 'false, 206–217 ms' },
+        },
+      ],
+    },
+    {
+      title: 'Standby 5 s behind, 10 s limit',
+      path: 'wait_for_lsn ✓ true after 4.93–4.96 s → read on the standby',
+      summary: 'Correct, but the user waited 5 s.',
+      steps: [
+        {
+          title: 'Wait it out',
+          note: 'true after 4,939, 4,958 and 4,926 ms. Long waits have a second risk on a busy standby: while waiting for a 200 MB backlog, a similar wait was cancelled after 14 s with "canceling statement due to conflict with recovery". Keep limits short and fall back.',
+          active: ['pri', 'stb', 'ok'],
+          edges: ['pri-stb', 'stb-ok'],
+          subs: { ok: '✓ 4.93–4.96 s' },
+        },
+      ],
+    },
+  ]}
+/>
+
+The alternative is to make the **writer** wait: with `synchronous_standby_names = 'walreceiver'` and `SET synchronous_commit = remote_apply`, COMMIT returns only after the standby has applied the commit. Against the 5 s-delayed standby, single-row commits took **5,003–5,011 ms** and the standby read right after returned the new value; with `on` (flush only) commits took 2.7–5.8 ms and the standby read was stale. Session 4 compares the levels.
+
+## MySQL InnoDB
+
+```sql
+-- On the source, after COMMIT: a GTID set that contains the write
+SELECT @@global.gtid_executed;
+-- On the replica: 0 = applied, 1 = timeout (seconds, fractions allowed)
+SELECT WAIT_FOR_EXECUTED_GTID_SET('<that set>', 0.2);
+```
+
+`@@global.gtid_executed` contains every transaction the source has executed, so the replica waits for a little more than necessary. To wait for exactly your own transaction, set `session_track_gtids = OWN_GTID` and read the GTID the server returns with the OK packet (a driver feature; from the documentation, not used in the lab).
+
+<Flow
+  title="MySQL: wait for the write's GTID on the replica"
+  height={360}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'keeps the GTID set', x: 20, y: 20, w: 200 },
+    { id: 'src', label: 'Source rpb-my1', sub: 'COMMIT, gtid_executed', x: 300, y: 20, w: 200 },
+    { id: 'rep', label: 'Replica rpb-my2', sub: 'WAIT_FOR_EXECUTED_GTID_SET', x: 560, y: 20, w: 220 },
+    { id: 'ok', label: '✓ Returns 0', sub: 'read on replica', x: 560, y: 170, w: 220 },
+    { id: 'timeout', label: '✗ Returns 1', sub: 'timeout', x: 300, y: 170, w: 200 },
+    { id: 'fallback', label: 'Read on source', sub: 'fallback', x: 300, y: 290, w: 200 },
+  ]}
+  edges={[
+    { id: 'app-src', from: 'app', to: 'src', label: 'write' },
+    { id: 'src-rep', from: 'src', to: 'rep', label: 'GTIDs' },
+    { id: 'rep-ok', from: 'rep', to: 'ok' },
+    { id: 'rep-timeout', from: 'rep', to: 'timeout' },
+    { id: 'timeout-fb', from: 'timeout', to: 'fallback' },
+  ]}
+  cases={[
+    {
+      title: 'Healthy replica',
+      path: 'COMMIT → gtid_executed → WAIT ✓ 0 after 0 ms',
+      summary: 'Free when the replica is current.',
+      steps: [
+        {
+          title: 'Wait with a 1 s limit',
+          note: 'Three runs: returned 0 after 0 ms (measured with SYSDATE(6) around the call).',
+          code: "SET @t0 = SYSDATE(6);\nSELECT WAIT_FOR_EXECUTED_GTID_SET('<set>', 1) INTO @r;\nSELECT @r, TIMESTAMPDIFF(MICROSECOND, @t0, SYSDATE(6)) / 1000;",
+          active: ['app', 'src', 'rep', 'ok'],
+          edges: ['app-src', 'src-rep', 'rep-ok'],
+          subs: { ok: '✓ 0 ms' },
+        },
+      ],
+    },
+    {
+      title: 'SOURCE_DELAY = 5, limit 0.2 s',
+      path: 'WAIT ✗ 1 after 201–203 ms → read on the source',
+      summary: 'The function returns 1; it does not raise an error.',
+      steps: [
+        {
+          title: 'Timeout',
+          note: 'Returned 1 after 201, 203 and 203 ms. The replica still had the old status; the application must check the return value and fall back.',
+          active: ['src', 'rep', 'timeout', 'fallback'],
+          edges: ['src-rep', 'rep-timeout', 'timeout-fb'],
+          subs: { timeout: '1 after 201–203 ms' },
+        },
+      ],
+    },
+    {
+      title: 'SOURCE_DELAY = 5, limit 10 s',
+      path: 'WAIT ✓ 0 after 5.56–5.63 s → new status on the replica',
+      summary: 'Correct but slow.',
+      steps: [
+        {
+          title: 'Wait it out',
+          note: 'Returned 0 after 5,598, 5,559 and 5,628 ms, then the replica showed the new status.',
+          active: ['src', 'rep', 'ok'],
+          edges: ['src-rep', 'rep-ok'],
+          subs: { ok: '✓ 5.56–5.63 s' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+The write-side option: a write concern that names every member, so the acknowledgement means every secondary has applied it.
+
+<Flow
+  title="MongoDB: w = number of members"
+  height={340}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'updateOne w:3', x: 20, y: 20, w: 200 },
+    { id: 'pri', label: 'Primary rpb-mongo1', sub: 'applies first', x: 300, y: 20, w: 200 },
+    { id: 'secs', label: 'rpb-mongo2 + 3', sub: 'must both apply', x: 560, y: 20, w: 220 },
+    { id: 'ack', label: '✓ Acknowledged', sub: 'all 3 have it', x: 560, y: 170, w: 220 },
+    { id: 'wce', label: '✗ WriteConcernFailed', sub: 'after wtimeout', x: 280, y: 170, w: 240 },
+    { id: 'kept', label: 'Write stays', sub: 'on the primary', x: 280, y: 280, w: 240 },
+  ]}
+  edges={[
+    { id: 'app-pri', from: 'app', to: 'pri' },
+    { id: 'pri-secs', from: 'pri', to: 'secs', label: 'oplog' },
+    { id: 'secs-ack', from: 'secs', to: 'ack' },
+    { id: 'secs-wce', from: 'secs', to: 'wce' },
+    { id: 'wce-kept', from: 'wce', to: 'kept' },
+  ]}
+  cases={[
+    {
+      title: 'Healthy set',
+      path: 'w:3 ✓ acknowledged after 2.25 ms (w:1: 0.51 ms) → read on any secondary ✓ 20 of 20',
+      summary: 'Cheap when all members are healthy and close.',
+      steps: [
+        {
+          title: '20 updates per write concern',
+          note: 'Median acknowledgement: w:1 0.51 ms, w:3 2.25 ms, w:"majority" 5.67 ms (majority also waits for the journal by default). With w:3 the first read on rpb-mongo2 was fresh 20 of 20 times.',
+          code: "db.orders.updateOne({ _id: 7 }, { $set: { note: v } }, { writeConcern: { w: 3 } });",
+          active: ['app', 'pri', 'secs', 'ack'],
+          edges: ['app-pri', 'pri-secs', 'secs-ack'],
+          subs: { ack: '✓ 2.25 ms' },
+        },
+      ],
+    },
+    {
+      title: 'One member 10 s behind',
+      path: 'w:3 ✓ acknowledged after 10,017 ms',
+      summary: 'Every write now waits for the slowest member.',
+      steps: [
+        {
+          title: 'Delayed member',
+          note: 'rpb-mongo3 with secondaryDelaySecs = 10: w:3 returned after 10,017 ms. Read-your-writes on every member, at the price of every write.',
+          active: ['app', 'pri', 'secs', 'ack'],
+          edges: ['app-pri', 'pri-secs', 'secs-ack'],
+          subs: { secs: 'rpb-mongo3 10 s late', ack: '✓ 10.0 s' },
+        },
+      ],
+    },
+    {
+      title: 'One member frozen, wtimeout 1–2 s',
+      path: 'w:3 ✗ WriteConcernFailed after 2015 ms → the write is on the primary anyway',
+      summary: 'A write-concern error is not a rollback.',
+      steps: [
+        {
+          title: 'fsyncLock on rpb-mongo3',
+          note: 'w:3 with wtimeout 2000: "WriteConcernFailed: waiting for replication timed out" after 2015 ms (and 2016 ms with the delayed member).',
+          active: ['pri', 'secs', 'wce'],
+          edges: ['pri-secs', 'secs-wce'],
+          subs: { secs: 'rpb-mongo3 frozen', wce: 'after 2015 ms' },
+        },
+        {
+          title: 'Read it back',
+          note: 'Order 3 was "delivered"; the update to "cancelled" failed its write concern after 1 s, and the primary then read "cancelled". The application got an error for a write that happened; a retry must be idempotent.',
+          code: "db.orders.updateOne({ _id: 3 }, { $set: { status: 'cancelled' } }, { writeConcern: { w: 3, wtimeout: 1000 } });\n// error: WriteConcernFailed … then findOne({ _id: 3 }).status === 'cancelled'",
+          active: ['wce', 'kept'],
+          edges: ['wce-kept'],
+          subs: { kept: 'status = cancelled' },
+        },
+      ],
+    },
+  ]}
+/>
+
+The read-side option in MongoDB is a causally consistent session: the driver carries the write's `operationTime` to the next read and the secondary waits for it, like `wait_for_lsn` above but built in. Session 4 measures it.
+
+## Comparison
+
+| | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| Position to carry | LSN: `pg_current_wal_insert_lsn()` | GTID set: `@@global.gtid_executed` or `OWN_GTID` | `operationTime` (session) |
+| Built-in wait on the replica | none in 17 (own loop) | `WAIT_FOR_EXECUTED_GTID_SET(set, timeout)` | causal session (Session 4) |
+| Healthy replica, wait | 1 ms | 0 ms | — |
+| Replica 5 s behind, short limit | false after 206–217 ms | 1 after 201–203 ms | — |
+| Make the writer wait | `remote_apply`: 5.0 s commit at 5 s lag | semi-sync waits for receipt, not apply (Session 2) | `w: 3`: 2.25 ms healthy, 10.0 s delayed, error when frozen |
+
+<Pitfall>
+A write-side guarantee turns one slow replica into a slow (or failing) write path for everyone: `w: 3` took 10 s per write with one delayed member and failed outright with a frozen one, and `remote_apply` commits took 5 s. Prefer read-side waits with a short limit and a primary fallback; they only slow the reads that need freshness, and only while a replica is behind.
+</Pitfall>
+
+## Real-world scenario: the seller edits a listing
+
+A seller saves a new price; the next page view should show it. The application tags the seller's session with the write's position (PostgreSQL LSN or MySQL GTID set) for 30 seconds. Reads for that session go to a replica with "wait up to 100 ms for this position, else read from the primary". Other users' reads of the same listing go to replicas without waiting: a buyer seeing the old price for a second is acceptable, a seller seeing their own edit disappear is not.
+
+| Decision | Reason |
+|---|---|
+| Only the writer's session carries the position | Read-your-writes is per user; global freshness would need synchronous replication |
+| Limit 100 ms, then primary | Bounded latency; primary load only while replicas lag |
+| Expire the position after 30 s | After that, normal lag (milliseconds) is far below it |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 3 | The stale reads this prevents |
+| Session 4 | MongoDB causal consistency and read concerns |
+| [Transactions Session 7, Concept 3](/blogs/databases/transactions/session-7-application-patterns/concept-3-retry-loops) | Retries after a write-concern error must be idempotent |
+
+## Key takeaways
+
+1. Read-your-writes on replicas: route to the primary after a write, wait for the write's position on the replica, or make the write wait for every replica.
+2. PostgreSQL 17 has no built-in replay wait; a loop on `pg_last_wal_replay_lsn()` with a limit works (1 ms healthy, false after about 0.2 s when 5 s behind).
+3. MySQL's `WAIT_FOR_EXECUTED_GTID_SET` returns 0 or 1; check it and fall back.
+4. MongoDB `w: <all members>` costs little when healthy (2.25 ms vs 0.51 ms) but makes every write wait for the slowest member (10 s) or fail.
+5. A write-concern timeout is not a rollback: the write stayed on the primary.
+
+## Check questions
+
+1. Which LSN should the PostgreSQL writer pass to the reader, and why not `pg_current_wal_lsn()` from another connection?
+2. Why is a short limit plus a primary fallback better than waiting until the replica catches up?
+3. Why can a long wait on a busy standby be cancelled, and what error did the lab see?
+4. What does `WAIT_FOR_EXECUTED_GTID_SET` return on timeout, and what must the caller do?
+5. A `w: 3` write failed with WriteConcernFailed. Is the data written? What should the retry look like?
+6. Compare the cost of `synchronous_commit = remote_apply` with a read-side wait when one replica is 5 s behind.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-3-replica-lag/concept-4-reading-your-own-writes/answers">Worked answers to Q1–Q6</DeepDive>

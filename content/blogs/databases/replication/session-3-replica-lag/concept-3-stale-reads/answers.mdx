@@ -1,0 +1,55 @@
+---
+title: "Answers: Stale reads"
+description: "Worked answers to the Session 3 Concept 3 check questions."
+companion: "answers"
+tags: ["replication", "consistency", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+  - "https://www.postgresql.org/docs/17/hot-standby.html"
+---
+
+<Tldr>
+The replica is not wrong; it is earlier. Whether that matters depends on what the read is for.
+</Tldr>
+
+## Q1. Stale 7 times out of 20 on a healthy set
+
+**Question:** why did a read on a healthy MongoDB secondary return the old value 7 times out of 20?
+
+With `w: 1` the primary acknowledges as soon as it has applied the write itself. The secondary still has to fetch the oplog entry and apply it, which took about 1 ms (median). The test read the secondary immediately after the acknowledgement, from the same process, so in 7 of 20 cases the read arrived inside that millisecond. Lag of "almost zero" is still a window.
+
+> **Common mistake:** testing replica freshness with a human clicking around. Human reaction time hides millisecond windows that programs hit every time.
+
+## Q2. Fresh on PostgreSQL, 9 of 9
+
+**Question:** why were PostgreSQL standby reads fresh 9 of 9 times without a delay, and would that hold in production?
+
+Each read went through a new `docker exec` and `psql`, about 50 ms after the write, while the standby replays a single-row change in about 2 ms. The read simply arrived after the window. In production the application often reads within a millisecond on an existing connection, the standby is busy with its own queries, and big transactions or conflicts stretch the lag (Concept 2). The 9 of 9 says the window is short on an idle laptop, not that it is closed.
+
+> **Common mistake:** concluding "our replica lag is zero" from a few manual checks.
+
+## Q3. Majority acknowledged, still stale
+
+**Question:** a write was acknowledged with `w: "majority"` in 3 ms. Why was the read on `rpb-mongo3` stale for 10 s?
+
+A majority of three is two. The primary and `rpb-mongo2` had the write, so the acknowledgement was correct. `rpb-mongo3` was configured with `secondaryDelaySecs = 10` and applied the entry 10.02–10.22 s later. A write concern describes how many members have the write when the client hears "ok", not which ones; a read on a member outside that set can be stale.
+
+> **Common mistake:** pairing `w: "majority"` with `readPreference: secondary` and expecting read-your-writes. Use a causally consistent session (Session 4) or `w` equal to the member count.
+
+## Q4. Marketplace reads, stale or not
+
+**Question:** give two kinds of reads in a marketplace that may be served stale and two that may not.
+
+May be stale (seconds): product listing and search pages for buyers, seller analytics and dashboards, category counts, recommendation feeds.
+Must be fresh: the page shown right after the user's own write (order confirmation, edited listing), payment and order status used by support, stock or balance read in order to decide a write (reserve stock, refund), anything checked for uniqueness before inserting.
+
+> **Common mistake:** deciding per service ("the catalog service uses replicas") instead of per read. The same service has reads of both kinds.
+
+## Q5. Monotonic reads
+
+**Question:** what is a monotonic-read violation, and how can two replicas cause one?
+
+A client reads a value, then reads again and gets an older value: data appears to move backwards. With two replicas, one 1 s behind and one 8 s behind, a load balancer can send the first read to the fresher replica (new status "shipped") and the second to the staler one (old status "paid"). Each replica is internally consistent; the client's sequence is not. Pinning a user to one replica, or reading from the primary after a write, prevents it; MongoDB's causally consistent sessions also guarantee monotonic reads (from the documentation).
+
+> **Common mistake:** round-robin load balancing across replicas for a user's session without considering that their lags differ.

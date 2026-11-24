@@ -1,0 +1,63 @@
+---
+title: "Answers: What makes a replica fall behind"
+description: "Worked answers to the Session 3 Concept 2 check questions."
+companion: "answers"
+tags: ["replication", "lag", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/warm-standby.html#STREAMING-REPLICATION-SLOTS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-options-replica.html#sysvar_replica_preserve_commit_order"
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+---
+
+<Tldr>
+Replicas apply fast. Lag means something stopped receiving or applying; find the stop.
+</Tldr>
+
+## Q1. Replay faster than the primary
+
+**Question:** why did the standby replay 200 MB of WAL three times faster than the primary produced it?
+
+The primary had to run 8 UPDATE statements: parse, plan, scan 100,000 rows each time, evaluate `amount + 0.01`, find each row's new place, write WAL. The WAL records already say which page changes and how; replay only applies those page changes, with no planning, no expression evaluation and no client round trips. 1.95 s of work on the primary became 0.60–0.67 s of replay.
+
+> **Common mistake:** sizing a replica smaller "because it only replays". Replay is cheaper, but the replica also serves its own read traffic, and a single slow disk or lock can stop replay entirely.
+
+## Q2. Where a frozen standby's backlog lives
+
+**Question:** the standby was frozen for 80 s. Where was the backlog, and what would have happened without a slot?
+
+On the primary, in `pg_wal`, held by the replication slot `standby1`: 9.9 MB after 70 s (`pg_replication_slots`, `active = false`). The standby had received nothing. Without a slot, the primary keeps only `wal_keep_size` worth of old WAL; if the standby is away longer than that, the WAL it needs is recycled and it must be rebuilt from a new base backup (from the documentation). With a slot the opposite risk applies: a standby that never returns fills the primary's disk.
+
+> **Common mistake:** creating slots and never alerting on retained WAL. Set `max_slot_wal_keep_size` or monitor it.
+
+## Q3. Unrelated rows waiting for row 10
+
+**Question:** why did transactions on rows 21–25 wait for a lock on row 10 on the MySQL replica?
+
+They did not wait for the lock; they waited for their turn to commit. With `replica_preserve_commit_order = 1` (the 8.4 default with parallel workers), workers may apply transactions in parallel but must commit them in the source's order. The transaction on row 10 came first and was stuck on the replica-side row lock, so workers B–D finished their work and showed "Waiting for preceding transaction to commit". The missing GTID range stayed …:29-34 until the lock was released.
+
+> **Common mistake:** turning off commit order to "fix" it. Then the replica can show states that never existed on the source (a later transaction visible before an earlier one).
+
+## Q4. 28 seconds to catch up
+
+**Question:** after the network came back, why did the MySQL replica need 28 s to catch up?
+
+The I/O thread had given up on the dead connection and was in "Connecting", retrying every `Connect_Retry` = 60 s (up to `Source_Retry_Count` = 10 attempts). The network came back between two attempts; the next attempt happened 28 s later, then the 8 missing transactions arrived and applied within milliseconds.
+
+> **Common mistake:** concluding the replica is too slow. The time was spent waiting for a timer, which `CHANGE REPLICATION SOURCE TO SOURCE_CONNECT_RETRY = …` controls.
+
+## Q5. Nobody noticed the 30-second lag
+
+**Question:** a MongoDB secondary is 30 s behind. Why did no write fail or slow down?
+
+The writes used `w: 1` (primary only) and `w: "majority"` (2 of 3 members). The primary and `rpb-mongo2` form a majority without `rpb-mongo3`, so `w: "majority"` was acknowledged in 6 ms. Only a write concern that names all three members, `w: 3`, waited for `rpb-mongo3` and failed with WriteConcernFailed when its `wtimeout` expired.
+
+> **Common mistake:** assuming the default write concern (majority) means "every replica has my data". It means a majority has it; reads from the rest can be stale.
+
+## Q6. The 40-minute UPDATE
+
+**Question:** a backfill runs as one 40-minute UPDATE. Describe the replica's lag over time.
+
+From 02:00 to 02:40 the replica is current for everything else: the backfill is not in the binlog yet. At 02:40 the transaction commits and is shipped; the replica starts applying it, which takes on the order of the source's run time, and the transactions committed after 02:40 wait behind it. Lag grows from 0 to roughly the apply time, then drains. In PostgreSQL the WAL streams while the UPDATE runs, but the rows only become visible on the standby when the commit record is replayed, so the visible effect is similar.
+
+> **Common mistake:** watching lag during the backfill, seeing 0, and declaring it safe. The lag arrives at the commit.

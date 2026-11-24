@@ -1,0 +1,253 @@
+---
+title: "Lab and session quiz: Replica lag"
+description: "Read every engine's lag numbers while you pause replay, freeze a standby, cut a replica off the network, lock a row on a replica and freeze a MongoDB secondary; watch which readings lie. Then make the lag reproducible with delayed replicas, produce stale reads, and fix them with an LSN wait, WAIT_FOR_EXECUTED_GTID_SET, synchronous_commit = remote_apply and w = all members."
+type: "how-to"
+tags: ["replication", "lag", "consistency", "postgresql", "mysql", "mongodb", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW"
+  - "https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-RECOVERY-CONTROL"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-delayed.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/gtid-functions.html"
+  - "https://www.mongodb.com/docs/manual/reference/method/db.fsyncLock/"
+---
+
+<Tldr>
+Uses the clusters and the `orders` data from the [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab): prefix `rp`, PostgreSQL `rp-pg1` → `rp-pg2`, MySQL `rp-my1` → `rp-my2` (database `shop`), MongoDB `rp-mongo1..3` (replica set `rprs`, database `shop`), 100,000 orders loaded on each primary. Run one engine at a time. Several exercises need **two terminals**. Every exercise ends by undoing its changes (delays, locks, network). The quoted results come from the same steps run with another prefix on one laptop.
+</Tldr>
+
+## Setup
+
+The aliases from Session 1, plus the third MongoDB member:
+
+```bash
+alias rpg1='docker exec -it rp-pg1 psql -U postgres'
+alias rpg2='docker exec -it rp-pg2 psql -U postgres'
+alias rmy1='docker exec -it rp-my1 mysql -uroot -plab'
+alias rmy2='docker exec -it rp-my2 mysql -uroot -plab'
+alias rmg1='docker exec -it rp-mongo1 mongosh --quiet'
+alias rmg2='docker exec -it rp-mongo2 mongosh --quiet'
+alias rmg3='docker exec -it rp-mongo3 mongosh --quiet'
+```
+
+## Exercise 1: PostgreSQL lag readings (Concept 1, Concept 2)
+
+**a. Idle.** Update one row, then read the three numbers right away and again after a minute.
+
+```sql
+-- rpg1
+UPDATE orders SET status = 'returned' WHERE id = 1;
+SELECT write_lag, flush_lag, replay_lag,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS bytes_behind
+FROM pg_stat_replication;
+-- rpg2
+SELECT now() - pg_last_xact_replay_timestamp() AS naive_lag;
+```
+
+Lab: lags 0.0004 / 0.0016 / 0.0018 s, 0 bytes; after a minute replay_lag NULL, still 0 bytes, naive lag 42.7 s.
+
+**b. Replay paused.**
+
+```sql
+-- rpg2
+SELECT pg_wal_replay_pause();
+-- rpg1: a burst, then read the numbers 5 s later
+UPDATE orders SET amount = amount + 0.01 WHERE id <= 20000;   -- run 3 times
+SELECT replay_lag, pg_size_pretty(pg_wal_lsn_diff(sent_lsn, replay_lsn)) FROM pg_stat_replication;
+-- rpg2
+SELECT pg_size_pretty(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()));
+```
+
+Lab: replay_lag 0.23 s, 15 MB not replayed. Now run one small UPDATE every 5 s and watch replay_lag grow (5.15 s, 10.4 s, 15.6 s, 20.7 s). Finish with `SELECT pg_wal_replay_resume();` on `rpg2`.
+
+**c. Replay speed.** Pause replay again, run `UPDATE orders SET amount = amount + 0.01;` eight times on the primary (time it), resume, and time how long until `pg_last_wal_replay_lsn()` passes the primary's `pg_current_wal_lsn()`. Lab: 192–205 MB of WAL, 1.95 s on the primary, 0.60–0.67 s to replay.
+
+**d. Standby frozen.** In a shell:
+
+```bash
+docker pause rp-pg2
+# every 10 s for 80 s, on rp-pg1:
+#   UPDATE orders SET amount = amount + 0.01 WHERE id <= 5000;
+#   SELECT state, write_lag, replay_lag, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)) FROM pg_stat_replication;
+#   SELECT active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots;
+docker unpause rp-pg2
+```
+
+Lab: `streaming` with NULL lags for 50 s, then no row (log: "terminating walsender process due to replication timeout"); the slot, inactive, held 9.9 MB; caught up about 0.1 s after unpausing.
+
+## Exercise 2: PostgreSQL stale reads and read-your-writes (Concepts 3 and 4)
+
+```sql
+-- rpg2: apply WAL 5 s late
+ALTER SYSTEM SET recovery_min_apply_delay = '5s';
+SELECT pg_reload_conf();
+-- rpg1: create the wait function (it replicates to the standby)
+CREATE OR REPLACE FUNCTION wait_for_lsn(target pg_lsn, timeout_ms int DEFAULT 1000) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE deadline timestamptz := clock_timestamp() + timeout_ms * interval '1 millisecond';
+BEGIN
+  IF NOT pg_is_in_recovery() THEN RETURN true; END IF;
+  WHILE pg_last_wal_replay_lsn() < target LOOP
+    IF clock_timestamp() > deadline THEN RETURN false; END IF;
+    PERFORM pg_sleep(0.005);
+  END LOOP;
+  RETURN true;
+END $$;
+-- rpg1: write and capture the position
+UPDATE orders SET status = 'returned' WHERE id = 3;
+SELECT pg_current_wal_insert_lsn();
+-- rpg2, immediately: stale, then wait with two limits (paste the LSN)
+SELECT status FROM orders WHERE id = 3;
+SELECT wait_for_lsn('<lsn>', 200),
+       round(extract(epoch FROM clock_timestamp() - statement_timestamp()) * 1000) AS ms;
+SELECT wait_for_lsn('<lsn>', 10000),
+       round(extract(epoch FROM clock_timestamp() - statement_timestamp()) * 1000) AS ms;
+```
+
+Lab: stale read right after; `false` after 206–217 ms; `true` after 4.93–4.96 s. With the delay back at 0, `true` after 1 ms.
+
+Then make the **writer** wait instead:
+
+```sql
+-- rpg1
+ALTER SYSTEM SET synchronous_standby_names = 'walreceiver';
+SELECT pg_reload_conf();
+SELECT application_name, sync_state FROM pg_stat_replication;   -- sync
+\timing on
+SET synchronous_commit = on;            UPDATE orders SET amount = amount + 0.01 WHERE id = 5 RETURNING amount;
+SET synchronous_commit = remote_apply;  UPDATE orders SET amount = amount + 0.01 WHERE id = 5 RETURNING amount;
+-- rpg2 after each: SELECT amount FROM orders WHERE id = 5;
+```
+
+Lab, standby delayed 5 s: `on` committed in 2.7–5.8 ms and the standby was stale; `remote_apply` committed in 5,003–5,011 ms and the standby was fresh.
+
+Reset: `ALTER SYSTEM RESET synchronous_standby_names; SELECT pg_reload_conf();` on `rpg1`, `ALTER SYSTEM RESET recovery_min_apply_delay; SELECT pg_reload_conf();` on `rpg2`. Leaving `synchronous_standby_names` set while the standby is down makes every commit hang.
+
+## Exercise 3: MySQL, a replica off the network (Concept 1, Concept 2)
+
+Terminal A loops; terminal B cuts the network.
+
+```bash
+# B
+docker network disconnect rp-net rp-my2
+# A, every 10 s for 80 s:
+SRC=$(docker exec rp-my1 mysql -uroot -plab -N -e "SELECT @@global.gtid_executed" 2>/dev/null | tr -d '\n')
+docker exec rp-my1 mysql -uroot -plab -e "UPDATE shop.orders SET amount = amount + 0.01 WHERE id <= 1000" 2>/dev/null
+docker exec rp-my2 mysql -uroot -plab -N -e "SELECT GTID_SUBTRACT('$SRC', @@global.gtid_executed)" 2>/dev/null
+docker exec rp-my2 mysql -uroot -plab -e "SHOW REPLICA STATUS\G" 2>/dev/null | grep -E 'IO_Running:|Seconds_Behind'
+# B, after 80 s:
+docker network connect rp-net rp-my2
+```
+
+Lab: `Yes` and 0 s for 40–50 s with 1 → 5 GTIDs missing, then `Connecting` / NULL; after reconnecting, caught up 28 s later (`Connect_Retry: 60`).
+
+## Exercise 4: MySQL, a lock on the replica and a delayed replica (Concepts 2–4)
+
+**a. Lock blocks the applier.** Terminal A on the replica:
+
+```sql
+-- rmy2
+BEGIN;
+SELECT id FROM shop.orders WHERE id = 10 FOR UPDATE;
+SELECT SLEEP(20);
+COMMIT;
+```
+
+Terminal B, within those 20 s:
+
+```sql
+-- rmy1
+UPDATE shop.orders SET status = 'cancelled' WHERE id = 10;
+UPDATE shop.orders SET amount = amount + 0.01 WHERE id = 21;   -- and ids 22–25
+-- rmy2, every few seconds
+SHOW REPLICA STATUS\G
+SELECT PROCESSLIST_STATE FROM performance_schema.threads
+WHERE NAME LIKE '%replica_worker%' AND PROCESSLIST_STATE IS NOT NULL;
+```
+
+Lab: SBS 1, 5, 9, 13, 17; one worker "Applying batch of row changes (update)", the others "Waiting for preceding transaction to commit".
+
+**b. Delayed replica and GTID waits.**
+
+```sql
+-- rmy2
+STOP REPLICA SQL_THREAD; CHANGE REPLICATION SOURCE TO SOURCE_DELAY = 5; START REPLICA SQL_THREAD;
+-- rmy1
+UPDATE shop.orders SET status = IF(status = 'delivered', 'returned', 'delivered') WHERE id = 11;
+SELECT status FROM shop.orders WHERE id = 11;
+SELECT @@global.gtid_executed;
+-- rmy2, immediately (paste the set)
+SELECT status FROM shop.orders WHERE id = 11;
+SET @t0 = SYSDATE(6);
+SELECT WAIT_FOR_EXECUTED_GTID_SET('<set>', 0.2) INTO @r;
+SELECT @r, ROUND(TIMESTAMPDIFF(MICROSECOND, @t0, SYSDATE(6)) / 1000) AS waited_ms;
+-- repeat the wait with 10 instead of 0.2
+```
+
+Lab: stale status; 1 after 201–203 ms; 0 after 5.56–5.63 s. Reset: `STOP REPLICA SQL_THREAD; CHANGE REPLICATION SOURCE TO SOURCE_DELAY = 0; START REPLICA SQL_THREAD;`
+
+## Exercise 5: MongoDB, a frozen secondary and w = all (Concepts 1–4)
+
+```js
+// rmg3
+db.fsyncLock()
+// rmg1: one update every 5 s, then look
+db.getSiblingDB('shop').orders.updateOne({ _id: 1 }, { $inc: { amount: NumberDecimal('0.01') } }, { writeConcern: { w: 1 } })
+rs.printSecondaryReplicationInfo()
+// rmg1: three write concerns
+const t0 = Date.now();
+try { db.getSiblingDB('shop').orders.updateOne({ _id: 3 }, { $set: { status: 'cancelled' } }, { writeConcern: { w: 3, wtimeout: 2000 } }) }
+catch (e) { print(e.codeName, Date.now() - t0, 'ms') }
+db.getSiblingDB('shop').orders.findOne({ _id: 3 }).status     // the write is there
+// rmg3
+db.fsyncUnlock()
+```
+
+Lab: `rp-mongo3` lag 8 → 30 s; `w: "majority"` 6 ms; `w: 3` WriteConcernFailed after 2015 ms; status `cancelled` on the primary.
+
+Measure the healthy window with one script run on `rp-mongo1` (`docker cp visible.js rp-mongo1:/tmp/ && docker exec rp-mongo1 mongosh --quiet shop /tmp/visible.js`):
+
+```js
+// visible.js: write on the primary, poll rp-mongo2 until the value is there; 20 rounds.
+const prim = db.getSiblingDB('shop');
+const sec = new Mongo('mongodb://rp-mongo2:27017/?directConnection=true&readPreference=secondary').getDB('shop');
+const W = { w: 1 };   // try { w: 'majority' } and { w: 3 }
+const res = [];
+for (let i = 0; i < 20; i++) {
+  const v = 'v' + Date.now() + '-' + i;
+  const t0 = process.hrtime.bigint();
+  prim.orders.updateOne({ _id: 7 }, { $set: { note: v } }, { writeConcern: W });
+  const t1 = process.hrtime.bigint();
+  let first = null;
+  while (true) { const d = sec.orders.findOne({ _id: 7 }); if (first === null) first = d.note === v; if (d.note === v) break; }
+  res.push({ ack: Number(t1 - t0) / 1e6, visible: Number(process.hrtime.bigint() - t0) / 1e6, first });
+}
+const med = a => a.sort((x, y) => x - y)[10];
+print(JSON.stringify(W), 'ack ms', med(res.map(r => r.ack)).toFixed(2), '| visible ms', med(res.map(r => r.visible)).toFixed(2),
+      '| first read fresh', res.filter(r => r.first).length, 'of 20');
+```
+
+Lab: w:1 ack 0.51 ms, visible 1.04 ms, first read fresh 13 of 20; w:"majority" ack 5.67 ms, 20 of 20; w:3 ack 2.25 ms, 20 of 20.
+
+Optional, a delayed member (it must have priority 0):
+
+```js
+// rmg1
+const c = rs.conf(); c.members[2].priority = 0; c.members[2].secondaryDelaySecs = 10; rs.reconfig(c);
+// write with w: 'majority' (3–12 ms) and with w: 3 (about 10 s); read rp-mongo3 over a direct connection
+// reset:
+const r = rs.conf(); r.members[2].priority = 1; r.members[2].secondaryDelaySecs = 0; rs.reconfig(r);
+```
+
+## Session quiz
+
+1. Name one situation in which each of these misled: `replay_lag`, `now() − pg_last_xact_replay_timestamp()`, `Seconds_Behind_Source`, `rs.status()` optimes.
+2. Which lag reading would you alert on in each engine, and what second check catches a dead replica?
+3. A standby replayed 200 MB of WAL in 0.6 s. Why can it still be minutes behind in production?
+4. Why did locking one row on a MySQL replica stop transactions on other rows?
+5. Why can a MongoDB secondary be 30 s behind while every `w: "majority"` write succeeds in milliseconds?
+6. A buyer pays and is redirected to "My orders", served from a replica. Describe two fixes and their costs.
+7. What do PostgreSQL's `wait_for_lsn()` (as written here) and MySQL's `WAIT_FOR_EXECUTED_GTID_SET` return on timeout, and what should the application do then?
+8. Why is `synchronous_commit = remote_apply` (or `w` = all members) a poor default for read-your-writes?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-3-replica-lag/lab/answers">Answers to the session quiz</DeepDive>

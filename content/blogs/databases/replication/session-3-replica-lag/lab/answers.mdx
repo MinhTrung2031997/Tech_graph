@@ -1,0 +1,84 @@
+---
+title: "Answers: Replica lag session quiz"
+description: "Worked answers to the Session 3 quiz, with the lab's measured values."
+companion: "answers"
+tags: ["replication", "lag", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW"
+  - "https://dev.mysql.com/doc/refman/8.4/en/show-replica-status.html"
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+---
+
+<Tldr>
+Measure lag by position, expect replicas to be stopped rather than slow, and give each read that must be fresh a bounded way to get there.
+</Tldr>
+
+## Q1. Four misleading readings
+
+**Question:** name one situation in which each of these misled: `replay_lag`, `now() − pg_last_xact_replay_timestamp()`, `Seconds_Behind_Source`, `rs.status()` optimes.
+
+- `replay_lag`: replay paused after a burst of writes: 0.23 s while 15 MB waited (no new standby reply); and NULL for 50 s while the standby was frozen.
+- `now() − pg_last_xact_replay_timestamp()`: idle primary: 42.7 s with 0 bytes behind.
+- `Seconds_Behind_Source`: replica cut off the network: 0 with `Replica_IO_Running: Yes` for 40–50 s while 5 transactions were missing.
+- `rs.status()`: right after a write on a healthy set: a secondary 2–3 s behind that had the write within about 1 ms.
+
+> **Common mistake:** concluding that the numbers are useless. Each is right about something; know which question it answers.
+
+## Q2. What to alert on
+
+**Question:** which lag reading would you alert on in each engine, and what second check catches a dead replica?
+
+PostgreSQL: `pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)` per standby, plus "expected standby missing from `pg_stat_replication`" and retained WAL of inactive slots. MySQL: missing GTIDs (or a heartbeat table), plus `Replica_IO_Running`/`Replica_SQL_Running` not Yes or SBS NULL. MongoDB: optime difference over a window of 30–60 s, plus member state other than SECONDARY.
+
+> **Common mistake:** treating NULL as 0 in the alert rule.
+
+## Q3. Fast replay, slow replica
+
+**Question:** a standby replayed 200 MB of WAL in 0.6 s. Why can it still be minutes behind in production?
+
+Because the speed only matters while replay is running. Replay stops when the standby is disconnected, when a query conflict makes it wait (up to `max_standby_streaming_delay`), when an operator pauses it, or when a huge transaction commits and must be applied before anything after it. Disk or CPU contention from the standby's own read workload slows it further.
+
+> **Common mistake:** buying a faster replica when the cause is a long query on it.
+
+## Q4. One row lock, many waiting transactions
+
+**Question:** why did locking one row on a MySQL replica stop transactions on other rows?
+
+The applier worker for the row-10 update waited for the replica session's row lock. The other workers applied their transactions but `replica_preserve_commit_order = 1` makes them commit in source order, so they waited ("Waiting for preceding transaction to commit"). SBS rose 1 → 17 s in 20 s.
+
+> **Common mistake:** assuming parallel replication isolates unrelated rows.
+
+## Q5. Majority writes and a lagging member
+
+**Question:** why can a MongoDB secondary be 30 s behind while every `w: "majority"` write succeeds in milliseconds?
+
+A majority of three members is two. The primary and the healthy secondary acknowledge; the frozen member is not needed (6 ms in the lab). Only `w: 3` waited for it and failed after its `wtimeout`.
+
+> **Common mistake:** using "writes are fine" as evidence that replicas are fine.
+
+## Q6. "My orders" after payment
+
+**Question:** a buyer pays and is redirected to "My orders", served from a replica. Describe two fixes and their costs.
+
+- Read "My orders" from the primary for N seconds after the buyer's last write: always correct; costs primary reads for recent buyers only.
+- Pass the payment write's position (LSN, GTID set or MongoDB `operationTime`) and wait for it on the replica with a short limit (about 100–200 ms), then fall back to the primary: replicas still serve most reads; costs up to the limit in latency when a replica lags, plus plumbing to carry the position.
+- (MongoDB) a causally consistent session does the second option automatically (Session 4).
+
+> **Common mistake:** "fixing" it with `w` = all members on the payment write: every payment then waits for the slowest replica.
+
+## Q7. Timeout return values
+
+**Question:** what do PostgreSQL's `wait_for_lsn()` (as written here) and MySQL's `WAIT_FOR_EXECUTED_GTID_SET` return on timeout, and what should the application do then?
+
+`wait_for_lsn()` returns `false` (206–217 ms with a 200 ms limit); `WAIT_FOR_EXECUTED_GTID_SET` returns 1 (201–203 ms with 0.2 s). Neither raises an error. The application must check the value and read from the primary.
+
+> **Common mistake:** ignoring the return value and reading the replica anyway.
+
+## Q8. Synchronous apply as a default
+
+**Question:** why is `synchronous_commit = remote_apply` (or `w` = all members) a poor default for read-your-writes?
+
+It moves the wait from the few reads that need freshness to every write, and it ties write latency and availability to the slowest replica: commits took 5,003–5,011 ms with a standby 5 s behind; `w: 3` took 10,017 ms with a delayed member and failed with a frozen one. A read-side wait costs nothing for writes and only delays the reads that ask for it.
+
+> **Common mistake:** enabling it globally because one page needed fresh data.
