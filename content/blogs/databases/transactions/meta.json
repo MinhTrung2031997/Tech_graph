@@ -4,6 +4,7 @@
     "session-1-transaction-guarantees",
     "session-2-anomalies",
     "session-3-isolation-levels",
-    "session-4-mvcc-internals"
+    "session-4-mvcc-internals",
+    "session-5-locks-and-indexes"
   ]
 }

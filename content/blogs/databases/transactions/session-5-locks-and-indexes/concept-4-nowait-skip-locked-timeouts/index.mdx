@@ -1,0 +1,265 @@
+---
+title: "Concept 4: NOWAIT, SKIP LOCKED and lock timeouts"
+description: "Three ways not to wait forever for a lock: fail at once (NOWAIT), take the next free row (SKIP LOCKED) or give up after a timeout. A job queue measured in all three engines, including the InnoDB queue that locked 90,420 records without an index on status, and the difference between PostgreSQL's lock_timeout (whole transaction aborted) and MySQL's innodb_lock_wait_timeout (only the statement rolled back)."
+type: "concept"
+tags: ["transactions", "locking", "skip-locked", "nowait", "job-queue", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE"
+  - "https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-LOCK-TIMEOUT"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-parameters.html#sysvar_innodb_lock_wait_timeout"
+  - "https://www.mongodb.com/docs/manual/reference/method/db.collection.findOneAndUpdate/"
+  - "https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.maxTransactionLockRequestTimeoutMillis"
+---
+
+<Tldr>
+A worker claiming jobs with `SELECT … FOR UPDATE` waits behind every other worker. **`SKIP LOCKED`** skips rows someone else holds: with T1 holding jobs 90001–90003, T2 got **90004–90006** at once in both PostgreSQL and MySQL. **`NOWAIT`** fails immediately instead (`55P03` / `ERROR 3572`). But the scan still matters: MySQL with no index on `status` put **90,420 next-key locks** on the 90,000 finished jobs it scanned past (Concept 3), so an update of an old job timed out; with an index on `(status, id)` it locked **3 + 3** records. For waits you cannot avoid, set a timeout, and know what it rolls back: PostgreSQL's `lock_timeout` **aborts the whole transaction**; MySQL's `innodb_lock_wait_timeout` rolls back **only the statement**, and a following COMMIT saved the transaction's other updates. **MongoDB** has no `SKIP LOCKED`: `findOneAndUpdate` claims one job atomically (4 workers × 50 claims → 200 distinct jobs), and transactions never wait on documents (write conflicts, Concept 1).
+</Tldr>
+
+## Waiting policies
+
+| Policy | PostgreSQL | MySQL InnoDB | MongoDB |
+|---|---|---|---|
+| Wait (default) | Forever (`lock_timeout = 0`) | 50 s (`innodb_lock_wait_timeout`) | Transactions: no document waits; intent locks up to `maxTransactionLockRequestTimeoutMillis` (5 ms) |
+| Fail at once | `FOR UPDATE NOWAIT` → `55P03` | `FOR UPDATE NOWAIT` → `ERROR 3572` | Default for transactions (`WriteConflict`) |
+| Skip locked rows | `FOR UPDATE SKIP LOCKED` | `FOR UPDATE SKIP LOCKED` | Not available; use an atomic `findOneAndUpdate` |
+| Timeout | `SET lock_timeout = '…'` | `SET SESSION innodb_lock_wait_timeout = …` (seconds) | `maxTimeMS` per operation |
+| **✓ Claimed / ✗ Blocked** | The worker got rows, or it waited or failed | | |
+
+## PostgreSQL: a job queue
+
+<Flow
+  title="PostgreSQL: three workers, one queue"
+  height={330}
+  nodes={[
+    { id: 't1', label: 'T1 worker', sub: 'FOR UPDATE LIMIT 3', x: 20, y: 20, w: 220 },
+    { id: 'jobs', label: 'Queued jobs', sub: '90001–100000', x: 300, y: 110, w: 200 },
+    { id: 'skip', label: 'T2 SKIP LOCKED', sub: '', x: 20, y: 200, w: 220 },
+    { id: 'got', label: '✓ T2 claims', sub: '90004–90006', x: 580, y: 200, w: 200 },
+    { id: 'now', label: '✗ T3 NOWAIT', sub: '55P03 at once', x: 580, y: 20, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-jobs', from: 't1', to: 'jobs' },
+    { id: 'skip-jobs', from: 'skip', to: 'jobs' },
+    { id: 'jobs-got', from: 'jobs', to: 'got' },
+    { id: 'jobs-now', from: 'jobs', to: 'now' },
+  ]}
+  cases={[
+    {
+      title: 'Claim with SKIP LOCKED',
+      path: 'T1 locks 90001–90003 → T2 SKIP LOCKED ✓ 90004–90006 → T3 NOWAIT ✗ error',
+      summary: 'No worker waits for another; each gets different rows.',
+      steps: [
+        {
+          title: 'T1 claims three jobs',
+          note: 'pgrowlocks(\'jobs\') shows 3 rows locked. T1 will update them to running and commit.',
+          code: "BEGIN;\nSELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 3 FOR UPDATE;   -- 90001, 90002, 90003",
+          active: ['t1', 'jobs'],
+          edges: ['t1-jobs'],
+        },
+        {
+          title: 'T2 skips them',
+          note: 'Same query with SKIP LOCKED returns 90004, 90005, 90006 immediately. Without it, T2 would wait for T1 and then (READ COMMITTED) re-check the rows T1 changed.',
+          code: "SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 3 FOR UPDATE SKIP LOCKED;",
+          active: ['skip', 'jobs', 'got'],
+          edges: ['skip-jobs', 'jobs-got'],
+        },
+        {
+          title: 'T3 refuses to wait',
+          note: 'NOWAIT raises an error as soon as it meets a locked row: ERROR 55P03 could not obtain lock on row in relation "jobs".',
+          code: "SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 3 FOR UPDATE NOWAIT;",
+          active: ['jobs', 'now'],
+          edges: ['jobs-now'],
+        },
+        {
+          title: 'The scan still costs',
+          note: 'EXPLAIN ANALYZE of the SKIP LOCKED query: Index Scan using jobs_pkey, Rows Removed by Filter 90,000, 1,187 buffers, 4.8 ms per claim: it walks past every finished job. PostgreSQL does not lock those rows, but an index on status (or a partial index WHERE status = \'queued\') makes each claim a few buffers.',
+          code: "EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM jobs WHERE status = 'queued'\nORDER BY id LIMIT 3 FOR UPDATE SKIP LOCKED;",
+          active: ['skip', 'jobs'],
+          edges: ['skip-jobs'],
+        },
+      ],
+    },
+    {
+      title: 'lock_timeout ends the transaction',
+      path: 'UPDATE 8 ✓ → UPDATE 7 waits 500 ms ✗ lock timeout → UPDATE 9 ✗ transaction aborted → ROLLBACK',
+      summary: 'After a lock timeout, nothing more can run in the transaction.',
+      subs: { t1: 'holds account 7', skip: 'T2: lock_timeout 500ms', jobs: 'accounts 7, 8, 9', now: '✗ 7: lock timeout' },
+      steps: [
+        {
+          title: 'Timeout, then everything fails',
+          note: 'ERROR: canceling statement due to lock timeout, then ERROR: current transaction is aborted, commands ignored until end of transaction block for UPDATE 9; COMMIT turns into ROLLBACK. The update of account 8 is lost too. Use a SAVEPOINT before the risky statement if you want to continue.',
+          code: "BEGIN;\nUPDATE accounts SET balance = balance + 1 WHERE id = 8;\nSET LOCAL lock_timeout = '500ms';\nUPDATE accounts SET balance = balance + 1 WHERE id = 7;   -- ✗ lock timeout\nUPDATE accounts SET balance = balance + 1 WHERE id = 9;   -- ✗ transaction is aborted\nCOMMIT;                                                   -- ROLLBACK",
+          active: ['t1', 'skip', 'jobs', 'now'],
+          edges: ['t1-jobs', 'skip-jobs', 'jobs-now'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL InnoDB: the same queue
+
+<Flow
+  title="InnoDB: SKIP LOCKED with and without an index on status"
+  height={330}
+  nodes={[
+    { id: 't1', label: 'T1 worker', sub: 'FOR UPDATE LIMIT 3', x: 20, y: 20, w: 220 },
+    { id: 'scan', label: 'Records scanned', sub: '', x: 300, y: 110, w: 200 },
+    { id: 'skip', label: 'T2 SKIP LOCKED', sub: '', x: 20, y: 200, w: 220 },
+    { id: 'got', label: '✓ T2 claims', sub: '90004–90006', x: 580, y: 200, w: 200 },
+    { id: 'old', label: 'T3 updates job 5', sub: '', x: 580, y: 20, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-scan', from: 't1', to: 'scan' },
+    { id: 'skip-scan', from: 'skip', to: 'scan' },
+    { id: 'scan-got', from: 'scan', to: 'got' },
+    { id: 'old-scan', from: 'old', to: 'scan' },
+  ]}
+  cases={[
+    {
+      title: 'No index on status',
+      path: 'T1 scans PRIMARY from 1 → ✗ 90,420 next-key locks → T2 SKIP LOCKED ✓ → T3 update of finished job 5 ✗ 1205',
+      summary: 'The queue works, but every finished job is locked while a worker holds its claim.',
+      subs: { scan: 'PRIMARY 1 → 90003', old: '✗ ERROR 1205' },
+      steps: [
+        {
+          title: 'T1 locks the whole path',
+          note: 'REPEATABLE READ, no usable index: InnoDB walks PRIMARY from id 1, locking each record it reads. data_locks: 90,420 × X on jobs (the 90,000 done jobs, the 3 claimed, page supremums).',
+          code: "SELECT LOCK_MODE, COUNT(*) FROM performance_schema.data_locks\nWHERE OBJECT_NAME = 'jobs' AND LOCK_TYPE = 'RECORD' GROUP BY 1;   -- X 90420",
+          active: ['t1', 'scan'],
+          edges: ['t1-scan'],
+        },
+        {
+          title: 'T2 skips, T3 waits',
+          note: 'T2 with SKIP LOCKED still got 90004–90006 (it skipped the 90,003 locked records). T3 updating finished job 5 for an unrelated reason waited and failed: ERROR 1205. NOWAIT failed with ERROR 3572: Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set.',
+          code: "UPDATE jobs SET locked_by = 'x' WHERE id = 5;   -- ✗ 1205 after 1 s",
+          active: ['skip', 'scan', 'got', 'old'],
+          edges: ['skip-scan', 'scan-got', 'old-scan'],
+        },
+      ],
+    },
+    {
+      title: 'Index on (status, id)',
+      path: 'jobs_status → ✓ 3 next-key + 3 PRIMARY record locks → T2 ✓ 90004–90006 → T3 ✓',
+      summary: 'The index makes the scan, and so the lock set, three rows long.',
+      subs: { scan: 'jobs_status: 3 entries', old: '✓ updated' },
+      steps: [
+        {
+          title: 'Only the claimed jobs are locked',
+          note: 'After CREATE INDEX jobs_status ON jobs (status, id): data_locks shows jobs_status X × 3 and PRIMARY X,REC_NOT_GAP × 3. T2 claimed 90004–90006; T3\'s update of job 5 went through.',
+          code: "CREATE INDEX jobs_status ON jobs (status, id);",
+          active: ['t1', 'scan', 'skip', 'got', 'old'],
+          edges: ['t1-scan', 'skip-scan', 'scan-got', 'old-scan'],
+        },
+      ],
+    },
+    {
+      title: 'innodb_lock_wait_timeout rolls back one statement',
+      path: 'UPDATE 8 ✓ → UPDATE 7 ✗ 1205 → UPDATE 9 ✓ → COMMIT ✓ (8 and 9 saved, 7 not)',
+      summary: 'The transaction survives the timeout; a blind COMMIT saves half of it.',
+      subs: { t1: 'holds account 7', skip: 'T2: timeout 1 s', scan: 'accounts 7, 8, 9', got: '✓ 8 and 9 committed', old: '✗ 7: ERROR 1205' },
+      steps: [
+        {
+          title: 'Statement rollback only',
+          note: 'innodb_rollback_on_timeout is OFF (the default), so 1205 undoes only the waiting statement. The client continued (mysql --force), UPDATE 9 and COMMIT succeeded: afterwards accounts 8 and 9 were 1001.00 and 7 was 1000.00. An application that catches 1205 and carries on commits a partial transfer.',
+          code: "SET SESSION innodb_lock_wait_timeout = 1;\nSTART TRANSACTION;\nUPDATE accounts SET balance = balance + 1 WHERE id = 8;\nUPDATE accounts SET balance = balance + 1 WHERE id = 7;   -- ERROR 1205\nUPDATE accounts SET balance = balance + 1 WHERE id = 9;\nCOMMIT;",
+          active: ['t1', 'skip', 'scan', 'got', 'old'],
+          edges: ['t1-scan', 'skip-scan', 'scan-got', 'old-scan'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: claim atomically instead of locking
+
+<Flow
+  title="MongoDB: four workers claim jobs with findOneAndUpdate"
+  height={300}
+  nodes={[
+    { id: 'w', label: '4 workers × 50', sub: 'findOneAndUpdate', x: 20, y: 20, w: 220 },
+    { id: 'q', label: 'First queued job', sub: 'sort _id', x: 300, y: 20, w: 200 },
+    { id: 'ok', label: '✓ 200 distinct jobs', sub: '90001–90200', x: 580, y: 20, w: 200 },
+    { id: 'cost', label: 'Without an index', sub: '90,001 keys + docs', x: 300, y: 190, w: 200 },
+  ]}
+  edges={[
+    { id: 'w-q', from: 'w', to: 'q' },
+    { id: 'q-ok', from: 'q', to: 'ok' },
+    { id: 'q-cost', from: 'q', to: 'cost' },
+  ]}
+  cases={[
+    {
+      title: 'Atomic claim',
+      path: 'findOneAndUpdate(status queued → running) → ✓ each document claimed once → 200 claims, 200 distinct ids',
+      summary: 'One document, one atomic write: two workers cannot claim the same job.',
+      steps: [
+        {
+          title: 'Find and flip in one operation',
+          note: 'Each call finds the first queued job and sets it to running in a single atomic document write. If two workers pick the same document, one hits a write conflict internally and the server retries its search, so it moves on to the next job.',
+          code: 'db.jobs.findOneAndUpdate({ status: "queued" },\n  { $set: { status: "running", locked_by: "w1" } }, { sort: { _id: 1 } })',
+          active: ['w', 'q'],
+          edges: ['w-q'],
+        },
+        {
+          title: 'No duplicates',
+          note: '4 parallel workers × 50 calls: 200 documents running, 200 distinct _id values, exactly 90001–90200.',
+          active: ['q', 'ok'],
+          edges: ['q-ok'],
+        },
+        {
+          title: 'Index the queue',
+          note: 'explain: without an index, each claim examined 90,001 keys (_id order) and 90,001 documents (39 ms). With { status: 1, _id: 1 }: 1 document examined.',
+          code: 'db.jobs.createIndex({ status: 1, _id: 1 })',
+          active: ['q', 'cost'],
+          edges: ['q-cost'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Comparison
+
+| | PostgreSQL | MySQL InnoDB | MongoDB |
+|---|---|---|---|
+| Queue claim | `FOR UPDATE SKIP LOCKED` | `FOR UPDATE SKIP LOCKED` (+ index, or RC) | `findOneAndUpdate` |
+| Locks on scanned, non-matching rows | None | Yes in RR (90,420 here) | None |
+| Fail-fast error | `55P03` | `3572` | `WriteConflict` (transactions) |
+| Timeout rolls back | The whole transaction (unless a savepoint) | Only the statement (`innodb_rollback_on_timeout = OFF`) | The operation (`maxTimeMS`) |
+| Default wait | Forever | 50 s | Plain writes retry until done or `maxTimeMS` |
+
+<Pitfall>
+MySQL error **1205 does not end the transaction**. If your code catches it, logs, and continues to `COMMIT`, you commit everything except the statement that timed out: in the lab, two of three updates of a transfer. On 1205, roll back explicitly (or set `innodb_rollback_on_timeout = ON` server-wide). Deadlock error 1213 is different: it always rolls back the whole transaction (Session 6).
+</Pitfall>
+
+## Real-world scenario: a worker pool on MySQL
+
+Ten workers poll `SELECT … WHERE status = 'queued' ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED` every second. Throughput is fine, but the admin page that re-runs a failed job (`UPDATE jobs SET status = 'queued' WHERE id = ?` on an old job) times out several times a minute.
+
+| Check | Finding |
+|---|---|
+| `EXPLAIN` of the claim | `type: index` on PRIMARY, scanning all finished jobs |
+| `data_locks` during a claim | Tens of thousands of `X` locks on old jobs |
+| Fix | `CREATE INDEX jobs_status ON jobs (status, id)`; optionally move finished jobs to an archive table |
+
+## Key takeaways
+
+1. `SKIP LOCKED` lets workers take different rows without waiting; `NOWAIT` fails fast.
+2. In InnoDB REPEATABLE READ the queue query still locks every record it scans: index the queue condition (`(status, id)`).
+3. PostgreSQL `lock_timeout` aborts the whole transaction; MySQL `innodb_lock_wait_timeout` rolls back only the statement.
+4. MongoDB has no `SKIP LOCKED`; `findOneAndUpdate` claims one document atomically, and it needs an index on the queue condition too.
+5. Prefer short timeouts plus retries over long waits: a waiting session holds its own locks while it waits.
+
+## Check questions
+
+1. T1 has locked jobs 90001–90003. What do `FOR UPDATE`, `FOR UPDATE NOWAIT` and `FOR UPDATE SKIP LOCKED` each do for T2?
+2. Why did the MySQL queue query hold 90,420 locks to claim 3 jobs, and what did that break?
+3. Why does the same query lock only 3 rows in PostgreSQL even without an index? Why add the index anyway?
+4. After a MySQL `1205`, the application continued and committed. What was saved?
+5. What is different after a PostgreSQL `lock_timeout` error, and how can you continue the transaction?
+6. How does `findOneAndUpdate` prevent two MongoDB workers from claiming the same job?
+7. Is `SKIP LOCKED` appropriate for reading account balances in a report? Why not?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-5-locks-and-indexes/concept-4-nowait-skip-locked-timeouts/answers">Worked answers to Q1–Q7</DeepDive>

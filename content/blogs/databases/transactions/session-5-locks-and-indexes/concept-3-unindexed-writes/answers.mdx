@@ -1,0 +1,70 @@
+---
+title: "Answers: An UPDATE without an index locks what it scans"
+description: "Worked answers to the Session 5 Concept 3 check questions."
+companion: "answers"
+tags: ["transactions", "locking", "indexing", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locks-set.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html"
+---
+
+<Tldr>
+InnoDB: locks follow the scan. PostgreSQL and MongoDB: locks follow the changes.
+</Tldr>
+
+## Q1. 5,013 locks for 100 changes
+
+**Question:** why did T1 hold 5,013 locks when it changed 100 rows? Where does the 13 come from?
+
+With no index on `shelf`, the only access path is a full scan of the clustered index (PRIMARY). Under REPEATABLE READ InnoDB puts a next-key lock on **every record it scans**, so all 5,000 rows were locked. Next-key locks also cover the gap after the last record of each leaf page, represented by that page's `supremum` pseudo-record: the table's PRIMARY index had 13 leaf pages (14 index pages in the buffer pool including the root), hence 5,000 + 13 = 5,013.
+
+> **Common mistake:** "InnoDB locks the rows that match the WHERE clause". It locks the rows the **access path** reads.
+
+## Q2. Shelf 8 waits for shelf 7
+
+**Question:** why did an update of a shelf-8 item wait for a transaction that updated shelf 7?
+
+T2's `UPDATE … WHERE sku = 'SKU-000008'` needs an `X` lock on PRIMARY record `SKU-000008`. T1's full scan had already put a next-key lock on that record (it read it to check `shelf = 7`, found shelf 8, and kept the lock). So T2 waited, and failed after `innodb_lock_wait_timeout` (1 s in the lab) with ERROR 1205.
+
+> **Common mistake:** looking for a shelf-7 row in T2's statement. Nothing in T2 is related to shelf 7.
+
+## Q3. Zero matches, full blocking
+
+**Question:** `UPDATE inventory SET stock = 0 WHERE stock < 0` matched no rows. Why did it still block other writers?
+
+Same reason: no index on `stock`, so a full scan; every scanned record gets a next-key lock under REPEATABLE READ (5,013 again, `trx_rows_modified` 0). Whether a row matches does not matter in RR; the locks protect "the result of this scan" from changes until commit.
+
+> **Common mistake:** assuming a no-op UPDATE is free. It costs a full scan and, in InnoDB RR, a table-wide lock until commit.
+
+## Q4. What READ COMMITTED does
+
+**Question:** what does READ COMMITTED do differently with the 4,900 non-matching rows?
+
+It still scans and briefly locks each row while evaluating the WHERE clause, but **releases** the lock as soon as the row turns out not to match, so only the 100 matched rows stay locked (100 `X,REC_NOT_GAP`). When a scanned row is locked by someone else, an UPDATE under RC does a **semi-consistent read**: it checks the latest committed version against the WHERE clause and skips it without waiting if it does not match. No gap locks are taken.
+
+> **Common mistake:** treating RC as "no locks". The 100 changed rows are locked until commit at every isolation level.
+
+## Q5. With an index on shelf
+
+**Question:** after adding an index on `shelf`, an insert on shelf 8 succeeded but one on shelf 7 waited. Explain both.
+
+The UPDATE now scans only the 100 shelf-7 entries of `inventory_shelf`, locking them with next-key locks (101 including the boundary) plus a gap lock after the last one, and the 100 PRIMARY records. A new row on shelf 8 creates an index entry `(8, sku)` outside that stretch: ✓. A new row on shelf 7 creates `(7, sku)` inside the locked stretch: its insert intention lock waits for the gap lock (Concept 2).
+
+> **Common mistake:** expecting the index to remove all gap locking; it narrows it to the scanned range.
+
+## Q6. PostgreSQL does not block
+
+**Question:** why does the same unindexed UPDATE not block shelf-8 updates in PostgreSQL?
+
+PostgreSQL's sequential scan reads rows without locking them; only rows it actually updates get T1's transaction id in `xmax` (`pgrowlocks`: 100). A row on shelf 8 carries no lock, so T2 updated it in 0.37 ms. The missing index still costs a full scan of 5,000 rows on every run.
+
+> **Common mistake:** concluding indexes "do not matter for locking" in PostgreSQL. They do not change what is locked, but a slow statement holds its locks longer.
+
+## Q7. Predicting a table-wide lock
+
+**Question:** how would you check, before running it, whether a DELETE will lock the whole table in MySQL?
+
+Run `EXPLAIN DELETE …` (or `EXPLAIN UPDATE …`). If `type` is `ALL` (or `index`, a full index scan), every row of that index will be scanned and, under REPEATABLE READ, locked. Look for `range`/`ref`/`eq_ref` on an index that matches the WHERE clause. To measure, run it in a transaction on a copy and read `trx_rows_locked` from `information_schema.innodb_trx` or count `performance_schema.data_locks` before rolling back.
+
+> **Common mistake:** checking only `rows` in EXPLAIN. A 0-row result can still scan, and lock, the whole table.

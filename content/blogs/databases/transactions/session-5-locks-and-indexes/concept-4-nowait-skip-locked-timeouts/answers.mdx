@@ -1,0 +1,75 @@
+---
+title: "Answers: NOWAIT, SKIP LOCKED and lock timeouts"
+description: "Worked answers to the Session 5 Concept 4 check questions."
+companion: "answers"
+tags: ["transactions", "locking", "skip-locked", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-error-handling.html"
+---
+
+<Tldr>
+Decide per statement: wait, fail fast, or skip. Then check what the scan locks and what a timeout rolls back.
+</Tldr>
+
+## Q1. Three ways to ask
+
+**Question:** T1 has locked jobs 90001–90003. What do `FOR UPDATE`, `FOR UPDATE NOWAIT` and `FOR UPDATE SKIP LOCKED` each do for T2?
+
+| T2 runs | Result |
+|---|---|
+| `FOR UPDATE` | Waits until T1 ends (forever in PostgreSQL by default, 50 s in MySQL), then continues |
+| `FOR UPDATE NOWAIT` | Error at once: PostgreSQL `55P03`, MySQL `ERROR 3572` |
+| `FOR UPDATE SKIP LOCKED` | Returns the next unlocked rows at once: 90004–90006 in both engines |
+
+> **Common mistake:** using `NOWAIT` for a queue. Workers then fail every time two of them poll together; `SKIP LOCKED` is the queue tool.
+
+## Q2. 90,420 locks for 3 jobs
+
+**Question:** why did the MySQL queue query hold 90,420 locks to claim 3 jobs, and what did that break?
+
+Without an index on `status`, the query walks PRIMARY from id 1 and under REPEATABLE READ puts a next-key lock on every record it reads: the 90,000 finished jobs, the 3 claimed queued ones, plus the supremum of each leaf page. SKIP LOCKED only changes how **T2** treats locked rows, not what **T1** locks. Any write to an old job (re-queue, cleanup) then waits for the worker's transaction: the update of job 5 failed with ERROR 1205. An index on `(status, id)` reduced the lock set to 3 + 3.
+
+> **Common mistake:** "SKIP LOCKED means no contention". The claiming query must still scan only the rows it wants.
+
+## Q3. PostgreSQL without the index
+
+**Question:** why does the same query lock only 3 rows in PostgreSQL even without an index? Why add the index anyway?
+
+PostgreSQL locks only the rows it returns from a `FOR UPDATE` query; rows read and discarded by the filter are not locked. The index is still worth it for speed: each claim read 1,187 buffers and discarded 90,000 rows (4.8 ms), and that grows with every finished job. A partial index `ON jobs (id) WHERE status = 'queued'` stays tiny.
+
+> **Common mistake:** keeping finished jobs forever in the queue table "because the index handles it": the index on `(status, id)` still grows and needs vacuuming; archive or delete.
+
+## Q4. Commit after 1205
+
+**Question:** after a MySQL `1205`, the application continued and committed. What was saved?
+
+Every statement of the transaction except the one that timed out. With `innodb_rollback_on_timeout = OFF` (default), 1205 rolls back only the waiting statement; the transaction stays open. In the lab, accounts 8 and 9 were incremented and committed, account 7 was not: a half-applied transfer.
+
+> **Common mistake:** treating 1205 like 1213. A deadlock rolls back the whole transaction; a lock wait timeout does not.
+
+## Q5. PostgreSQL after lock_timeout
+
+**Question:** what is different after a PostgreSQL `lock_timeout` error, and how can you continue the transaction?
+
+Any error in a PostgreSQL transaction block aborts the whole transaction: the next statement fails with "current transaction is aborted, commands ignored until end of transaction block" and `COMMIT` becomes `ROLLBACK`. To continue, set a savepoint before the risky statement and `ROLLBACK TO SAVEPOINT` after the error; then the earlier work (account 8) survives.
+
+> **Common mistake:** retrying only the failed statement in the same transaction; it fails with "transaction is aborted".
+
+## Q6. MongoDB claims
+
+**Question:** how does `findOneAndUpdate` prevent two MongoDB workers from claiming the same job?
+
+The find and the update are one atomic operation on one document. If two workers select the same queued document, only one update can apply; the other meets a write conflict, and the server retries its operation, which then finds the next queued job. In the lab, 4 workers × 50 calls gave 200 distinct jobs. A separate `find()` followed by `updateOne()` would not be safe.
+
+> **Common mistake:** `find({status: "queued"}).limit(10)` then `updateMany` by ids: two workers can claim the same jobs.
+
+## Q7. SKIP LOCKED for reports
+
+**Question:** is `SKIP LOCKED` appropriate for reading account balances in a report? Why not?
+
+No. It silently leaves out any row that happens to be locked, so totals would be wrong and different on every run. Reports should use plain (non-locking) snapshot reads, which neither wait nor skip: they see the last committed version of every row.
+
+> **Common mistake:** adding `SKIP LOCKED` anywhere a query "sometimes waits".
