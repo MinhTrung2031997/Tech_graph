@@ -1,0 +1,124 @@
+---
+title: "Answers: Seq Scan — what a full scan does"
+description: "Worked answers to the Concept 3 check questions: pages read, the cost formula, LIMIT, the ring buffer, bloat, InnoDB scan order and COLLSCAN signals."
+companion: "answers"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "seq-scan", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/using-explain.html"
+  - "https://www.postgresql.org/docs/current/runtime-config-query.html#RUNTIME-CONFIG-QUERY-CONSTANTS"
+  - "https://github.com/postgres/postgres/blob/master/src/backend/storage/buffer/README"
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-performance-read_ahead.html"
+  - "https://www.mongodb.com/docs/manual/reference/explain-results/"
+---
+
+<Tldr>
+One rule answers most of these: **a full scan costs the pages in the table, not the rows it returns.** `LIMIT` can stop it early only when a match comes early; deleting rows does not remove pages; and the signal that an index is missing is always "rows read ≫ rows returned". The numbers below were checked on the lab table (PostgreSQL 17, 10,102 pages).
+</Tldr>
+
+## Q1. Pages for one row vs 50,000 rows
+
+**Question:** `orders` has 1M rows in 10,300 pages and no indexes. How many pages does a Seq Scan read for `WHERE id = 7` (one row), and for `WHERE status = 'shipped'` (50,000 rows)? Why?
+
+**Both read all 10,300 pages.**
+
+| Query | Rows returned | Pages read |
+|---|---|---|
+| `WHERE id = 7` | 1 | 10,300 |
+| `WHERE status = 'shipped'` | 50,000 | 10,300 |
+
+Without an index, Postgres does not know where id 7 is, so it has to look at every row; and even after finding id 7, there could be another row with id 7 further on (without a unique index nothing rules it out). The cost is set by the table's size.
+
+> **Common mistake:** "the one-row query reads fewer pages because it finds the row quickly". A Seq Scan never stops early unless a `LIMIT` tells it to.
+
+## Q2. The planner's cost
+
+**Question:** with the default cost settings, compute the planner's total cost for that Seq Scan with the `status` filter. Which part is the I/O cost and which is the CPU cost?
+
+| Part | Formula | Value | Kind |
+|---|---|---|---|
+| Pages | 10,300 × `seq_page_cost` 1.0 | 10,300 | I/O |
+| Rows | 1,000,000 × `cpu_tuple_cost` 0.01 | 10,000 | CPU |
+| Filter | 1,000,000 × 1 operator × `cpu_operator_cost` 0.0025 | 2,500 | CPU |
+| **Total** | | **22,800** | |
+
+I/O ≈ 45%, CPU ≈ 55%. On the lab table (10,102 pages) `EXPLAIN` shows exactly `cost=0.00..22602.00` = 10,102 + 10,000 + 2,500.
+
+> **Common mistake:** leaving out the filter term, or adding a `cpu_operator_cost` per row *returned*. The filter is evaluated on every row read, so it is multiplied by 1M, not by 50,000.
+
+## Q3. LIMIT 1: 0.1 ms one day, 90 ms the next
+
+**Question:** `SELECT * FROM orders WHERE status = 'refunded' LIMIT 1` takes 0.1 ms one day and 90 ms the next, with the same plan and the same table size. Give a likely reason.
+
+**Where the first matching row is.** The scan stops at the first match.
+
+| Day | First `'refunded'` row | Pages read | Time |
+|---|---|---|---|
+| 1 | On page 0 | 1 | 0.1 ms |
+| 2 | None left (it was updated to another status), or only near the end of the file | ≈ all 10,300 | 90 ms |
+
+Measured on the lab: `LIMIT 1` with a match on page 0 read `shared read=1`; with no match it read `hit=64 read=10038`, the whole table.
+
+> **Common mistake:** blaming the cache. A cache difference changes time per page, not pages read; here the page count itself changed from 1 to 10,300.
+
+## Q4. A second run that still reads
+
+**Question:** `shared_buffers` is 128 MB and `orders` is 80 MB. You run `SELECT count(*) FROM orders` twice, and run 2 still shows mostly `shared read`. Why? What changes if `shared_buffers` is 1 GB?
+
+**The ring buffer.** The table (80 MB) is larger than ¼ of `shared_buffers` (32 MB), so the Seq Scan reads through a 256 KB ring of 32 slots and keeps overwriting them. After run 1, only the last 32 pages are still cached.
+
+| `shared_buffers` | ¼ of it | Ring? | Run 2 |
+|---|---|---|---|
+| 128 MB | 32 MB | ✓ (80 MB > 32 MB) | Measured: `hit=32 read=10070` |
+| 1 GB | 256 MB | ✗ (80 MB ≤ 256 MB) | `hit=10300 read=0` |
+
+The `read`s in run 2 are probably fast, because the OS page cache still holds the file, but Postgres counts them as reads.
+
+> **Common mistake:** "the cache is too small to hold 80 MB". 128 MB could hold it; the ring rule deliberately stops a big scan from doing so, to protect other tables' pages.
+
+## Q5. Deleting 90% of the rows
+
+**Question:** a PostgreSQL table had 10M rows (1.2 GB). A job deleted the oldest 9M rows and VACUUM ran. Is a Seq Scan now about 10× faster? Why or why not, and what would make it so?
+
+**No: it reads the same ≈ 154,000 pages.**
+
+| | Before | After DELETE + VACUUM |
+|---|---|---|
+| Live rows | 10M | 1M |
+| Pages in the file | ≈ 154,000 | ≈ 154,000 |
+| Pages a Seq Scan reads | ≈ 154,000 | ≈ 154,000 |
+
+VACUUM marks the dead rows' space as free **for reuse** and can only cut off empty pages **at the end** of the file. The deleted rows were the oldest, at the front, so nothing was truncated. A Seq Scan reads every page in the file, empty or not. (It does skip the per-row work for rows that are gone, so CPU drops a little.)
+
+**To make it ≈ 10× faster:** rewrite the table: `VACUUM FULL` (exclusive lock) or `pg_repack` (online), giving ≈ 15,400 pages. For data deleted by age on a schedule, partition by time and drop old partitions.
+
+> **Common mistake:** "VACUUM gives the space back". It gives it back **to the table** for new rows, not to the operating system, except for empty pages at the very end.
+
+## Q6. InnoDB full scan: UUIDv4 vs AUTO_INCREMENT
+
+**Question:** an InnoDB table with a UUIDv4 primary key and the same table with `AUTO_INCREMENT` hold the same rows. Why can a full scan of the UUIDv4 table be slower when the data is on disk? Give two reasons.
+
+| Reason | Why |
+|---|---|
+| More pages | Random inserts split pages, leaving them ≈ 69% full instead of 15/16: ≈ 1.35× as many leaves to read |
+| Leaves out of file order | The scan follows next-leaf pointers in key order; after splits, the next leaf is anywhere in the file (4 → 9 → 5 → 12), so each read is a jump |
+| No read-ahead | Linear read-ahead triggers only when the pages of an extent are read in order; a scattered scan rarely triggers it, so leaves arrive one 16 KB read at a time instead of 1 MB at a time |
+
+If the whole table is in the buffer pool, the difference is only the extra pages.
+
+> **Common mistake:** "the UUID key is bigger, so rows are bigger". The 16-byte key costs a little, but the main effects are fill factor and scan order.
+
+## Q7. COLLSCAN with nReturned 12
+
+**Question:** a MongoDB `explain("executionStats")` shows `COLLSCAN`, `nReturned: 12`, `totalDocsExamined: 2000000`. What does it tell you, and what is the PostgreSQL equivalent of the same signal?
+
+**The query read 2,000,000 documents to return 12**: no index matched the filter, so every document was examined. 12 / 2,000,000 = 0.0006% of the work was useful. The filter is very selective, so an index on the filtered field would replace the scan with a few index pages plus 12 documents.
+
+| Engine | The same signal |
+|---|---|
+| MongoDB | `totalDocsExamined` ≫ `nReturned`, stage `COLLSCAN`, `totalKeysExamined: 0` |
+| PostgreSQL | `Seq Scan` with `Rows Removed by Filter` ≫ actual `rows` |
+| MySQL | `type: ALL`, `rows` ≈ table size, low `filtered` |
+
+> **Common mistake:** reading only `executionTimeMillis`. A small collection can scan fast today; the ratio of examined to returned tells you what happens as it grows.

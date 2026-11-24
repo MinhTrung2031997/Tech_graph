@@ -1,0 +1,433 @@
+---
+title: "Lab and session quiz: Storage basics"
+description: "Set up PostgreSQL 17, MySQL 8.4 and MongoDB 8.0 in Docker with the 1M-row orders dataset used by every lab, then see pages, heap vs clustered storage, full scans and random I/O for yourself."
+type: "how-to"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "lab"]
+status: "draft"
+sources:
+  - "https://hub.docker.com/_/postgres"
+  - "https://hub.docker.com/_/mysql"
+  - "https://hub.docker.com/_/mongo"
+  - "https://www.postgresql.org/docs/current/pageinspect.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/server-status-variables.html"
+---
+
+<Tldr>
+This lab builds the environment every later lab reuses: three databases in Docker, each with the same **1M-row `orders` table**. Then it reproduces Session 1 on real data: ≈ 10,100 pages of 99 rows, ctids, HOT vs non-HOT updates, the ring buffer, a delete that does not shrink a table, and an index that reads fewer pages yet loses to a full scan. Every output below was produced by these exact commands; your timings will differ, page counts should not.
+</Tldr>
+
+## 1. Start the databases
+
+Ports are shifted (5433, 3307, 27018) so they do not clash with databases you already run.
+
+```bash
+docker run -d --name idx-pg    -e POSTGRES_PASSWORD=lab -p 5433:5432 postgres:17-alpine -c shared_buffers=128MB
+docker run -d --name idx-mysql -e MYSQL_ROOT_PASSWORD=lab -e MYSQL_DATABASE=lab -p 3307:3306 mysql:8.4
+docker run -d --name idx-mongo -p 27018:27017 mongo:8.0
+```
+
+Shortcuts used in the rest of the labs:
+
+```bash
+alias pg='docker exec -it idx-pg psql -U postgres'
+alias my='docker exec -it idx-mysql mysql -uroot -plab lab'
+alias mg='docker exec -it idx-mongo mongosh --quiet lab'
+```
+
+## 2. Load the dataset
+
+`orders`: 1M rows, `id` 1 to 1,000,000 in insert order, `created_at` rising with `id` over 2025, 100,000 customers spread evenly, 5% `shipped`.
+
+| status | rows |
+|---|---|
+| delivered | 350,000 |
+| paid | 350,000 |
+| pending | 200,000 |
+| shipped | 50,000 |
+| cancelled | 50,000 |
+
+### PostgreSQL
+
+Save as `pg-seed.sql`, then run `docker exec -i idx-pg psql -U postgres < pg-seed.sql` (≈ 10 s).
+
+```sql
+-- Lab dataset: 1M orders of about 80 bytes each, ids in insert order, created_at rising with id.
+DROP TABLE IF EXISTS orders;
+CREATE TABLE orders (
+  id          bigint        PRIMARY KEY,
+  customer_id integer       NOT NULL,
+  status      text          NOT NULL,
+  channel     text          NOT NULL,
+  sku         text          NOT NULL,
+  amount      numeric(10,2) NOT NULL,
+  created_at  timestamptz   NOT NULL
+);
+INSERT INTO orders
+SELECT g,
+       1 + (hashint4(g) & 2147483647) % 100000,                          -- 100k customers, spread evenly
+       CASE WHEN g % 20 = 0 THEN 'shipped'                               -- 5%
+            WHEN g % 20 = 1 THEN 'cancelled'                             -- 5%
+            WHEN g % 10 IN (2, 3) THEN 'pending'                         -- 20%
+            WHEN g % 2 = 0 THEN 'delivered' ELSE 'paid' END,             -- 35% each
+       (ARRAY['web', 'app', 'store'])[1 + g % 3],                        -- sales channel
+       'SKU-' || lpad(((hashint4(g * 3) & 2147483647) % 5000)::text, 6, '0'),  -- 5,000 products
+       ((hashint4(g * 7) & 2147483647) % 50000) / 100.0,                 -- 0.00 to 499.99
+       timestamptz '2025-01-01' + g * interval '31.536 seconds'          -- one year, in id order
+FROM generate_series(1, 1000000) AS g;
+VACUUM ANALYZE orders;
+```
+
+### MySQL
+
+Save as `mysql-seed.sql`, then run `docker exec -i idx-mysql mysql -uroot -plab lab < mysql-seed.sql` (≈ 5 s). Customer ids use a different hash than PostgreSQL, so individual customers differ; the distributions are the same.
+
+```sql
+-- Lab dataset: 1M orders, same shape as the PostgreSQL table.
+DROP TABLE IF EXISTS orders;
+CREATE TABLE orders (
+  id          BIGINT        NOT NULL PRIMARY KEY,
+  customer_id INT           NOT NULL,
+  status      VARCHAR(16)   NOT NULL,
+  channel     VARCHAR(8)    NOT NULL,
+  sku         VARCHAR(12)   NOT NULL,
+  amount      DECIMAL(10,2) NOT NULL,
+  created_at  DATETIME      NOT NULL
+) ENGINE = InnoDB;
+-- 1M row numbers from a 1,000 x 1,000 cross join of a 0-999 sequence.
+SET SESSION cte_max_recursion_depth = 1000;
+INSERT INTO orders
+WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < 999),
+     nums AS (SELECT a.n * 1000 + b.n + 1 AS g FROM seq a CROSS JOIN seq b)
+SELECT g,
+       1 + (g * 2654435761) % 100000,                                   -- 100k customers, spread evenly
+       CASE WHEN g % 20 = 0 THEN 'shipped'                              -- 5%
+            WHEN g % 20 = 1 THEN 'cancelled'                            -- 5%
+            WHEN g % 10 IN (2, 3) THEN 'pending'                        -- 20%
+            WHEN g % 2 = 0 THEN 'delivered' ELSE 'paid' END,            -- 35% each
+       ELT(1 + g % 3, 'web', 'app', 'store'),                           -- sales channel
+       CONCAT('SKU-', LPAD((g * 40503) % 5000, 6, '0')),                -- 5,000 products
+       ((g * 7919) % 50000) / 100,                                      -- 0.00 to 499.99
+       TIMESTAMP '2025-01-01 00:00:00' + INTERVAL ROUND(g * 31.536) SECOND  -- one year, in id order
+FROM nums ORDER BY g;
+ANALYZE TABLE orders;
+```
+
+### MongoDB
+
+Save as `mongo-seed.js`, then run `docker cp mongo-seed.js idx-mongo:/ && docker exec idx-mongo mongosh --quiet /mongo-seed.js` (≈ 30 s). The same customer formula as MySQL, so customer ids match MySQL's.
+
+```js
+// Lab dataset: 1M orders, same shape as the SQL tables; _id is the order number.
+db = db.getSiblingDB('lab');
+db.orders.drop();
+const statuses = g => g % 20 === 0 ? 'shipped' : g % 20 === 1 ? 'cancelled'
+  : (g % 10 === 2 || g % 10 === 3) ? 'pending' : g % 2 === 0 ? 'delivered' : 'paid';
+const start = new Date('2025-01-01T00:00:00Z').getTime();
+for (let base = 1; base <= 1000000; base += 10000) {
+  const batch = [];
+  for (let g = base; g < base + 10000; g++) {
+    batch.push({
+      _id: g,
+      customer_id: 1 + Number((BigInt(g) * 2654435761n) % 100000n),   // 100k customers
+      status: statuses(g),
+      channel: ['web', 'app', 'store'][g % 3],
+      sku: 'SKU-' + String((g * 40503) % 5000).padStart(6, '0'),        // 5,000 products
+      amount: ((g * 7919) % 50000) / 100,
+      created_at: new Date(start + Math.round(g * 31536)),              // one year, in _id order
+    });
+  }
+  db.orders.insertMany(batch, { ordered: false });
+}
+printjson({ count: db.orders.countDocuments(), size: db.orders.stats().size, storage: db.orders.stats().storageSize });
+```
+
+To reset any database to a clean state later, run its seed again.
+
+## Exercise 1: pages and rows per page (Concept 1)
+
+```sql
+-- pg
+SELECT relpages, reltuples::bigint AS rows,
+       pg_size_pretty(pg_relation_size('orders')) AS size,
+       round(reltuples / relpages) AS rows_per_page
+FROM pg_class WHERE relname = 'orders';
+
+SELECT ctid, id FROM orders WHERE id IN (1, 99, 100, 1000000);
+```
+
+```text
+ relpages |  rows   | size  | rows_per_page
+----------+---------+-------+---------------
+    10102 | 1000000 | 79 MB |            99
+
+   ctid    |   id
+-----------+---------
+ (0,1)     |       1
+ (0,99)    |      99
+ (1,1)     |     100
+ (10101,1) | 1000000
+```
+
+**What to notice:** 99 rows fill page 0, so row 100 starts page 1. Row 1,000,000 is alone on the last page, 10,101. The concepts use 97 rows and 10,300 pages for an "80-byte row"; the lab rows are slightly smaller.
+
+Look inside page 0:
+
+```sql
+-- pg
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+SELECT lower, upper, upper - lower AS free_bytes FROM page_header(get_raw_page('orders', 0));
+```
+
+```text
+ lower | upper | free_bytes
+-------+-------+------------
+   420 |   456 |         36
+```
+
+`lower` = 24 B header + 99 line pointers × 4 B = 420. Only 36 bytes are free: page 0 is full.
+
+## Exercise 2: hit, read and the ring buffer (Concepts 1 and 3)
+
+Restart Postgres so `shared_buffers` is empty, then run the same scan twice:
+
+```bash
+docker restart idx-pg
+```
+
+```sql
+-- pg
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM orders;   -- run 1
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM orders;   -- run 2
+```
+
+```text
+run 1:   Buffers: shared read=10102
+run 2:   Buffers: shared hit=32 read=10070
+```
+
+**What to notice:** the table (79 MB) is larger than ¼ of `shared_buffers` (32 MB), so the scan uses a 32-slot ring. Run 2 finds only the last 32 pages cached.
+
+## Exercise 3: heap updates, HOT and not HOT (Concept 2)
+
+```sql
+-- pg
+SELECT ctid, status FROM orders WHERE id = 7;
+UPDATE orders SET status = 'shipped'   WHERE id = 7 RETURNING ctid;
+UPDATE orders SET status = 'delivered' WHERE id = 7 RETURNING ctid;
+SELECT pg_stat_force_next_flush();
+SELECT n_tup_upd, n_tup_hot_upd FROM pg_stat_user_tables WHERE relname = 'orders';
+```
+
+```text
+ (0,7)     | paid         -- before
+ (10101,2)                -- first update
+ (10101,3)                -- second update
+
+ n_tup_upd | n_tup_hot_upd
+-----------+---------------
+         2 |             1
+```
+
+**What to notice:**
+
+| Update | Page of the old version had room? | New version | HOT? |
+|---|---|---|---|
+| 1st | ✗ page 0 has 36 B free | Moved to page 10,101, the only page with room | ✗: the PK index gets a new entry `7 → (10101,2)` |
+| 2nd | ✓ page 10,101 is almost empty | Same page, (10101,3) | ✓: no index touched |
+
+## Exercise 4: one tree vs two (Concept 2)
+
+Add a secondary index in MySQL, then count page requests per query with InnoDB's `Innodb_buffer_pool_read_requests` counter (the lab server is otherwise idle, so the global counter works):
+
+```sql
+-- my
+CREATE INDEX orders_customer_idx ON orders (customer_id);
+
+SELECT VARIABLE_VALUE INTO @b FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Innodb_buffer_pool_read_requests';
+SELECT id, customer_id, status FROM orders WHERE id = 42;
+SELECT VARIABLE_VALUE - @b AS page_requests FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Innodb_buffer_pool_read_requests';
+
+SELECT VARIABLE_VALUE INTO @b FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Innodb_buffer_pool_read_requests';
+SELECT id, customer_id, status FROM orders WHERE customer_id = 7;
+SELECT VARIABLE_VALUE - @b AS page_requests FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Innodb_buffer_pool_read_requests';
+```
+
+```text
+WHERE id = 42            → page_requests 3     (EXPLAIN type: const)
+WHERE customer_id = 7    → page_requests ≈ 50  (EXPLAIN type: ref, 10 rows)
+```
+
+**What to notice:** the primary-key lookup is one descent of the clustered index: 3 pages (root, one internal page, leaf). The secondary lookup returns 10 rows; each needs its own clustered-index descent (≈ 3–4 page requests each), on top of the secondary index range and the optimizer's own index dive.
+
+In MongoDB, `_id` lookups have a dedicated fast path:
+
+```js
+// mg
+db.orders.find({ _id: 42 }).explain('executionStats').executionStats.executionStages.stage
+// 'EXPRESS_IXSCAN': _id index → RecordId → document, 1 key and 1 document examined
+```
+
+## Exercise 5: what a Seq Scan costs (Concept 3)
+
+```sql
+-- pg
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE status = 'shipped';
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE status = 'shipped' LIMIT 1;
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE status = 'refunded' LIMIT 1;
+```
+
+```text
+Seq Scan on orders  (cost=0.00..22602.00 rows=50967 width=48) (actual … rows=50000 loops=1)
+  Filter: (status = 'shipped'::text)
+  Rows Removed by Filter: 950000
+
+Limit … (actual … rows=1)          → Rows Removed by Filter: 19,       Buffers: shared read=1
+Limit … (actual … rows=0)          → Rows Removed by Filter: 1000000,  Buffers: ≈ 10,102 pages
+```
+
+**What to notice:** 22,602 = 10,102 pages × 1.0 + 1,000,000 rows × 0.01 + 1,000,000 × 0.0025. `LIMIT 1` reads 1 page when row 20 matches, and the whole table when nothing matches.
+
+The same in MongoDB:
+
+```js
+// mg
+db.orders.find({ status: 'shipped' }).explain('executionStats').executionStats
+// COLLSCAN, nReturned 50000, totalKeysExamined 0, totalDocsExamined 1000000
+db.orders.find({ status: 'refunded' }).limit(1).explain('executionStats').executionStats
+// LIMIT <- COLLSCAN, nReturned 0, totalDocsExamined 1000000
+```
+
+## Exercise 6: deleting rows does not shrink the scan (Concept 3)
+
+Work on a copy so `orders` stays intact:
+
+```sql
+-- pg
+CREATE TABLE orders_copy AS SELECT * FROM orders;
+VACUUM ANALYZE orders_copy;
+DELETE FROM orders_copy WHERE id <= 900000;
+VACUUM ANALYZE orders_copy;
+SELECT relpages, reltuples::bigint, pg_size_pretty(pg_relation_size('orders_copy'))
+FROM pg_class WHERE relname = 'orders_copy';
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM orders_copy;
+
+VACUUM FULL orders_copy;
+-- repeat the two queries above
+```
+
+```text
+after DELETE + VACUUM:   relpages 10101 · 100000 rows · 79 MB    → Seq Scan reads 10101 pages
+after VACUUM FULL:       relpages 1011  · 100000 rows · 8088 kB  → Seq Scan reads 1011 pages
+```
+
+**What to notice:** 90% of the rows are gone but the scan reads the same pages until the table is rewritten. Drop the copy afterwards: `DROP TABLE orders_copy;`
+
+## Exercise 7: fewer pages, slower (Concept 4)
+
+This exercise needs **cold caches**: Postgres restarted and the operating system's page cache emptied. On Docker Desktop, the containers share one Linux VM, and this drops that VM's cache (harmless, it only makes the next reads slower):
+
+```bash
+# cold.sh "<SET commands>" "<query>": restart Postgres, drop the VM's page cache, run once.
+docker restart idx-pg >/dev/null
+docker run --rm --privileged alpine sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+until docker exec idx-pg pg_isready -U postgres -q; do sleep 0.5; done
+docker exec idx-pg psql -U postgres -c "SET track_io_timing = on" -c "$1" -c "EXPLAIN (ANALYZE, BUFFERS) $2"
+```
+
+```sql
+-- pg: create the indexes once
+CREATE INDEX orders_customer_idx ON orders (customer_id);
+CREATE INDEX orders_created_idx  ON orders (created_at);
+ANALYZE orders;
+SELECT attname, correlation FROM pg_stats WHERE tablename = 'orders' AND attname IN ('customer_id', 'created_at');
+```
+
+```text
+   attname   | correlation
+-------------+--------------
+ customer_id | -0.008
+ created_at  |  1
+```
+
+Then run each plan cold:
+
+```bash
+Q="SELECT * FROM orders WHERE customer_id BETWEEN 1 AND 1000"
+./cold.sh "SET max_parallel_workers_per_gather=0; SET enable_indexscan=off; SET enable_bitmapscan=off" "$Q"   # Seq Scan
+./cold.sh "SET enable_seqscan=off; SET enable_bitmapscan=off" "$Q"                                          # Index Scan
+./cold.sh "SET max_parallel_workers_per_gather=0; SET enable_seqscan=off; SET enable_indexscan=off" "$Q"   # Bitmap
+./cold.sh "SET enable_seqscan=off; SET enable_bitmapscan=off" "SELECT * FROM orders WHERE created_at < '2025-01-04 15:00'"
+```
+
+| Plan | Buffers | I/O time | Total |
+|---|---|---|---|
+| Seq Scan | read=10102 | 20.8 ms | 39.8 ms |
+| Index Scan, `customer_id` | hit=3577 read=6387 | 46.6 ms | 51.1 ms |
+| Bitmap Heap Scan, `customer_id` | read=6387 (Heap Blocks: exact=6376) | 13.5 ms | 35.5 ms |
+| Index Scan, `created_at` | read=131 | 0.6 ms | 1.3 ms |
+
+`SET enable_… = off` only discourages a plan type, for experiments like this; never use it to fix production queries.
+
+## Exercise 8: read-ahead in InnoDB (Concept 4)
+
+```bash
+# mycold.sh "<query>": restart MySQL with an empty buffer pool, drop the VM's page cache, run once,
+# and report pages read on demand vs by read-ahead.
+docker exec idx-mysql mysql -uroot -plab -e "SET PERSIST innodb_buffer_pool_dump_at_shutdown = OFF"   # once
+docker restart idx-mysql >/dev/null
+docker run --rm --privileged alpine sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+until docker exec idx-mysql mysqladmin -uroot -plab ping 2>/dev/null | grep -q alive; do sleep 1; done
+docker exec idx-mysql mysql -uroot -plab lab -e "
+SELECT SUM(IF(VARIABLE_NAME = 'Innodb_buffer_pool_reads', VARIABLE_VALUE, 0)),
+       SUM(IF(VARIABLE_NAME = 'Innodb_buffer_pool_read_ahead', VARIABLE_VALUE, 0)) INTO @r0, @a0
+FROM performance_schema.global_status;
+EXPLAIN ANALYZE $1;
+SELECT SUM(IF(VARIABLE_NAME = 'Innodb_buffer_pool_reads', VARIABLE_VALUE, 0)) - @r0 AS on_demand_reads,
+       SUM(IF(VARIABLE_NAME = 'Innodb_buffer_pool_read_ahead', VARIABLE_VALUE, 0)) - @a0 AS read_ahead_pages
+FROM performance_schema.global_status"
+```
+
+```bash
+./mycold.sh "SELECT * FROM orders IGNORE INDEX (orders_customer_idx) WHERE customer_id BETWEEN 1 AND 1000"
+./mycold.sh "SELECT * FROM orders FORCE INDEX (orders_customer_idx) WHERE customer_id BETWEEN 1 AND 1000"
+```
+
+| Plan | On-demand reads | Read-ahead pages | Time |
+|---|---|---|---|
+| Full table scan | 99 | 4,160 | 167 ms |
+| Secondary index | 4,224 | 0 | 41 ms |
+
+## Exercise 9: COLLSCAN vs IXSCAN (Concept 4)
+
+```js
+// mg
+db.orders.createIndex({ customer_id: 1 });
+const s1 = db.orders.find({ customer_id: { $gte: 1, $lte: 1000 } }).hint({ $natural: 1 }).explain('executionStats').executionStats;
+const s2 = db.orders.find({ customer_id: { $gte: 1, $lte: 1000 } }).hint({ customer_id: 1 }).explain('executionStats').executionStats;
+printjson([s1, s2].map(s => ({ docs: s.totalDocsExamined, keys: s.totalKeysExamined, returned: s.nReturned, ms: s.executionTimeMillis })));
+```
+
+Cold (restart `idx-mongo` and drop the VM cache before each), measured:
+
+| Plan | Docs examined | Keys examined | Pages read into cache | Time |
+|---|---|---|---|---|
+| `COLLSCAN` | 1,000,000 | 0 | 2,858 | 197 ms |
+| `IXSCAN` → `FETCH` | 10,000 | 10,000 | 3,279 | 68 ms |
+
+`Pages read into cache` is the change in `db.serverStatus().wiredTiger.cache['pages read into cache']` across the query.
+
+## Session quiz
+
+1. The lab table has 10,102 pages and 99 rows per page. Without running anything, what is the ctid of the row with `id = 250`?
+2. Exercise 2's run 2 showed `hit=32 read=10070`. Where did the 32 hits come from, and what would run 2 show with `shared_buffers = 1GB`?
+3. In Exercise 3, why did the first update move the row to page 10,101 rather than to a brand-new page 10,102?
+4. In Exercise 4, `WHERE id = 42` needed 3 page requests. How many would the same lookup need in PostgreSQL with a B-tree on `id` of the same height, and why the difference?
+5. Exercise 5's `LIMIT 1` query found its match after 20 rows. Which row was it, and why that one?
+6. After Exercise 6's `DELETE` and `VACUUM`, how many pages would the copy have used if the deleted rows had been the **newest** 900,000 (`id > 100000`) instead? Why?
+7. Using Exercise 7's numbers, estimate how long the Index Scan's heap reads would take on a cloud disk at 1 ms per random read, and the Seq Scan's reads at 125 MB/s.
+8. In Exercise 9, the IXSCAN read more pages into cache than the COLLSCAN but was 3× faster. What did the COLLSCAN spend its time on?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-1-storage-basics/lab/answers">Answers to the session quiz</DeepDive>

@@ -822,3 +822,5 @@ FROM pg_class WHERE relname = 'events';
 5. A PostgreSQL table had 10M rows (1.2 GB). A job deleted the oldest 9M rows and VACUUM ran. Is a Seq Scan now about 10× faster? Why or why not, and what would make it so?
 6. An InnoDB table with a UUIDv4 primary key and the same table with `AUTO_INCREMENT` hold the same rows. Why can a full scan of the UUIDv4 table be slower when the data is on disk? Give two reasons.
 7. A MongoDB `explain("executionStats")` shows `COLLSCAN`, `nReturned: 12`, `totalDocsExamined: 2000000`. What does it tell you, and what is the PostgreSQL equivalent of the same signal?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-1-storage-basics/concept-3-seq-scan/answers">Worked answers to Q1–Q7, with the cost formula, the ring buffer and common mistakes</DeepDive>

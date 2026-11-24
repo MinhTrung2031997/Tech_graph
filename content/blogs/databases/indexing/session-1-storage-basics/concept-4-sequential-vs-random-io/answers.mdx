@@ -1,0 +1,116 @@
+---
+title: "Answers: Sequential vs random I/O"
+description: "Worked answers to the Concept 4 check questions: why sequential reads are cheaper, the page-touch formula, correlation, Bitmap Heap Scan and read-ahead."
+companion: "answers"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "io", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/runtime-config-query.html#RUNTIME-CONFIG-QUERY-CONSTANTS"
+  - "https://www.postgresql.org/docs/current/view-pg-stats.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-performance-read_ahead.html"
+---
+
+<Tldr>
+Two numbers decide the I/O cost of a plan: **how many pages** it touches and **in what order**. Sequential pages come many per request and cost a few µs each; random pages come one per request. Spread-out rows touch far more pages than their count suggests: pages ≈ P × (1 − e^(−k/P)).
+</Tldr>
+
+## Q1. Sequential vs random
+
+**Question:** define a sequential and a random read, and give two reasons a sequential read is cheaper per page.
+
+| | Definition |
+|---|---|
+| Sequential read | The next page read is the next page in the file |
+| Random read | The next page read is somewhere else in the file |
+
+| Reason sequential is cheaper | Where it applies |
+|---|---|
+| Many pages per request: Postgres combines up to 16 pages (128 kB), InnoDB reads a 1 MB extent ahead, the OS reads ahead. The fixed cost of a request is paid once for many pages | Every kind of storage |
+| No seek: the disk head stays in place while the pages stream past | Hard disks (≈ 5–10 ms per seek) |
+| Fewer operations against an IOPS limit: one large request counts as one operation | Cloud disks (e.g. 3,000 IOPS baseline on gp3) |
+
+> **Common mistake:** "sequential is faster because it reads less". It often reads *more* pages; each page is just much cheaper.
+
+## Q2. Pages touched by 1% of the rows
+
+**Question:** a table has 20,000 pages and 2M rows (100 per page). A query matches 20,000 rows spread evenly over the table. Roughly how many pages does an Index Scan touch? What fraction of the table is that?
+
+| Step | Value |
+|---|---|
+| k / P | 20,000 / 20,000 = 1 |
+| 1 − e^(−1) | 0.632 |
+| Pages touched | 20,000 × 0.632 ≈ **12,600** |
+| Fraction | **≈ 63%** of the table, for 1% of the rows |
+
+Check from the other side: a page is untouched only if none of its 100 rows matches: 0.99^100 ≈ 0.366, so ≈ 63% of pages are touched.
+
+> **Common mistake:** "1% of the rows, so 1% of the pages = 200". That holds only if the matching rows are packed together (a correlated column).
+
+## Q3. Fewer pages, still slower
+
+**Question:** in the lab, the Index Scan on `customer_id` read 37% fewer pages than the Seq Scan but was slower. Why? Use the per-page numbers.
+
+| | Pages read | Per page | I/O time | Total |
+|---|---|---|---|---|
+| Seq Scan | 10,102 | 2.1 µs | 20.8 ms | 39.8 ms |
+| Index Scan | 6,387 (+ 3,577 revisits) | 7.3 µs | 46.6 ms | 51.1 ms |
+
+Each random page cost 3.5× a sequential one, which more than cancels the 37% saving. The Index Scan also visited 3,577 pages a second time (another customer's row on a page already read) and walked the index itself.
+
+> **Common mistake:** comparing only the page counts. Pages × cost per page is what matters, and the cost per page depends on the order.
+
+## Q4. 131 pages vs 6,387 pages
+
+**Question:** the same 9,931 rows cost 131 pages through `created_at` and 6,387 pages through `customer_id`. What property explains the difference, and where does PostgreSQL record it?
+
+**Correlation**: how closely the column's order matches the rows' physical order in the heap.
+
+| Column | `pg_stats.correlation` | Matching rows sit on | Pages |
+|---|---|---|---|
+| `created_at` | 1.0 | The first ≈ 100 pages, in order | 131 (≈ 100 heap + 31 index) |
+| `customer_id` | −0.008 | Pages all over the table | 6,387 |
+
+The planner uses `pg_stats.correlation` to estimate how many heap pages an Index Scan will read and how many of them will be random (Session 3).
+
+> **Common mistake:** "`created_at` is a timestamp, so its index is faster". The type does not matter; the insert order does. A timestamp column filled in random order would be uncorrelated too.
+
+## Q5. Bitmap Heap Scan
+
+**Question:** how does a Bitmap Heap Scan read the same 6,387 pages as the Index Scan in a quarter of the I/O time? What else does it avoid?
+
+1. It scans the index first and only **marks** the heap pages that hold matches in a bitmap.
+2. It then reads the marked pages **in file order**. With 63% of all pages marked, most are next to or near the previous one, so reads are forward and can be combined or read ahead.
+
+| | Index Scan | Bitmap Heap Scan |
+|---|---|---|
+| Order of heap pages | Customer order: jumps back and forth | File order: forward only |
+| Per page | 7.3 µs | 2.1 µs |
+| Page visits | 9,964 (3,577 repeats) | 6,376: each page once |
+
+It also avoids the **repeat visits**: all matching rows on a page are taken in one visit. The cost: rows come out in page order, not index order, so it cannot provide an `ORDER BY` for free.
+
+> **Common mistake:** "a bitmap scan reads fewer pages". It reads the same set of pages; it changes the order and removes repeats.
+
+## Q6. InnoDB read-ahead counters
+
+**Question:** an InnoDB full scan showed `Innodb_buffer_pool_reads` +99 and `Innodb_buffer_pool_read_ahead` +4,160. What happened, and why does a lookup through the `customer_id` index show read-ahead 0?
+
+- **Full scan:** only 99 pages were read on demand (the first leaves of each extent). InnoDB saw the leaves being read in file order and fetched the next 1 MB extents in the background: 4,160 of the 4,203 leaves (98%) arrived by read-ahead.
+- **Index lookups:** each `customer_id` entry leads to a primary key in a different part of the table (ids 100,000, 200,000, then 25,841 …), so the leaf reads jump around. Linear read-ahead needs many pages of one extent read in order, which never happens: 4,224 on-demand reads, 0 read-ahead.
+
+> **Common mistake:** reading `Innodb_buffer_pool_reads` alone as "pages read from disk". Pages fetched by read-ahead are counted separately.
+
+## Q7. Laptop 30 ms, production 4 s
+
+**Question:** a query takes 30 ms on your laptop and 4 s in production with the same plan. Give the most likely cause and two fixes.
+
+**Cause:** the plan does thousands of **random** page reads. On the laptop they come from local NVMe or the OS cache (≈ 5 µs each); in production from a network disk (≈ 1 ms each). ≈ 4,000 reads × 1 ms ≈ 4 s.
+
+| Fix | How it helps |
+|---|---|
+| More memory for the working set | Random reads become cache hits |
+| Allow a Bitmap Heap Scan; set `random_page_cost` to match the real storage | Same pages, read in file order |
+| A covering index (Session 5) | The table is not visited at all |
+| Physically group related rows (`CLUSTER`, an InnoDB primary key starting with the filtered column, a MongoDB clustered collection) | The rows become correlated, so they share pages |
+
+> **Common mistake:** "production is slower hardware, nothing to do". The plan's random page count is the real cause, and every fix above reduces it or makes it cheaper.

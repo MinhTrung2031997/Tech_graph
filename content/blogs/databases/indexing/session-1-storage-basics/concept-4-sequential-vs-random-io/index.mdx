@@ -1,0 +1,641 @@
+---
+title: "Concept 4: Sequential vs random I/O"
+description: "Why reading pages in file order is cheaper per page than jumping around, and why an index that reads fewer pages can still lose to a full scan. Measured on PostgreSQL 17, MySQL 8.4 and MongoDB 8.0."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "storage", "io"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/runtime-config-query.html#RUNTIME-CONFIG-QUERY-CONSTANTS"
+  - "https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-IO-COMBINE-LIMIT"
+  - "https://www.postgresql.org/docs/current/view-pg-stats.html"
+  - "https://www.postgresql.org/docs/current/sql-cluster.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-performance-read_ahead.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/server-status-variables.html"
+  - "https://www.mongodb.com/docs/manual/reference/explain-results/"
+  - "https://docs.aws.amazon.com/ebs/latest/userguide/ebs-io-characteristics.html"
+---
+
+<Tldr>
+A **sequential** read takes the next page in the file; a **random** read jumps somewhere else. Sequential reads are cheaper **per page** because neighbouring pages can be fetched in one large request (read-ahead), while every jump is a separate small request. So an index that reads **fewer** pages, but in random order, can be **slower** than a full scan. On the lab table, an index scan returning 1% of the rows read 6,387 pages at 7.3 µs each and lost to a Seq Scan that read all 10,102 pages at 2.1 µs each. Whether an index wins depends on how many pages it touches **and** in what order.
+</Tldr>
+
+## Two ways to read pages
+
+| | Sequential | Random |
+|---|---|---|
+| Which page comes next | The next page in the file | A page somewhere else in the file |
+| Requests | Many pages per request: Postgres combines up to 16 pages (128 kB), InnoDB reads a whole 1 MB extent, the OS reads ahead | One request per page |
+| Who reads this way | Seq Scan, InnoDB full scan, COLLSCAN, Bitmap Heap Scan (mostly) | Index Scan following an index whose order differs from the table's |
+
+### What one read costs
+
+Typical orders of magnitude; your hardware will differ.
+
+| Storage | One random read | Sequential throughput | Why sequential is cheaper |
+|---|---|---|---|
+| RAM (a cache hit) | ≈ 0.1 µs | ≈ 10+ GB/s | Hardly any difference |
+| Local NVMe SSD | ≈ 20–100 µs | ≈ 2–7 GB/s | Fewer, larger requests; no per-request overhead for each page |
+| Cloud network disk (e.g. AWS EBS gp3) | ≈ 0.5–1 ms | 125 MB/s baseline | A round trip over the network per request; volumes are also limited in operations per second (3,000 IOPS baseline on gp3), and one large sequential request counts as one operation |
+| Hard disk | ≈ 5–10 ms (seek + rotation) | ≈ 150–250 MB/s | The head moves only once, then the pages stream past it |
+
+On a cloud disk, 6,000 random reads at about 1 ms each take about **6 s**; reading the whole 80 MB table sequentially at 125 MB/s takes about **0.65 s**.
+
+### How PostgreSQL's planner models it
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `seq_page_cost` | 1.0 | Cost of a page read in file order (the unit in Concept 3) |
+| `random_page_cost` | 4.0 | Cost of a page read out of order: 4× a sequential one |
+
+The 4.0 dates from spinning disks with most pages cached; on SSDs many teams lower it to about 1.1–1.5. Session 3 shows how this one number moves the planner between Seq Scan and Index Scan.
+
+## How many pages does 1% of the rows touch?
+
+The lab query is `WHERE customer_id BETWEEN 1 AND 1000`: 1% of the customers, 9,956 of the 1M rows. The orders of each customer are **spread evenly over the whole table** (a customer orders now and then over the year), so the matching rows land all over the 10,102 pages.
+
+If k matching rows are spread at random over P pages, the expected number of pages touched is:
+
+**pages touched ≈ P × (1 − e^(−k / P))**
+
+| | Value |
+|---|---|
+| P (pages) | 10,102 |
+| k (matching rows) | 9,956 |
+| k / P | 0.986 |
+| 1 − e^(−0.986) | 0.627 |
+| Pages touched | 10,102 × 0.627 ≈ **6,330** (measured: 6,376) |
+
+**1% of the rows touch 63% of the pages.** A page holds 99 rows, so a page escapes only if none of its 99 rows matches: (0.99)^99 ≈ 37%.
+
+A column whose values follow the table's physical order behaves completely differently. `created_at` rises with `id`, and rows were inserted in `id` order, so the first 9,931 rows by `created_at` sit on the first 101 pages. PostgreSQL measures this as `pg_stats.correlation`: **1.0** for `created_at`, **−0.008** for `customer_id`.
+
+## PostgreSQL: the order heap pages are read in
+
+| Term | Meaning |
+|---|---|
+| **Index Scan** | Walks the index in key order and fetches each row's heap page as it goes |
+| **Bitmap Heap Scan** | First collects every matching page number from the index into a bitmap, then reads those pages in **file order** |
+| **Correlation** | How closely the column's order matches the heap's physical order: 1 = same order, 0 = unrelated |
+| **✓ Forward** | The next page read is the next or a nearby page further on in the file: cheap, can be combined or read ahead |
+| **✗ Jump** | The next page is far away, possibly behind: a separate random read |
+
+<Flow
+  title="PostgreSQL: the order heap pages are read in"
+  height={400}
+  nodes={[
+    { id: 'q', label: 'Query', sub: 'customer_id 1–1,000', x: 20, y: 20, w: 170 },
+    { id: 'idx', label: 'Index', sub: 'orders_customer_idx', x: 270, y: 20, w: 220 },
+    { id: 'bm', label: 'Bitmap', sub: 'page numbers, sorted', x: 590, y: 20, w: 190 },
+    { id: 'p0', label: 'page 0', sub: 'ids 1–99', x: 20, y: 200, w: 115 },
+    { id: 'p1', label: 'page 1', sub: 'ids 100–198', x: 147, y: 200, w: 115 },
+    { id: 'pa', label: 'page 1,041', sub: '(1041,36)', x: 274, y: 200, w: 115 },
+    { id: 'pb', label: 'page 2,554', sub: '(2554,4)', x: 401, y: 200, w: 115 },
+    { id: 'pc', label: 'page 2,565', sub: '(2565,90)', x: 528, y: 200, w: 115 },
+    { id: 'pd', label: 'page 9,555', sub: '(9555,90)', x: 655, y: 200, w: 115 },
+    { id: 'fwd', label: '✓ Forward', sub: 'next or nearby page', x: 100, y: 330, w: 220 },
+    { id: 'jump', label: '✗ Jump', sub: 'a separate random read', x: 470, y: 330, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-p0', from: 'q', to: 'p0' },
+    { id: 'q-idx', from: 'q', to: 'idx' },
+    { id: 'idx-bm', from: 'idx', to: 'bm', label: 'pages' },
+    { id: 'idx-p0', from: 'idx', to: 'p0', quiet: true },
+    { id: 'idx-p1', from: 'idx', to: 'p1', quiet: true },
+    { id: 'idx-pa', from: 'idx', to: 'pa', quiet: true },
+    { id: 'idx-pb', from: 'idx', to: 'pb', quiet: true },
+    { id: 'idx-pc', from: 'idx', to: 'pc', quiet: true },
+    { id: 'idx-pd', from: 'idx', to: 'pd', quiet: true },
+    { id: 'bm-pa', from: 'bm', to: 'pa', quiet: true },
+    { id: 'bm-pb', from: 'bm', to: 'pb', quiet: true },
+    { id: 'bm-pc', from: 'bm', to: 'pc', quiet: true },
+    { id: 'bm-pd', from: 'bm', to: 'pd', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Seq Scan',
+      path: 'page 0 → 1 → … → 10,101 ✓ forward every time → 16 pages per request',
+      summary: 'Measured: 10,102 pages read, 20.8 ms of I/O (2.1 µs per page), 39.8 ms in total.',
+      steps: [
+        {
+          title: 'Start at page 0',
+          note: 'The Seq Scan ignores the index and starts at the beginning of the file. PostgreSQL 17 asks for pages 0–15 in a single 128 kB request (io_combine_limit), and the OS reads further ahead on its own.',
+          code: 'SELECT * FROM orders WHERE customer_id BETWEEN 1 AND 1000;',
+          active: ['q', 'p0'],
+          edges: ['q-p0'],
+          subs: { q: 'Seq Scan' },
+        },
+        {
+          title: 'Page 1: ✓ forward',
+          note: 'The next page is the next 8 KB of the file. It arrived in the same request as page 0.',
+          active: ['p0', 'p1', 'fwd'],
+          },
+        {
+          title: 'Pages 1,041, 2,554, 2,565 … on the way',
+          note: 'The pages that hold customer 1–1,000 rows are read in passing, along with every page that does not. Every step is ✓ forward.',
+          active: ['pa', 'pb', 'pc', 'fwd'],
+          },
+        {
+          title: 'Total: every page, cheaply',
+          note: 'Buffers: shared read=10102, I/O Timings: 20.8 ms. That is 2.1 µs per page, because the pages came in large sequential requests. Execution time 39.8 ms, about half of it checking 1M rows against the filter.',
+          active: ['pd', 'fwd'],
+          subs: { fwd: '10,102 pages · 2.1 µs each' },
+        },
+      ],
+    },
+    {
+      title: 'Index Scan, uncorrelated',
+      path: 'index in customer_id order → page 1,041 ✗ jump → 2,565 ✗ jump → 9,555 ✗ jump → back to 2,554 ✗ jump',
+      summary: 'Measured: 6,387 pages read plus 3,577 revisits, 46.6 ms of I/O (7.3 µs per page), 51.1 ms in total.',
+      subs: { q: 'Index Scan' },
+      steps: [
+        {
+          title: 'Descend the index to customer_id = 1',
+          note: 'The index is sorted by customer_id. Its first matching entry is customer 1, order 103,095 → ctid (1041,36).',
+          code: 'SELECT * FROM orders WHERE customer_id BETWEEN 1 AND 1000;',
+          active: ['q', 'idx'],
+          edges: ['q-idx'],
+          subs: { idx: '1 → (1041,36)' },
+        },
+        {
+          title: 'Page 1,041: ✗ jump',
+          note: 'Postgres reads heap page 1,041 to get the row. One 8 KB request.',
+          active: ['idx', 'pa', 'jump'],
+          edges: ['idx-pa'],
+        },
+        {
+          title: 'Next entry: page 2,565, ✗ jump',
+          note: "Customer 1's next order is 254,025 at (2565,90): 1,524 pages further on. Another separate request.",
+          active: ['idx', 'pc', 'jump'],
+          edges: ['idx-pc'],
+          subs: { idx: '1 → (2565,90)' },
+        },
+        {
+          title: "Customer 1's last order: page 9,555",
+          note: 'Customer 1 has 12 orders spread from page 1,041 to page 9,555. Each is its own read.',
+          active: ['idx', 'pd', 'jump'],
+          edges: ['idx-pd'],
+          subs: { idx: '1 → (9555,90)' },
+        },
+        {
+          title: 'Customer 2: back to page 2,554',
+          note: 'The index moves on to customer 2, whose first order is at (2554,4): back near the start of the file. The scan zig-zags across the table once per customer, 1,000 times.',
+          active: ['idx', 'pb', 'jump'],
+          edges: ['idx-pb'],
+          subs: { idx: '2 → (2554,4)' },
+        },
+        {
+          title: 'Total: fewer pages, slower',
+          note: 'Buffers: shared hit=3577 read=6387. 9,956 rows meant 9,964 page visits: 6,387 distinct pages read and 3,577 visits to pages already fetched for an earlier customer. I/O 46.6 ms = 7.3 µs per page, 3.5× the Seq Scan. Execution time 51.1 ms: it read 37% fewer pages and still lost.',
+          active: ['pd', 'jump'],
+          subs: { jump: '6,387 pages · 7.3 µs each' },
+        },
+      ],
+    },
+    {
+      title: 'Index Scan, correlated',
+      path: 'index in created_at order → page 0 → page 1 ✓ forward → … → page 100',
+      summary: 'Measured: 131 pages read (about 100 heap + 31 index), 1.3 ms in total.',
+      subs: { q: 'created_at < 4 Jan 15:00', idx: 'orders_created_idx' },
+      steps: [
+        {
+          title: 'Descend the index to the earliest created_at',
+          note: 'Rows were inserted in created_at order, so the index order and the heap order are the same (correlation 1.0). The first entry points at (0,1).',
+          code: "SELECT * FROM orders WHERE created_at < '2025-01-04 15:00';",
+          active: ['q', 'idx'],
+          edges: ['q-idx'],
+          subs: { idx: '1 Jan 00:00:31 → (0,1)' },
+        },
+        {
+          title: 'Page 0: 99 rows in one visit',
+          note: 'The next 98 index entries point at (0,2) … (0,99): the same page. One read serves 99 rows.',
+          active: ['idx', 'p0'],
+          edges: ['idx-p0'],
+        },
+        {
+          title: 'Page 1: ✓ forward',
+          note: 'The 100th entry points at (1,1), the next page in the file. The scan walks the heap front to back, just like a Seq Scan, but stops at page 100.',
+          active: ['idx', 'p1', 'fwd'],
+          edges: ['idx-p1'],
+        },
+        {
+          title: 'Total: 131 pages for 9,931 rows',
+          note: 'Buffers: shared read=131, 1.3 ms. Same number of rows as the uncorrelated case, 50× fewer pages. Correlation, not the row count alone, decides how many pages an index scan touches.',
+          active: ['p1', 'fwd'],
+          subs: { fwd: '131 pages' },
+        },
+      ],
+    },
+    {
+      title: 'Bitmap Heap Scan',
+      path: 'index → bitmap of pages, sorted → 1,041 → 2,554 → 2,565 → 9,555 ✓ forward each time',
+      summary: 'Measured: the same 6,387 pages as the Index Scan, read once each in file order: 13.5 ms of I/O, 35.5 ms in total.',
+      subs: { q: 'Bitmap Heap Scan' },
+      steps: [
+        {
+          title: 'Collect every matching page first',
+          note: 'Postgres scans the index for all customer_id 1–1,000 entries but does not visit the heap yet. It sets a bit per heap page in a bitmap: 6,376 pages.',
+          code: 'SELECT * FROM orders WHERE customer_id BETWEEN 1 AND 1000;',
+          active: ['q', 'idx', 'bm'],
+          edges: ['q-idx', 'idx-bm'],
+          subs: { bm: '6,376 pages marked' },
+        },
+        {
+          title: 'Read the lowest page first: 1,041',
+          note: 'The bitmap is read in page order, not customer order. Page 1,041 is the first marked page in this part of the file.',
+          active: ['bm', 'pa', 'fwd'],
+          edges: ['bm-pa'],
+        },
+        {
+          title: '2,554 then 2,565: ✓ forward',
+          note: "Customer 2's page 2,554 and customer 1's page 2,565 are read one after the other. With 63% of all pages marked, most marked pages are next to or near the previous one.",
+          active: ['bm', 'pb', 'pc', 'fwd'],
+          edges: ['bm-pb', 'bm-pc'],
+        },
+        {
+          title: 'Each page once, front to back',
+          note: 'Page 9,555 is read once even though several customers have rows on it; all its matching rows are taken in that one visit (no 3,577 revisits).',
+          active: ['bm', 'pd', 'fwd'],
+          edges: ['bm-pd'],
+        },
+        {
+          title: 'Total: same pages, quarter of the I/O time',
+          note: 'Buffers: shared read=6387 (11 index + 6,376 heap). I/O 13.5 ms = 2.1 µs per page, as cheap as the Seq Scan. Execution 35.5 ms: the fastest plan for this query. Session 3 shows when the planner picks it.',
+          active: ['pd', 'fwd'],
+          subs: { fwd: '6,387 pages · 2.1 µs each' },
+        },
+      ],
+    },
+  ]}
+/>
+
+Measured on the lab (`postgres:17`, 128 MB `shared_buffers`, laptop NVMe through Docker), with Postgres restarted and the OS cache dropped before each run:
+
+| Plan | Pages read | I/O time | Per page | Total time |
+|---|---|---|---|---|
+| Seq Scan | 10,102 | 20.8 ms | 2.1 µs | 39.8 ms |
+| Index Scan on `customer_id` (uncorrelated) | 6,387 + 3,577 revisits | 46.6 ms | 7.3 µs | 51.1 ms |
+| Bitmap Heap Scan on `customer_id` | 6,387 | 13.5 ms | 2.1 µs | 35.5 ms |
+| Index Scan on `created_at` (correlated) | 131 | 0.6 ms | 4.8 µs | 1.3 ms |
+
+On a cloud disk at about 1 ms per random read, the uncorrelated Index Scan's 6,387 reads would take about 6 s, the Seq Scan well under 1 s.
+
+## MySQL InnoDB: full scan vs secondary-index lookups
+
+| Term | Meaning |
+|---|---|
+| **On-demand read** | A page read because a query needs it right now: one 16 KB request (`Innodb_buffer_pool_reads`) |
+| **Read-ahead** | Pages read in the background in 1 MB extents because InnoDB saw a sequential pattern (`Innodb_buffer_pool_read_ahead`) |
+| **Secondary-index lookup** | `customer_id` index → primary key `id` → descend the clustered index to the leaf with that `id` (Concept 2) |
+| **✓ Read-ahead** | The leaf was already fetched as part of an extent |
+| **✗ On-demand** | The leaf had to be fetched on its own |
+
+<Flow
+  title="InnoDB: the order leaf pages are read in"
+  height={410}
+  nodes={[
+    { id: 'q', label: 'Query', sub: 'customer_id 1–1,000', x: 20, y: 20, w: 170 },
+    { id: 'sec', label: 'Secondary index', sub: 'customer_id → id', x: 270, y: 20, w: 220 },
+    { id: 'root', label: 'Clustered root', sub: 'routes by id', x: 570, y: 20, w: 210 },
+    { id: 'l1', label: 'leaf 1', sub: 'ids 1–238', x: 20, y: 220, w: 120 },
+    { id: 'l2', label: 'leaf 2', sub: 'ids 239–476', x: 185, y: 220, w: 120 },
+    { id: 'l3', label: 'leaf 109', sub: 'id 25,841', x: 350, y: 220, w: 120 },
+    { id: 'l4', label: 'leaf 421', sub: 'id 100,000', x: 515, y: 220, w: 120 },
+    { id: 'l5', label: 'leaf 841', sub: 'id 200,000', x: 680, y: 220, w: 120 },
+    { id: 'ra', label: '✓ Read-ahead', sub: 'came with its 1 MB extent', x: 100, y: 340, w: 230 },
+    { id: 'od', label: '✗ On-demand', sub: 'one 16 KB random read', x: 470, y: 340, w: 230 },
+  ]}
+  edges={[
+    { id: 'q-sec', from: 'q', to: 'sec' },
+    { id: 'sec-root', from: 'sec', to: 'root', label: 'id' },
+    { id: 'root-l1', from: 'root', to: 'l1', quiet: true },
+    { id: 'root-l2', from: 'root', to: 'l2', quiet: true },
+    { id: 'root-l3', from: 'root', to: 'l3', quiet: true },
+    { id: 'root-l4', from: 'root', to: 'l4', quiet: true },
+    { id: 'root-l5', from: 'root', to: 'l5', quiet: true },
+    { id: 'l1-l2', from: 'l1', to: 'l2', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Full table scan',
+      path: 'root → leaf 1 ✗ on-demand → leaf 2, 3, … ✓ read-ahead → … → last leaf',
+      summary: 'Measured: 99 on-demand reads + 4,160 pages by read-ahead, 167 ms in total.',
+      subs: { q: 'IGNORE INDEX: full scan' },
+      steps: [
+        {
+          title: 'Descend to leaf 1',
+          note: 'The full scan descends the clustered index once, to the leaf with the smallest ids. Nothing is cached yet, so these are on-demand reads.',
+          code: 'SELECT * FROM orders IGNORE INDEX (orders_customer_idx) WHERE customer_id BETWEEN 1 AND 1000;',
+          active: ['q', 'root', 'l1', 'od'],
+          edges: ['root-l1'],
+        },
+        {
+          title: 'Leaf 2: ✓ read-ahead',
+          note: "The scan follows leaf 1's next pointer. Leaves were filled in id order, so they sit one after another in the file; after enough sequential reads inside one extent, InnoDB fetches the whole next 1 MB extent (64 pages) in the background.",
+          active: ['l1', 'l2', 'ra'],
+          edges: ['l1-l2'],
+        },
+        {
+          title: 'Total: almost all by read-ahead',
+          note: 'Innodb_buffer_pool_reads +99, Innodb_buffer_pool_read_ahead +4,160: 98% of the 4,203 leaves arrived in 1 MB requests. Time 167 ms, of which about 150 ms is evaluating 1M rows: on fast storage, InnoDB full scans are CPU-bound.',
+          active: ['ra'],
+          subs: { ra: '4,160 pages by read-ahead' },
+        },
+      ],
+    },
+    {
+      title: 'Secondary index, uncorrelated',
+      path: 'customer_id index → id 100,000 → leaf 421 ✗ → id 200,000 → leaf 841 ✗ → customer 2: id 25,841 → leaf 109 ✗',
+      summary: 'Measured: 4,224 on-demand reads, 0 read-ahead, 40.6 ms in total.',
+      subs: { q: 'FORCE INDEX (customer)' },
+      steps: [
+        {
+          title: 'Customer 1, first order: id 100,000',
+          note: 'The secondary index is sorted by customer_id and stores the primary key. Customer 1\'s first entry is 1 → id 100,000.',
+          code: 'SELECT * FROM orders FORCE INDEX (orders_customer_idx) WHERE customer_id BETWEEN 1 AND 1000;',
+          active: ['q', 'sec'],
+          edges: ['q-sec'],
+          subs: { sec: '1 → id 100,000' },
+        },
+        {
+          title: 'Leaf 421: ✗ on-demand',
+          note: 'InnoDB descends the clustered index by id 100,000 to leaf 421 (≈ 238 rows per leaf) and reads it alone.',
+          active: ['sec', 'root', 'l4', 'od'],
+          edges: ['sec-root', 'root-l4'],
+        },
+        {
+          title: 'id 200,000: leaf 841, ✗ on-demand',
+          note: "Customer 1's next order is 100,000 ids later: another leaf, another separate read.",
+          active: ['sec', 'root', 'l5', 'od'],
+          edges: ['sec-root', 'root-l5'],
+          subs: { sec: '1 → id 200,000' },
+        },
+        {
+          title: 'Customer 2: back to leaf 109',
+          note: "Customer 2's first order is id 25,841, near the start of the table. The lookups zig-zag across the file, so read-ahead never sees a sequential pattern.",
+          active: ['sec', 'root', 'l3', 'od'],
+          edges: ['sec-root', 'root-l3'],
+          subs: { sec: '2 → id 25,841' },
+        },
+        {
+          title: 'Total: every leaf, read one at a time',
+          note: 'Innodb_buffer_pool_reads +4,224, read-ahead 0: 10,000 rows touched practically all 4,203 leaves, each as its own 16 KB read. Yet it took 40.6 ms, faster than the full scan, because local NVMe makes random reads cheap and only 10,000 rows were evaluated. On a cloud disk at ≈ 1 ms per read, it would take about 4 s.',
+          active: ['od'],
+          subs: { od: '4,224 random reads' },
+        },
+      ],
+    },
+    {
+      title: 'Secondary index, correlated',
+      path: 'created_at index → id 1 → leaf 1 → id 239 → leaf 2 → … neighbouring leaves only',
+      summary: 'Measured: 60 on-demand reads, 4.1 ms in total.',
+      subs: { q: 'created_at < 4 Jan 15:00', sec: 'created_at → id' },
+      steps: [
+        {
+          title: 'Earliest created_at: id 1',
+          note: 'created_at rises with id, so the index entries come out in id order.',
+          code: "SELECT * FROM orders FORCE INDEX (orders_created_idx) WHERE created_at < '2025-01-04 15:00';",
+          active: ['q', 'sec', 'root', 'l1', 'od'],
+          edges: ['q-sec', 'sec-root', 'root-l1'],
+          subs: { sec: '1 Jan 00:00:31 → id 1' },
+        },
+        {
+          title: 'Next 237 entries: same leaf',
+          note: 'ids 2–238 are on leaf 1, already in the buffer pool. No new read.',
+          active: ['l1'],
+        },
+        {
+          title: 'id 239: leaf 2',
+          note: 'The next leaf in the file. The query needs only about 42 leaves in a row, too few for read-ahead to trigger, but each read is next to the previous one.',
+          active: ['sec', 'root', 'l2'],
+          edges: ['sec-root', 'root-l2'],
+          subs: { sec: '… → id 239' },
+        },
+        {
+          title: 'Total: 60 pages',
+          note: 'Innodb_buffer_pool_reads +60 (≈ 42 leaves plus index pages), 4.1 ms for 9,931 rows.',
+          active: ['l2', 'od'],
+          subs: { od: '60 reads' },
+        },
+      ],
+    },
+  ]}
+/>
+
+MySQL's optimizer chose the index for the uncorrelated query on its own (`type: range`, `rows: 17998`). On this storage that was right. On a network disk at ≈ 1 ms per random read, the same choice would take ≈ 4.2 s against ≈ 0.7 s for the full scan (66 MB at 125 MB/s plus 150 ms of CPU).
+
+## MongoDB: COLLSCAN vs IXSCAN → FETCH
+
+| Term | Meaning |
+|---|---|
+| `IXSCAN` → `FETCH` | Walk the index in key order, then fetch each document from the collection B-tree by its `RecordId` |
+| `pages read into cache` | WiredTiger's counter of pages it had to read from disk (`db.serverStatus().wiredTiger.cache`) |
+| **✓ In cache** | The leaf holding the document is already in the WiredTiger cache |
+| **✗ Read from disk** | The leaf must be read (and decompressed) first |
+
+<Flow
+  title="MongoDB: the order collection pages are read in"
+  height={410}
+  nodes={[
+    { id: 'q', label: 'Query', sub: 'customer_id 1–1,000', x: 20, y: 20, w: 170 },
+    { id: 'idx', label: 'customer_id_1', sub: 'key → RecordId', x: 270, y: 20, w: 220 },
+    { id: 'coll', label: 'Collection B-tree', sub: 'by RecordId', x: 570, y: 20, w: 210 },
+    { id: 'l1', label: 'leaf 1', sub: 'RecordId 1–350', x: 20, y: 220, w: 120 },
+    { id: 'l2', label: 'leaf 2', sub: '351–700', x: 185, y: 220, w: 120 },
+    { id: 'l3', label: 'leaf 74', sub: 'RecordId 25,841', x: 350, y: 220, w: 120 },
+    { id: 'l4', label: 'leaf 286', sub: '100,000', x: 515, y: 220, w: 120 },
+    { id: 'l5', label: 'leaf 572', sub: '200,000', x: 680, y: 220, w: 120 },
+    { id: 'hit', label: '✓ In cache', sub: 'no read', x: 100, y: 340, w: 230 },
+    { id: 'miss', label: '✗ Read from disk', sub: 'read and decompress a leaf', x: 470, y: 340, w: 230 },
+  ]}
+  edges={[
+    { id: 'q-idx', from: 'q', to: 'idx' },
+    { id: 'idx-coll', from: 'idx', to: 'coll', label: 'RecordId' },
+    { id: 'coll-l1', from: 'coll', to: 'l1', quiet: true },
+    { id: 'coll-l2', from: 'coll', to: 'l2', quiet: true },
+    { id: 'coll-l3', from: 'coll', to: 'l3', quiet: true },
+    { id: 'coll-l4', from: 'coll', to: 'l4', quiet: true },
+    { id: 'coll-l5', from: 'coll', to: 'l5', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'COLLSCAN',
+      path: 'collection B-tree leaf 1 → 2 → … → last, in RecordId order, every leaf read once',
+      summary: 'Measured: 1,000,000 documents examined, 2,858 pages read into cache, 197 ms.',
+      subs: { q: 'hint $natural: COLLSCAN' },
+      steps: [
+        {
+          title: 'Leaf 1: ✗ read from disk',
+          note: 'The scan starts at the smallest RecordId. Nothing is cached, so the first leaf is read and decompressed.',
+          code: 'db.orders.find({ customer_id: { $gte: 1, $lte: 1000 } }).hint({ $natural: 1 })',
+          active: ['q', 'coll', 'l1', 'miss'],
+          edges: ['coll-l1'],
+        },
+        {
+          title: '350 documents from one leaf',
+          note: 'Every document in leaf 1 is checked against the filter: about 350 documents for one page read.',
+          active: ['l1'],
+        },
+        {
+          title: 'Leaf 2, 3, … in order',
+          note: 'The cursor moves to the next leaf in RecordId order, which is also roughly file order for a collection filled by inserts.',
+          active: ['coll', 'l2', 'miss'],
+          edges: ['coll-l2'],
+        },
+        {
+          title: 'Total: every leaf once',
+          note: 'totalDocsExamined 1,000,000, nReturned 10,000, pages read into cache +2,858, 197 ms. Mostly CPU: decompressing pages and checking a million documents.',
+          active: ['miss'],
+          subs: { miss: '2,858 pages' },
+        },
+      ],
+    },
+    {
+      title: 'IXSCAN → FETCH, uncorrelated',
+      path: 'index → RecordId 100,000 → leaf 286 ✗ → 200,000 → leaf 572 ✗ → customer 2: 25,841 → leaf 74 ✗',
+      summary: 'Measured: 10,000 keys and documents examined, 3,279 pages read into cache, 68 ms.',
+      subs: { q: 'hint customer_id_1' },
+      steps: [
+        {
+          title: 'Customer 1, first entry',
+          note: 'The index is sorted by customer_id; its first entry for customer 1 points at RecordId 100,000.',
+          code: 'db.orders.find({ customer_id: { $gte: 1, $lte: 1000 } }).hint({ customer_id: 1 })',
+          active: ['q', 'idx'],
+          edges: ['q-idx'],
+          subs: { idx: '1 → RecordId 100,000' },
+        },
+        {
+          title: 'FETCH: leaf 286, ✗ read from disk',
+          note: 'FETCH descends the collection B-tree to the leaf with RecordId 100,000 and reads it for one document.',
+          active: ['idx', 'coll', 'l4', 'miss'],
+          edges: ['idx-coll', 'coll-l4'],
+        },
+        {
+          title: 'Next: leaf 572, ✗ read from disk',
+          note: "Customer 1's next order, RecordId 200,000, is 286 leaves further on.",
+          active: ['idx', 'coll', 'l5', 'miss'],
+          edges: ['idx-coll', 'coll-l5'],
+          subs: { idx: '1 → RecordId 200,000' },
+        },
+        {
+          title: 'Customer 2: back to leaf 74',
+          note: "Customer 2's first order is RecordId 25,841, near the start. Same zig-zag as PostgreSQL and InnoDB.",
+          active: ['idx', 'coll', 'l3', 'miss'],
+          edges: ['idx-coll', 'coll-l3'],
+          subs: { idx: '2 → RecordId 25,841' },
+        },
+        {
+          title: 'Total: more pages than the COLLSCAN',
+          note: 'pages read into cache +3,279: practically every collection leaf plus the index pages, more than the COLLSCAN read. It still took 68 ms, because only 10,000 documents were examined, on fast storage.',
+          active: ['miss'],
+          subs: { miss: '3,279 pages' },
+        },
+      ],
+    },
+    {
+      title: 'IXSCAN → FETCH, correlated',
+      path: 'created_at index → RecordId 1 → leaf 1 → 2 … → ✓ in cache for most documents',
+      summary: 'Measured: 9,931 keys and documents examined, 6 ms.',
+      subs: { q: 'created_at < 4 Jan 15:00', idx: 'created_at_1' },
+      steps: [
+        {
+          title: 'Earliest created_at: RecordId 1',
+          note: 'Documents were inserted in created_at order, so the index entries come out in RecordId order.',
+          code: 'db.orders.find({ created_at: { $lt: ISODate("2025-01-04T15:00:00Z") } }).hint({ created_at: 1 })',
+          active: ['q', 'idx', 'coll', 'l1', 'miss'],
+          edges: ['q-idx', 'idx-coll', 'coll-l1'],
+          subs: { idx: '1 Jan 00:00:31 → RecordId 1' },
+        },
+        {
+          title: 'Next 349 documents: ✓ in cache',
+          note: 'RecordIds 2–350 are in leaf 1, which was just read.',
+          active: ['l1', 'hit'],
+          },
+        {
+          title: 'Leaf 2, 3, … about 29 leaves',
+          note: 'Each new leaf is the next one; one read per 350 documents.',
+          active: ['coll', 'l2', 'miss'],
+          edges: ['coll-l2'],
+          subs: { idx: '… → RecordId 351' },
+        },
+        {
+          title: 'Total: 6 ms',
+          note: 'totalKeysExamined 9,931, totalDocsExamined 9,931, 6 ms: 11× faster than the uncorrelated index for the same number of documents.',
+          active: ['hit'],
+          subs: { hit: 'most documents' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## The three engines side by side
+
+Same query, `customer_id` 1–1,000 (1% of rows), cold cache, same laptop:
+
+| | Full scan | Index, uncorrelated | Index, correlated (`created_at`) |
+|---|---|---|---|
+| PostgreSQL 17 | 40 ms (Bitmap: 35 ms) | 51 ms | 1.3 ms |
+| MySQL 8.4 | 167 ms | 41 ms | 4.1 ms |
+| MongoDB 8.0 | 197 ms | 68 ms | 6 ms |
+
+| What the numbers show | Why |
+|---|---|
+| The correlated index wins by far everywhere | Few pages, read in order |
+| The uncorrelated index touches almost the whole table | 1% of the rows spread over 63% (Postgres) to ≈ 100% (InnoDB, MongoDB: fewer, bigger pages) of the pages |
+| PostgreSQL's full scan is fastest among the three | Cheap per-row filtering; InnoDB and MongoDB spend most of the full scan on CPU |
+| On this laptop, random reads are cheap | Local NVMe. On a network disk (≈ 1 ms per random read) every "uncorrelated" number grows by seconds, while full scans grow far less |
+
+<Pitfall>
+**Benchmarks on a laptop lie about random I/O.** A plan that reads 6,000 pages randomly costs a few tens of milliseconds on local NVMe and several seconds on a cloud disk. Compare plans by **pages read and their order** (Concept 1: compare pages, not time), then check timings on production-like storage.
+</Pitfall>
+
+## Real-world scenario: fast in development, slow in production
+
+A dashboard query `WHERE customer_id = ANY(:ids)` for 200 customers (≈ 4,000 orders, spread over a large table) takes 30 ms on a developer laptop and 4 s in production. The plans are identical: an Index Scan on `customer_id`.
+
+| | Laptop | Production |
+|---|---|---|
+| Storage | Local NVMe, data mostly in the OS cache | Network disk, data larger than RAM |
+| Heap pages read | ≈ 4,000, randomly | ≈ 4,000, randomly |
+| Cost per random read | ≈ 5 µs | ≈ 1 ms |
+| Time | ≈ 30 ms | ≈ 4 s |
+
+**Fixes, from cheapest:**
+
+| Fix | Effect |
+|---|---|
+| Keep the working set in memory (more `shared_buffers` / RAM) | Random reads become cache hits; works until data outgrows RAM |
+| Let Postgres use a Bitmap Heap Scan (do not disable it; lower `random_page_cost` only to match real storage) | Same pages, read in file order |
+| Covering index (Session 5) | The heap is not visited at all: no random heap reads |
+| Store related rows together: `CLUSTER orders USING orders_customer_idx` in PostgreSQL (one-off, takes a full lock, not maintained), a primary key starting with `customer_id` in InnoDB, a clustered collection in MongoDB | Makes `customer_id` correlated, so one customer's rows share pages |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 2: B-tree internals | Range scans along the leaves are sequential; jumping from index to table is where randomness comes in |
+| Session 3: query planner | `random_page_cost`, correlation and Bitmap Heap Scan are how Postgres prices this exact trade-off |
+| Session 5: covering indexes | The cure for random table visits: do not visit the table |
+| Session 6: engine differences | InnoDB's choice of primary key decides which queries get correlated data for free |
+
+## Key takeaways
+
+1. A sequential read fetches the next page in the file; a random read jumps elsewhere. Sequential pages arrive many per request, random pages one per request.
+2. Per page, sequential is several times cheaper: 2.1 µs vs 7.3 µs on the lab's NVMe, and far more on cloud disks and hard disks.
+3. Rows spread evenly over the table make a small fraction of rows touch a large fraction of pages: pages ≈ P × (1 − e^(−k/P)); 1% of rows touched 63% of pages.
+4. Correlation decides how many pages an index scan touches: the same 9,931 rows cost 131 pages through `created_at` and 6,387 through `customer_id`.
+5. A Bitmap Heap Scan reads the pages an index points at in file order, once each.
+6. PostgreSQL's planner models the gap with `seq_page_cost = 1.0` and `random_page_cost = 4.0`.
+7. Fast local storage hides random I/O; compare plans by pages and order, not laptop timings.
+
+## Check questions
+
+1. Define a sequential and a random read, and give two reasons a sequential read is cheaper per page.
+2. A table has 20,000 pages and 2M rows (100 per page). A query matches 20,000 rows spread evenly over the table. Roughly how many pages does an Index Scan touch? What fraction of the table is that?
+3. In the lab, the Index Scan on `customer_id` read 37% fewer pages than the Seq Scan but was slower. Why? Use the per-page numbers.
+4. The same 9,931 rows cost 131 pages through `created_at` and 6,387 pages through `customer_id`. What property explains the difference, and where does PostgreSQL record it?
+5. How does a Bitmap Heap Scan read the same 6,387 pages as the Index Scan in a quarter of the I/O time? What else does it avoid?
+6. An InnoDB full scan showed `Innodb_buffer_pool_reads` +99 and `Innodb_buffer_pool_read_ahead` +4,160. What happened, and why does a lookup through the `customer_id` index show read-ahead 0?
+7. A query takes 30 ms on your laptop and 4 s in production with the same plan. Give the most likely cause and two fixes.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-1-storage-basics/concept-4-sequential-vs-random-io/answers">Worked answers to Q1–Q7, with the page-touch formula and the measured numbers</DeepDive>
