@@ -16,7 +16,7 @@ sources:
 Every PostgreSQL tuple carries **xmin** (the transaction that created it) and **xmax** (the one that deleted or replaced it). An UPDATE by transaction 2343343 set the old version's xmax to 2343343 and wrote a new version with xmin 2343343 on another page; both stayed in the table. A reader's **snapshot**, printed as `2343357:2343365:2343357,2343362`, lists the oldest running transaction, the next transaction id, and the transactions still running; a version is visible if its xmin committed **before** the snapshot and its xmax did not. After a **rollback** nothing is undone: the new version just becomes dead. Readers record what they learn from the commit log as **hint bits** (infomask 0x0802 → 0x0902 after the first `SELECT`), and **VACUUM FREEZE** marks old tuples as visible to everyone (0x0B02) so that 32-bit transaction ids can wrap around safely.
 </Tldr>
 
-[Session 3](/blogs/databases/transactions/session-3-isolation-levels) used snapshots as a black box. This session opens them, one engine per concept. The index-side cost of PostgreSQL's design (new index entries for non-HOT updates) is covered in [Indexing Session 6](/blogs/databases/indexing/session-6-engine-differences/concept-1-postgres-mvcc).
+[Session 3](/blogs/databases/transactions/session-3-isolation-levels/concept-1-when-the-snapshot-starts) used snapshots as a black box. This session opens them, one engine per concept. The index-side cost of PostgreSQL's design (new index entries for non-HOT updates) is covered in [Indexing Session 6](/blogs/databases/indexing/session-6-engine-differences/concept-1-postgres-mvcc).
 
 ## The tuple header
 
