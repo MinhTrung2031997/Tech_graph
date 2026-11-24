@@ -1,0 +1,87 @@
+---
+title: "Answers: Logical replication and CDC session quiz"
+description: "Worked answers to the Session 7 quiz, with the lab's measured values."
+companion: "answers"
+tags: ["replication", "cdc", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/logical-replication-restrictions.html"
+  - "https://www.postgresql.org/docs/17/runtime-config-replication.html#GUC-MAX-SLOT-WAL-KEEP-SIZE"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html"
+  - "https://www.mongodb.com/docs/manual/changeStreams/"
+---
+
+<Tldr>
+Change data capture is replication you own: you decide the schema order, the retention, the position and the delivery semantics. The lab's failures were all in those four places.
+</Tldr>
+
+## Q1. A column added on the publisher
+
+**Question:** logical replication of `orders` is running. A developer adds a column on the publisher. What stops, what keeps growing, and what is the safe order for schema changes?
+
+The ALTER is not replicated. The first change that carries the new column fails on the subscriber ("missing replicated column"), and because apply is in commit order, every later transaction of the subscription waits behind it, on all tables. The subscription's slot on the publisher keeps WAL from that point (25 MB after one full-table update in the lab), so the publisher's disk grows. Safe order: add columns and tables on the subscriber first, then the publisher; remove them on the publisher first, then the subscriber. After adding the column on the subscriber, the lab caught up in 2.30 s.
+
+> **Common mistake:** running the migration tool only against the primary's connection string.
+
+## Q2. Row filter and updates
+
+**Question:** why does `UPDATE orders SET status = …` fail on the publisher after someone creates a publication with `WHERE (marketplace = 'shopee')`, and what are two fixes?
+
+To decide whether an UPDATE is an update, insert or delete for the subscriber, PostgreSQL must evaluate the filter on the old row, so the filter's columns must be in the WAL's old-row image, the replica identity. With the default identity (primary key `id`), `marketplace` is not, so every UPDATE and DELETE on `orders` fails immediately: "Column used in the publication WHERE expression is not part of the replica identity." Fixes: a unique index including the column used as `REPLICA IDENTITY USING INDEX` (the lab used `(id, marketplace)`), or `REPLICA IDENTITY FULL` (whole old row; +18 % WAL per update here; a column list must then include every column).
+
+> **Common mistake:** testing the publication on a staging database without write traffic.
+
+## Q3. Cut-over to a logical subscriber
+
+**Question:** you move writes from an old PostgreSQL server to a logical subscriber during an upgrade. Which object types must you copy by hand at cut-over?
+
+Sequence values (`setval` each sequence on the new server, at least to the old server's value; in the lab the subscriber's sequence was still at 1 after 1,000 replicated rows), any DDL made after the initial schema copy, large objects, and anything outside the published tables (roles, grants if not scripted, materialized view contents, which you refresh). Stop writes on the old server, wait until the subscription has applied everything (`pg_stat_subscription.latest_end_lsn` equals the publisher's current LSN), set sequences, then point the application at the new server.
+
+> **Common mistake:** relying on identity columns "just working" and failing the first insert after cut-over.
+
+## Q4. A connector stopped for a week
+
+**Question:** a Debezium connector on PostgreSQL has been stopped for a week. What happens on the primary, and what does `max_slot_wal_keep_size` change?
+
+Its slot keeps every WAL file since the connector's last confirmed position, so `pg_wal` grows with a week of write volume; in the lab five full-table updates already meant 206 MB retained. If the WAL volume fills, the primary stops accepting writes. With `max_slot_wal_keep_size` set, the slot is marked `unreserved` when it passes the limit and `lost` at the next checkpoint; the primary is safe, and the connector, when restarted, gets "can no longer get changes from replication slot" and must take a new snapshot. The setting trades the primary's availability for the consumer's continuity, which is almost always the right trade.
+
+> **Common mistake:** discovering the stopped connector from the disk alert instead of from an alert on inactive slots and retained bytes.
+
+## Q5. MySQL as a CDC source
+
+**Question:** name three things a MySQL server must be configured with to be a good CDC source, and what goes wrong without each.
+
+- `binlog_format = ROW`: without it, the binlog holds SQL text and the consumer cannot know which rows changed.
+- `binlog_row_image = FULL`: with MINIMAL the update events carried only the key before and the changed column after (161,046 vs 822,952 bytes for 10,000 rows), so the consumer cannot publish full rows.
+- `binlog_row_metadata = FULL`: without it, columns arrive as `UNKNOWN_COL0 …`, and the consumer must track the schema itself.
+- Also `gtid_mode = ON` (resume by GTID after a failover) and `binlog_expire_logs_seconds` longer than the longest consumer outage (otherwise error 1236 after a purge, as both the consumer and the replica showed).
+
+> **Common mistake:** checking only `binlog_format`, the one setting that is already right by default.
+
+## Q6. updateLookup for status transitions
+
+**Question:** a MongoDB consumer uses `fullDocument: 'updateLookup'` to compute "previous status → new status" for each order. Why is that wrong, and what should it use?
+
+`updateLookup` reads the document when the event is returned, not as it was at the event. With two quick updates (paid, then shipped) both events showed `shipped`, and after a delete it returns `null`. The transitions it computes are wrong exactly when orders change quickly, which is when they matter. Use pre- and post-images: enable `changeStreamPreAndPostImages` on the collection and request `fullDocumentBeforeChange` and `fullDocument`; the lab then showed delivered → paid and paid → shipped. Or put the old value into the update itself (for example a `status_history` push) so the event's `updatedFields` contains it.
+
+> **Common mistake:** keeping the previous status in the consumer's memory; it is lost on restart and wrong after a resnapshot.
+
+## Q7. Who keeps the history
+
+**Question:** compare who keeps the change history for a slow consumer in PostgreSQL, MySQL and MongoDB, and what each failure looks like.
+
+| | Kept by | Failure |
+|---|---|---|
+| PostgreSQL | The consumer's slot on the primary, until confirmed | Primary's WAL disk fills; with a limit, slot `lost` and "can no longer get changes" |
+| MySQL | Nobody per consumer; binlogs expire by age or PURGE | Consumer gets error 1236 ("Could not find first log file name in binary log index file"); replica 13114 |
+| MongoDB | Nobody per consumer; capped oplog by size | Resume fails with ChangeStreamHistoryLost (286) |
+
+> **Common mistake:** monitoring consumer lag in events or bytes only. Compare it, in time, with the source's retention window.
+
+## Q8. Crash between publish and advance
+
+**Question:** an outbox relay publishes to Kafka and then advances its slot. A crash happens between the two. What do downstream consumers see, and how do they cope?
+
+They see the events published since the last advance a second time after the relay restarts (in the lab, three of five). Nothing is lost. Consumers cope by being idempotent: key each message by the outbox row id, record processed ids under a unique constraint and skip repeats, and make the action itself idempotent (an upsert by business key, treating "already shipped" as success). Keep messages for one aggregate in one Kafka partition so repeats do not reorder an order's events.
+
+> **Common mistake:** "fixing" the duplicates by advancing the slot before publishing. That converts duplicates into silent loss.

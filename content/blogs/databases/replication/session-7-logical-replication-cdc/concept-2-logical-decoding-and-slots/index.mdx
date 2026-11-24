@@ -1,0 +1,272 @@
+---
+title: "Concept 2: Logical decoding and replication slots"
+description: "A logical slot turns WAL into a change stream any program can read. test_decoding showed only committed transactions, in commit order, with transactional messages next to the rows. A slot nobody reads keeps WAL forever: 206 MB after five full-table updates, until max_slot_wal_keep_size invalidated it ('can no longer get changes'). A big transaction spilled 17 MB to disk with 64 kB of decoding memory. A plain slot did not survive a failover; a PostgreSQL 17 failover slot did, after two configuration traps."
+type: "concept"
+tags: ["replication", "cdc", "logical-decoding", "replication-slots", "postgresql"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/logicaldecoding-explanation.html"
+  - "https://www.postgresql.org/docs/17/test-decoding.html"
+  - "https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-REPLICATION"
+  - "https://www.postgresql.org/docs/17/runtime-config-replication.html#GUC-MAX-SLOT-WAL-KEEP-SIZE"
+  - "https://www.postgresql.org/docs/17/logicaldecoding-explanation.html#LOGICALDECODING-REPLICATION-SLOTS-SYNCHRONIZATION"
+---
+
+<Tldr>
+A **logical replication slot** is a bookmark in the WAL plus an output plugin that turns WAL into row changes. Subscriptions use one (plugin `pgoutput`); CDC tools such as Debezium use one; you can read one with SQL (`pg_logical_slot_get_changes`). Measured: decoding returns **only committed transactions, in commit order**, each change with its column values; rolled-back work never appears; `pg_logical_emit_message` puts application events in the same stream. The slot's job is to keep WAL until the consumer confirms it, so an **unread slot is a disk leak**: 44 MB grew to **206 MB** after five full-table updates. With `max_slot_wal_keep_size = 256MB` the slot went to `unreserved`, then `lost` at the next checkpoint, and reading it failed: "can no longer get changes from replication slot". A slot exists only on the server where it was created: after promoting a standby, the plain slot was gone; a PostgreSQL 17 **failover slot** was there and delivered the next change.
+</Tldr>
+
+| Term | Meaning |
+|---|---|
+| Logical decoding | Reading WAL back into row changes per transaction |
+| Output plugin | Formats the changes: `pgoutput` (binary, for subscriptions and Debezium), `test_decoding` (text, for learning), `wal2json` (extension) |
+| `restart_lsn` | Oldest WAL the slot may still need; WAL from here on is kept |
+| `confirmed_flush_lsn` | Position the consumer has confirmed; changes before it are not sent again |
+| `catalog_xmin` | Oldest transaction whose system-catalog rows the slot still needs (to decode old rows with the old table definition) |
+| `wal_status` | `reserved` (within max_wal_size), `extended`, `unreserved` (will be removed at next checkpoint), `lost` |
+| peek / get | `pg_logical_slot_peek_changes` reads without moving the slot; `pg_logical_slot_get_changes` reads and confirms |
+
+## What a consumer sees
+
+Five transactions on the publisher, then one read of slot `cdc` (plugin `test_decoding`):
+
+```sql
+SELECT * FROM pg_create_logical_replication_slot('cdc', 'test_decoding');
+BEGIN; INSERT INTO orders VALUES (300001, 11, 'tiktok', 'delivered', 20.00, now(), NULL);
+       UPDATE orders SET status = 'returned' WHERE id = 300001;
+       DELETE FROM pings WHERE id = 1; COMMIT;
+BEGIN; INSERT INTO orders VALUES (300002, …); ROLLBACK;
+BEGIN; INSERT INTO orders VALUES (300003, 13, 'lazada', …);
+       SELECT pg_logical_emit_message(true, 'outbox', '{"type":"OrderPlaced","order_id":300003}'); COMMIT;
+BEGIN; SELECT pg_logical_emit_message(true, 'outbox', '{"type":"OrderPlaced","order_id":300004}'); ROLLBACK;
+SELECT pg_logical_emit_message(false, 'audit', 'non-transactional');
+```
+
+```text
+lsn        | xid | data
+0/5362270  | 944 | BEGIN 944
+0/5362270  | 944 | table public.orders: INSERT: id[bigint]:300001 seller_id[integer]:11 marketplace[text]:'tiktok' status[text]:'delivered' …
+0/5362368  | 944 | table public.orders: UPDATE: id[bigint]:300001 … status[text]:'returned' …
+0/53623E0  | 944 | table public.pings: DELETE: id[integer]:1
+0/5362450  | 944 | COMMIT 944
+0/5362570  | 946 | BEGIN 946
+0/5362570  | 946 | table public.orders: INSERT: id[bigint]:300003 seller_id[integer]:13 marketplace[text]:'lazada' …
+0/53626D0  | 946 | message: transactional: 1 prefix: outbox, sz: 40 content:{"type":"OrderPlaced","order_id":300003}
+0/5362700  | 946 | COMMIT 946
+0/53627E0  |   0 | message: transactional: 0 prefix: audit, sz: 17 content:non-transactional
+```
+
+- Transaction 945 (rolled back) is absent, and so is the rolled-back message for order 300004.
+- The UPDATE carries the full new row. The DELETE carries only the key (`id`): the default replica identity.
+- The non-transactional message has no transaction (xid 0). It was not in the first read; it appeared once its WAL was flushed.
+
+<Flow
+  title="Logical slot: from WAL to a consumer"
+  height={330}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'commits transactions', x: 20, y: 20, w: 200 },
+    { id: 'wal', label: 'WAL', sub: 'pg_wal on the primary', x: 300, y: 20, w: 200 },
+    { id: 'slot', label: 'Logical slot', sub: 'restart / confirmed LSN', x: 580, y: 20, w: 200 },
+    { id: 'buf', label: 'Reorder buffer', sub: 'logical_decoding_work_mem', x: 300, y: 250, w: 200 },
+    { id: 'consumer', label: 'Consumer', sub: 'subscription / Debezium', x: 580, y: 250, w: 200 },
+  ]}
+  edges={[
+    { id: 'app-wal', from: 'app', to: 'wal' },
+    { id: 'wal-slot', from: 'wal', to: 'slot' },
+    { id: 'wal-buf', from: 'wal', to: 'buf' },
+    { id: 'buf-consumer', from: 'buf', to: 'consumer' },
+    { id: 'slot-consumer', from: 'slot', to: 'consumer' },
+  ]}
+  cases={[
+    {
+      title: 'Normal decoding',
+      path: 'commit → WAL ✓ → reorder buffer collects the transaction → sent at COMMIT ✓ → consumer confirms → slot advances ✓',
+      summary: 'Changes are grouped per transaction and released at commit, in commit order.',
+      steps: [
+        {
+          title: 'Changes are written',
+          note: 'WAL records of many transactions are interleaved. The decoder reads them in WAL order.',
+          active: ['app', 'wal'],
+          edges: ['app-wal'],
+        },
+        {
+          title: 'Reassembled per transaction',
+          note: 'The reorder buffer keeps each open transaction\'s changes in memory until its COMMIT record, then hands the whole transaction to the plugin. Aborted transactions are thrown away.',
+          active: ['wal', 'buf', 'consumer'],
+          edges: ['wal-buf', 'buf-consumer'],
+          subs: { buf: 'txn 944: 3 changes' },
+        },
+        {
+          title: 'Confirm',
+          note: 'pg_logical_slot_get_changes (or a streaming consumer\'s feedback) moves confirmed_flush_lsn; later restart_lsn follows and old WAL may be removed.',
+          active: ['wal', 'slot', 'consumer'],
+          edges: ['wal-slot', 'slot-consumer'],
+          subs: { slot: '✓ advanced' },
+        },
+      ],
+    },
+    {
+      title: 'One transaction larger than memory',
+      path: 'UPDATE of 100,004 rows → reorder buffer over 64 kB ✗ → spilled to disk 269 times, 17 MB → decoded in 255 ms (147 ms with 64 MB)',
+      summary: 'Big transactions are decoded through temporary files.',
+      steps: [
+        {
+          title: 'Spill to disk',
+          note: 'With logical_decoding_work_mem = 64kB in the reading session, decoding the 100,004-row UPDATE spilled 1 transaction 269 times, 17 MB (pg_stat_replication_slots), and took 255 ms. With 64MB: no spill, 147 ms. One run each.',
+          code: "SET logical_decoding_work_mem = '64kB';\nSELECT count(*) FROM pg_logical_slot_peek_changes('cdc', NULL, NULL);\nSELECT spill_txns, spill_count, spill_bytes FROM pg_stat_replication_slots;",
+          active: ['wal', 'buf'],
+          edges: ['wal-buf'],
+          subs: { buf: '✗ spilled 17 MB' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Peek, get, and where the bookmark is
+
+| Call | Rows returned | Slot moved |
+|---|---|---|
+| `pg_logical_slot_peek_changes('cdc', NULL, NULL)` | 10 | no |
+| same again | 10 | no |
+| `pg_logical_slot_get_changes('cdc', NULL, NULL)` | 10 | yes |
+| `pg_logical_slot_peek_changes(…)` | 0 | — |
+
+A consumer that uses `get` confirms before it has processed anything; one that uses `peek` must advance the slot itself after processing (`pg_replication_slot_advance`). Concept 5 turns this into delivery guarantees.
+
+## The unread slot
+
+The slot's promise is that WAL stays until the consumer confirms it. Nothing checks that the consumer still exists.
+
+<Flow
+  title="An abandoned slot and max_slot_wal_keep_size"
+  height={300}
+  nodes={[
+    { id: 'writes', label: 'Write traffic', sub: 'full-table UPDATEs', x: 20, y: 20, w: 200 },
+    { id: 'pgwal', label: 'pg_wal', sub: 'WAL files on disk', x: 300, y: 20, w: 200 },
+    { id: 'slot', label: 'Slot cdc', sub: 'nobody reads it', x: 580, y: 20, w: 200 },
+    { id: 'ckpt', label: 'Checkpoint', sub: 'removes old WAL', x: 300, y: 200, w: 200 },
+    { id: 'reader', label: 'Late consumer', sub: 'comes back', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'writes-pgwal', from: 'writes', to: 'pgwal' },
+    { id: 'slot-pgwal', from: 'slot', to: 'pgwal' },
+    { id: 'pgwal-ckpt', from: 'pgwal', to: 'ckpt' },
+    { id: 'reader-slot', from: 'reader', to: 'slot' },
+  ]}
+  cases={[
+    {
+      title: 'No limit (default, -1)',
+      path: 'slot reserved: 44 MB → 5 updates + CHECKPOINT → 206 MB retained, pg_wal 112 → 224 MB',
+      summary: 'Retention grows with write volume until the disk is full.',
+      steps: [
+        {
+          title: 'WAL accumulates',
+          note: 'max_slot_wal_keep_size = -1 (no limit). After five UPDATEs of all 100,004 rows and a CHECKPOINT, the slot still needed 206 MB of WAL (pg_current_wal_lsn − restart_lsn), wal_status reserved; the pg_wal directory grew from 112 MB to 224 MB. On a busy server this is how a forgotten Debezium connector fills a disk over a weekend.',
+          code: "SELECT slot_name, wal_status,\n  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained\nFROM pg_replication_slots;",
+          active: ['writes', 'pgwal', 'slot', 'ckpt'],
+          edges: ['writes-pgwal', 'slot-pgwal', 'pgwal-ckpt'],
+          subs: { slot: 'retained 206 MB' },
+        },
+      ],
+    },
+    {
+      title: 'max_slot_wal_keep_size = 256MB',
+      path: 'safe_wal_size 62 MB → 3 more updates → unreserved (−49 MB) → CHECKPOINT ✗ slot lost → consumer ✗ can no longer get changes',
+      summary: 'The server is protected; the consumer has to start again from a fresh snapshot.',
+      steps: [
+        {
+          title: 'Unreserved',
+          note: 'After the limit was set (ALTER SYSTEM + reload), safe_wal_size showed 62 MB left. Three more full-table updates: retained 318 MB, wal_status unreserved, safe_wal_size −49 MB.',
+          active: ['writes', 'pgwal', 'slot'],
+          edges: ['writes-pgwal', 'slot-pgwal'],
+          subs: { slot: 'unreserved, −49 MB' },
+        },
+        {
+          title: 'Lost',
+          note: 'The next CHECKPOINT removed the WAL: wal_status lost, invalidation_reason wal_removed, restart_lsn NULL.',
+          active: ['pgwal', 'ckpt', 'slot'],
+          edges: ['pgwal-ckpt', 'slot-pgwal'],
+          subs: { slot: '✗ lost (wal_removed)' },
+        },
+        {
+          title: 'The consumer returns',
+          note: 'ERROR: can no longer get changes from replication slot "cdc". DETAIL: This slot has been invalidated because it exceeded the maximum reserved size. The only way back is a new slot and a new initial snapshot; the two active subscription slots on the same server were unaffected.',
+          active: ['reader', 'slot'],
+          edges: ['reader-slot'],
+          subs: { reader: '✗ must resnapshot' },
+        },
+      ],
+    },
+  ]}
+/>
+
+A logical slot also holds `catalog_xmin`: VACUUM cannot remove old rows of the **system catalogs** that the slot might need to decode old changes. It does not hold back VACUUM on ordinary tables (a physical slot with `hot_standby_feedback` does, see Session 6).
+
+## Slots and failover
+
+A slot lives in one server's `pg_replication_slots`. Physical standbys do not copy it, so after a failover the consumer connects to a new primary that has never heard of its slot. PostgreSQL 17 adds **failover slots**: a standby with `sync_replication_slots = on` keeps a synchronized copy of every slot created with `failover = true`.
+
+```sql
+-- primary: a slot that should survive failover (5th argument: failover)
+SELECT * FROM pg_create_logical_replication_slot('cdc_failover', 'test_decoding', false, false, true);
+SELECT * FROM pg_create_logical_replication_slot('cdc_plain',    'test_decoding');
+-- primary: do not let logical consumers get ahead of that standby
+ALTER SYSTEM SET synchronized_standby_slots = 'pubs_phys';
+-- standby (rpd-pubs): wal_level = logical, sync_replication_slots = on, hot_standby_feedback = on,
+--   primary_slot_name = 'pubs_phys', primary_conninfo must contain dbname=…
+```
+
+| Step | Measured |
+|---|---|
+| Standby started with `wal_level = replica` | Log: `replication slot synchronization requires "wal_level" >= "logical"`; nothing synced |
+| Standby with `wal_level = logical`, slot just created | Copy created as **temporary**: "could not synchronize replication slot "cdc_failover"", DETAIL: "Synchronization could lead to data loss, because the remote slot needs WAL at LSN 0/1B000028 and catalog xmin 965, but the standby has LSN 0/1C000028 and catalog xmin 966." |
+| After the primary's slot was consumed past that point | Standby copy `synced = t`, `temporary = f`, same `restart_lsn` and `confirmed_flush_lsn` as the primary |
+| Primary stopped, standby promoted, read `cdc_failover` | Hung: `WARNING: replication slot "pubs_phys" specified in parameter "synchronized_standby_slots" does not exist`, wait event `WaitForStandbyConfirmation` |
+| Same, after `ALTER SYSTEM RESET synchronized_standby_slots` on the new primary | ✓ `table public.pings: INSERT: id[integer]:600 …`, the change committed just before the failover |
+| Read `cdc_plain` on the new primary | ✗ `ERROR: replication slot "cdc_plain" does not exist` |
+
+The hang came from the base backup: `ALTER SYSTEM` on the old primary had written `synchronized_standby_slots` into `postgresql.auto.conf`, and `pg_basebackup` copied that file to the standby. After promotion the new primary waited for a standby slot that only existed on the old primary.
+
+<Pitfall>
+Every logical slot is a promise to keep WAL. Monitor `pg_replication_slots` for inactive slots and retained bytes, set `max_slot_wal_keep_size` so a dead consumer cannot fill the disk, and drop slots when a consumer is retired. A slot left by a one-off `CREATE SUBSCRIPTION` test on production is the classic cause of a full WAL disk.
+</Pitfall>
+
+## Real-world scenario: Debezium after a failover
+
+Orders are streamed to Kafka by Debezium from PostgreSQL through a logical slot. The primary fails at 03:10 and Patroni promotes the standby. Debezium reconnects, finds no slot, creates a new one and, depending on its snapshot mode, either re-snapshots all tables (hours of duplicate events) or starts from "now" and silently skips the changes between its last confirmation and the failover.
+
+| Option | Effect |
+|---|---|
+| PostgreSQL 17 failover slot + `sync_replication_slots` on the standby | Slot survives; consumer resumes from its confirmed position |
+| `synchronized_standby_slots` on the primary | Consumers never get changes the standby does not have yet; must be reset on promotion if it names the old standby's slot |
+| Before PostgreSQL 17 | Re-snapshot after failover, or tools that copy slot state (pg_failover_slots, Patroni slot handling: from the documentation) |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 1 | Every subscription is a `pgoutput` slot with these properties |
+| Concept 5 | Peek vs get decides duplicates vs loss in your own consumer |
+| [Transactions Session 4, Concept 4](/blogs/databases/transactions/session-4-mvcc-internals/concept-4-long-transactions) | catalog_xmin and physical-slot xmin are the replication versions of "an old snapshot blocks cleanup" |
+| [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) | Physical slots and standbys |
+
+## Key takeaways
+
+1. Logical decoding emits whole committed transactions in commit order; rolled-back work never appears.
+2. `pg_logical_emit_message(true, …)` puts application events in the same transactional stream.
+3. A slot keeps WAL until it is confirmed; an unread slot grew from 44 MB to 206 MB with five table rewrites.
+4. `max_slot_wal_keep_size` caps the damage: the slot is invalidated and the consumer must start over.
+5. Large transactions spill to disk above `logical_decoding_work_mem` (17 MB spilled, 255 ms vs 147 ms).
+6. Plain slots do not survive failover. PostgreSQL 17 failover slots do, with `wal_level = logical` on the standby and `synchronized_standby_slots` reset after promotion.
+
+## Check questions
+
+1. Why did transaction 945 never appear in the slot, and when does a transaction's first change reach the consumer?
+2. What is the difference between `restart_lsn` and `confirmed_flush_lsn`?
+3. A slot's consumer has been down for three days. What do you check, and what are your two options?
+4. After `max_slot_wal_keep_size` invalidated a slot, what must the consumer do to be correct again?
+5. Why was the plain slot missing after promotion, and what two settings made the failover slot usable?
+6. What does a logical slot hold back besides WAL, and what does it not hold back?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-7-logical-replication-cdc/concept-2-logical-decoding-and-slots/answers">Worked answers to Q1–Q6</DeepDive>

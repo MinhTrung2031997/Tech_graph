@@ -1,0 +1,192 @@
+---
+title: "Concept 5: Delivery guarantees and the outbox"
+description: "CDC gives at-least-once or at-most-once delivery depending on when the consumer confirms. An outbox relay that read three events and crashed before confirming saw all five again after restart: three duplicates. Advancing the slot only past what was published left exactly two. Reading with get_changes confirmed everything at once, so a crash after reading would have lost events. PostgreSQL subscriptions avoid duplicates by committing their position with each applied transaction; your consumers need idempotency keys."
+type: "concept"
+tags: ["replication", "cdc", "outbox", "idempotency", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/logicaldecoding-explanation.html"
+  - "https://www.postgresql.org/docs/17/replication-origins.html"
+  - "https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-REPLICATION"
+  - "https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html"
+  - "https://www.mongodb.com/docs/manual/changeStreams/#resume-a-change-stream"
+---
+
+<Tldr>
+Every CDC consumer does two things: **act** on a change (publish to Kafka, call an API, write elsewhere) and **confirm** its position (slot LSN, binlog GTID set, resume token). Confirm before acting and a crash **loses** events (at-most-once); act before confirming and a crash **repeats** them (at-least-once). Measured with an outbox relay on a PostgreSQL slot: five orders committed with five outbox rows; the relay peeked and published three, then "crashed" without confirming; after restart it saw **all five** again (three duplicates). Advancing the slot to the third transaction's COMMIT LSN left **exactly two**. `pg_logical_slot_get_changes` confirmed both remaining events in the same call that read them. PostgreSQL subscriptions get **exactly-once apply** by storing their position (replication origin) in the same transaction as the applied rows (from the documentation); a Kafka pipeline gets at-least-once, so consumers need **idempotency keys**.
+</Tldr>
+
+| Term | Meaning |
+|---|---|
+| At-most-once | Each change is delivered zero or one time: confirm, then act |
+| At-least-once | Each change is delivered one or more times: act, then confirm |
+| Exactly-once effect | At-least-once delivery + an idempotent action, or position and effect committed atomically |
+| Outbox table | Table the application writes events into, in the same transaction as the business change; CDC publishes it |
+| Logical message | `pg_logical_emit_message(transactional, prefix, content)`: an event in the WAL with no table |
+| Replication origin | PostgreSQL's record of how far a subscriber has applied, updated in the same transaction as the applied changes |
+
+## The outbox, captured by CDC
+
+The dual-write problem: an order service updates `orders` and then publishes "OrderShipped" to Kafka. If it crashes between the two, the database and Kafka disagree. With an outbox, the event is a row in the **same transaction**, and CDC publishes committed outbox rows:
+
+```sql
+BEGIN;
+UPDATE orders SET status = 'shipped' WHERE id = 1;
+INSERT INTO outbox (aggregate_id, type, payload) VALUES (1, 'OrderShipped', '{"order_id": 1}');
+COMMIT;
+```
+
+Concept 2 showed the alternative without a table: `pg_logical_emit_message(true, 'outbox', …)` inside the transaction appeared in the stream only if the transaction committed. Debezium's outbox event router and most relays use a table, because a table can be inspected, replayed and cleaned up.
+
+<Flow
+  title="Outbox relay on a logical slot: when to confirm"
+  height={330}
+  nodes={[
+    { id: 'app', label: 'Order service', sub: 'order + outbox row', x: 20, y: 20, w: 200 },
+    { id: 'slot', label: 'Slot relay', sub: 'test_decoding', x: 300, y: 20, w: 200 },
+    { id: 'relay', label: 'Relay process', sub: 'reads, publishes', x: 580, y: 20, w: 200 },
+    { id: 'kafka', label: 'Kafka topic', sub: 'OrderShipped', x: 580, y: 250, w: 200 },
+    { id: 'confirm', label: 'Slot position', sub: 'confirmed_flush_lsn', x: 300, y: 250, w: 200 },
+  ]}
+  edges={[
+    { id: 'app-slot', from: 'app', to: 'slot' },
+    { id: 'slot-relay', from: 'slot', to: 'relay' },
+    { id: 'relay-kafka', from: 'relay', to: 'kafka' },
+    { id: 'relay-confirm', from: 'relay', to: 'confirm' },
+  ]}
+  cases={[
+    {
+      title: 'Act, crash, restart (at-least-once)',
+      path: '5 outbox rows committed → peek → publish orders 1, 2, 3 ✓ → crash before advance ✗ → restart: peek returns 5 → 3 duplicates',
+      summary: 'Nothing is lost; three events are published twice.',
+      steps: [
+        {
+          title: 'Five orders shipped',
+          note: 'Five transactions, each with one orders UPDATE and one outbox INSERT.',
+          active: ['app', 'slot'],
+          edges: ['app-slot'],
+        },
+        {
+          title: 'Publish three, then crash',
+          note: 'The relay used pg_logical_slot_peek_changes (does not move the slot) and published the events for orders 1, 2, 3 (LSNs 0/191A2AE0, 0/191A2CA8, 0/191A2E10). It crashed before advancing the slot.',
+          active: ['slot', 'relay', 'kafka'],
+          edges: ['slot-relay', 'relay-kafka'],
+          subs: { kafka: '✓ 1, 2, 3' },
+        },
+        {
+          title: 'Restart',
+          note: 'The same peek returned all 5 outbox inserts again. Publishing them gives Kafka 1, 2, 3, 1, 2, 3, 4, 5.',
+          active: ['slot', 'relay', 'kafka', 'confirm'],
+          edges: ['slot-relay', 'relay-kafka'],
+          subs: { kafka: '✗ 3 duplicates', confirm: 'not moved' },
+        },
+      ],
+    },
+    {
+      title: 'Act, then confirm exactly what was published',
+      path: 'publish 1, 2, 3 ✓ → advance slot to 3rd COMMIT LSN 0/191A2F00 ✓ → restart: 2 remaining',
+      summary: 'Confirm after acting and only up to a transaction boundary.',
+      steps: [
+        {
+          title: 'Advance to the last published commit',
+          note: 'pg_replication_slot_advance(relay, 0/191A2F00): the COMMIT of the third transaction. A crash before this call still repeats 1 to 3; a crash after it repeats nothing.',
+          code: "SELECT * FROM pg_replication_slot_advance('relay', '0/191A2F00');",
+          active: ['relay', 'confirm'],
+          edges: ['relay-confirm'],
+          subs: { confirm: '✓ 0/191A2F00' },
+        },
+        {
+          title: 'Restart',
+          note: 'peek returned exactly the 2 remaining outbox events (orders 4 and 5).',
+          active: ['slot', 'relay'],
+          edges: ['slot-relay'],
+          subs: { relay: '✓ 2 remaining' },
+        },
+      ],
+    },
+    {
+      title: 'Confirm, then act (at-most-once)',
+      path: 'get_changes returns 2 and moves the slot ✓ → crash before publishing ✗ → restart: peek returns 0 → 2 events lost',
+      summary: 'Reading with get_changes is confirming.',
+      steps: [
+        {
+          title: 'get_changes',
+          note: 'pg_logical_slot_get_changes returned the 2 outbox events and confirmed them in the same call. A following peek returned 0 rows. Had the relay crashed before publishing, orders 4 and 5 would never reach Kafka.',
+          active: ['slot', 'relay', 'confirm'],
+          edges: ['slot-relay', 'relay-confirm'],
+          subs: { confirm: 'moved before publish', kafka: '✗ 4, 5 never sent' },
+        },
+        {
+          title: 'Nothing to restart from',
+          note: 'The slot has no memory of what was read but not published.',
+          active: ['kafka', 'confirm'],
+          edges: [],
+          subs: { kafka: '✗ 4, 5 lost' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## The same rule in every engine
+
+| Engine | What the consumer confirms | At-least-once means |
+|---|---|---|
+| PostgreSQL slot | `confirmed_flush_lsn` (streaming feedback, `pg_replication_slot_advance`, or `get_changes`) | Advance after the action, to a COMMIT LSN |
+| PostgreSQL subscription | Replication origin, committed **with** each applied transaction | Exactly-once apply, by design (from the documentation) |
+| MySQL binlog reader | GTID set or file + offset, stored by the reader | Store after the action; on restart, send the stored GTID set |
+| MongoDB change stream | Resume token, stored by the consumer | Store the token after the action |
+
+The PostgreSQL subscription is exactly-once because its "action" (writing rows into the subscriber) and its "confirm" (advancing the replication origin) are one local transaction. Any consumer that writes into a database can copy that design: store the position in the same transaction as the effect. A consumer whose effect is outside a database (Kafka, an HTTP API) cannot, so it must make the effect idempotent.
+
+## Making duplicates harmless
+
+| Technique | How |
+|---|---|
+| Event id from the source | Use the outbox `id` (or LSN / GTID / resume token) as the message key; consumers keep a processed-ids table with a unique constraint |
+| Idempotent writes | `INSERT … ON CONFLICT DO NOTHING` / `upsert` by business key; "set status = shipped" instead of "increment shipped count" |
+| Ordering per key | Partition Kafka by `aggregate_id`, so all events of one order stay in order even when some are repeated |
+| Version numbers | Carry the order's version; consumers ignore events with a version they already have |
+
+<Pitfall>
+Do not use the time an event was **received** to deduplicate. After a restart the duplicates arrive seconds or hours later. Use an id that the source assigned once: the outbox row id, or the change's LSN / GTID / resume token.
+</Pitfall>
+
+## Real-world scenario: marketplace order sync
+
+An OMS publishes "OrderShipped" for every shipped order so that a sync service can push tracking numbers to Shopee, Lazada and TikTok Shop. After a relay restart, 3,000 events are published again; the sync service calls the marketplaces' "ship order" API twice for 3,000 orders. Two marketplaces return "already shipped" errors that page the on-call engineer; one accepts a duplicate tracking update.
+
+| Fix | Effect |
+|---|---|
+| Relay confirms the slot only after Kafka acknowledges, to a COMMIT LSN | No lost events; duplicates limited to the last unconfirmed batch |
+| Message key = outbox id; sync service keeps `processed_events (event_id PRIMARY KEY)` | Second delivery is a no-op |
+| Sync service treats "already shipped" as success | Idempotent against the marketplace API too |
+| Outbox rows deleted after N days by a job, not by the relay | Replays possible for incident recovery |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Transactions Session 8, Concept 4](/blogs/databases/transactions/session-8-when-transactions-hurt/concept-4-distributed-transactions) | Why the outbox replaces two-phase commit between a database and a broker |
+| Concept 2 | peek, get and slot advance |
+| Concept 4 | MongoDB resume tokens, the same rule |
+| Session 8 | Where CDC fits when designing a system around replicas |
+
+## Key takeaways
+
+1. Delivery semantics come from the order of "act" and "confirm", not from the database.
+2. A relay that confirmed nothing repeated three events after a crash; one that read with `get_changes` would have lost two.
+3. Advance a PostgreSQL slot to a COMMIT LSN, after the action.
+4. PostgreSQL subscriptions are exactly-once because the position commits with the applied rows; copy that when your effect is in a database.
+5. Everything else needs idempotent consumers keyed by an id the source assigned.
+
+## Check questions
+
+1. Write the two orderings of "act" and "confirm" and the failure each one allows.
+2. Why did the restarted relay see all five events, and how many were duplicates?
+3. Why advance to a COMMIT LSN rather than to the LSN of the last outbox INSERT?
+4. How does a PostgreSQL subscription avoid applying a transaction twice after a crash?
+5. Choose a deduplication key for an outbox relay publishing to Kafka, and say why `received_at` is not one.
+6. When is an outbox better than `pg_logical_emit_message`, and when is the message enough?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-7-logical-replication-cdc/concept-5-delivery-and-outbox/answers">Worked answers to Q1–Q6</DeepDive>

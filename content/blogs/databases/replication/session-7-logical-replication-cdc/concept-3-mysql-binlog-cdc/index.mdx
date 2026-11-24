@@ -1,0 +1,217 @@
+---
+title: "Concept 3: The MySQL binlog as a change stream"
+description: "A CDC consumer reads the MySQL binlog over the replication protocol, exactly like a replica. With row format and binlog_row_metadata = FULL each change arrives with column names, before and after values, and a GTID; DDL arrives too, as a statement. binlog_row_image = MINIMAL cut a 10,000-row update from 822,952 to 161,046 bytes but left the consumer without the row. MySQL keeps binlogs by age, not by consumer: after PURGE, both the consumer and a stopped replica failed with error 1236."
+type: "concept"
+tags: ["replication", "cdc", "binlog", "gtid", "mysql"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/binary-log-formats.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html#sysvar_binlog_row_image"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html#sysvar_binlog_row_metadata"
+  - "https://dev.mysql.com/doc/refman/8.4/en/purge-binary-logs.html"
+  - "https://python-mysql-replication.readthedocs.io/"
+---
+
+<Tldr>
+MySQL has no slots and no decoding plugin: the **binlog** itself is the change stream. A CDC tool (Debezium, Maxwell, or the Python library used here) connects as if it were a replica, sends a `server_id` and a starting position (file and offset, or a GTID set), and receives row events. Measured on MySQL 8.4 with `binlog_format = ROW`: with `binlog_row_metadata = MINIMAL` the consumer saw `UNKNOWN_COL0 … UNKNOWN_COL5`; with **FULL** it saw column names. Each transaction came with its **GTID**, and an `ALTER TABLE` arrived as a statement, so unlike PostgreSQL the consumer **does see DDL**. `binlog_row_image = MINIMAL` made a 10,000-row update **5× smaller** (161,046 vs 822,952 bytes) but the consumer then got only the key before and the changed column after. The binlog is kept by **age** (`binlog_expire_logs_seconds`, 30 days by default) or by an explicit `PURGE`, never for a slow consumer: after a purge, the consumer and a stopped replica both failed with **error 1236**.
+</Tldr>
+
+| Term | Meaning |
+|---|---|
+| Binary log (binlog) | Ordered files `binlog.000001`, `binlog.000002`, … of committed transactions; feeds replicas, point-in-time recovery and CDC |
+| `binlog_format = ROW` | Logs changed rows, not SQL text (default; needed for CDC) |
+| `binlog_row_image` | FULL: all columns before and after (default). MINIMAL: key before, changed columns after. NOBLOB: FULL without unchanged BLOB/TEXT |
+| `binlog_row_metadata` | MINIMAL (default): types only. FULL: also column names, primary key, enum/set strings |
+| GTID | Global transaction id `source_uuid:n`; a consumer can resume from "all GTIDs I have seen" |
+| `server_id` | Every binlog reader, replica or CDC tool, needs a unique id |
+| Error 1236 | Source cannot serve the requested position: usually the binlog file was purged |
+
+## Reading the binlog as a consumer
+
+The `mysql:8.4` Docker image does not ship `mysqlbinlog`, so the lab uses the `mysql-replication` Python library (1.0.17) in a separate container on the same network: a 30-line consumer that prints each GTID, each statement and each row change. Debezium's MySQL connector works the same way.
+
+```python
+stream = BinLogStreamReader(
+    connection_settings={"host": "rpd-my1", "port": 3306, "user": "root", "passwd": "lab"},
+    server_id=99,                      # unique, like a replica
+    log_file=sys.argv[1], log_pos=int(sys.argv[2]), resume_stream=True, blocking=False,
+    only_events=[GtidEvent, QueryEvent, WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent])
+```
+
+<Flow
+  title="MySQL: a CDC consumer is another replica"
+  height={330}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'UPDATE, DELETE, DDL', x: 20, y: 20, w: 200 },
+    { id: 'binlog', label: 'Binlog files', sub: 'binlog.000014, …', x: 300, y: 20, w: 200 },
+    { id: 'dump', label: 'Binlog dump thread', sub: 'one per reader', x: 580, y: 20, w: 200 },
+    { id: 'replica', label: 'Replica rpd-my2', sub: 'server_id 2', x: 300, y: 250, w: 200 },
+    { id: 'cdc', label: 'CDC consumer', sub: 'server_id 99', x: 580, y: 250, w: 200 },
+  ]}
+  edges={[
+    { id: 'app-binlog', from: 'app', to: 'binlog' },
+    { id: 'binlog-dump', from: 'binlog', to: 'dump' },
+    { id: 'dump-replica', from: 'dump', to: 'replica' },
+    { id: 'dump-cdc', from: 'dump', to: 'cdc' },
+  ]}
+  cases={[
+    {
+      title: 'binlog_row_metadata = MINIMAL (default)',
+      path: 'UPDATE id 1 → row event ✓ → consumer gets before/after values ✓ but no column names ✗',
+      summary: 'Values without names: the consumer must know the table layout at that moment.',
+      steps: [
+        {
+          title: 'Two changes',
+          note: 'The application changes order 1 and deletes order 2. Each transaction gets a GTID (5a53fca8-…:11 and :12).',
+          code: "UPDATE shop.orders SET status = 'returned' WHERE id = 1;\nDELETE FROM shop.orders WHERE id = 2;",
+          active: ['app', 'binlog'],
+          edges: ['app-binlog'],
+        },
+        {
+          title: 'What the consumer receives',
+          note: "UPDATE shop.orders before_values: UNKNOWN_COL0: 1, UNKNOWN_COL1: 1673, UNKNOWN_COL2: 'tiktok', UNKNOWN_COL3: 'delivered', … after_values: … UNKNOWN_COL3: 'returned'. The library printed a warning recommending binlog_row_metadata = FULL and binlog_row_image = FULL.",
+          active: ['binlog', 'dump', 'cdc'],
+          edges: ['binlog-dump', 'dump-cdc'],
+          subs: { cdc: '✗ UNKNOWN_COL0…5' },
+        },
+      ],
+    },
+    {
+      title: 'binlog_row_metadata = FULL',
+      path: 'UPDATE → named columns ✓ · ALTER TABLE → QUERY event ✓ · INSERT with the new column ✓',
+      summary: 'Names, keys and DDL in one ordered stream; replicas read the same events.',
+      steps: [
+        {
+          title: 'Named columns',
+          note: "GTID …:13 UPDATE shop.orders before_values: id 1, seller_id 1673, marketplace 'tiktok', status 'returned', amount 80.07, … after_values: … status 'delivered'.",
+          active: ['binlog', 'dump', 'cdc'],
+          edges: ['binlog-dump', 'dump-cdc'],
+          subs: { cdc: '✓ named columns' },
+        },
+        {
+          title: 'DDL is in the stream',
+          note: "GTID …:14 QUERY ALTER TABLE shop.orders ADD COLUMN note VARCHAR(40) NULL, then GTID …:15 WRITE shop.orders with note: 'gift wrap'. The consumer can change its own schema at exactly the right point. The replica applied the same events.",
+          active: ['app', 'binlog', 'dump', 'replica', 'cdc'],
+          edges: ['app-binlog', 'binlog-dump', 'dump-replica', 'dump-cdc'],
+          subs: { replica: '✓ applied', cdc: '✓ sees ALTER' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Row image: size against completeness
+
+The same `UPDATE shop.orders SET amount = amount + 1 WHERE id <= 10000`, measured as the growth of the binlog position (3 runs each, identical):
+
+| `binlog_row_image` | Bytes in the binlog | Per row | What a consumer gets for one UPDATE |
+|---|---|---|---|
+| FULL (default) | 822,952 | 82 | All 6 columns before and after |
+| MINIMAL | 161,046 | 16 | Before: `id` only. After: `status` only; the other columns are `None` ("cols bitmap") |
+
+MINIMAL is attractive for replication bandwidth, and a replica only needs the key and the changes. A CDC consumer that writes complete rows to a search index or a warehouse cannot rebuild the row from it. `binlog_row_image` can be set per session; CDC needs it FULL for every session that writes the captured tables, which in practice means the global default.
+
+## Retention: the source does not wait
+
+PostgreSQL keeps WAL for a slot until the consumer confirms it (Concept 2). MySQL has no such bookkeeping: a binlog file is removed when it is older than `binlog_expire_logs_seconds` (2,592,000 s, 30 days, in this lab) or when someone runs `PURGE BINARY LOGS`, whether or not a reader still needs it.
+
+<Flow
+  title="MySQL: purged binlog under a lagging reader"
+  height={300}
+  nodes={[
+    { id: 'src', label: 'Source rpd-my1', sub: 'FLUSH + PURGE', x: 20, y: 20, w: 220 },
+    { id: 'files', label: 'Binlog files', sub: 'only 000015 left', x: 300, y: 20, w: 200 },
+    { id: 'cdc', label: 'CDC consumer', sub: 'saved 000014:578', x: 560, y: 20, w: 220 },
+    { id: 'replica', label: 'Replica rpd-my2', sub: 'stopped, then started', x: 300, y: 200, w: 200 },
+    { id: 'err', label: 'Error 1236', sub: 'position no longer exists', x: 560, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'src-files', from: 'src', to: 'files' },
+    { id: 'cdc-files', from: 'cdc', to: 'files' },
+    { id: 'replica-files', from: 'replica', to: 'files' },
+    { id: 'cdc-err', from: 'cdc', to: 'err' },
+  ]}
+  cases={[
+    {
+      title: 'Purge while a consumer and a replica are behind',
+      path: 'consumer saved 000014:578, replica stopped → 100-row UPDATE → PURGE TO 000015 → consumer ✗ 1236 → replica ✗ 13114 / 1236',
+      summary: 'Both readers need a new snapshot; nothing on the source protected them.',
+      steps: [
+        {
+          title: 'Purge',
+          note: 'The consumer had saved its position binlog.000014:578 and the replica was stopped (STOP REPLICA). A 100-row UPDATE was written, then FLUSH BINARY LOGS and PURGE BINARY LOGS TO binlog.000015. SHOW BINARY LOGS listed only binlog.000015.',
+          code: "PURGE BINARY LOGS TO 'binlog.000015';",
+          active: ['src', 'files'],
+          edges: ['src-files'],
+          subs: { files: 'only 000015 left' },
+        },
+        {
+          title: 'The consumer resumes',
+          note: "pymysql.err.OperationalError: (1236, 'Could not find first log file name in binary log index file').",
+          active: ['cdc', 'files', 'err'],
+          edges: ['cdc-files', 'cdc-err'],
+          subs: { cdc: '✗ 1236' },
+        },
+        {
+          title: 'The replica resumes',
+          note: "Last_IO_Errno 13114: Got fatal error 1236 from source when reading data from binary log: 'Cannot replicate because the source purged required binary logs. Replicate the missing transactions from elsewhere, or provision a new replica from backup. Consider increasing the source's binary log expiration period. … the missing transactions are '5a53fca8-…:23''. With GTIDs the error names exactly what is missing.",
+          active: ['replica', 'files'],
+          edges: ['replica-files'],
+          subs: { replica: '✗ IO thread stopped' },
+        },
+      ],
+    },
+  ]}
+/>
+
+| | PostgreSQL logical slot | MySQL binlog reader |
+|---|---|---|
+| Source keeps the log for a slow reader | Yes, until confirmed (or `max_slot_wal_keep_size`) | No: by age or PURGE only |
+| Failure mode of a dead reader | Source disk fills | Reader falls off the end and must resnapshot |
+| Position | Slot's `confirmed_flush_lsn` (on the source) | File + offset or GTID set (kept by the reader) |
+| DDL in the stream | No | Yes, as a statement event |
+| Column names | Always (from the catalog via the slot) | Only with `binlog_row_metadata = FULL` |
+
+<Pitfall>
+Size binlog retention for your **slowest** reader, not for replicas that are normally seconds behind: a CDC connector that is paused over a holiday weekend, or one whose Kafka cluster is down, needs the binlog to still be there when it comes back. Alert on the consumer's lag in time against `binlog_expire_logs_seconds`, and never run `PURGE BINARY LOGS` without checking every reader's position (replicas: `SHOW REPLICAS` on the source; CDC tools: their offsets topic or state).
+</Pitfall>
+
+## Real-world scenario: syncing orders to a search index
+
+A seller center shows orders from Elasticsearch, fed by Debezium from the MySQL primary. The DBA switches `binlog_row_image` to MINIMAL to cut replication traffic. The next day, edited orders in the seller center show blank buyer names and prices: each update event now carries only the changed column, and the connector writes those partial rows into the index.
+
+| Setting for a CDC source | Why |
+|---|---|
+| `binlog_format = ROW` | Row changes, not SQL text |
+| `binlog_row_image = FULL` | Consumers get the complete row before and after |
+| `binlog_row_metadata = FULL` | Column names travel with the events; safer across DDL |
+| `gtid_mode = ON` | Consumers resume by GTID set, also after a failover to a replica |
+| `binlog_expire_logs_seconds` above the longest expected consumer outage | No error 1236 after a long pause |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 2 | The PostgreSQL design: the source keeps the log for the reader |
+| Concept 5 | What the consumer must do with duplicates after a restart |
+| [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) | The same binlog feeds the MySQL replica |
+| [Transactions Session 8, Concept 4](/blogs/databases/transactions/session-8-when-transactions-hurt/concept-4-distributed-transactions) | Outbox tables read through CDC |
+
+## Key takeaways
+
+1. A MySQL CDC tool is a binlog reader with its own `server_id`, like a replica.
+2. Use `binlog_format = ROW`, `binlog_row_image = FULL` and `binlog_row_metadata = FULL` for CDC; MINIMAL images were 5× smaller and incomplete.
+3. Every transaction has a GTID, and DDL appears in the stream as a statement.
+4. The source keeps binlogs by age, not by reader: after a purge both the consumer and the replica failed with error 1236.
+5. The reader owns its position; store it durably and alert on its lag in time.
+
+## Check questions
+
+1. Why does a CDC connector need a `server_id`, and what happens if two readers use the same one?
+2. With metadata MINIMAL, the consumer saw `UNKNOWN_COL0 … UNKNOWN_COL5`. What else must it know to use those events, and when does that go wrong?
+3. What did MINIMAL row image save, and what did it cost the consumer?
+4. Compare what happens to a dead consumer in PostgreSQL and in MySQL.
+5. The replica's error listed the missing GTID `…:23`. What does a GTID give you over file and offset?
+6. Write the checklist you would run before `PURGE BINARY LOGS` on a production source.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-7-logical-replication-cdc/concept-3-mysql-binlog-cdc/answers">Worked answers to Q1–Q6</DeepDive>

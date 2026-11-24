@@ -1,0 +1,234 @@
+---
+title: "Concept 4: MongoDB change streams"
+description: "A change stream is a cursor over the oplog that returns only majority-committed changes. Inserts arrived after 3 ms (median); with both secondaries paused, a w:1 insert was acknowledged but reached the stream only when they came back, 5.1 s later. Update events carry only the changed fields; fullDocument: updateLookup returned the document as it was when read, not at the event, and null after a delete. Pre- and post-images fixed that at the cost of an extra write per change. A resume token stopped working once the oplog had moved past it: ChangeStreamHistoryLost (286)."
+type: "concept"
+tags: ["replication", "cdc", "change-streams", "oplog", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/changeStreams/"
+  - "https://www.mongodb.com/docs/manual/reference/change-events/"
+  - "https://www.mongodb.com/docs/manual/changeStreams/#change-streams-with-document-pre--and-post-images"
+  - "https://www.mongodb.com/docs/manual/changeStreams/#resume-a-change-stream"
+  - "https://www.mongodb.com/docs/manual/core/replica-set-oplog/"
+---
+
+<Tldr>
+MongoDB exposes the oplog to applications as **change streams**: `db.orders.watch()` returns a cursor of events (`insert`, `update`, `replace`, `delete`, …), each with a **resume token** (`_id`). Measured on a 3-member replica set: an insert reached a watcher after **3 ms** (median, p95 10 ms). A change stream only returns **majority-committed** changes: with both secondaries paused, a `w: 1` insert was acknowledged and readable on the primary, but the stream showed it only after they were unpaused, **5.1 s** later. An update event carries only `updateDescription` (the changed fields). `fullDocument: 'updateLookup'` fetches the document **when the event is read**: both of two updates showed the second state, and after a delete it was `null`. **Pre- and post-images** gave the exact before and after of each update, at the cost of a document in `config.system.preimages` per change. Resuming with a saved token works while the oplog still holds that point; with a 10 MB oplog it stopped working after about 29 MB of writes: **ChangeStreamHistoryLost (286)**.
+</Tldr>
+
+| Term | Meaning |
+|---|---|
+| Change stream | Aggregation cursor over the oplog: `collection.watch()`, `db.watch()` or a whole deployment |
+| Resume token | Event `_id`; `resumeAfter` / `startAfter` continue after it |
+| `updateDescription` | Default content of an update event: `updatedFields`, `removedFields`, `truncatedArrays` |
+| `fullDocument: 'updateLookup'` | Read the current version of the document when the event is returned |
+| Pre/post images | With `changeStreamPreAndPostImages` on the collection, the document before and after each change, stored in `config.system.preimages` |
+| Majority commit point | Newest oplog entry known to be on a majority of voting members; change streams never go past it |
+| Oplog window | Time between the oldest and newest oplog entry: how long a consumer can be away |
+
+## What arrives, and when
+
+<Flow
+  title="MongoDB: change stream on a 3-member replica set"
+  height={330}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'insert w:1', x: 20, y: 20, w: 200 },
+    { id: 'primary', label: 'Primary rpd-mongo2', sub: 'oplog', x: 300, y: 20, w: 200 },
+    { id: 'watcher', label: 'Change stream', sub: 'db.pings.watch()', x: 580, y: 20, w: 200 },
+    { id: 'sec1', label: 'Secondary 1', sub: 'rpd-mongo1', x: 160, y: 250, w: 200 },
+    { id: 'sec2', label: 'Secondary 2', sub: 'rpd-mongo3', x: 440, y: 250, w: 200 },
+  ]}
+  edges={[
+    { id: 'app-primary', from: 'app', to: 'primary' },
+    { id: 'primary-watcher', from: 'primary', to: 'watcher' },
+    { id: 'primary-sec1', from: 'primary', to: 'sec1' },
+    { id: 'primary-sec2', from: 'primary', to: 'sec2' },
+  ]}
+  cases={[
+    {
+      title: 'Normal',
+      path: 'insert ✓ → oplog → secondaries replicate ✓ → majority committed → event ✓ after 3 ms (p50)',
+      summary: 'The event waits for the majority, which on a healthy set takes milliseconds.',
+      steps: [
+        {
+          title: 'Write',
+          note: '100 inserts { i, sent: new Date() }, 20 per second, with w: 1.',
+          active: ['app', 'primary'],
+          edges: ['app-primary'],
+        },
+        {
+          title: 'Replicate',
+          note: 'Both secondaries fetch the oplog entries; when one of them has it, two of three members do: the majority commit point advances.',
+          active: ['primary', 'sec1', 'sec2'],
+          edges: ['primary-sec1', 'primary-sec2'],
+        },
+        {
+          title: 'Deliver',
+          note: 'The watcher (another mongosh process) measured Date.now() − sent: p50 3 ms, p95 10 ms, max 16 ms.',
+          active: ['primary', 'watcher'],
+          edges: ['primary-watcher'],
+          subs: { watcher: '✓ p50 3 ms' },
+        },
+      ],
+    },
+    {
+      title: 'Both secondaries paused for 5 s',
+      path: 'insert w:1 ✓ acknowledged → local read ✓ → majority read ✗ → stream ✗ waits → unpause → event ✓ 5,087 ms after insert',
+      summary: 'A consumer never sees a write that could still be rolled back.',
+      steps: [
+        {
+          title: 'Acknowledged but not majority-committed',
+          note: 'docker pause on both secondaries, then insert { i: 1001 } with w: 1: acknowledged after 190 ms. On the primary a normal read found it (1), a readConcern majority read did not (0).',
+          active: ['app', 'primary', 'sec1', 'sec2'],
+          edges: ['app-primary'],
+          subs: { sec1: '✗ paused', sec2: '✗ paused' },
+        },
+        {
+          title: 'The stream waits',
+          note: 'Nothing on the change stream during the pause.',
+          active: ['primary', 'watcher'],
+          edges: ['primary-watcher'],
+          subs: { watcher: '✗ nothing yet' },
+        },
+        {
+          title: 'Unpause',
+          note: 'The secondaries caught up, the majority point advanced, and the event arrived: delay 5,087 ms. In a second run with a 10 s pause the primary stepped down after the 10 s election timeout, was re-elected 10 s after the unpause, and the event arrived 20,017 ms after the insert.',
+          active: ['primary', 'sec1', 'sec2', 'watcher'],
+          edges: ['primary-sec1', 'primary-sec2', 'primary-watcher'],
+          subs: { watcher: '✓ after 5,087 ms' },
+        },
+      ],
+    },
+  ]}
+/>
+
+This is the safe default: a `w: 1` write that is later rolled back in a failover (Session 5) never reaches a consumer. The price is that change-stream lag includes replication lag to a majority.
+
+## Update events and the full document
+
+Order 200001 was inserted, updated to `paid`, updated to `shipped`, deleted. A stream resumed from before the insert, read after the delete:
+
+| Event | Default | `fullDocument: 'updateLookup'` |
+|---|---|---|
+| insert | full document, status `placed` | same |
+| update | `updatedFields: { status: 'paid' }` | `fullDocument: null` |
+| update | `updatedFields: { status: 'shipped' }` | `fullDocument: null` |
+| delete | `documentKey` only | same |
+
+With order 10 updated to `paid` then `shipped` and read afterwards, **both** update events had `fullDocument.status = 'shipped'`: the lookup reads the document as it is now, not as it was at the event. With pre- and post-images enabled on the collection (`collMod … changeStreamPreAndPostImages: { enabled: true }`) and `fullDocument: 'required'`, `fullDocumentBeforeChange: 'required'`:
+
+| Event | `fullDocumentBeforeChange.status` | `fullDocument.status` |
+|---|---|---|
+| first update | delivered | **paid** |
+| second update | paid | shipped |
+
+| Pre/post images cost (measured) | Value |
+|---|---|
+| Documents in `config.system.preimages` after 10,000 updates | 10,003 (one per change), 2,255 KB |
+| 5,000 single updates, with vs without images, 3 alternating rounds | 12.6–16.6 s vs 8.2–13.0 s (slower in every round; noisy laptop numbers) |
+| Retention | Expire with `expireAfterSeconds` or when the oplog entry is gone (from the documentation) |
+
+## Resume tokens and the oplog window
+
+A consumer stores the token of the last event it processed and resumes after it. That only works while the oplog still contains that point.
+
+<Flow
+  title="Resume after a pause: inside and outside the oplog window"
+  height={300}
+  nodes={[
+    { id: 'consumer', label: 'Consumer', sub: 'saved token after i=2', x: 20, y: 20, w: 220 },
+    { id: 'oplog', label: 'Oplog rpd-tiny', sub: '10 MB capped', x: 300, y: 20, w: 200 },
+    { id: 'events', label: 'Events i=3,4,5', sub: 'after the token', x: 560, y: 20, w: 220 },
+    { id: 'filler', label: 'Other writes', sub: '29 x 1 MB batches', x: 300, y: 200, w: 200 },
+    { id: 'lost', label: 'HistoryLost 286', sub: 'resume impossible', x: 560, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'consumer-oplog', from: 'consumer', to: 'oplog' },
+    { id: 'oplog-events', from: 'oplog', to: 'events' },
+    { id: 'filler-oplog', from: 'filler', to: 'oplog' },
+    { id: 'consumer-lost', from: 'consumer', to: 'lost' },
+  ]}
+  cases={[
+    {
+      title: 'Resume soon',
+      path: 'resumeAfter(token) → oplog still holds it ✓ → events 3, 4, 5',
+      summary: 'No event lost, none repeated.',
+      steps: [
+        {
+          title: 'Resume',
+          note: 'After processing events 1 and 2 the consumer closed the stream and reopened it with resumeAfter: token. Next events: [3, 4, 5].',
+          code: "const cs = db.events.watch([], { resumeAfter: token });",
+          active: ['consumer', 'oplog', 'events'],
+          edges: ['consumer-oplog', 'oplog-events'],
+          subs: { events: '✓ 3, 4, 5' },
+        },
+      ],
+    },
+    {
+      title: 'Resume after the oplog rolled over',
+      path: '~29 MB of other writes → token position truncated ✗ → resumeAfter ✗ ChangeStreamHistoryLost',
+      summary: 'The consumer has to resynchronize from the collection itself.',
+      steps: [
+        {
+          title: 'The oplog moves on',
+          note: 'A single-member replica set started with --oplogSize 10. Inserting 1 MB batches, the oldest oplog entry passed the token after 29 batches (3.55 s). The oplog is truncated in the background: one check showed 33 MB in a 10 MB oplog before the truncation thread ran.',
+          active: ['filler', 'oplog'],
+          edges: ['filler-oplog'],
+          subs: { oplog: 'oldest entry > token' },
+        },
+        {
+          title: 'Resume fails',
+          note: 'ChangeStreamHistoryLost (286): Resume of change stream was not possible, as the resume point may no longer be in the oplog.',
+          active: ['consumer', 'lost'],
+          edges: ['consumer-lost'],
+          subs: { consumer: '✗ resnapshot' },
+        },
+      ],
+    },
+  ]}
+/>
+
+The oplog window is what matters, in time: `rs.printReplicationInfo()` on the lab's default set showed an oplog of 29,175 MB (5 % of free disk) but only 544 s of history, because the set was 9 minutes old. On a production set the window is "oplog size / write rate". Like MySQL and unlike a PostgreSQL slot, MongoDB does not keep oplog for a slow consumer (except a fixed `oplogMinRetentionHours`, from the documentation).
+
+<Pitfall>
+Do not build state from `updatedFields` plus `updateLookup` and assume each event shows the document at that moment. Under concurrent updates every event shows the latest version, and after a delete the lookup returns `null`. If consumers need exact before and after values (audit, sync to another store), enable pre- and post-images on those collections and pay the extra write.
+</Pitfall>
+
+## Real-world scenario: stock events for marketplace sync
+
+A warehouse service writes stock levels in MongoDB; a sync worker watches the `stock` collection and pushes changes to Shopee, Lazada and TikTok Shop APIs. During a marketplace API outage the worker is stopped for 14 hours; the oplog window at peak is 9 hours. On restart: ChangeStreamHistoryLost, and the worker has no idea which SKUs changed.
+
+| Control | Effect |
+|---|---|
+| Store the resume token after each successful push (not before) | Restart resumes exactly; a crash repeats at most the last event |
+| Monitor the oplog window in hours against the worker's lag | Know before the token expires |
+| Fallback full sync from the collection, with a `last_modified` field | A defined recovery when history is lost |
+| Pre/post images only on collections whose consumers need them | Keeps the write cost where it buys something |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 5, Concept 2](/blogs/databases/replication/session-5-failover/concept-2-lost-writes-and-rollback) | Why majority-committed delivery protects consumers from rolled-back writes |
+| Concept 2 | PostgreSQL keeps WAL for a slot; MongoDB does not keep oplog for a stream |
+| Concept 5 | Resume tokens give at-least-once delivery when stored after processing |
+| [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) | The replica set and oplog these streams read |
+
+## Key takeaways
+
+1. A change stream is a cursor over the oplog; each event has a resume token.
+2. Events are delivered only once majority-committed: 3 ms normally, 5.1 s when the secondaries were paused for 5 s.
+3. Update events carry only the changed fields; `updateLookup` returns the current document, not the one at the event.
+4. Pre- and post-images give exact before and after values for an extra write per change.
+5. Resuming works only inside the oplog window; outside it the error is ChangeStreamHistoryLost (286).
+
+## Check questions
+
+1. Why did the change stream not show the `w: 1` insert that the primary had already acknowledged?
+2. Two updates set status to `paid` then `shipped`. What did `updateLookup` show for the first event, and why?
+3. When would you enable pre- and post-images, and what do they cost?
+4. A consumer saves the resume token before processing each event. What can go wrong?
+5. How do you estimate how long a consumer can be stopped before its token is lost?
+6. Compare what keeps the change history available for a slow consumer in PostgreSQL, MySQL and MongoDB.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-7-logical-replication-cdc/concept-4-mongodb-change-streams/answers">Worked answers to Q1–Q6</DeepDive>

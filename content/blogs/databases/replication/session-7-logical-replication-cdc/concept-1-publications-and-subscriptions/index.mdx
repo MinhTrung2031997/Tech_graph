@@ -1,0 +1,282 @@
+---
+title: "Concept 1: Publications and subscriptions"
+description: "PostgreSQL logical replication copies rows, not disk blocks. A subscription copied 100,000 orders in 0.41 s and then applied single-row inserts with a median delay of 2.24 ms. It does not copy DDL or sequence values: one ALTER TABLE on the publisher stopped every later change until the subscriber had the column, and the subscriber's identity sequence stayed at 1. A row written on the subscriber stopped apply with a duplicate-key error until the transaction was skipped, leaving the two copies different."
+type: "concept"
+tags: ["replication", "logical-replication", "cdc", "postgresql"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/logical-replication.html"
+  - "https://www.postgresql.org/docs/17/logical-replication-restrictions.html"
+  - "https://www.postgresql.org/docs/17/logical-replication-row-filter.html"
+  - "https://www.postgresql.org/docs/17/logical-replication-conflicts.html"
+  - "https://www.postgresql.org/docs/17/sql-altertable.html#SQL-ALTERTABLE-REPLICA-IDENTITY"
+---
+
+<Tldr>
+Physical streaming (Session 1) ships WAL blocks to an exact, read-only copy of the whole server. **Logical replication** decodes the WAL into row changes (`INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`) for the tables in a **publication**, and a **subscription** on another, writable server applies them. In the lab the first copy of 100,000 orders took **0.41 s**, and single-row inserts arrived after **2.24 ms** (median; p95 5.0 ms). What it does **not** carry is the main source of incidents: **DDL** (one `ADD COLUMN` on the publisher stopped all apply until the subscriber had the column), **sequence values** (the subscriber's sequence stayed at 1, so its first insert failed with a duplicate key), and **conflicts** (a row written on the subscriber stopped apply until the transaction was skipped). Updates and deletes need a **replica identity**; a row filter on a column outside it blocks every `UPDATE` on the publisher.
+</Tldr>
+
+## Physical vs logical
+
+| | Physical streaming (Session 1) | Logical replication |
+|---|---|---|
+| What is sent | WAL records: changed 8 KB pages | Row changes decoded from WAL |
+| Target | Byte-identical standby, read-only | Any PostgreSQL server, writable, may have other tables and indexes |
+| Scope | Whole server | Chosen tables, rows (row filter), columns (column list) |
+| Versions | Same major version | Across major versions (used for upgrades) |
+| DDL, sequences | Replicated (they are in the WAL) | **Not** replicated |
+| Needs | `wal_level = replica` | `wal_level = logical` on the publisher |
+
+| Term | Meaning |
+|---|---|
+| Publication | Named set of tables (and optional row filter / column list) whose changes are published: `CREATE PUBLICATION … FOR TABLE …` |
+| Subscription | On the target: connection string + publications. Creates a **logical replication slot** on the publisher |
+| Walsender | Publisher process that decodes WAL for one slot and streams it (plugin `pgoutput`) |
+| Apply worker | Subscriber process that applies the stream, one transaction at a time, in commit order |
+| Tablesync worker | Subscriber process that does the initial `COPY` of one table, then catches up |
+| Replica identity | Which old-row columns are written to WAL for UPDATE/DELETE so the subscriber can find the row: primary key (default), a unique index, or FULL |
+| **✓ / ✗** | Change applied / stuck or rejected |
+
+## Initial copy and streaming
+
+The lab publisher `rpd-pub` and subscriber `rpd-sub` are two standalone PostgreSQL 17 servers (`wal_level = logical` on the publisher). The subscriber has the same `CREATE TABLE orders …` but no rows. DDL has to be run on both sides by hand from the first minute.
+
+<Flow
+  title="PostgreSQL logical replication: copy, stream, stop"
+  height={330}
+  nodes={[
+    { id: 'pub', label: 'Publisher orders', sub: 'rpd-pub, 100,000 rows', x: 20, y: 20, w: 220 },
+    { id: 'slot', label: 'Slot orders_sub', sub: 'walsender, pgoutput', x: 300, y: 20, w: 200 },
+    { id: 'apply', label: 'Apply worker', sub: 'rpd-sub', x: 560, y: 20, w: 220 },
+    { id: 'sync', label: 'Tablesync worker', sub: 'COPY orders', x: 20, y: 250, w: 220 },
+    { id: 'sub', label: 'Subscriber orders', sub: 'rpd-sub, empty', x: 560, y: 250, w: 220 },
+  ]}
+  edges={[
+    { id: 'pub-slot', from: 'pub', to: 'slot' },
+    { id: 'slot-apply', from: 'slot', to: 'apply' },
+    { id: 'apply-sub', from: 'apply', to: 'sub' },
+    { id: 'pub-sync', from: 'pub', to: 'sync' },
+    { id: 'sync-sub', from: 'sync', to: 'sub' },
+  ]}
+  cases={[
+    {
+      title: 'CREATE SUBSCRIPTION',
+      path: 'slot created on publisher ✓ → tablesync COPY 100,000 rows ✓ 0.41 s → apply worker streams new changes ✓ (median 2.24 ms)',
+      summary: 'A consistent copy plus every change committed after it, with no gap and no duplicate.',
+      steps: [
+        {
+          title: 't0: create the subscription',
+          note: 'The subscriber connects and creates the slot: NOTICE: created replication slot "orders_sub" on publisher. The slot remembers how far this subscriber has confirmed (confirmed_flush_lsn).',
+          code: "-- publisher\nCREATE PUBLICATION orders_pub FOR TABLE orders;\n-- subscriber\nCREATE SUBSCRIPTION orders_sub\n  CONNECTION 'host=rpd-pub user=postgres dbname=postgres'\n  PUBLICATION orders_pub;",
+          active: ['pub', 'slot', 'apply'],
+          edges: ['pub-slot', 'slot-apply'],
+          subs: { slot: '✓ created' },
+        },
+        {
+          title: 't1: initial copy',
+          note: 'One tablesync worker per table runs COPY from a snapshot taken when its own temporary slot was created, then applies changes made during the copy. pg_subscription_rel.srsubstate went from i (init) to r (ready) 0.41 s after CREATE SUBSCRIPTION; count and sum(amount) matched (100000, 25099500.00).',
+          active: ['pub', 'sync', 'sub'],
+          edges: ['pub-sync', 'sync-sub'],
+          subs: { sub: '✓ 100,000 rows', sync: '✓ ready in 0.41 s' },
+        },
+        {
+          title: 't2: streaming',
+          note: 'Each committed transaction is decoded and sent once it commits. A replica-only trigger on the subscriber stamped arrival time: 100 single-row inserts, 20 per second, arrived after p50 2.24 ms, p95 5.00 ms, max 17.1 ms. Pings sent while a newly added table was still in its initial copy took 106 to 175 ms.',
+          code: "-- subscriber: stamp arrival (fires only for replicated rows)\nALTER TABLE pings ENABLE REPLICA TRIGGER pings_stamp;",
+          active: ['pub', 'slot', 'apply', 'sub'],
+          edges: ['pub-slot', 'slot-apply', 'apply-sub'],
+          subs: { apply: '✓ p50 2.24 ms' },
+        },
+      ],
+    },
+    {
+      title: 'ALTER TABLE on the publisher only',
+      path: 'publisher ADD COLUMN note ✓ → insert with note → apply ✗ missing column, retried every 5 s → slot holds WAL (25 MB) → subscriber ADD COLUMN → caught up in 2.30 s',
+      summary: 'DDL is not replicated; the first change that needs it stops the whole stream.',
+      steps: [
+        {
+          title: 'The publisher gets a new column',
+          note: 'ALTER TABLE succeeds on the publisher and nothing is sent: DDL is not decoded. The next INSERT carries a value for note.',
+          code: "ALTER TABLE orders ADD COLUMN note text;\nINSERT INTO orders VALUES (100001, 42, 'shopee', 'delivered', 10.00, now(), 'gift wrap');",
+          active: ['pub', 'slot'],
+          edges: ['pub-slot'],
+          subs: { pub: 'has column note' },
+        },
+        {
+          title: 'Apply stops',
+          note: 'Subscriber log: ERROR: logical replication target relation "public.orders" is missing replicated column: "note", CONTEXT … in transaction 907, finished at 0/25DEE70. The worker exits and restarts every 5 s (wal_retrieve_retry_interval); apply_error_count rose to 3. A ping committed after the INSERT did not arrive either: apply is strictly in commit order.',
+          active: ['slot', 'apply', 'sub'],
+          edges: ['slot-apply'],
+          subs: { apply: '✗ missing column, retrying', sub: '✗ frozen' },
+        },
+        {
+          title: 'WAL piles up, then the fix',
+          note: 'A 100,001-row UPDATE on the publisher: the slot now retained 25 MB of WAL and pg_wal was 48 MB. After ALTER TABLE orders ADD COLUMN note text on the subscriber, it caught up in 2.30 s and count, sum(amount) and count(note) matched.',
+          code: "-- subscriber\nALTER TABLE orders ADD COLUMN note text;",
+          active: ['pub', 'slot', 'apply', 'sub'],
+          edges: ['pub-slot', 'slot-apply', 'apply-sub'],
+          subs: { slot: 'retained 25 MB', apply: '✓ caught up 2.30 s' },
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+Order DDL for a logical replica the way you order it for an old and a new application version: **add on the subscriber first, then on the publisher** (new columns, new tables); **drop on the publisher first** (and stop writing the column), then on the subscriber. A table added to the publication but missing on the subscriber fails the same way: `ERROR: logical replication target relation "public.audit_log" does not exist`, every 5 s.
+</Pitfall>
+
+## What is not replicated
+
+| Object | What happened in the lab | Consequence |
+|---|---|---|
+| DDL | `ADD COLUMN` on the publisher only: apply stopped with "missing replicated column" | Run schema changes on both sides, in the right order |
+| Sequence values | 1,000 rows copied into `refunds`; publisher `last_value` 1000, subscriber `last_value` 1, `is_called` f. First insert on the subscriber: `ERROR: duplicate key value violates unique constraint "refunds_pkey"`, `Key (id)=(1) already exists.` | Before switching writes to the subscriber (upgrade, migration), set every sequence with `setval` |
+| Rows that existed before a table joined the publication, without `REFRESH PUBLICATION` | `audit_log` had row a before it was added; only later changes flowed. An UPDATE of both rows changed 2 rows on the publisher and 1 on the subscriber, with no error | Always `ALTER SUBSCRIPTION … REFRESH PUBLICATION` after adding a table: it runs the initial copy |
+| Large objects, materialized views | Not tested; from the documentation: not replicated | Keep them out of logical designs |
+
+## Replica identity: updates and deletes need a key
+
+To apply an UPDATE or DELETE, the subscriber must find the old row, so the publisher writes the **replica identity** columns of the old row into the WAL.
+
+| Table | Publisher statement | Result |
+|---|---|---|
+| `audit_log`, no primary key, default identity | `UPDATE audit_log SET msg = 'c'` | `ERROR: cannot update table "audit_log" because it does not have a replica identity and publishes updates`, HINT: set REPLICA IDENTITY using ALTER TABLE |
+| same | `DELETE FROM audit_log` | `ERROR: cannot delete from table "audit_log" because it does not have a replica identity and publishes deletes` |
+| same, `REPLICA IDENTITY FULL` | `UPDATE …` | ✓ UPDATE 2 (the whole old row is logged; the subscriber searches by all columns) |
+| `orders`, default identity (primary key) | UPDATE of 10,000 rows | 2,447–2,553 kB of WAL, **251–261 bytes per row** (3 runs) |
+| `orders`, `REPLICA IDENTITY FULL` | same UPDATE | 2,963–2,993 kB, **303–306 bytes per row**: +18 % |
+
+These errors are raised on the **publisher**, to the application, the moment the table is in any publication that publishes updates or deletes. Adding a key-less table to a publication can break a production write path.
+
+## Row filters and column lists
+
+A publication can send only some rows (`WHERE`) and some columns (column list). Two rules, both measured:
+
+1. A column used in the row filter must be part of the replica identity, or **every UPDATE and DELETE on the table fails on the publisher**. Creating `shopee_pub FOR TABLE orders … WHERE (marketplace = 'shopee')` with the default identity (primary key `id`) made `UPDATE orders SET status = status WHERE id = 1` fail with `ERROR: cannot update table "orders"`, `DETAIL: Column used in the publication WHERE expression is not part of the replica identity.` No subscriber existed yet.
+2. With `REPLICA IDENTITY FULL`, a column list that leaves out a column fails the same way: `DETAIL: Column list used by the publication does not cover the replica identity.`
+
+The fix used in the lab: a unique index that includes the filter column, used as the identity.
+
+```sql
+CREATE UNIQUE INDEX orders_id_mkt ON orders (id, marketplace);
+ALTER TABLE orders REPLICA IDENTITY USING INDEX orders_id_mkt;
+CREATE PUBLICATION shopee_pub FOR TABLE orders (id, seller_id, marketplace, status, amount, created_at)
+  WHERE (marketplace = 'shopee');
+```
+
+<Flow
+  title="Row filter: a row moves in and out of the filter"
+  height={300}
+  nodes={[
+    { id: 'pub', label: 'Publisher orders', sub: 'all marketplaces', x: 20, y: 20, w: 220 },
+    { id: 'filter', label: 'Row filter', sub: "marketplace = 'shopee'", x: 300, y: 20, w: 200 },
+    { id: 'sub', label: 'Subscriber shop', sub: 'shopee rows only', x: 560, y: 20, w: 220 },
+    { id: 'del', label: 'Applied as DELETE', sub: 'row left the filter', x: 300, y: 200, w: 200 },
+    { id: 'ins', label: 'Applied as INSERT', sub: 'row entered the filter', x: 560, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'pub-filter', from: 'pub', to: 'filter' },
+    { id: 'filter-sub', from: 'filter', to: 'sub' },
+    { id: 'filter-del', from: 'filter', to: 'del' },
+    { id: 'filter-ins', from: 'filter', to: 'ins' },
+  ]}
+  cases={[
+    {
+      title: 'Initial copy',
+      path: '100,000 rows → filter → 50,135 shopee rows ✓',
+      summary: 'The copy applies the same WHERE clause.',
+      steps: [
+        {
+          title: 'COPY with the filter',
+          note: 'The subscriber database shop received 50,135 rows, exactly the number of shopee orders on the publisher.',
+          active: ['pub', 'filter', 'sub'],
+          edges: ['pub-filter', 'filter-sub'],
+          subs: { sub: '✓ 50,135 rows' },
+        },
+      ],
+    },
+    {
+      title: 'UPDATE changes marketplace',
+      path: "id 2: shopee → lazada ⇒ DELETE on subscriber ✓ · id 3: lazada → shopee ⇒ INSERT on subscriber ✓",
+      summary: 'Old row in, new row out is a delete; the reverse is an insert.',
+      steps: [
+        {
+          title: 'Leaving the filter',
+          note: "UPDATE orders SET marketplace = 'lazada' WHERE id = 2: the old row matched, the new one does not, so pgoutput sends a DELETE. Order 2 disappeared from the subscriber.",
+          active: ['pub', 'filter', 'del'],
+          edges: ['pub-filter', 'filter-del'],
+          subs: { del: '✓ id 2 removed' },
+        },
+        {
+          title: 'Entering the filter',
+          note: "UPDATE orders SET marketplace = 'shopee' WHERE id = 3: sent as an INSERT of the full new row. The subscriber still had 50,135 rows.",
+          active: ['pub', 'filter', 'ins', 'sub'],
+          edges: ['pub-filter', 'filter-ins'],
+          subs: { ins: '✓ id 3 added' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Conflicts: the subscriber is writable
+
+Nothing stops an application from writing to the subscriber. In the lab, order 200000 was inserted on the subscriber, then a different order 200000 on the publisher:
+
+```text
+ERROR:  duplicate key value violates unique constraint "orders_pkey"
+DETAIL:  Key (id)=(200000) already exists.
+CONTEXT:  processing remote data for replication origin "pg_16395" during message type "INSERT"
+          for replication target relation "public.orders" in transaction 942, finished at 0/535FAA8
+```
+
+Apply stopped there and retried every 5 s; a later ping did not arrive. PostgreSQL 17 does not resolve such conflicts. The two ways out are to fix the data on the subscriber (delete the local row) or to skip the remote transaction:
+
+```sql
+ALTER SUBSCRIPTION orders_sub SKIP (lsn = '0/535FAA8');
+-- log: logical replication starts skipping transaction at LSN 0/535FAA8
+-- log: logical replication completed skipping transaction at LSN 0/535FAA8
+```
+
+The ping arrived, and the copies now **disagree**: seller 1 / tiktok on the subscriber, seller 7 / shopee on the publisher. Skipping drops the **whole** remote transaction, including any other rows it changed. An UPDATE or DELETE whose row is missing on the subscriber produces no error at all in PostgreSQL 17: it is silently skipped (the `audit_log` case above).
+
+## Real-world scenario: a reporting copy of orders
+
+A marketplace team replicates `orders` and `order_items` to a reporting server with logical replication, so analysts can add their own indexes and tables. Three months later a developer adds `orders.voucher_code` in a migration that runs only on the primary. Reporting stops updating at the first order with a voucher; the slot on the primary holds WAL until the disk alert fires (Concept 2).
+
+| Control | Effect |
+|---|---|
+| Migrations run against the subscriber first, then the publisher | New columns exist before the first row needs them |
+| Alert on `pg_stat_subscription_stats.apply_error_count` increasing and on slot retained WAL | Minutes, not days, to notice |
+| Reporting users get read-only roles on the subscriber | No local writes, no duplicate-key stops |
+| Every replicated table has a primary key; key-less tables use `REPLICA IDENTITY FULL` knowingly (+18 % WAL per update here) | UPDATE/DELETE do not fail on the publisher |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) | Physical streaming, the containers and scripts this course uses |
+| Concept 2 | The slot behind every subscription, and what happens when it is not consumed |
+| Concept 5 | Why a subscription applies each transaction exactly once, but your own consumers usually do not |
+| [Transactions Session 8, Concept 4](/blogs/databases/transactions/session-8-when-transactions-hurt/concept-4-distributed-transactions) | The outbox pattern, built on change data capture |
+
+## Key takeaways
+
+1. Logical replication sends row changes for chosen tables to a writable server; the initial copy of 100,000 rows took 0.41 s and changes arrived in about 2 ms.
+2. DDL is not replicated. A column added only on the publisher stops all apply; add on the subscriber first.
+3. Sequence values are not replicated; set them before moving writes to the subscriber.
+4. UPDATE and DELETE need a replica identity; without one they fail **on the publisher**. FULL works and costs WAL (+18 % per updated row here).
+5. A row-filter column must be in the replica identity, or every UPDATE on the table fails.
+6. Local writes on the subscriber cause conflicts that stop apply; skipping a transaction leaves the copies different.
+
+## Check questions
+
+1. What does a subscription copy first, and how does it avoid missing changes made during the copy?
+2. An `ALTER TABLE … ADD COLUMN` ran only on the publisher. What happens to the change that uses the column, and to changes after it?
+3. Why did the subscriber's first insert into `refunds` fail after 1,000 rows had been replicated?
+4. Which statement fails, on which server, when a key-less table is added to a publication?
+5. Why does a row filter on `marketplace` break `UPDATE … SET status = …` on the publisher, and how did the lab fix it?
+6. A duplicate-key error stopped apply. Compare deleting the subscriber's row with `ALTER SUBSCRIPTION … SKIP`.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-7-logical-replication-cdc/concept-1-publications-and-subscriptions/answers">Worked answers to Q1–Q6</DeepDive>

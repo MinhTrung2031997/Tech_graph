@@ -1,0 +1,66 @@
+---
+title: "Answers: Delivery guarantees and the outbox"
+description: "Worked answers to the Session 7 Concept 5 check questions."
+companion: "answers"
+tags: ["replication", "cdc", "outbox", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/replication-origins.html"
+  - "https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-REPLICATION"
+  - "https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html"
+---
+
+<Tldr>
+Act, then confirm, to a transaction boundary; key every event by an id the source assigned; make every consumer idempotent.
+</Tldr>
+
+## Q1. Two orderings
+
+**Question:** write the two orderings of "act" and "confirm" and the failure each one allows.
+
+- **Confirm, then act** (at-most-once): a crash after confirming and before acting loses the change for good. `pg_logical_slot_get_changes` is this ordering: reading is confirming.
+- **Act, then confirm** (at-least-once): a crash after acting and before confirming repeats the change on restart. The relay that peeked, published three events and crashed is this ordering.
+
+There is no third ordering that avoids both, unless acting and confirming are one atomic step.
+
+> **Common mistake:** believing a CDC tool advertised as "exactly-once" removes the need for idempotent consumers. Its guarantee usually stops at the broker.
+
+## Q2. The restarted relay
+
+**Question:** why did the restarted relay see all five events, and how many were duplicates?
+
+It read with `pg_logical_slot_peek_changes`, which never moves the slot, and crashed before calling `pg_replication_slot_advance`. The slot's `confirmed_flush_lsn` was still before the first of the five transactions, so the restart decoded all five again. Three (orders 1, 2, 3) had already been published: three duplicates.
+
+> **Common mistake:** concluding from this test that peek is wrong. Peek plus a correct advance is the at-least-once design; the duplicates are the price.
+
+## Q3. Advancing to a COMMIT LSN
+
+**Question:** why advance to a COMMIT LSN rather than to the LSN of the last outbox INSERT?
+
+Decoding works in whole transactions: on restart, the decoder skips transactions whose COMMIT is before the confirmed position and sends every other transaction complete, from its BEGIN. If the relay confirms the LSN of order 3's outbox INSERT, the COMMIT of that transaction is still after the confirmed point, so the whole transaction, including event 3, is sent again: a duplicate you did not need. Advancing to the COMMIT LSN of the last fully published transaction (0/191A2F00 in the lab) marks that transaction done and leaves the next one complete. (Transaction-level skipping is from the documentation; the lab measured the advance to the COMMIT LSN.)
+
+> **Common mistake:** assuming a confirmed position inside a transaction means "the changes before it are done". The unit of delivery is the transaction.
+
+## Q4. Subscriptions and exactly-once apply
+
+**Question:** how does a PostgreSQL subscription avoid applying a transaction twice after a crash?
+
+The apply worker records its progress in a **replication origin** and updates it inside the same local transaction that writes the replicated rows. After a crash, either both the rows and the new origin position are committed or neither is. On restart the subscriber asks the publisher to stream from the origin's position, so an applied transaction is not applied again and an unapplied one is applied once (from the documentation; the lab did not crash a subscriber mid-transaction).
+
+> **Common mistake:** writing your own consumer into a database but storing its position in a file or Redis. Store it in a table, in the same transaction.
+
+## Q5. A deduplication key
+
+**Question:** choose a deduplication key for an outbox relay publishing to Kafka, and say why `received_at` is not one.
+
+The outbox row's `id` (assigned once, inside the business transaction), or a UUID event id stored in the outbox payload. Use it as the Kafka message key's event id and keep `processed_events (event_id PRIMARY KEY)` in each consumer. `received_at` differs between the first delivery and the duplicate, so two deliveries of one event look like two events; and two different events can share a timestamp.
+
+> **Common mistake:** deduplicating by `(aggregate_id, type)`: an order that is legitimately shipped, returned and shipped again loses its second event.
+
+## Q6. Outbox table or logical message
+
+**Question:** when is an outbox better than `pg_logical_emit_message`, and when is the message enough?
+
+An outbox table is better when you need to inspect or replay events (they are rows you can query), when events must survive the loss of a slot (rebuild the stream from the table), when a non-CDC fallback poller may read them, or when the tooling expects it (Debezium's outbox event router). The logical message is enough when the only consumer is a logical decoding client, events are disposable after delivery, and you want no table to clean up: it is transactional, ordered with the data changes, and costs no heap rows or VACUUM.
+
+> **Common mistake:** sending events with non-transactional messages (`transactional = false`). They are emitted even if the transaction rolls back.
