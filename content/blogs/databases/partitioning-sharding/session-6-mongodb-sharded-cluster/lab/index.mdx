@@ -1,0 +1,220 @@
+---
+title: "Lab and session quiz: A live MongoDB sharded cluster"
+description: "Shard a loaded collection and watch the balancer do nothing until the collection's chunk size is lowered, compare targeted and broadcast queries with explain and the per-shard profiler, move a range by hand under a read and update workload and find the orphans it leaves, move unsharded data with moveCollection and movePrimary, and change a shard key with refineCollectionShardKey and reshardCollection."
+type: "how-to"
+tags: ["sharding", "mongodb", "balancer", "resharding", "lab"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/sharding/"
+  - "https://www.mongodb.com/docs/manual/core/sharding-balancer-administration/"
+  - "https://www.mongodb.com/docs/manual/reference/command/moveRange/"
+  - "https://www.mongodb.com/docs/manual/core/sharding-reshard-a-collection/"
+---
+
+<Tldr>
+Uses the sharded cluster and the `parts` database from the [Session 5 lab](/blogs/databases/partitioning-sharding/session-5-choosing-a-shard-key/lab): config server replica set `pt-cfg`, shards `pt-shard1` (sh1) and `pt-shard2` (sh2), router `pt-mongos`, MongoDB 8.0, and the 1,000,000-order collection `orders`. Exercises 3–5 need **two terminals**; Exercises 4 and 5 each run for about six minutes. The numbers quoted were measured on the course machine while other databases on the same cluster were busy; compare ratios, not absolute times. Never stop the cluster-wide balancer or change the global chunk size: every setting below is per collection.
+</Tldr>
+
+## Setup
+
+```bash
+alias mgs='docker exec -it pt-mongos mongosh --quiet parts'     # through the router
+alias sh1='docker exec -it pt-shard1 mongosh --quiet parts'     # straight to shard sh1 (read-only use)
+alias sh2='docker exec -it pt-shard2 mongosh --quiet parts'     # straight to shard sh2 (read-only use)
+```
+
+```js
+// mgs
+db.getSiblingDB('config').databases.findOne({ _id: 'parts' }).primary   // the primary shard; in the course run pt6 had 'sh1'
+db.orders.countDocuments()                                              // 1000000
+```
+
+Below, "the primary" means the shard this returned and "the other shard" the second one. Swap `sh1`/`sh2` in the commands if your primary is `sh2`.
+
+## Exercise 1: shard a loaded collection, then make the balancer work (Concept 2)
+
+```js
+// mgs
+db.orders.aggregate([{ $out: 'orders_s' }]);              // 2.6 s in the course run
+db.orders_s.createIndex({ seller_id: 1 });
+db.orders_s.createIndex({ created_at: 1 });              // $out does not copy indexes
+sh.shardCollection('parts.orders_s', { seller_id: 1 });  // 88 ms
+db.orders_s.getShardDistribution();                      // one chunk, 100% on the primary
+db.adminCommand({ balancerCollectionStatus: 'parts.orders_s' });   // chunkSize 128, balancerCompliant: true
+```
+
+Wait a minute and check again: nothing moves. Now lower the chunk size for this collection only and watch:
+
+```js
+// mgs
+db.adminCommand({ configureCollectionBalancing: 'parts.orders_s', chunkSize: 4 });
+const cfg = db.getSiblingDB('config'), uuid = cfg.collections.findOne({ _id: 'parts.orders_s' }).uuid;
+for (let i = 0; i < 40; i++) {
+  print(new Date().toISOString(), JSON.stringify(cfg.chunks.aggregate([{ $match: { uuid } }, { $group: { _id: '$shard', n: { $sum: 1 } } }]).toArray()),
+        db.adminCommand({ balancerCollectionStatus: 'parts.orders_s' }).balancerCompliant);
+  sleep(2000);
+}
+db.orders_s.getShardDistribution();
+```
+
+Course run: first migration about 10 s after the change, 13 migrations in 16 s, compliant with 1 chunk (61.6 MiB) on sh1 and 13 (52.3 MiB) on sh2. Then compare the counts right away:
+
+```js
+// mgs
+db.orders_s.countDocuments({});          // 1,000,000
+db.orders_s.estimatedDocumentCount();     // 1,460,637 in the course run: orphans included
+db.orders_s.aggregate([{ $collStats: { storageStats: {} } }, { $project: { shard: 1, count: '$storageStats.count', orphans: '$storageStats.numOrphanDocs' } }]);
+```
+
+## Exercise 2: targeted vs broadcast (Concept 1)
+
+```js
+// mgs: print the top stage and per-shard work
+function show(label, e) {
+  const s = e.executionStats.executionStages;
+  print(label, s.stage, JSON.stringify((s.shards || []).map(x => [x.shardName, x.nReturned, x.totalKeysExamined])));
+}
+show('seller', db.orders_s.find({ seller_id: 4321 }).explain('executionStats'));                 // SINGLE_SHARD
+show('_id', db.orders_s.find({ _id: 777777 }).explain('executionStats'));                        // SHARD_MERGE
+show('latest', db.orders_s.find().sort({ created_at: -1 }).limit(10).explain('executionStats'));  // SHARD_MERGE_SORT
+printjson(db.orders_s.explain().aggregate([{ $group: { _id: '$marketplace', gmv: { $sum: '$amount' } } }]).splitPipeline);
+```
+
+Count what each shard actually runs, with the profiler of the `parts` database on each shard (per database, not server-wide):
+
+```js
+// sh1 and sh2: start profiling
+db.setProfilingLevel(0); db.system.profile.drop(); db.setProfilingLevel(2);
+// mgs: 500 lookups by _id, then 500 lookups with the shard key
+const d = db.orders.find({ _id: { $in: Array.from({ length: 500 }, (_, i) => 1 + (i * 7919) % 1000000) } }, { seller_id: 1 }).toArray();
+d.forEach(x => db.orders_s.findOne({ _id: x._id }));
+// sh1 and sh2: count, then reset the profiler and repeat with: d.forEach(x => db.orders_s.findOne({ seller_id: x.seller_id, _id: x._id }))
+db.system.profile.countDocuments({ ns: 'parts.orders_s', op: 'query' });
+// finally, on both: db.setProfilingLevel(0); db.system.profile.drop();
+```
+
+Course run: 500 + 500 for `_id` only, 272 + 228 with `seller_id`.
+
+## Exercise 3: move a range under load and find the orphans (Concept 3)
+
+Turn off balancing for this collection and raise its chunk size so a large range can move:
+
+```js
+// mgs
+sh.disableBalancing('parts.orders_s');
+db.adminCommand({ configureCollectionBalancing: 'parts.orders_s', chunkSize: 64 });
+```
+
+Terminal 2: a workload on the range that will move (sellers 2303–3399 sat on sh1 in the course run; pick a range your primary owns from `config.chunks`). It stops when a `stop` document appears.
+
+```js
+// mgs (terminal 2)
+db.ctl.drop();
+const sample = db.orders_s.aggregate([{ $match: { seller_id: { $gte: 2303, $lt: 3400 } } }, { $sample: { size: 2000 } }, { $project: { seller_id: 1 } }]).toArray();
+const lat = []; let i = 0;
+while (!db.ctl.findOne({ _id: 'stop' })) {
+  const d = sample[i++ % sample.length], s = Date.now();
+  db.orders_s.updateOne({ seller_id: d.seller_id, _id: d._id }, { $inc: { touched: 1 } });
+  lat.push([s, Date.now() - s]);
+}
+lat.sort((a, b) => b[1] - a[1]).slice(0, 5).forEach(x => print(new Date(x[0]).toISOString(), x[1] + ' ms'));
+```
+
+Terminal 1: move the range, then stop the workload.
+
+```js
+// mgs (terminal 1)
+const t = Date.now();
+printjson(db.adminCommand({ moveRange: 'parts.orders_s', min: { seller_id: 2303 }, max: { seller_id: 3400 }, toShard: 'sh2' }));
+print(Date.now() - t, 'ms');                // 1,555 ms for 219,705 documents in the course run
+sleep(5000); db.ctl.insertOne({ _id: 'stop' });
+```
+
+If `moveRange` answers "this shard is currently receiving chunk … for namespace …", another collection is migrating on that shard: retry a few seconds later. Then look at the orphans:
+
+```js
+// sh1 (direct): pending deletions and the orphan copy
+db.getSiblingDB('config').rangeDeletions.find({ nss: 'parts.orders_s' }, { range: 1, whenToClean: 1, numOrphanDocs: 1 });
+db.orders_s.countDocuments({ seller_id: 100 });     // orphans are visible on a direct connection
+// mgs
+db.orders_s.countDocuments({ seller_id: 100 });     // the same number once, not twice
+```
+
+Check `rangeDeletions` again 15 minutes after the move: it is empty and `numOrphanDocs` is 0.
+
+## Exercise 4: moving unsharded data (Concept 4)
+
+```js
+// mgs
+db.orders.aggregate([{ $out: 'orders_u' }]);
+db.getSiblingDB('config').collections.countDocuments({ _id: 'parts.orders_u' });   // 0: untracked
+const t = Date.now();
+printjson(db.adminCommand({ moveCollection: 'parts.orders_u', toShard: 'sh2' }));  // about 333 s in the course run
+print(Date.now() - t, 'ms');
+db.getSiblingDB('config').collections.findOne({ _id: 'parts.orders_u' }, { key: 1, unsplittable: 1 });
+db.getSiblingDB('config').changelog.find({ ns: 'parts.orders_u', what: /resharding.coordinator/ }, { time: 1, 'details.newState': 1 }).sort({ time: 1 });
+```
+
+Then `movePrimary` with a write loop in terminal 2 that catches errors (use another database for the stop flag, because `movePrimary` moves `ctl` too):
+
+```js
+// mgs (terminal 2)
+const ctl = db.getSiblingDB('parts_ctl').ctl; ctl.drop(); let ok = 0, err = 0, last = '';
+while (!ctl.findOne({ _id: 'stop' })) {
+  try { db.orders.updateOne({ _id: 1 + (ok + err) % 1000000 }, { $inc: { touched: 1 } }); ok++; }
+  catch (e) { err++; last = e.code + ' ' + e.message; }
+}
+print('ok', ok, 'failed', err, last);
+```
+
+```js
+// mgs (terminal 1): move the primary to the other shard, then stop the loop
+const t2 = Date.now(); printjson(db.adminCommand({ movePrimary: 'parts', to: 'sh2' })); print(Date.now() - t2, 'ms');
+db.getSiblingDB('parts_ctl').ctl.insertOne({ _id: 'stop' });
+```
+
+Course run: 5.0–5.3 s, and every update in that time failed with code 319.
+
+## Exercise 5: refine and reshard (Concept 5)
+
+```js
+// mgs
+db.adminCommand({ refineCollectionShardKey: 'parts.orders_s', key: { seller_id: 1, created_at: 1 } });   // error: index needed
+db.orders_s.createIndex({ seller_id: 1, created_at: 1 });
+db.adminCommand({ refineCollectionShardKey: 'parts.orders_s', key: { seller_id: 1, created_at: 1 } });   // 110 ms
+db.adminCommand({ refineCollectionShardKey: 'parts.orders_s', key: { created_at: 1, seller_id: 1 } });   // does not extend …
+
+db.orders.aggregate([{ $out: 'orders_r' }]);
+db.orders_r.createIndex({ seller_id: 1 });
+sh.shardCollection('parts.orders_r', { seller_id: 1 });
+const t3 = Date.now();
+printjson(db.adminCommand({ reshardCollection: 'parts.orders_r', key: { _id: 'hashed' } }));   // about 332 s
+print(Date.now() - t3, 'ms');
+db.orders_r.getShardDistribution();
+db.getSiblingDB('config').changelog.find({ ns: 'parts.orders_r', what: /resharding.coordinator/ }, { time: 1, 'details.newState': 1 }).sort({ time: 1 });
+```
+
+While it runs, in terminal 2 watch progress: `db.getSiblingDB('admin').aggregate([{ $currentOp: { allUsers: true } }, { $match: { 'originatingCommand.reshardCollection': 'parts.orders_r' } }])`.
+
+## Reset
+
+```js
+// mgs
+['orders_s', 'orders_u', 'orders_r', 'ctl'].forEach(c => db.getCollection(c).drop());
+db.getSiblingDB('parts_ctl').dropDatabase();
+db.adminCommand({ movePrimary: 'parts', to: '<the original primary>' });   // only if you moved it
+db.orders.countDocuments();   // 1000000
+```
+
+## Session quiz
+
+1. You sharded a 300 MB collection on a good key and it is still 100% on one shard. Why, and what is the per-collection fix?
+2. What does mongos need to route `find({ seller_id: 4321 })` to one shard, and where does that information live?
+3. A lookup by `_id` on a collection sharded by `seller_id` runs in 0.3 ms on a 2-shard cluster. Why is it still a scaling problem?
+4. During a migration, when are writes to the moving range held, and for how long was that in the lab?
+5. Give two ways orphan documents can mislead you, and how long they stay by default.
+6. Why did `moveCollection` of 1M documents take more than five minutes, while `movePrimary` took five seconds?
+7. What does `movePrimary` do to writes, and what must the application do about it?
+8. When is `refineCollectionShardKey` enough, and when do you need `reshardCollection`?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-6-mongodb-sharded-cluster/lab/answers">Answers to the session quiz</DeepDive>

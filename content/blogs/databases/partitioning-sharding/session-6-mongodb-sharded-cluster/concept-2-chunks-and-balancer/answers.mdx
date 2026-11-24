@@ -1,0 +1,63 @@
+---
+title: "Answers: Chunks and the balancer"
+description: "Worked answers to the Session 6 Concept 2 check questions."
+companion: "answers"
+tags: ["sharding", "mongodb", "balancer", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-balancer-administration/"
+  - "https://www.mongodb.com/docs/manual/reference/command/configureCollectionBalancing/"
+  - "https://www.mongodb.com/docs/manual/reference/command/moveRange/"
+---
+
+<Tldr>
+The balancer balances data size per collection, in steps of one chunk size, one migration per shard at a time.
+</Tldr>
+
+## Q1. Sharding 113 MiB in 88 ms
+
+**Question:** why did sharding `orders_s` take 88 ms although it holds 113 MiB?
+
+`sh.shardCollection` on a populated collection only writes metadata: the collection's entry in `config.collections` (key `{ seller_id: 1 }`) and one chunk `[MinKey, MaxKey)` owned by the primary shard, where the data already is. No document is read or copied. Moving data is the balancer's job, later. The one real prerequisite is an index starting with the shard key, which the lab built first (874 ms).
+
+> **Common mistake:** scheduling a maintenance window for `shardCollection` and expecting the data to be spread when it finishes.
+
+## Q2. 100% on one shard and "compliant"
+
+**Question:** the collection was 100% on sh1 and the balancer said it was compliant. Explain.
+
+A collection is balanced when the difference in data between its most and least loaded shards is below three times its chunk size. With the default 128 MB, the threshold is 384 MB; the whole collection was 113 MiB, so even "everything on sh1, nothing on sh2" is within the threshold. `balancerCollectionStatus` returned `chunkSize: 128, balancerCompliant: true` before and 70 s later.
+
+> **Common mistake:** reading `balancerCompliant: true` as "evenly spread". It means "within the threshold".
+
+## Q3. 1 chunk vs 13 chunks, and done
+
+**Question:** after balancing, sh1 had 1 chunk and sh2 had 13. Why did the balancer stop?
+
+Since MongoDB 6.0.3 the balancer compares **data size** per shard, not chunk counts. With `chunkSize: 4`, the threshold is 3 × 4 MB = 12 MB. After 13 moves sh1 held 61.6 MiB and sh2 52.25 MiB; the 9.4 MiB difference is under 12 MB, so `balancerCollectionStatus` turned compliant at 26.2 s. sh1's data stayed in one large `[2303, MaxKey)` range because the balancer does not split ranges just because they are big; it cut 4 MB pieces off that range only to move them.
+
+> **Common mistake:** using chunk counts from `sh.status()` to judge balance.
+
+## Q4. 1,460,637 documents
+
+**Question:** why did `estimatedDocumentCount()` return 1,460,637 right after balancing?
+
+A migration copies the range to the recipient and then switches ownership; the donor deletes its copy later (by default after 900 s, Concept 3). Until then sh1 still physically held all 1,000,000 documents, 460,637 of them orphans in ranges now owned by sh2. `estimatedDocumentCount()`, `count()` without a filter and `getShardDistribution()` add up each shard's collection metadata, orphans included. `countDocuments({})` runs an aggregation through mongos, where each shard filters out documents it does not own: 1,000,000.
+
+> **Common mistake:** paging on a sudden jump in `estimatedDocumentCount()` after a migration, or using it for billing counts on a sharded collection.
+
+## Q5. The 71,088 limit
+
+**Question:** where does the number 71,088 in the `moveRange` error come from, and how did the lab get past it?
+
+A shard refuses to donate a range holding more documents than about twice the collection's chunk size divided by the average document size: 2 × 4,194,304 bytes ÷ 118 bytes ≈ 71,089 (the server reported 71,088). The requested range `[2303, 3400)` held 219,705 documents. The lab raised the collection's chunk size with `configureCollectionBalancing … chunkSize: 64` (limit about 1.1 million documents) and the same `moveRange` succeeded in 1,555 ms. `moveRange` also accepts `forceJumbo: true` for oversized ranges.
+
+> **Common mistake:** lowering the chunk size to spread a collection, then trying to move large ranges by hand with the small size still set.
+
+## Q6. "Currently receiving chunk … for namespace pt8.orders_by_seller"
+
+**Question:** what does that error tell you about migrations in a cluster?
+
+A shard takes part in at most one range migration at a time, as donor or recipient, whatever the collection. sh1 was receiving a range of another collection (`pt8.orders_by_seller`, another lab database on the same cluster), so it refused to start donating `pt6.orders_s`. Migrations across the cluster therefore run at most one per shard; on two shards, at most one at a time. Balancing many collections, or one big collection with a small chunk size, takes time, and manual `moveRange` calls must retry.
+
+> **Common mistake:** assuming migrations of different collections run in parallel on the same shards.

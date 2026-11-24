@@ -1,0 +1,66 @@
+---
+title: "Answers: Unsharded collections and the primary shard"
+description: "Worked answers to the Session 6 Concept 4 check questions."
+companion: "answers"
+tags: ["sharding", "mongodb", "primary-shard", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/reference/command/moveCollection/"
+  - "https://www.mongodb.com/docs/manual/reference/command/movePrimary/"
+---
+
+<Tldr>
+Unsharded data sits on the primary shard until you move it. `moveCollection` is slow and online; `movePrimary` is fast and rejects writes.
+</Tldr>
+
+## Q1. Where unsharded collections live
+
+**Question:** where does an unsharded collection live, and what decides that?
+
+On its database's primary shard, recorded in `config.databases` (`pt6` → sh1). The primary is chosen when the database is first created (the cluster picks a shard, typically the one with the least data at that moment) and changes only with `movePrimary`. In 8.0 an unsharded collection can also be moved individually with `moveCollection`, which makes it a tracked collection that lives wherever it was moved.
+
+> **Common mistake:** assuming the balancer spreads unsharded collections. It only moves ranges of sharded (and tracked) collections.
+
+## Q2. 332.7 s for a 4 s copy
+
+**Question:** why did `moveCollection` take 332.7 s for a collection that a plain copy handled in about 4 s?
+
+`moveCollection` is implemented as resharding: clone, then apply the oplog, then block writes briefly and commit. Resharding has a minimum duration, `reshardingMinimumOperationDurationMillis`, 300,000 ms by default: the cloning phase lasted 301 s although `$currentOp` already reported 1,000,000 documents copied at 174 s, then 30 s of applying followed. The minimum is there so the operation is paced for large production collections; on a small one it is pure waiting. (The parameter is server-wide; the lab left it at the default.)
+
+> **Common mistake:** timing `moveCollection` on a test collection and extrapolating linearly down to "seconds" for small collections.
+
+## Q3. The config.collections entry
+
+**Question:** what changed in `config.collections` for `pt6.orders_u`, and why does that matter?
+
+Before: no entry (untracked, lives on the primary shard). After: an entry with `key: { _id: 1 }` and `unsplittable: true`: a *tracked unsharded* collection. mongos now routes it from that metadata instead of assuming the primary shard, which is what lets it live on sh2 while the database's primary stays sh1. It also means `movePrimary` no longer moves it (Q5).
+
+> **Common mistake:** reading `key: { _id: 1 }` as "it is sharded on _id". `unsplittable: true` means it has exactly one range and cannot be split or balanced.
+
+## Q4. Reads and writes during movePrimary
+
+**Question:** during `movePrimary`, what happened to reads and to writes of `pt6.orders`?
+
+Reads kept working: 8,632 reads during the 4,986 ms window, median 0.21 ms. Writes were rejected, not queued: every `updateOne` from +27 ms to +4,931 ms failed with code 319, "movePrimary is in progress for namespace pt6.orders", 8,626 failures. In the first run the workload did not catch errors and died on the first one.
+
+> **Common mistake:** expecting writes to wait like they do during a migration's critical section.
+
+## Q5. orders_u did not come back
+
+**Question:** after `movePrimary` back to sh1, `orders_u` stayed on sh2. Why?
+
+`movePrimary` moves only **untracked** unsharded collections. `orders_u` had become tracked when it was moved with `moveCollection`, so its placement is recorded in `config.collections` and no longer follows the primary. `orders` (untracked) moved with each `movePrimary`; sharded `orders_s` and `orders_r` were not affected either.
+
+> **Common mistake:** using `movePrimary` to undo a `moveCollection`.
+
+## Q6. A 200 GB audit collection
+
+**Question:** which would you use to move a 200 GB unsharded audit collection off a busy shard, and what do you check first?
+
+`moveCollection`: it keeps writes flowing until a short block at the commit, while `movePrimary` would reject audit writes for the whole copy and move every other untracked collection too. Check first:
+- free disk on the recipient for the full collection plus its indexes (and on the donor until the old copy is dropped);
+- oplog size on the donor, because the recipient applies the oplog written during the clone;
+- that the application tolerates a write pause of about a second at the end (0.96 s in the lab);
+- that nothing else is resharding or migrating to those shards at the same time.
+
+> **Common mistake:** choosing by speed in a test environment, where `movePrimary` took 5 s.

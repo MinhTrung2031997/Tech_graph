@@ -1,0 +1,183 @@
+---
+title: "Concept 3: What a migration costs"
+description: "Moving 219,705 orders (26.2 MB) from sh1 to sh2 with moveRange took 1.56 s while a workload kept reading and updating that range: median update latency rose from 1.95 to 3.47 ms and the worst update took 34 ms, at the commit. The donor kept its copy as orphans for 900 s (orphanCleanupDelaySecs), so sh1 held 680,342 orphans: metadata counts were wrong, direct shard reads returned duplicates and a June query examined 41,040 keys to return 22,209. The range deleter then removed 219,705 orphans in about 11–17 s."
+type: "concept"
+tags: ["sharding", "mongodb", "migration", "orphans", "balancer"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-balancer-administration/"
+  - "https://www.mongodb.com/docs/manual/reference/command/moveRange/"
+  - "https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.orphanCleanupDelaySecs"
+  - "https://www.mongodb.com/docs/manual/reference/command/cleanupOrphaned/"
+---
+
+<Tldr>
+A migration copies a range from the donor to the recipient while the range stays writable, then holds writes to that range briefly while ownership switches on the config servers. With a read + update workload on the moving range, `moveRange` of **219,705 documents / 26.2 MB** took **1,555 ms**; median update latency went from **1.95 to 3.47 ms** during the move and the slowest update took **34 ms**, right at the commit. Afterwards the donor still holds the documents as **orphans**: deletion is delayed **900 s** (`orphanCleanupDelaySecs`). For those 15 minutes sh1 had **680,342 orphans** next to 319,658 owned documents. Queries through mongos stayed correct (a `SHARDING_FILTER` stage drops orphans), but they examined orphan keys, metadata counts reported 1,460,637 documents, and a query sent straight to a shard returned duplicates. The range deleter then removed 13 balancer ranges (460,637 documents) in about 30 s and the 219,705-document range in about 11–17 s.
+</Tldr>
+
+## Terms
+
+| Term | Meaning |
+|---|---|
+| Donor / recipient | The shard that owns the range now / the shard it moves to |
+| Clone | Recipient copies the range's documents from the donor; writes continue on the donor and are forwarded |
+| Critical section | Short final phase: writes to the range wait while the last changes are copied and the config servers record the new owner |
+| Orphan | A document on a shard that does not own its range (left by a migration until cleanup) |
+| SHARDING_FILTER | Plan stage on each shard that drops documents the shard does not own |
+| Range deleter | Background task on the donor that deletes the old copy after `orphanCleanupDelaySecs` (default 900) |
+| **✓ / ✗** | Allowed / held or filtered |
+
+## The setup
+
+`orders_s` (sharded on `seller_id`, balancing turned off for this collection) owned sellers 2303 and above on sh1. A workload picked 2,000 random orders of sellers 2303–3399 and, in a loop, read one by `seller_id` + `_id` and incremented a counter on it. After 8 s, `moveRange` moved sellers `[2303, 3400)` to sh2.
+
+<Flow
+  title="moveRange of sellers [2303, 3400) under a read and update workload"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'Workload', sub: 'read + update range', x: 20, y: 20, w: 200 },
+    { id: 'mongos', label: 'mongos', sub: 'routing table v1', x: 300, y: 20, w: 200 },
+    { id: 'cfg', label: 'Config servers', sub: 'owner: sh1', x: 580, y: 20, w: 200 },
+    { id: 'sh1', label: 'sh1 donor', sub: 'owns 2303..3400', x: 160, y: 220, w: 200 },
+    { id: 'sh2', label: 'sh2 recipient', sub: 'empty for range', x: 440, y: 220, w: 200 },
+  ]}
+  edges={[
+    { id: 'app-mongos', from: 'app', to: 'mongos' },
+    { id: 'mongos-sh1', from: 'mongos', to: 'sh1' },
+    { id: 'mongos-sh2', from: 'mongos', to: 'sh2' },
+    { id: 'sh1-sh2', from: 'sh1', to: 'sh2', label: 'clone' },
+    { id: 'sh1-cfg', from: 'sh1', to: 'cfg' },
+  ]}
+  cases={[
+    {
+      title: 'The move',
+      path: 'clone 219,705 docs ✓ writes continue → critical section ✗ writes wait (max 34 ms) → commit owner = sh2 → mongos refreshes',
+      summary: '1.56 s end to end; the workload never stopped, it only slowed down.',
+      steps: [
+        {
+          title: 't0: before the move',
+          note: 'Requests for sellers 2303–3399 go to sh1. Reads: median 0.37 ms, p99 1.63 ms. Updates: median 1.95 ms, p99 7.03 ms (2,580 of each).',
+          active: ['app', 'mongos', 'sh1'],
+          edges: ['app-mongos', 'mongos-sh1'],
+          subs: { sh1: '✓ serves reads + writes' },
+        },
+        {
+          title: 't1: clone',
+          note: 'sh2 copies the 219,705 documents (26,211,283 bytes, changelog counts.cloned). The donor keeps serving the range and records the writes made meanwhile. The longest step in the changelog, 1,319 ms on the donor and 1,267 ms on the recipient, scales with the data copied.',
+          code: "db.adminCommand({ moveRange: 'pt6.orders_s', min: { seller_id: 2303 }, max: { seller_id: 3400 }, toShard: 'sh2' })",
+          active: ['mongos', 'sh1', 'sh2'],
+          edges: ['mongos-sh1', 'sh1-sh2'],
+          subs: { sh1: '✓ still owner', sh2: 'copying 219,705 docs' },
+        },
+        {
+          title: 't2: critical section and commit',
+          note: 'Writes to the range wait while the last changes are sent and the config servers record sh2 as owner. The slowest update of the whole run, 34 ms, happened 1,517 ms after the start, at the end of the 1,555 ms move. Reads of other ranges and of other collections are not held.',
+          active: ['app', 'sh1', 'cfg'],
+          edges: ['app-mongos', 'sh1-cfg'],
+          subs: { sh1: '✗ writes to range wait', cfg: 'owner: sh2' },
+        },
+        {
+          title: 't3: mongos follows',
+          note: 'mongos sends the next request with its old routing version; sh1 answers that its version is stale; mongos refreshes from the config servers and retries on sh2. After the move: reads median 0.40 ms, updates 2.05 ms, the same as before.',
+          active: ['app', 'mongos', 'sh2', 'cfg'],
+          edges: ['app-mongos', 'mongos-sh2'],
+          subs: { mongos: 'routing table v2', sh2: '✓ owns 2303..3400' },
+        },
+      ],
+    },
+    {
+      title: 'The 15 minutes after',
+      path: 'sh1 keeps 219,705 orphans → mongos reads ✓ SHARDING_FILTER drops them → direct shard reads ✗ duplicates → range deleter after 900 s',
+      summary: 'Correct through mongos, but more work, wrong metadata counts and duplicates for anything that bypasses mongos.',
+      steps: [
+        {
+          title: 'Orphans wait for the delay',
+          note: 'sh1 config.rangeDeletions: one entry per moved range, whenToClean: delayed, numOrphanDocs 35,360 … 219,705. $collStats on sh1: count 1,000,000, numOrphanDocs 680,342.',
+          active: ['sh1', 'sh2'],
+          edges: ['sh1-sh2'],
+          subs: { sh1: '680,342 orphans', sh2: 'owner copies' },
+        },
+        {
+          title: 'Through mongos: filtered',
+          note: 'A June 2025 query through mongos returned 41,040 orders, correct. But sh1 examined 41,040 keys to return 22,209 of them: the other 18,831 were orphans dropped by SHARDING_FILTER. After cleanup the same query examined 13,135 keys on sh1.',
+          active: ['app', 'mongos', 'sh1', 'sh2'],
+          edges: ['app-mongos', 'mongos-sh1', 'mongos-sh2'],
+          subs: { sh1: '✗ 18,831 orphans filtered' },
+        },
+        {
+          title: 'Range deleter',
+          note: 'First balancer migration committed 12:54:17.8; deletion began 13:09:21, 903 s later. The 13 balancer ranges (460,637 documents) were gone by 13:09:49. The manual range committed 12:58:09.5 and was deleted between 13:13:20 and 13:13:26.',
+          active: ['sh1'],
+          subs: { sh1: '✓ orphans 0' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Latency during the move
+
+| Workload on sellers 2303–3399 | Reads median / p99 / max (ms) | Updates median / p99 / max (ms) |
+|---|---|---|
+| Before (2,580 each) | 0.37 / 1.63 / 8.1 | 1.95 / 7.03 / 22.8 |
+| During the 1,555 ms move (323 each) | 0.67 / 3.42 / 5.7 | 3.47 / 10.91 / **33.8** |
+| After (2,697 each) | 0.40 / 1.77 / 5.7 | 2.05 / 8.09 / 27.4 |
+
+The balancer's own migrations of 4 MB ranges (Concept 2) took 199–447 ms each. A migration's cost grows with the range's size; the write pause at the end stays short because only the changes made during the copy are left to send.
+
+## Orphans: who sees them
+
+| Reader | Result for seller 100 (range moved to sh2), before cleanup |
+|---|---|
+| `countDocuments({ seller_id: 100 })` through mongos | 191 |
+| `countDocuments({ seller_id: 100 })` directly on sh1 | 191 (all orphans) |
+| `countDocuments({ seller_id: 100 })` directly on sh2 | 191 |
+| `estimatedDocumentCount()` through mongos, whole collection | 1,460,637 (1,000,000 real) |
+
+A backup, export or analytics job that connects to each shard directly and adds the results counts the 191 orders twice. Through mongos, each shard filters by the routing table it owns.
+
+## The range deleter's own cost
+
+During the 219,705-document deletion on sh1 (13:13:09.5 to about 13:13:26), a workload on sellers sh1 still owned (3400 and above) saw reads at median 0.71 ms against 0.41 ms before, and updates at 3.22 ms against 2.62 ms. The range deleter works in batches; the effect was visible but small at this size.
+
+<Pitfall>
+After a big rebalance, disk usage on the donor does not drop for 15 minutes, and then only inside WiredTiger's files: deleted documents free space for reuse, the files do not shrink. Do not judge a rebalance by disk graphs in the first quarter hour, and never read shards directly (mongodump per shard, `--host` straight to a shard member) for anything that must be exact while orphans exist. `numOrphanDocs` in `$collStats` and `config.rangeDeletions` on each shard show what is pending.
+</Pitfall>
+
+## Real-world scenario: the nightly per-shard export
+
+An analytics pipeline exports each shard's `orders` directly, to spread load, and sums the files. The night after a rebalance, GMV is 46% higher than the dashboards. The rebalance moved ranges at 23:55; the exports ran at 00:00, inside the 900 s window, and counted every moved order on both the old and new shard.
+
+| Fix | Effect |
+|---|---|
+| Export through mongos (or `$out`/`$merge` from mongos) | Each shard filters orphans |
+| If per-shard reads are needed, filter by the ranges the shard owns in `config.chunks` | Duplicates excluded |
+| Check `config.rangeDeletions` is empty on every shard before exporting | Detects pending orphans |
+| Disable balancing during the export window for that collection | No new orphans appear mid-export |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 2 | What schedules migrations and how big each one is |
+| Concept 5 | Resharding is a whole-collection copy with the same "copy, then switch" design |
+| [Transactions Session 8, Concept 4](/blogs/databases/transactions/session-8-when-transactions-hurt/concept-4-distributed-transactions) | Commit across servers: the config servers record ownership in one place |
+
+## Key takeaways
+
+1. A migration copies the range while it stays readable and writable, then holds writes to that range briefly to switch ownership.
+2. 219,705 documents moved in 1.56 s; median update latency rose from 1.95 to 3.47 ms during the move; the worst write took 34 ms, at the commit.
+3. The donor keeps the moved documents as orphans for `orphanCleanupDelaySecs` (900 s by default).
+4. Through mongos, `SHARDING_FILTER` hides orphans, but shards still examine them; direct shard reads and metadata counts include them.
+5. The range deleter removed 460,637 orphans in about 30 s and 219,705 in about 11–17 s, with a small latency effect on the donor.
+
+## Check questions
+
+1. Why could the workload keep updating the range while it was being copied?
+2. When exactly did the slowest update (34 ms) happen, and why there?
+3. How does mongos learn that the range now lives on sh2?
+4. Why did the June query examine 41,040 keys on sh1 to return 22,209 orders?
+5. A job reads each shard directly and sums the counts. What goes wrong right after a migration, and for how long by default?
+6. The range deleter started 903 s after the first migration. What controls that delay, and why does it exist?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-6-mongodb-sharded-cluster/concept-3-cost-of-a-migration/answers">Worked answers to Q1–Q6</DeepDive>

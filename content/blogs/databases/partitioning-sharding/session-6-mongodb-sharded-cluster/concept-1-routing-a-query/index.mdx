@@ -1,0 +1,195 @@
+---
+title: "Concept 1: How mongos routes a query"
+description: "A sharded MongoDB cluster is a router (mongos), a config server replica set that stores which shard owns which shard-key range, and the shards. With orders sharded on seller_id, a query by seller went to one shard (SINGLE_SHARD); a lookup by _id went to both (SHARD_MERGE): 500 lookups became 1,000 shard queries instead of 500. A sort with a limit is merged on mongos (SHARD_MERGE_SORT), and an aggregation is split into a shards part and a merger part."
+type: "concept"
+tags: ["sharding", "mongodb", "mongos", "explain", "routing"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/sharding/"
+  - "https://www.mongodb.com/docs/manual/core/sharded-cluster-query-router/"
+  - "https://www.mongodb.com/docs/manual/reference/explain-results/"
+---
+
+<Tldr>
+The application talks only to **mongos**. mongos keeps a cached copy of the **routing table** (which shard owns which range of the shard key, stored in `config.chunks` on the config servers) and uses the query's filter on the shard key to pick shards. With `pt6.orders_s` sharded on `{ seller_id: 1 }`: a query for one seller went to **one shard** (`SINGLE_SHARD`); a lookup by `_id` went to **both** (`SHARD_MERGE`). Counted with the profiler, 500 lookups by `_id` ran **500 queries on each shard**; the same 500 lookups with `seller_id` added ran **272 + 228**. On two shards on one laptop the latency difference was small (median 0.29 ms vs 0.23–0.28 ms), but every broadcast query costs work on every shard, and that work grows with the number of shards. A sort with a limit is merged on mongos (`SHARD_MERGE_SORT`), and an aggregation is split into a `shardsPart` and a `mergerPart`.
+</Tldr>
+
+## The cluster
+
+| Term | Meaning |
+|---|---|
+| mongos | The router. Stateless; applications connect to it as if it were one server |
+| Config servers | A replica set (`cfg`) holding the cluster metadata: databases, sharded collections, chunks |
+| Shard | A replica set holding part of the data (`sh1`, `sh2`, one member each in the lab) |
+| Shard key | The field(s) whose value decides which shard owns a document (`seller_id` here) |
+| Chunk / range | A contiguous range of shard-key values owned by one shard, e.g. sellers `[178, 355)` |
+| Routing table | mongos's cached copy of the chunk list, refreshed when a shard reports it is stale |
+| **✓ / ✗** | Shard receives the query / shard is skipped |
+
+The lab collection `pt6.orders_s` is a copy of the 1,000,000 orders, sharded on `{ seller_id: 1 }` and balanced into 14 chunks (Concept 2). At the time of these measurements `sh2` owned sellers below 2303 and `sh1` owned 2303 and above.
+
+<Flow
+  title="mongos: one seller, one order id, latest orders"
+  height={290}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'driver', x: 20, y: 20, w: 200 },
+    { id: 'mongos', label: 'mongos', sub: 'routing table cache', x: 300, y: 20, w: 200 },
+    { id: 'cfg', label: 'Config servers', sub: 'config.chunks', x: 580, y: 20, w: 200 },
+    { id: 'sh1', label: 'sh1', sub: 'sellers ≥ 2303', x: 160, y: 210, w: 200 },
+    { id: 'sh2', label: 'sh2', sub: 'sellers < 2303', x: 440, y: 210, w: 200 },
+  ]}
+  edges={[
+    { id: 'app-mongos', from: 'app', to: 'mongos' },
+    { id: 'mongos-cfg', from: 'mongos', to: 'cfg' },
+    { id: 'mongos-sh1', from: 'mongos', to: 'sh1' },
+    { id: 'mongos-sh2', from: 'mongos', to: 'sh2' },
+  ]}
+  cases={[
+    {
+      title: 'Filter on the shard key: seller 4321',
+      path: 'app → mongos → routing table: 4321 in [2303, MaxKey) → sh1 ✓ / sh2 ✗ → SINGLE_SHARD, 212 orders',
+      summary: 'Equality on the shard key names exactly one range, so exactly one shard does the work.',
+      steps: [
+        {
+          title: 'mongos looks up the range',
+          note: 'The routing table is loaded from config.chunks when mongos first needs it and cached. A query does not go to the config servers each time.',
+          code: 'db.orders_s.find({ seller_id: 4321 })',
+          active: ['app', 'mongos', 'cfg'],
+          edges: ['app-mongos', 'mongos-cfg'],
+          subs: { mongos: '4321 → sh1' },
+        },
+        {
+          title: 'Only sh1 runs it',
+          note: 'explain: stage SINGLE_SHARD, shards [sh1], IXSCAN on seller_id_1, 212 keys, 212 documents, nReturned 212.',
+          active: ['mongos', 'sh1', 'sh2'],
+          edges: ['mongos-sh1'],
+          subs: { sh1: '✓ 212 docs', sh2: '✗ skipped' },
+        },
+      ],
+    },
+    {
+      title: 'No shard key in the filter: _id 777777',
+      path: 'app → mongos → no seller_id → sh1 ✓ + sh2 ✓ → SHARD_MERGE, 1 document',
+      summary: 'Any shard could own the document, so every shard is asked.',
+      steps: [
+        {
+          title: 'Broadcast',
+          note: 'explain: stage SHARD_MERGE, both shards ran EXPRESS_IXSCAN on _id. sh2 returned the order; sh1 examined one key and returned nothing (that key was an orphan, see Concept 3).',
+          code: 'db.orders_s.find({ _id: 777777 })',
+          active: ['app', 'mongos', 'sh1', 'sh2'],
+          edges: ['app-mongos', 'mongos-sh1', 'mongos-sh2'],
+          subs: { sh1: '✓ 0 returned', sh2: '✓ 1 returned' },
+        },
+        {
+          title: 'Counted on the shards',
+          note: 'Profiler level 2 on pt6 on both shards, 500 lookups by _id through mongos: 500 queries on sh1 and 500 on sh2. The same 500 lookups with seller_id added: 272 on sh1, 228 on sh2.',
+          code: "db.orders_s.findOne({ _id: id })                       // 500 + 500\ndb.orders_s.findOne({ seller_id: s, _id: id })        // 272 + 228",
+          active: ['mongos', 'sh1', 'sh2'],
+          edges: ['mongos-sh1', 'mongos-sh2'],
+          subs: { mongos: '1 lookup → 2 queries' },
+        },
+      ],
+    },
+    {
+      title: 'Sort and limit: latest 10 orders',
+      path: 'mongos → sh1 ✓ top 10 + sh2 ✓ top 10 → SHARD_MERGE_SORT → 10 rows',
+      summary: 'Each shard sorts and limits its own part; mongos merges the sorted streams.',
+      steps: [
+        {
+          title: 'Each shard returns its own top 10',
+          note: 'With an index on created_at, each shard ran LIMIT > SHARDING_FILTER > FETCH > IXSCAN and returned 10 documents (sh1 examined 18 keys because of orphans). mongos received 20 and kept 10.',
+          code: 'db.orders_s.find().sort({ created_at: -1 }).limit(10)',
+          active: ['mongos', 'sh1', 'sh2'],
+          edges: ['mongos-sh1', 'mongos-sh2'],
+          subs: { sh1: '✓ 10 rows', sh2: '✓ 10 rows', mongos: 'SHARD_MERGE_SORT' },
+        },
+        {
+          title: 'Back to the application',
+          note: 'Without the created_at index (the $out copy did not have it at first), both shards ran a full COLLSCAN and an in-memory SORT: 360 ms instead of 3 ms. Indexes are per shard, and every shard needs them.',
+          active: ['app', 'mongos'],
+          edges: ['app-mongos'],
+          subs: { app: '10 rows' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## What explain shows
+
+| Query on `orders_s` | Top stage | Shards | Returned | Work per shard |
+|---|---|---|---|---|
+| `seller_id: 4321` | SINGLE_SHARD | sh1 | 212 | 212 keys, 212 docs |
+| `seller_id: { $in: [100, 4321] }` | SHARD_MERGE | sh1, sh2 | 403 | sh2 192 keys, sh1 405 keys (orphans of seller 100 filtered out) |
+| `seller_id` from 1000 to 1099 | SINGLE_SHARD | sh2 | 20,075 | 20,075 keys |
+| `_id: 777777` | SHARD_MERGE | sh1, sh2 | 1 | 1 key each |
+| June 2025 by `created_at` | SHARD_MERGE | sh1, sh2 | 41,040 | sh2 18,831 keys; sh1 41,040 keys for 22,209 rows |
+| Latest 10 by `created_at` | SHARD_MERGE_SORT | sh1, sh2 | 10 (20 received) | 18 and 10 keys |
+
+A range on the shard key is targeted too: sellers 1000–1099 lived in sh2's ranges, so only sh2 ran it. `$in` touches every shard that owns one of the values.
+
+## Aggregations are split
+
+```js
+db.orders_s.explain('executionStats').aggregate([
+  { $match: { created_at: { $gte: ISODate('2025-06-01'), $lt: ISODate('2025-07-01') } } },
+  { $group: { _id: '$marketplace', gmv: { $sum: '$amount' }, n: { $sum: 1 } } }
+])
+// mergeType: 'mongos'
+// shardsPart: [ $match, $group { gmv: $sum amount, n: $sum 1 } ]        runs on each shard
+// mergerPart: [ $mergeCursors, $group { gmv: $sum $$ROOT.gmv, n: $sum $$ROOT.n, $doingMerge: true } ]
+```
+
+Each shard computes a partial GMV per marketplace; mongos adds the partials. Only 3 documents per shard cross the network, not 41,040.
+
+## Latency on the lab cluster
+
+| 500 point lookups through mongos (median / p95 ms, 3 rounds) | Round 1 | Round 2 | Round 3 |
+|---|---|---|---|
+| Unsharded `orders`, by `_id` | 0.350 / 2.317 | 0.213 / 0.863 | 0.194 / 0.717 |
+| `orders_s`, by `_id` only (both shards) | 0.381 / 1.508 | 0.288 / 1.208 | 0.294 / 1.210 |
+| `orders_s`, by `seller_id` + `_id` (one shard) | 0.275 / 1.165 | 0.268 / 1.234 | 0.227 / 0.976 |
+
+Two shards on one machine hide most of the cost: the two shard queries run in parallel and the network is a local bridge. The profiler count is the number to remember. With 20 shards, a query without the shard key is 20 queries, the slowest shard sets the latency, and the cluster's total query capacity no longer grows when you add shards.
+
+<Pitfall>
+"Sharding scales reads" holds only for queries that carry the shard key. A lookup by order id on a collection sharded by seller is a broadcast: it costs one query per shard, forever. Either include the shard key in the application's queries (store `seller_id` next to every order reference), choose a key that the hot queries carry (Session 5), or keep a small lookup collection keyed by order id that returns the seller.
+</Pitfall>
+
+## Real-world scenario: order detail page
+
+A marketplace back office shards orders by `seller_id` because every seller dashboard filters by seller. The customer-service tool opens an order by its number only. With 2 shards nobody notices; after growing to 12 shards, each order-detail view runs 12 queries, the busiest shard's queue sets the response time, and adding shards makes the tool slower, not faster.
+
+| Fix | Effect |
+|---|---|
+| Put `seller_id` in the order reference the tool already has (URL, ticket) | The lookup becomes SINGLE_SHARD |
+| Lookup collection `order_seller` sharded on `_id` | Two targeted queries instead of N |
+| Leave it, but measure | Fine at low volume; check `explain` and the per-shard profiler before scaling out |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 5, Concept 3](/blogs/databases/partitioning-sharding/session-5-choosing-a-shard-key/concept-3-targeted-vs-scatter-gather) | Which key makes the common queries targeted |
+| Concept 2 | Where the routing table's ranges come from |
+| Concept 3 | Why sh1 examined keys it then filtered out (orphans and SHARDING_FILTER) |
+| [Session 2, Concept 2](/blogs/databases/partitioning-sharding/session-2-partitioning-postgresql/concept-2-pruning-plan-vs-execution) | Targeting is partition pruning across servers |
+
+## Key takeaways
+
+1. Applications connect to mongos; mongos routes with a cached copy of the chunk ranges stored on the config servers.
+2. A filter with the shard key (equality, `$in` or a range) goes only to the shards that own those values: `SINGLE_SHARD`.
+3. A filter without the shard key goes to every shard: `SHARD_MERGE`. 500 lookups by `_id` ran 1,000 shard queries.
+4. Sorts with a limit are merged on mongos (`SHARD_MERGE_SORT`); aggregations are split into a per-shard part and a merger part.
+5. Indexes are per shard: a missing index makes every shard scan.
+
+## Check questions
+
+1. Name the three kinds of processes in a sharded cluster and what each stores.
+2. Does mongos read `config.chunks` for every query? What does it use instead?
+3. Why did `find({ _id: 777777 })` go to both shards, while `find({ seller_id: 4321 })` went to one?
+4. 500 lookups by `_id` and 500 lookups by `seller_id` + `_id` took almost the same time on the lab cluster. Why is the first one still worse?
+5. In the aggregation's split, what does each shard return to mongos, and why is that cheap?
+6. The latest-10 query took 360 ms before the `created_at` index existed on `orders_s` and 3 ms after. Why did the copy not have the index?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-6-mongodb-sharded-cluster/concept-1-routing-a-query/answers">Worked answers to Q1–Q6</DeepDive>

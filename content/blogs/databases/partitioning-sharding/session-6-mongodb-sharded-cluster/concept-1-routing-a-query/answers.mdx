@@ -1,0 +1,64 @@
+---
+title: "Answers: How mongos routes a query"
+description: "Worked answers to the Session 6 Concept 1 check questions."
+companion: "answers"
+tags: ["sharding", "mongodb", "mongos", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharded-cluster-query-router/"
+  - "https://www.mongodb.com/docs/manual/reference/explain-results/"
+---
+
+<Tldr>
+Targeting is decided on mongos from the shard key in the filter. No shard key, every shard.
+</Tldr>
+
+## Q1. The three kinds of processes
+
+**Question:** name the three kinds of processes in a sharded cluster and what each stores.
+
+- **mongos:** stores nothing durable. It routes operations and merges results, using a cached routing table.
+- **Config servers** (a replica set, `cfg` in the lab): the cluster metadata: which databases exist and their primary shard (`config.databases`), sharded collections and their keys (`config.collections`), and the chunk ranges with their owning shard (`config.chunks`).
+- **Shards** (each a replica set, `sh1` and `sh2`): the documents and their indexes, for the ranges they own (plus orphans waiting for cleanup, Concept 3).
+
+> **Common mistake:** treating mongos as a cache of data. It caches only metadata.
+
+## Q2. Does mongos read config.chunks every time?
+
+**Question:** does mongos read `config.chunks` for every query? What does it use instead?
+
+No. mongos loads the routing table for a collection the first time it needs it and keeps it in memory. Every request it sends to a shard carries the routing-table version it used; if the shard's version is newer (a migration committed since), the shard answers "stale config", mongos refreshes from the config servers and retries. That is why a migration does not need to notify every mongos.
+
+> **Common mistake:** sizing the config servers for the cluster's query rate. They serve metadata refreshes, not queries.
+
+## Q3. One shard vs two
+
+**Question:** why did `find({ _id: 777777 })` go to both shards, while `find({ seller_id: 4321 })` went to one?
+
+The routing table maps **seller_id ranges** to shards. 4321 falls in `[2303, MaxKey)`, owned by sh1, so only sh1 can hold matching documents. `_id` says nothing about the seller, so the document could be on either shard: mongos must ask all of them and merge (`SHARD_MERGE`). The `_id` index exists on each shard, so each probe was cheap, but each shard still ran a query.
+
+> **Common mistake:** assuming the `_id` index makes `_id` lookups targeted. Indexes are local to each shard; only the shard key routes.
+
+## Q4. Same latency, still worse
+
+**Question:** 500 lookups by `_id` and 500 by `seller_id` + `_id` took almost the same time on the lab cluster. Why is the first one still worse?
+
+Because it did twice the work: the profiler counted 500 queries on sh1 **and** 500 on sh2, against 272 + 228 for the targeted version. On two shards in one Docker network, the two probes run in parallel and the extra hop is microseconds, so the medians were 0.29 ms vs 0.23–0.28 ms. With N shards, a broadcast costs N queries; the response time is the slowest of N; and total throughput stops growing when you add shards, because every shard sees every lookup.
+
+> **Common mistake:** benchmarking a two-shard test cluster and concluding broadcast queries are free.
+
+## Q5. The aggregation split
+
+**Question:** in the aggregation's split, what does each shard return to mongos, and why is that cheap?
+
+The `shardsPart` (`$match` + `$group`) runs on each shard and returns one partial document per marketplace: 3 documents per shard, each with a partial `gmv` sum and count `n`. The `mergerPart` on mongos (`$mergeCursors` then `$group` with `$doingMerge: true`) adds the partials. The 41,040 matching orders never leave the shards.
+
+> **Common mistake:** assuming mongos pulls all matching documents and groups them itself. It does that only for stages that cannot be split.
+
+## Q6. The missing index on the copy
+
+**Question:** the latest-10 query took 360 ms before the `created_at` index existed on `orders_s` and 3 ms after. Why did the copy not have the index?
+
+`orders_s` was made with `db.orders.aggregate([{ $out: 'orders_s' }])`. `$out` copies documents only, not the source's secondary indexes. The lab then created the `seller_id` index (required to shard on it) but not `created_at`, so each shard ran COLLSCAN + SORT over its whole part (sh1 scanned 1,000,000 documents including orphans). `createIndex` through mongos builds the index on every shard that has data for the collection: 849 ms here.
+
+> **Common mistake:** creating an index directly on one shard. Create indexes through mongos so every shard gets the same set.

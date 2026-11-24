@@ -1,0 +1,163 @@
+---
+title: "Concept 4: Unsharded collections and the primary shard"
+description: "Collections you do not shard live on the database's primary shard. In MongoDB 8.0 moveCollection moves one of them to another shard: 1M orders took 332.7 s, because the resharding machinery behind it waits at least 300 s; writes kept working and waited at most 1,074 ms at the switch. movePrimary moves all untracked unsharded collections at once: 5.0–5.3 s for 1M orders, but every update to them failed with error 319 'movePrimary is in progress' for 4.9 s."
+type: "concept"
+tags: ["sharding", "mongodb", "primary-shard", "moveCollection", "movePrimary"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharded-cluster-shards/#primary-shard"
+  - "https://www.mongodb.com/docs/manual/reference/command/moveCollection/"
+  - "https://www.mongodb.com/docs/manual/reference/command/movePrimary/"
+  - "https://www.mongodb.com/docs/manual/core/unsharded-collections/"
+---
+
+<Tldr>
+Every database in a sharded cluster has a **primary shard** (`config.databases`), and every collection you do not shard lives entirely there. `pt6`'s primary is sh1, so the unsharded `orders` was answered only by sh1 (`SINGLE_SHARD`). MongoDB 8.0 can move one unsharded collection with **`moveCollection`**: it registers the collection as *tracked* (`unsplittable: true`, key `_id`) and copies it with the resharding machinery. For 1M orders it took **332.7 s**: 301 s cloning (resharding never finishes in less than `reshardingMinimumOperationDurationMillis`, 300,000 ms by default), 30 s applying, **0.96 s blocking writes**, 0.15 s committing. The worst write during it took 1,074 ms. **`movePrimary`** moves the primary role and every *untracked* unsharded collection with it: 5.3 s and 5.0 s for the 1M orders, but writes to them **failed** with error code 319 (`movePrimary is in progress for namespace pt6.orders`): 8,626 failed updates in 4.9 s. Reads kept working.
+</Tldr>
+
+## Terms
+
+| Term | Meaning |
+|---|---|
+| Primary shard | Per database: the shard that stores its unsharded collections; chosen when the database is created |
+| Untracked collection | Unsharded collection with no entry in `config.collections`; it lives on the primary shard |
+| Tracked unsharded | 8.0: unsharded collection registered in `config.collections` with `unsplittable: true`; it can live on any shard |
+| `moveCollection` | 8.0: move one unsharded collection to a named shard (online, resharding-based) |
+| `movePrimary` | Change a database's primary shard; moves its untracked unsharded collections |
+| **✓ / ✗** | Request served / request rejected or held |
+
+## Where unsharded data lives
+
+```js
+db.getSiblingDB('config').databases.findOne({ _id: 'pt6' })      // primary: 'sh1'
+db.orders.find({ _id: 5 }).explain().queryPlanner.winningPlan      // SINGLE_SHARD, shards: [ 'sh1' ]
+db.getSiblingDB('config').collections.countDocuments({ _id: 'pt6.orders_u' })   // 0: untracked
+```
+
+On a cluster where many databases share the same primary shard, all their unsharded collections pile up on one shard. In this lab, sh1 was the primary of `pt6`, sh2 of three other databases: placement is decided when a database is created, not by load.
+
+<Flow
+  title="Moving unsharded data: moveCollection vs movePrimary"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'Workload', sub: 'findOne + updateOne', x: 20, y: 20, w: 200 },
+    { id: 'mongos', label: 'mongos', sub: 'routes by metadata', x: 300, y: 20, w: 200 },
+    { id: 'cfg', label: 'Config servers', sub: 'databases, collections', x: 580, y: 20, w: 200 },
+    { id: 'sh1', label: 'sh1', sub: 'primary of pt6', x: 160, y: 220, w: 200 },
+    { id: 'sh2', label: 'sh2', sub: 'other shard', x: 440, y: 220, w: 200 },
+  ]}
+  edges={[
+    { id: 'app-mongos', from: 'app', to: 'mongos' },
+    { id: 'mongos-cfg', from: 'mongos', to: 'cfg' },
+    { id: 'mongos-sh1', from: 'mongos', to: 'sh1' },
+    { id: 'mongos-sh2', from: 'mongos', to: 'sh2' },
+    { id: 'sh1-sh2', from: 'sh1', to: 'sh2', label: 'copy' },
+  ]}
+  cases={[
+    {
+      title: 'moveCollection pt6.orders_u to sh2',
+      path: 'register as tracked → clone 301 s ✓ writes continue → apply 30 s → block writes 0.96 s ✗ → commit → served by sh2',
+      summary: 'One collection, online, but never faster than about 5 minutes.',
+      steps: [
+        {
+          title: 'Register the collection',
+          note: 'changelog: createCollection.start/end for pt6.orders_u (97 ms): it gets a config.collections entry with key { _id: 1 } and unsplittable: true, one chunk on sh1.',
+          code: "db.adminCommand({ moveCollection: 'pt6.orders_u', toShard: 'sh2' })",
+          active: ['app', 'mongos', 'cfg'],
+          edges: ['app-mongos', 'mongos-cfg'],
+          subs: { cfg: 'orders_u tracked' },
+        },
+        {
+          title: 'Clone and apply',
+          note: 'Coordinator states: cloning 12:59:12.7 → 13:04:13.9 (301 s; $currentOp already showed documentsCopied 1,000,000 at 174 s, but resharding waits for reshardingMinimumOperationDurationMillis = 300,000), applying 30 s. The workload ran on sh1 throughout: 94,293 reads and 94,293 updates, update median 2.29 ms.',
+          active: ['mongos', 'sh1', 'sh2'],
+          edges: ['mongos-sh1', 'sh1-sh2'],
+          subs: { sh1: '✓ serves writes', sh2: 'copy + oplog' },
+        },
+        {
+          title: 'Block writes, commit',
+          note: 'blocking-writes 0.96 s, committing 0.15 s. The slowest update, 1,074 ms, ended at +332.7 s, inside that window. Afterwards explain shows shards: [sh2]; sh1 keeps an empty orders_u (0 documents, 2 indexes).',
+          active: ['app', 'mongos', 'sh2', 'cfg'],
+          edges: ['app-mongos', 'mongos-sh2', 'mongos-cfg'],
+          subs: { sh2: '✓ 1,000,000 docs', mongos: '✗ writes wait ≤ 1.07 s' },
+        },
+      ],
+    },
+    {
+      title: 'movePrimary pt6 to sh1 (from sh2)',
+      path: 'copy every untracked collection ✓ reads → writes ✗ error 319 for 4.9 s → primary = sh1',
+      summary: 'Fast, but writes fail instead of waiting: the application must retry.',
+      steps: [
+        {
+          title: 'Copy the untracked collections',
+          note: 'pt6.orders (1M, untracked) moved with the primary role; tracked collections (orders_u, orders_s, orders_r) stayed where they were. 4,986 ms in total (5,278 ms in the other direction).',
+          code: "db.adminCommand({ movePrimary: 'pt6', to: 'sh1' })",
+          active: ['mongos', 'sh1', 'sh2', 'cfg'],
+          edges: ['mongos-cfg', 'sh1-sh2'],
+          subs: { cfg: 'primary sh2 → sh1' },
+        },
+        {
+          title: 'Writes are rejected',
+          note: 'From +27 ms to +4,931 ms every updateOne on pt6.orders failed: code 319, "movePrimary is in progress for namespace pt6.orders". 8,626 failed updates, 0 failed reads; reads ran at median 0.21 ms. A workload that does not catch the error stops at the first one (the first run did).',
+          active: ['app', 'mongos', 'sh2'],
+          edges: ['app-mongos', 'mongos-sh2'],
+          subs: { mongos: '✗ updates: error 319', sh2: '✓ reads' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## The two commands side by side
+
+| 1M orders, 113 MiB | `moveCollection` (one collection) | `movePrimary` (whole database's untracked collections) |
+|---|---|---|
+| Total time | 332.7 s | 5.0–5.3 s |
+| Writes during the copy | allowed (median 2.29 ms) | **rejected**, code 319, for 4.9 s |
+| Write pause at the end | 0.96 s (blocking-writes), worst write 1,074 ms | (the whole copy) |
+| Reads | allowed | allowed |
+| What moves | the named collection | every untracked unsharded collection of the database |
+| Works on a sharded collection | no: `MoveCollection can only be called on an unsharded collection.` | sharded and tracked collections are not moved |
+
+<Pitfall>
+`movePrimary` looks like the quick option, and on a small database it is. But it rejects writes instead of queueing them, for as long as the copy takes, and the copy grows with every unsharded collection in the database. Run it only for databases whose unsharded collections are small or can stop taking writes, with an application that retries on error 319. For one large collection, `moveCollection` is online but takes at least five minutes and a full copy: plan disk on the recipient for the whole collection.
+</Pitfall>
+
+## Real-world scenario: one shard full of side collections
+
+A seller platform shards `orders` and `order_items`, but its 40 other collections (`sellers`, `promotions`, `sessions`, `audit_log`, …) were never sharded. All databases were created when the cluster had one shard, so every one of them has sh1 as primary. Two years later sh1 holds 70% of the data and its disk alerts fire, while the sharded collections are perfectly balanced.
+
+| Fix | Effect |
+|---|---|
+| `moveCollection` the large unsharded collections (e.g. `audit_log`) to other shards | Online; spreads the side data one collection at a time |
+| `movePrimary` for small databases, in a write-pause window, with retries | Moves all their untracked collections in seconds |
+| Shard the collections that will keep growing | The balancer spreads them from then on |
+| Check `$collStats` per shard, not only `sh.status()` for sharded collections | Unsharded data is where imbalance hides |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 1 | An unsharded collection is always a single-shard target |
+| Concept 5 | `moveCollection` runs on the same resharding machinery, with the same 5-minute minimum |
+| Session 7 (sharding PostgreSQL and MySQL) | Citus reference and local tables are the same design question |
+| [Session 1, Concept 3](/blogs/databases/partitioning-sharding/session-1-why-split-data/concept-3-partitioning-sharding-replication) | Sharding splits data, but only the collections you choose |
+
+## Key takeaways
+
+1. Unsharded collections live on their database's primary shard; databases do not spread themselves.
+2. `moveCollection` (8.0) moves one unsharded collection online, by registering it as tracked and resharding it: 332.7 s for 1M orders, with a 0.96 s write block at the end.
+3. Resharding-based operations never finish before `reshardingMinimumOperationDurationMillis` (300 s by default).
+4. `movePrimary` moves every untracked unsharded collection in seconds, but rejects writes with code 319 meanwhile.
+5. Check per-shard data size including unsharded collections when judging balance.
+
+## Check questions
+
+1. Where does an unsharded collection live, and what decides that?
+2. Why did `moveCollection` take 332.7 s for a collection that a plain copy handled in about 4 s?
+3. What changed in `config.collections` for `pt6.orders_u`, and why does that matter?
+4. During `movePrimary`, what happened to reads and to writes of `pt6.orders`?
+5. After `movePrimary` back to sh1, `orders_u` stayed on sh2. Why?
+6. Which would you use to move a 200 GB unsharded audit collection off a busy shard, and what do you check first?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-6-mongodb-sharded-cluster/concept-4-unsharded-collections/answers">Worked answers to Q1–Q6</DeepDive>
