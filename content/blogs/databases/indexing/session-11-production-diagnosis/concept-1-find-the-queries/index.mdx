@@ -1,0 +1,286 @@
+---
+title: "Concept 1: Find the queries that cost the most"
+description: "Rank statements by total time (calls × mean), not by how slow one execution looks. Measured on an 8-query e-commerce workload: pg_stat_statements put an order-detail query with a 39 ms mean at 69% of database time, MySQL digest snapshots found the same query at 17.1 of 21.9 seconds, and the MongoDB profiler grouped by query shape showed a report that timed out on every call. Plus the traps: cumulative counters, text-sorted sys views, and $queryStats returning nothing on a self-managed server."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "pg_stat_statements", "performance_schema", "profiler", "diagnosis"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pgstatstatements.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/performance-schema-statement-digests.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/sys-statement-analysis.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/sys-statements-with-full-table-scans.html"
+  - "https://www.mongodb.com/docs/manual/tutorial/manage-the-database-profiler/"
+  - "https://www.mongodb.com/docs/manual/reference/operator/aggregation/queryStats/"
+---
+
+<Tldr>
+This session is the course in one exercise. A small shop runs **8 query shapes** against `orders` (1M), `customers` (100k) and `order_items` (2M), the tables from [Session 9](/blogs/databases/indexing/session-9-indexes-for-joins/lab). Step one is finding which statements cost the most **in total**. In a 60-second PostgreSQL run, `pg_stat_statements` put the **order-detail query** (39 ms mean, nothing alarming) at **69%** of database time: 3,990 calls, each reading **16,707 buffers**, which is all of `order_items`, to return 2 rows. The **login by email** (4.6 ms) was second at 12%, reading the whole 854-page `customers` table every time. Ranked by mean time instead, the list starts with a weekly report that is only 10% of the load. MySQL's digest table and MongoDB's profiler show the same picture, with their own traps: counters that accumulate since server start, a `sys` view that sorts latencies as **text**, and `$queryStats`, which returned **0 documents** on a self-managed 8.0 server.
+</Tldr>
+
+## The workload
+
+The same 8 statements run in all three engines, with these weights (pgbench for PostgreSQL, a generated script for MySQL, a seeded loop for MongoDB; [lab](/blogs/databases/indexing/session-11-production-diagnosis/lab)):
+
+| # | Query | Share of calls | Session that covers its index |
+|---|---|---|---|
+| Q1 | Login: customer by `email` | 30% | 2 (point lookup), 5 (unique) |
+| Q2 | Order history: a customer's newest 20 orders | 25% | 4 (equality + ORDER BY + LIMIT) |
+| Q3 | Order detail: one order joined to its items | 20% | 9 (joins) |
+| Q4 | Admin search: pending orders of one day, newest 50 | 4% | 4 (equality before range) |
+| Q5 | Daily revenue for one week | 1% | 7 (BRIN), 5 (covering) |
+| Q6 | Top 10 SKUs of one week | 1% | 9 (joins), 10 (aggregation) |
+| Q7 | Latest order of each gold customer in one country | 2% | 9 (lateral join), 10 (top-N per group) |
+| Q8 | Checkout: insert one order and two items | 17% | 8 (write cost) |
+
+Starting indexes: primary keys, `orders (customer_id)` and `orders (status, created_at)`. Nothing on `customers.email` or `order_items.order_id` (the lab removes the indexes the Session 9 lab added, to start from this state).
+
+| Term | Meaning |
+|---|---|
+| Normalized statement | Constants replaced by placeholders (`$1`, `?`), so all executions of one query shape share one row: `queryid` (PostgreSQL), digest (MySQL), `queryHash` / query shape (MongoDB) |
+| Total time | Calls × mean time: the database time that query shape consumed |
+| Per-call evidence | Buffers (PostgreSQL), rows examined (MySQL), docs/keys examined (MongoDB) per call, compared with rows returned |
+| Snapshot diff | Copy the counters before a period, subtract afterwards: measures that period only |
+| **✓ Ranked by total / ✗ Ranked by mean** | Finds what the server spends its time on, or what looks slow once |
+
+## PostgreSQL: pg_stat_statements
+
+`pg_stat_statements` must be listed in `shared_preload_libraries` (server restart), then `CREATE EXTENSION pg_stat_statements` in the database you query it from.
+
+<Flow
+  title="PostgreSQL: ranking the workload with pg_stat_statements"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'Workload', sub: '8 shapes, 4 clients', x: 20, y: 20, w: 200 },
+    { id: 'pss', label: 'pg_stat_statements', sub: 'one row per queryid', x: 290, y: 20, w: 230 },
+    { id: 'total', label: '✓ By total time', sub: '', x: 590, y: 20, w: 190 },
+    { id: 'mean', label: '✗ By mean time', sub: '', x: 590, y: 150, w: 190 },
+    { id: 'bufs', label: 'Buffers per call', sub: '', x: 290, y: 150, w: 230 },
+  ]}
+  edges={[
+    { id: 'app-pss', from: 'app', to: 'pss' },
+    { id: 'pss-total', from: 'pss', to: 'total' },
+    { id: 'pss-mean', from: 'pss', to: 'mean' },
+    { id: 'pss-bufs', from: 'pss', to: 'bufs' },
+  ]}
+  cases={[
+    {
+      title: 'Rank by total time',
+      path: 'workload → pg_stat_statements → ✓ ORDER BY total_exec_time → order detail 69%, login 12%',
+      summary: '60 s, 4 clients, 20,157 transactions, 336 per second.',
+      subs: { total: 'Q3 detail: 69%', bufs: 'Q3: 16,707 per call' },
+      steps: [
+        {
+          title: 'Collect normalized statements',
+          note: 'Every execution adds to its queryid row: calls, total and mean time, rows, buffers hit and read, WAL bytes. Constants become $1, $2: the 3,990 order-detail calls for different ids are one row. Reset only your database before a measurement: pg_stat_statements_reset(userid, dbid, queryid), with 0 meaning "all".',
+          code: "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;\nSELECT pg_stat_statements_reset(0, (SELECT oid FROM pg_database WHERE datname = current_database()), 0);",
+          active: ['app', 'pss'],
+          edges: ['app-pss'],
+        },
+        {
+          title: '✓ Rank by total time',
+          note: 'Order detail: 3,990 calls × 39.3 ms = 156.9 s, 69% of all execution time. Login: 6,072 × 4.58 ms = 27.8 s, 12%. Top SKUs: 188 × 121 ms = 22.8 s, 10%. Daily revenue: 5%. Latest order per gold customer: 4%. The other four shapes together: under 1%.',
+          code: "SELECT left(query, 50) AS query, calls,\n       round(total_exec_time) AS total_ms,\n       round(mean_exec_time::numeric, 2) AS mean_ms,\n       round(100 * total_exec_time / sum(total_exec_time) OVER ()) AS pct\nFROM pg_stat_statements\nWHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())\nORDER BY total_exec_time DESC LIMIT 10;",
+          active: ['pss', 'total'],
+          edges: ['pss-total'],
+        },
+        {
+          title: 'Read the evidence per call',
+          note: 'Order detail: 16,707 buffers per call, for 2 rows. order_items has 16,667 pages: every call scans the whole table. Login: 854 buffers per call = all 854 pages of customers, for 1 row. Rows per call vs buffers per call is the missing-index signal (Session 3).',
+          code: "SELECT left(query, 50), calls,\n       (shared_blks_hit + shared_blks_read) / calls AS blks_per_call,\n       rows / calls AS rows_per_call\nFROM pg_stat_statements WHERE dbid = … ORDER BY total_exec_time DESC LIMIT 5;",
+          active: ['pss', 'bufs'],
+          edges: ['pss-bufs'],
+        },
+      ],
+    },
+    {
+      title: 'Rank by mean time (the trap)',
+      path: 'pg_stat_statements → ✗ ORDER BY mean_exec_time → the weekly report first, the real cost third',
+      summary: 'The slowest single execution is not the biggest cost.',
+      subs: { mean: 'Q6 report: 121 ms' },
+      steps: [
+        {
+          title: '✗ Sort by mean',
+          note: 'Top SKUs 121 ms, daily revenue 61 ms, then order detail 39 ms. Optimizing the report first would save at most 10% of database time. The 4.6 ms login does not appear near the top at all, yet costs more than the report.',
+          code: 'SELECT left(query, 50), calls, round(mean_exec_time::numeric, 2) AS mean_ms\nFROM pg_stat_statements WHERE dbid = … ORDER BY mean_exec_time DESC LIMIT 5;',
+          active: ['pss', 'mean'],
+          edges: ['pss-mean'],
+        },
+      ],
+    },
+  ]}
+/>
+
+| Query (baseline run) | Calls | Total | Mean | Share | Buffers per call |
+|---|---|---|---|---|---|
+| Q3 order detail | 3,990 | 156.9 s | 39.3 ms | 69% | 16,707 |
+| Q1 login by email | 6,072 | 27.8 s | 4.58 ms | 12% | 854 |
+| Q6 top SKUs | 188 | 22.8 s | 121 ms | 10% | 26,862 |
+| Q5 daily revenue | 203 | 12.4 s | 61.2 ms | 5% | 10,226 |
+| Q7 latest order per gold customer | 392 | 8.3 s | 21.2 ms | 4% | 13,139 |
+| Q2 order history | 4,965 | 0.23 s | 0.05 ms | 0% | 13 |
+| Q8 checkout inserts | 3,507 × 2 | 0.16 s | 0.03 / 0.01 ms | 0% | 9 / 6 |
+| Q4 admin search | 840 | 0.06 s | 0.07 ms | 0% | 6 |
+
+Timings are ≈: other workloads were running on the same machine. Buffer counts do not depend on load.
+
+## MySQL: digests, measured as a difference
+
+`performance_schema.events_statements_summary_by_digest` keeps one row per (schema, digest) **since the server started**. Truncating it resets everyone's numbers, so take a snapshot and subtract.
+
+<Flow
+  title="MySQL: ranking digests with a snapshot diff"
+  height={300}
+  nodes={[
+    { id: 'dig', label: 'summary_by_digest', sub: 'since server start', x: 20, y: 20, w: 220 },
+    { id: 'snap', label: 'digest_snap', sub: 'copy before the run', x: 310, y: 20, w: 200 },
+    { id: 'diff', label: '✓ Diff after run', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'sys', label: '✗ sys views', sub: 'cumulative', x: 310, y: 150, w: 200 },
+  ]}
+  edges={[
+    { id: 'dig-snap', from: 'dig', to: 'snap' },
+    { id: 'snap-diff', from: 'snap', to: 'diff' },
+    { id: 'dig-sys', from: 'dig', to: 'sys' },
+  ]}
+  cases={[
+    {
+      title: 'Snapshot diff',
+      path: 'summary_by_digest → snapshot → run 500 statements → ✓ diff: order detail 17.1 s of 21.9 s',
+      summary: 'The same 8 shapes, 500 statements, one client.',
+      subs: { diff: 'Q3: 107 × 160 ms' },
+      steps: [
+        {
+          title: 'Snapshot the counters',
+          note: 'Copy COUNT_STAR, SUM_TIMER_WAIT (picoseconds), SUM_ROWS_EXAMINED and SUM_NO_INDEX_USED for this schema into a table.',
+          code: "CREATE TABLE digest_snap AS\nSELECT DIGEST, COUNT_STAR, SUM_TIMER_WAIT, SUM_ROWS_EXAMINED, SUM_NO_INDEX_USED\nFROM performance_schema.events_statements_summary_by_digest\nWHERE SCHEMA_NAME = DATABASE();",
+          active: ['dig', 'snap'],
+          edges: ['dig-snap'],
+        },
+        {
+          title: '✓ Rank the difference',
+          note: 'Order detail: 107 calls, 17.1 s, 160 ms mean, 2,000,077 rows examined per call, all 107 without an index. Top SKUs: 5 calls, 2.7 s (4,000,184 rows examined each). Login: 146 calls, 1.16 s, 100,000 rows examined each. Statements with an index (order history, admin search) examined 20 and 50 rows per call. Read it again a few seconds later if the counts look short: right after the client returned, the last statements were sometimes not yet in the table.',
+          code: "SELECT LEFT(d.DIGEST_TEXT, 60) AS query,\n       d.COUNT_STAR - IFNULL(s.COUNT_STAR, 0) AS calls,\n       ROUND((d.SUM_TIMER_WAIT - IFNULL(s.SUM_TIMER_WAIT, 0)) / 1e9) AS total_ms,\n       ROUND((d.SUM_ROWS_EXAMINED - IFNULL(s.SUM_ROWS_EXAMINED, 0))\n             / (d.COUNT_STAR - IFNULL(s.COUNT_STAR, 0))) AS examined_per_call\nFROM performance_schema.events_statements_summary_by_digest d\nLEFT JOIN digest_snap s USING (DIGEST)\nWHERE d.SCHEMA_NAME = DATABASE() AND d.COUNT_STAR > IFNULL(s.COUNT_STAR, 0)\nORDER BY total_ms DESC LIMIT 10;",
+          active: ['snap', 'diff'],
+          edges: ['snap-diff'],
+        },
+      ],
+    },
+    {
+      title: 'Cumulative sys views (the trap)',
+      path: 'summary_by_digest → ✗ sys.statement_analysis → text-sorted latencies, one-off statements, before and after mixed',
+      summary: 'Useful for a first look, misleading for a measurement.',
+      subs: { sys: 'mixed periods' },
+      steps: [
+        {
+          title: '✗ ORDER BY a formatted column',
+          note: 'sys.statement_analysis formats total_latency as text ("33.19 s", "98.03 ms"). ORDER BY total_latency DESC on it returned "98.03 ms", "92.67 ms", then "910.56 ms": a text sort. Use sys.x$statement_analysis (raw picoseconds) for sorting. Even then the top 5 included the seed INSERTs (6.6 s and 4.3 s) and an ALTER TABLE (3.3 s): one-off statements since the server started.',
+          code: "-- ✗ text sort\nSELECT query, total_latency FROM sys.statement_analysis WHERE db = 'lab' ORDER BY total_latency DESC;\n-- ✓ raw values\nSELECT query, sys.format_time(total_latency) FROM sys.x$statement_analysis WHERE db = 'lab' ORDER BY total_latency DESC;",
+          active: ['dig', 'sys'],
+          edges: ['dig-sys'],
+        },
+        {
+          title: '✗ Before and after in one number',
+          note: 'After the indexes were added, sys.statements_with_full_table_scans still listed the login, with half of its executions counted as "no index used" and rows_examined_avg 50,001: the average of 100,000 before the fix and 1 after. Cumulative views cannot tell you whether a fix worked; a snapshot diff can. Dropping and recreating the schema did not reset them either: digests are kept by schema name.',
+          code: "SELECT query, exec_count, no_index_used_count, rows_examined_avg\nFROM sys.statements_with_full_table_scans WHERE db = 'lab';",
+          active: ['sys'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: the profiler, grouped by query shape
+
+The profiler writes operations of one database into its `system.profile` collection: level 1 records operations slower than `slowms`, level 2 records all. The default `system.profile` is a 1 MB capped collection; create a bigger one before a measurement. `slowms`, `sampleRate` and `filter` apply to the whole `mongod`, while the level is per database.
+
+<Flow
+  title="MongoDB: ranking profiled operations"
+  height={300}
+  nodes={[
+    { id: 'prof', label: 'Profiler level 2', sub: 'system.profile', x: 20, y: 20, w: 220 },
+    { id: 'grp', label: '$group by queryHash', sub: 'sum millis', x: 310, y: 20, w: 220 },
+    { id: 'top', label: '✓ Top shapes', sub: '', x: 600, y: 20, w: 180 },
+    { id: 'qs', label: '✗ $queryStats', sub: '', x: 310, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'prof-grp', from: 'prof', to: 'grp' },
+    { id: 'grp-top', from: 'grp', to: 'top' },
+  ]}
+  cases={[
+    {
+      title: 'Profile and group',
+      path: 'profiler → $group by queryHash → ✓ top SKUs: 3 timeouts (30 s); order detail: 54 × 263 ms',
+      summary: '300 operations, the same mix, 45.5 s of profiled time.',
+      subs: { top: 'Q6: 3 × 10 s timeout' },
+      steps: [
+        {
+          title: 'Turn on the profiler for one database',
+          note: 'Level 2 for the measurement window, then back to 0. Each document has millis, docsExamined, keysExamined, planSummary and queryHash (the query shape).',
+          code: 'db.setProfilingLevel(0); db.system.profile.drop();\ndb.createCollection("system.profile", { capped: true, size: 64 * 1024 * 1024 });\ndb.setProfilingLevel(2);',
+          active: ['prof'],
+        },
+        {
+          title: '✓ Group and rank',
+          note: 'Top SKUs: 3 calls, all hit maxTimeMS 10,000 (30.0 s). Order detail ($match _id + $lookup): 54 calls, 263 ms mean, 2,000,062 docs examined per call. Login: 99 calls, 7.3 ms, 52,029 docs per call (findOne stops at the first match, on average halfway). Daily revenue: 2 calls, COLLSCAN of ≈ 1M documents, 156 ms each.',
+          code: 'db.system.profile.aggregate([\n  { $group: { _id: { ns: "$ns", shape: "$queryHash" }, calls: { $sum: 1 },\n              total_ms: { $sum: "$millis" }, docs: { $sum: "$docsExamined" },\n              plan: { $first: "$planSummary" } } },\n  { $sort: { total_ms: -1 } }, { $limit: 8 }\n])',
+          active: ['prof', 'grp', 'top'],
+          edges: ['prof-grp', 'grp-top'],
+        },
+      ],
+    },
+    {
+      title: '$queryStats on a self-managed server',
+      path: '✗ $queryStats → 0 documents: collection is rate-limited to 0 outside Atlas',
+      summary: 'The command exists in 8.0 but collected nothing here.',
+      subs: { qs: '0 documents' },
+      steps: [
+        {
+          title: '✗ Nothing collected',
+          note: 'On the lab mongod 8.0, $queryStats (run against the admin database) ran without error and returned 0 documents, even after queries ran. internalQueryStatsRateLimit was 0, which disables collection. MongoDB documents $queryStats for Atlas clusters; on self-managed servers rely on the profiler and the slow query log.',
+          code: 'db.getSiblingDB("admin").aggregate([{ $queryStats: {} }]).toArray().length   // 0\ndb.adminCommand({ getParameter: 1, internalQueryStatsRateLimit: 1 })        // 0',
+          active: ['qs'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+Rank by **total** time over a **known period**. Mean time favours rare reports; cumulative counters mix last month with today and include one-off migrations; a threshold-based log (`log_min_duration_statement`, MySQL's slow log, `slowms`) never shows the 4.6 ms login that cost more than the 121 ms report. Measure a window: reset your own counters or snapshot and subtract.
+</Pitfall>
+
+## Real-world scenario: "the database is slow"
+
+| Step | Tool | Finding in the lab |
+|---|---|---|
+| Which statements? | `pg_stat_statements` / digest diff / profiler | One join (order detail) is two thirds of the load |
+| Why that one? | Buffers or rows examined per call | It reads all of `order_items` to return 2 rows |
+| Second? | Same list | The login reads all of `customers` to return 1 |
+| What to ignore for now? | Share of total | The weekly reports: slow per call, 15% together |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 2: capture plans | The ranking says which plans to read |
+| Concept 3: test before building | Candidate indexes come from the top of this list |
+| Concept 4: case study | The ranking is redone after every change |
+
+## Key takeaways
+
+1. Rank by total time (calls × mean): in the lab a 39 ms query was 69% of database time and a 4.6 ms one 12%.
+2. Per-call evidence (buffers, rows or docs examined vs returned) shows why a statement is expensive.
+3. Measure a window: reset your own database's counters (PostgreSQL), snapshot and subtract (MySQL), profile a period (MongoDB).
+4. `sys.statement_analysis` sorts formatted text; use `sys.x$statement_analysis` for ordering.
+5. `$queryStats` collected nothing on a self-managed 8.0 server; the profiler and slow query log are the tools there.
+
+## Check questions
+
+1. Why was the order-detail query (39 ms) a bigger problem than the top-SKU report (121 ms)?
+2. What does 16,707 buffers per call tell you when the query returns 2 rows?
+3. Why should you not call `pg_stat_statements_reset()` with no arguments on a shared server?
+4. Why does MySQL need a snapshot diff, and what does `sys.statements_with_full_table_scans` show after a fix?
+5. What went wrong with `ORDER BY total_latency` on `sys.statement_analysis`?
+6. Which MongoDB profiler settings are per database and which are server-wide?
+7. A slow query log with a 100 ms threshold is your only tool. Which query from this workload would you never see, and why does it matter?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-11-production-diagnosis/concept-1-find-the-queries/answers">Worked answers to Q1–Q7</DeepDive>

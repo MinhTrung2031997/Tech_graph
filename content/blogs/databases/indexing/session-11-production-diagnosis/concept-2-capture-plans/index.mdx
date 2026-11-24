@@ -1,0 +1,269 @@
+---
+title: "Concept 2: Capture the plans that production actually ran"
+description: "A ranking says which statement costs the most; the plan says why. auto_explain logs the real plan of slow statements in PostgreSQL, MySQL's EXPLAIN ANALYZE and optimizer trace show what ran and which alternatives were costed, and MongoDB's slow query log and explain show docs examined per stage. Measured: a 29 ms order-detail query scanning 2M items, a BRIN regression that tripled the pages read with the same plan, and a MongoDB log line whose planSummary said EXPRESS_IXSCAN while 2,000,225 documents were examined."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "auto_explain", "optimizer_trace", "explain", "diagnosis"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/auto-explain.html"
+  - "https://www.postgresql.org/docs/current/brin.html#BRIN-OPERATION"
+  - "https://dev.mysql.com/doc/refman/8.4/en/explain.html#explain-analyze"
+  - "https://dev.mysql.com/doc/dev/mysql-server/latest/PAGE_OPT_TRACE.html"
+  - "https://www.mongodb.com/docs/manual/reference/log-messages/"
+  - "https://www.mongodb.com/docs/manual/reference/explain-results/"
+---
+
+<Tldr>
+Running `EXPLAIN` yourself shows the plan **you** get, with your values, cache and settings. To see what production ran, capture plans where they happen. **PostgreSQL:** `auto_explain` logged the order-detail query at **29 ms**: a parallel sequential scan of `order_items` removing 669,004 rows per worker to find 2. It also exposed a regression that no ranking shows by shape: the weekly-revenue report kept the **same plan** but read **1,161** heap pages instead of **384**, because 7 BRIN ranges added by new orders had not been summarized. **MySQL:** `EXPLAIN ANALYZE` gives actual rows and time per step; the optimizer trace shows the alternatives (table scan cost **101,940** vs index range **3,719**). **MongoDB:** the slow query log said `planSummary: EXPRESS_IXSCAN { _id: 1 }` for a query that examined **2,000,225** documents: the cost was inside `$lookup`, visible only in its explain stage (`collectionScans: 1`, `indexesUsed: []`).
+</Tldr>
+
+## What each tool shows
+
+| Tool | Shows | Cost to run |
+|---|---|---|
+| `EXPLAIN` (all engines) | The plan the optimizer would choose now, with estimates | None |
+| `EXPLAIN ANALYZE` / `executionStats` | Plan + actual rows, loops, time, pages or keys | Runs the statement |
+| PostgreSQL `auto_explain` | The plan of statements over a duration, logged as they run | Small; large if `log_analyze` with timing is on |
+| MySQL optimizer trace | Every access path the optimizer costed and why it chose one | Per session, for one statement |
+| MongoDB slow query log / profiler | Per operation: planSummary, keys and docs examined, duration | Proportional to what is logged |
+
+| Term | Meaning |
+|---|---|
+| Plan regression | Same statement, worse plan or same plan reading more, after data, statistics or settings changed |
+| BRIN summarization | Recording min/max for a 128-page range; unsummarized ranges always match, so they are always read (Session 7) |
+| **✓ Captured / ✗ Missed** | The plan that ran is in the log, or the statement stayed under the threshold |
+
+## PostgreSQL: auto_explain
+
+`auto_explain` must be loaded (`shared_preload_libraries`, or `LOAD 'auto_explain'` in a session). Its settings can be set per session by a superuser, or for a database or role with `ALTER DATABASE … SET` / `ALTER ROLE … SET`.
+
+<Flow
+  title="PostgreSQL: auto_explain in the workload"
+  height={300}
+  nodes={[
+    { id: 'stmt', label: 'Statement', sub: 'any session', x: 20, y: 20, w: 200 },
+    { id: 'ae', label: 'auto_explain', sub: 'min duration 20 ms', x: 290, y: 20, w: 220 },
+    { id: 'log', label: '✓ Plan in the log', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'skip', label: '✗ Under threshold', sub: '', x: 580, y: 150, w: 200 },
+    { id: 'reg', label: 'Same plan, more pages', sub: 'BRIN ranges', x: 290, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'stmt-ae', from: 'stmt', to: 'ae' },
+    { id: 'ae-log', from: 'ae', to: 'log' },
+    { id: 'ae-skip', from: 'ae', to: 'skip' },
+    { id: 'ae-reg', from: 'ae', to: 'reg' },
+  ]}
+  cases={[
+    {
+      title: 'Slow statement: logged',
+      path: 'order detail 29 ms → auto_explain ✓ logged → Parallel Seq Scan on order_items, 669,004 rows removed per worker',
+      summary: 'The plan, buffers and row counts of the execution that was slow.',
+      subs: { log: 'Q3: 29.4 ms', stmt: 'order detail' },
+      steps: [
+        {
+          title: 'Configure',
+          note: 'log_min_duration 20 ms: log plans of statements over 20 ms. log_analyze adds actual rows; log_buffers adds pages; log_timing off avoids per-node clock calls, which the documentation warns can be very expensive. sample_rate (0–1) explains only a fraction of statements on busy servers.',
+          code: "SET auto_explain.log_min_duration = '20ms';\nSET auto_explain.log_analyze = on;\nSET auto_explain.log_buffers = on;\nSET auto_explain.log_timing = off;\n-- production: ALTER DATABASE shop SET auto_explain.log_min_duration = '200ms'; plus sample_rate",
+          active: ['stmt', 'ae'],
+          edges: ['stmt-ae'],
+        },
+        {
+          title: '✓ The logged plan',
+          note: 'duration: 29.381 ms. Gather → Nested Loop → Parallel Seq Scan on order_items, Filter (order_id = 424242), Rows Removed by Filter 669,004 per worker, Buffers shared hit 8,046 read 8,692; then Index Scan using orders_pkey. The estimate (rows=1) was right; the access path is the problem.',
+          code: "LOG:  duration: 29.381 ms  plan:\n  Gather (actual rows=2 loops=1)\n    Buffers: shared hit=8046 read=8692\n    ->  Nested Loop (actual rows=1 loops=3)\n          ->  Parallel Seq Scan on order_items i (actual rows=1 loops=3)\n                Filter: (order_id = 424242)\n                Rows Removed by Filter: 669004\n          ->  Index Scan using orders_pkey on orders o (actual rows=1 loops=2)",
+          active: ['ae', 'log'],
+          edges: ['ae-log'],
+        },
+      ],
+    },
+    {
+      title: 'Fast statement: not logged',
+      path: 'login 6.5 ms → auto_explain ✗ under 20 ms → nothing in the log',
+      summary: 'The 12%-of-load login never appears: thresholds hide frequent queries.',
+      subs: { skip: 'Q1: 6.5 ms', stmt: 'login by email' },
+      steps: [
+        {
+          title: '✗ Under the threshold',
+          note: 'The login by email took ≈ 6.5 ms (a sequential scan of 854 pages). It ran in the same session after the order detail and produced no log entry. That is why Concept 1 comes first: pg_stat_statements finds it, then you EXPLAIN it yourself.',
+          code: "SELECT id, tier FROM customers WHERE email = 'c4242@example.com';   -- no log line",
+          active: ['stmt', 'ae', 'skip'],
+          edges: ['stmt-ae', 'ae-skip'],
+        },
+      ],
+    },
+    {
+      title: 'Regression: same plan, more pages',
+      path: 'weekly revenue → same BRIN plan → ✗ lossy 1,161 pages (was 384) → 7 unsummarized ranges → summarize → 384',
+      summary: 'Found while comparing plans of the report between workload runs.',
+      subs: { reg: 'lossy 1,161 vs 384', stmt: 'weekly revenue' },
+      steps: [
+        {
+          title: 'The plan did not change',
+          note: 'Bitmap Heap Scan on orders using orders_created_brin, as before. But Heap Blocks: lossy=1,161 instead of 384, and Rows Removed by Index Recheck 93,913 instead of 18,838: 8.7 ms instead of 3.7 ms. A plan-shape comparison would say "no change".',
+          code: "->  Bitmap Heap Scan on orders\n      Rows Removed by Index Recheck: 93913\n      Heap Blocks: lossy=1161\n      ->  Bitmap Index Scan on orders_created_brin (actual rows=11610)",
+          active: ['ae', 'reg'],
+          edges: ['ae-reg'],
+        },
+        {
+          title: 'Why: unsummarized ranges',
+          note: 'The workload had inserted ≈ 85,000 orders since the last VACUUM. New 128-page ranges at the end of the table had no min/max yet, and a BRIN scan must read every unsummarized range. brin_summarize_new_values() summarized 7 ranges; the plan went back to lossy=384 and 18,838 rows removed. Autovacuum had not run yet: inserts alone trigger it only after a large fraction of the table.',
+          code: "SELECT brin_summarize_new_values('orders_created_brin');   -- 7\nALTER INDEX orders_created_brin SET (autosummarize = on);",
+          active: ['reg'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: EXPLAIN ANALYZE and the optimizer trace
+
+MySQL has no built-in equivalent of `auto_explain`; the slow query log records the statement and its counters, not the plan. Capture the statement from the digest table or slow log, then run `EXPLAIN ANALYZE` and, when the choice itself is in question, the optimizer trace.
+
+<Flow
+  title="MySQL: what ran, and what else was costed"
+  height={300}
+  nodes={[
+    { id: 'ea', label: 'EXPLAIN ANALYZE', sub: 'actual rows, time', x: 20, y: 20, w: 220 },
+    { id: 'tr', label: 'optimizer_trace', sub: 'alternatives', x: 310, y: 20, w: 200 },
+    { id: 'rng', label: '✓ Index range', sub: 'cost 3,719', x: 580, y: 20, w: 200 },
+    { id: 'tbl', label: '✗ Table scan', sub: 'cost 101,940', x: 580, y: 150, w: 200 },
+  ]}
+  edges={[
+    { id: 'ea-tr', from: 'ea', to: 'tr' },
+    { id: 'tr-rng', from: 'tr', to: 'rng' },
+    { id: 'tr-tbl', from: 'tr', to: 'tbl' },
+  ]}
+  cases={[
+    {
+      title: 'Measured plan',
+      path: 'weekly revenue → EXPLAIN ANALYZE → covering index range scan, 19,178 rows (estimated 36,384), 3.8 ms',
+      summary: 'After the case-study index (created_at, amount) was added.',
+      subs: { ea: 'rows 19,178 / est 36,384' },
+      steps: [
+        {
+          title: 'Actual vs estimated',
+          note: 'Covering index range scan on orders using orders_created_amt: estimated 36,384 rows, actual 19,178; then an aggregate through a temporary table and a sort of 7 groups: 3.84 ms. An estimate off by 1.9× did not change the choice here; off by 100× it would (Session 3).',
+          code: "EXPLAIN ANALYZE\nSELECT DATE(created_at) AS day, COUNT(*), SUM(amount) FROM orders\nWHERE created_at >= '2025-06-01' AND created_at < '2025-06-08'\nGROUP BY day ORDER BY day;",
+          active: ['ea'],
+        },
+      ],
+    },
+    {
+      title: 'Why this plan',
+      path: 'optimizer_trace → ✓ range on orders_created_amt 3,719.2 (index_only) vs ✗ table scan 101,940',
+      summary: 'The trace lists every candidate index with its cost or the reason it was skipped.',
+      subs: { tr: 'per-session' },
+      steps: [
+        {
+          title: 'Turn the trace on for one statement',
+          note: 'The trace is per session and kept in information_schema.OPTIMIZER_TRACE for the last statement.',
+          code: "SET SESSION optimizer_trace = 'enabled=on';\nSELECT DATE(created_at) AS day, … ;\nSELECT TRACE FROM information_schema.OPTIMIZER_TRACE;",
+          active: ['ea', 'tr'],
+          edges: ['ea-tr'],
+        },
+        {
+          title: 'Read the alternatives',
+          note: 'table_scan: rows 996,190, cost 101,940. orders_status_created_idx and orders_cust_created_idx: "no_valid_range_for_this_index" (created_at is not their leading column, Session 4). orders_created_amt: rows 36,384, cost 3,719.2, index_only true, chosen.',
+          code: '"table_scan": {"rows": 996190, "cost": 101940}\n{"index": "orders_status_created_idx", "chosen": false, "cause": "no_valid_range_for_this_index"}\n{"index": "orders_created_amt", "rows": 36384, "cost": 3719.2, "index_only": true, "chosen": true}',
+          active: ['tr', 'rng', 'tbl'],
+          edges: ['tr-rng', 'tr-tbl'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: the log line and the explain stage
+
+<Flow
+  title="MongoDB: where the $lookup cost hides"
+  height={300}
+  nodes={[
+    { id: 'line', label: 'Slow query log', sub: 'or system.profile', x: 20, y: 20, w: 220 },
+    { id: 'ps', label: '✗ planSummary', sub: 'EXPRESS_IXSCAN _id', x: 310, y: 20, w: 200 },
+    { id: 'docs', label: 'docsExamined', sub: '2,000,225', x: 580, y: 20, w: 200 },
+    { id: 'exp', label: 'explain', sub: 'executionStats', x: 20, y: 150, w: 220 },
+    { id: 'lk', label: '✓ $lookup stage', sub: '', x: 310, y: 150, w: 200 },
+  ]}
+  edges={[
+    { id: 'line-ps', from: 'line', to: 'ps' },
+    { id: 'ps-docs', from: 'ps', to: 'docs' },
+    { id: 'exp-lk', from: 'exp', to: 'lk' },
+  ]}
+  cases={[
+    {
+      title: 'Read the log line',
+      path: 'order detail → log: planSummary EXPRESS_IXSCAN { _id: 1 }, keysExamined 1, ✗ docsExamined 2,000,225',
+      summary: 'The summary names the plan of the first stage only.',
+      steps: [
+        {
+          title: '✗ A misleading summary',
+          note: 'The log line for $match { _id } + $lookup: planSummary "EXPRESS_IXSCAN { _id: 1 }", keysExamined 1, durationMillis 265. Read alone, that says "fast primary-key lookup".',
+          code: '{"msg":"Slow query","attr":{"ns":"lab.orders","planSummary":"EXPRESS_IXSCAN { _id: 1 }",\n "keysExamined":1,"docsExamined":2000225,"nreturned":1,"durationMillis":265, …}}',
+          active: ['line', 'ps'],
+          edges: ['line-ps'],
+        },
+        {
+          title: 'The counters disagree',
+          note: '1 key examined but 2,000,225 documents examined: the extra documents were read by a stage the summary does not describe. Any docsExamined ≫ keysExamined + nreturned is worth an explain.',
+          active: ['ps', 'docs'],
+          edges: ['ps-docs'],
+        },
+      ],
+    },
+    {
+      title: 'Explain the pipeline',
+      path: 'explain("executionStats") → ✓ $lookup stage: collectionScans 1, indexesUsed [], 2,000,224 docs → with the index: indexesUsed [order_id]',
+      summary: 'Per-stage statistics for the aggregation.',
+      subs: { lk: 'collectionScans: 1' },
+      steps: [
+        {
+          title: '✓ Stage statistics',
+          note: 'explain("executionStats") on the aggregate returns a stages array. $cursor: EXPRESS_IXSCAN, 1 document. $lookup: totalDocsExamined 2,000,224, totalKeysExamined 0, collectionScans 1, indexesUsed []; the whole explain took 273 ms. With an index on order_items.order_id: indexesUsed ["order_id"], 0 ms.',
+          code: 'db.orders.explain("executionStats").aggregate([\n  { $match: { _id: 424242 } },\n  { $lookup: { from: "order_items", localField: "_id", foreignField: "order_id", as: "items" } }\n]).stages[1]',
+          active: ['exp', 'lk'],
+          edges: ['exp-lk'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+A plan you get by pasting a statement into `EXPLAIN` can differ from what production ran: different parameter values (selectivity), a generic prepared-statement plan, a cold cache, different session settings, or statistics that changed since. Capture plans where they run (`auto_explain`, profiler) and compare **counters** (pages, rows, docs examined), not only the shape: the BRIN regression kept the same shape and read 3× the pages.
+</Pitfall>
+
+## Real-world scenario: "it was fast yesterday"
+
+| Symptom | Capture | Typical cause |
+|---|---|---|
+| Same statement, new plan | `auto_explain` before/after, profiler `planSummary` | Statistics changed, a new index, a parameter value with a different selectivity |
+| Same plan, more pages | Buffers per call over time (`pg_stat_statements`), docs/keys examined | Unsummarized BRIN ranges, bloat, lost visibility-map bits (Session 5) |
+| Summary looks fine, counters do not | Slow log fields | Cost inside a sub-stage (`$lookup`, subquery, trigger) |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 3: test before building | The captured plan is the baseline a candidate index must beat |
+| Concept 4: case study | Regressions show up between iterations |
+
+## Key takeaways
+
+1. `auto_explain` logs the real plan of slow statements; keep `log_timing` off and sample on busy servers.
+2. Thresholds hide frequent fast statements; rank first (Concept 1), then capture.
+3. Compare counters, not only plan shapes: the BRIN report read 1,161 pages instead of 384 with an identical plan.
+4. MySQL: `EXPLAIN ANALYZE` for what ran, the optimizer trace for what was considered.
+5. MongoDB: `planSummary` describes the first stage; check docs/keys examined and explain each stage.
+
+## Check questions
+
+1. Why can the plan you get from `EXPLAIN` in psql differ from the one production ran?
+2. What do `auto_explain.log_analyze` and `log_timing` add, and what do they cost?
+3. The weekly-revenue report kept the same plan but read 3× more pages. What happened, and what prevents it?
+4. What does the MySQL optimizer trace tell you that `EXPLAIN ANALYZE` does not?
+5. Why did the trace say `no_valid_range_for_this_index` for `orders_status_created_idx`?
+6. A MongoDB log line shows `EXPRESS_IXSCAN { _id: 1 }` and `docsExamined: 2000225`. Where were the documents examined?
+7. Name two counters in each engine that reveal a regression even when the plan shape is unchanged.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-11-production-diagnosis/concept-2-capture-plans/answers">Worked answers to Q1–Q7</DeepDive>

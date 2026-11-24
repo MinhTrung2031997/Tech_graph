@@ -1,0 +1,75 @@
+---
+title: "Answers: Capture the plans that production actually ran"
+description: "Worked answers to the Session 11 Concept 2 check questions."
+companion: "answers"
+tags: ["indexing", "diagnosis", "auto_explain", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/auto-explain.html"
+  - "https://dev.mysql.com/doc/dev/mysql-server/latest/PAGE_OPT_TRACE.html"
+  - "https://www.mongodb.com/docs/manual/reference/explain-results/"
+---
+
+<Tldr>
+Capture the plan where it ran, then compare counters as well as shapes.
+</Tldr>
+
+## Q1. Your EXPLAIN vs production's
+
+**Question:** why can the plan you get from `EXPLAIN` in psql differ from the one production ran?
+
+Any input to the planner can differ: the **parameter values** (a common customer vs a rare one, Session 3), a **generic plan** for a prepared statement after five executions, **session settings** (`work_mem`, `random_page_cost`, `enable_*`), **statistics** refreshed by ANALYZE since, and the **cache state**, which changes time but not the plan. `auto_explain` logs the plan of the execution that was actually slow.
+
+> **Common mistake:** testing with `WHERE customer_id = 1` because it is easy to type, when the slow calls were for the largest customers.
+
+## Q2. log_analyze and log_timing
+
+**Question:** what do `auto_explain.log_analyze` and `log_timing` add, and what do they cost?
+
+`log_analyze` makes the logged plan an `EXPLAIN ANALYZE`: actual rows and loops per node (and buffers with `log_buffers`). To have those numbers ready, instrumentation runs for **every** statement while it is on, not only those that end up logged. `log_timing` adds per-node times, which need clock calls per row on some nodes; the documentation warns this can be very expensive. In production: `log_analyze` on, `log_timing` off, `log_buffers` on, a duration threshold, and `sample_rate` below 1 on busy servers.
+
+> **Common mistake:** enabling `log_analyze` with timing on a busy server and blaming the slowdown on the database.
+
+## Q3. Same plan, 3× the pages
+
+**Question:** the weekly-revenue report kept the same plan but read 3× more pages. What happened, and what prevents it?
+
+The BRIN index on `created_at` had 7 **unsummarized** ranges at the end of the table, left by ≈ 85,000 new orders since the last VACUUM. A BRIN scan cannot exclude a range without its min/max, so it reads all of them: lossy heap blocks went from 384 to 1,161. `brin_summarize_new_values()` returned 7 and the scan went back to 384. Prevent it with `WITH (autosummarize = on)` on the index (summarizes a range as soon as the next one starts receiving rows) and appropriate autovacuum for insert-heavy tables.
+
+> **Common mistake:** concluding BRIN "stopped working" and replacing it with a 21 MB B-tree.
+
+## Q4. Trace vs EXPLAIN ANALYZE
+
+**Question:** what does the MySQL optimizer trace tell you that `EXPLAIN ANALYZE` does not?
+
+`EXPLAIN ANALYZE` shows only the chosen plan, with actual rows and times. The trace shows **every alternative** the optimizer considered (table scan, each candidate index, join orders) with its estimated rows and cost, and the reason a candidate was rejected. It answers "why not my index?": in the lab, table scan 101,940 vs range on `orders_created_amt` 3,719.2.
+
+> **Common mistake:** adding `FORCE INDEX` before reading why the optimizer preferred something else.
+
+## Q5. no_valid_range_for_this_index
+
+**Question:** why did the trace say `no_valid_range_for_this_index` for `orders_status_created_idx`?
+
+The query has a condition only on `created_at`. In `(status, created_at)` the leading column is `status`, and there is no condition on it, so no contiguous range of the index matches (leftmost prefix, Session 4). The optimizer could still consider a skip scan in some cases, but here a full index scan or skip scan over 5 statuses was not cheaper than the dedicated index.
+
+> **Common mistake:** expecting any index that contains the column to be usable for a range on it.
+
+## Q6. EXPRESS_IXSCAN with 2M documents
+
+**Question:** a MongoDB log line shows `EXPRESS_IXSCAN { _id: 1 }` and `docsExamined: 2000225`. Where were the documents examined?
+
+In the `$lookup` stage. `planSummary` describes the plan of the first stage (the `$match` on `_id`, 1 key, 1 document). The `$lookup` scanned all 2,000,224 documents of `order_items` because `order_id` had no index; `explain("executionStats")` shows it in the `$lookup` stage: `collectionScans: 1`, `indexesUsed: []`.
+
+> **Common mistake:** trusting the summary and looking for the problem elsewhere.
+
+## Q7. Counters that reveal regressions
+
+**Question:** name two counters in each engine that reveal a regression even when the plan shape is unchanged.
+
+| Engine | Counters |
+|---|---|
+| PostgreSQL | Buffers per call in `pg_stat_statements` (`shared_blks_hit + shared_blks_read`) / calls; in a plan: `Rows Removed by Filter` / `Index Recheck`, `Heap Blocks: lossy`, `Heap Fetches` |
+| MySQL | Rows examined per call in the digest table; `Handler_read_*` status deltas; actual rows per step in `EXPLAIN ANALYZE` |
+| MongoDB | `docsExamined` and `keysExamined` per operation vs `nreturned`; per-stage `totalDocsExamined` in explain |
+
+> **Common mistake:** alerting only on plan changes (a new `queryHash` plan or `planSummary`), which misses same-plan regressions.

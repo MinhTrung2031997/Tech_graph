@@ -1,0 +1,12 @@
+{
+  "title": "Session 11: Capstone: diagnosing indexes in production",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-find-the-queries/index",
+    "concept-2-capture-plans/index",
+    "concept-3-test-before-build/index",
+    "concept-4-case-study/index",
+    "lab/index"
+  ]
+}

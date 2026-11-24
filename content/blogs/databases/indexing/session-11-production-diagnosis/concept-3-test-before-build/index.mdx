@@ -1,0 +1,262 @@
+---
+title: "Concept 3: Test an index before you pay for it"
+description: "Building a 39 MB index on a busy table costs I/O, WAL, replication and write overhead forever after, so test the candidate first. PostgreSQL's hypopg plans with an index that does not exist (cost 28,190 → 16.55), MySQL's invisible indexes can be switched on for one session only (table scan 211 ms → lookup 0.01 ms), and MongoDB has no hypothetical indexes, so you test on a copy and compare with hide/unhide. Then measure the write side: +137 bytes of WAL per checkout in steady state, more while a new random-key index is splitting its pages."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "hypopg", "invisible-indexes", "hidden-indexes", "write-amplification"]
+status: "draft"
+sources:
+  - "https://hypopg.readthedocs.io/en/latest/usage.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/invisible-indexes.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/switchable-optimizations.html"
+  - "https://www.mongodb.com/docs/manual/core/index-hidden/"
+  - "https://www.postgresql.org/docs/current/pgstatstatements.html"
+  - "https://www.postgresql.org/docs/current/pgstattuple.html"
+---
+
+<Tldr>
+A candidate index has two questions: **will the planner use it** for the target query, and **what does it cost** on every write. **PostgreSQL:** the `hypopg` extension creates a hypothetical index visible only to `EXPLAIN` in your session: the order-detail plan's estimated cost fell from **28,190** to **16.55**, in milliseconds, with nothing built. It cannot run the query (`EXPLAIN ANALYZE` ignores it), and its size estimate was **56 MB** for an index that turned out to be **39 MB**. **MySQL:** no hypothetical indexes, but an **invisible** index plus `SET SESSION optimizer_switch = 'use_invisible_indexes=on'` lets one session test it: 211 ms table scan elsewhere, 0.01 ms lookup in that session. It is fully built and maintained, though. **MongoDB:** neither; a hidden index cannot even be hinted (`BadValue`). Test on a copy, then compare with `hideIndex()` / `unhideIndex()` (273 ms vs 0 ms). The write side, measured with `pg_stat_statements.wal_bytes`: the `order_items (order_id)` index added a steady **137 bytes** of WAL per checkout; `(customer_id, created_at)` cost nothing extra at first, then up to **+250 bytes** per order while its pages, built 90% full, were splitting, then little again once its leaves had settled at **54%** density, and the index had grown from 30 MB to 72 MB.
+</Tldr>
+
+| Engine | Plan with an index that does not exist | Plan with an index others cannot see | Quick on/off for an existing index |
+|---|---|---|---|
+| PostgreSQL | ✓ `hypopg` (extension) | — | — (no invisible indexes; Session 8) |
+| MySQL | — | ✓ invisible + `use_invisible_indexes=on` in one session | ✓ `ALTER INDEX … INVISIBLE / VISIBLE` |
+| MongoDB | — | — | ✓ `hideIndex()` / `unhideIndex()` (not hintable while hidden) |
+
+| Term | Meaning |
+|---|---|
+| Hypothetical index | Catalog entry that exists only in your session's memory; the planner costs it, nothing is built |
+| Invisible / hidden index | Built and maintained on every write, ignored by the optimizer (unless a session opts in, MySQL) |
+| `wal_bytes` | Bytes of WAL generated per statement, in `pg_stat_statements` (PostgreSQL 13+) |
+| **✓ Planner would use it / ✗ Not tested by this** | What the method answers, and what it cannot |
+
+## PostgreSQL: hypopg
+
+`hypopg` is a third-party extension (packages for most distributions; the lab compiles it inside the container). It needs no restart.
+
+<Flow
+  title="PostgreSQL: a hypothetical index for the order-detail join"
+  height={300}
+  nodes={[
+    { id: 'cand', label: 'Candidate', sub: 'order_items (order_id)', x: 20, y: 20, w: 220 },
+    { id: 'hypo', label: 'hypopg_create_index', sub: 'this session only', x: 310, y: 20, w: 220 },
+    { id: 'exp', label: '✓ EXPLAIN', sub: '', x: 600, y: 20, w: 180 },
+    { id: 'ana', label: '✗ EXPLAIN ANALYZE', sub: '', x: 600, y: 150, w: 180 },
+    { id: 'size', label: 'hypopg_relation_size', sub: '', x: 310, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'cand-hypo', from: 'cand', to: 'hypo' },
+    { id: 'hypo-exp', from: 'hypo', to: 'exp' },
+    { id: 'hypo-ana', from: 'hypo', to: 'ana' },
+    { id: 'hypo-size', from: 'hypo', to: 'size' },
+  ]}
+  cases={[
+    {
+      title: 'Plan with a hypothetical index',
+      path: 'candidate → hypopg_create_index → ✓ EXPLAIN: Index Scan using <13664>btree_order_items_order_id, cost 28,190 → 16.55',
+      summary: 'The planner costs the index as if it existed; nothing is written to disk.',
+      subs: { exp: 'cost 16.55' },
+      steps: [
+        {
+          title: 'Create it in memory',
+          note: 'hypopg_create_index takes an ordinary CREATE INDEX statement and returns an oid and a name like <13664>btree_order_items_order_id. Other sessions do not see it; it disappears at disconnect or with hypopg_reset().',
+          code: "CREATE EXTENSION hypopg;\nSELECT * FROM hypopg_create_index('CREATE INDEX ON order_items (order_id)');",
+          active: ['cand', 'hypo'],
+          edges: ['cand-hypo'],
+        },
+        {
+          title: '✓ EXPLAIN uses it',
+          note: 'Before: Gather → Parallel Seq Scan on order_items, total cost 28,189.82. With the hypothetical index: Nested Loop → Index Scan using orders_pkey → Index Scan using "<13664>btree_order_items_order_id", total cost 16.55. The planner would use it.',
+          code: 'EXPLAIN SELECT o.id, o.status, o.amount, i.sku, i.qty, i.price\nFROM orders o JOIN order_items i ON i.order_id = o.id WHERE o.id = 424242;',
+          active: ['hypo', 'exp'],
+          edges: ['hypo-exp'],
+        },
+      ],
+    },
+    {
+      title: 'What it cannot tell you',
+      path: 'hypothetical index → ✗ EXPLAIN ANALYZE runs without it → size estimate 56 MB vs 39 MB built',
+      summary: 'A plan estimate, not a measurement.',
+      subs: { ana: 'Seq Scan, 19.9 ms', size: 'est. 56 MB (real 39 MB)' },
+      steps: [
+        {
+          title: '✗ No execution',
+          note: 'EXPLAIN ANALYZE executes the query, and an index with no data cannot be executed: the same session got Parallel Seq Scan on order_items, 19.9 ms. You learn whether the planner would choose it and the estimated cost, not the real pages or time.',
+          code: 'EXPLAIN ANALYZE SELECT i.sku FROM order_items i WHERE i.order_id = 424242;\n-- Parallel Seq Scan on order_items … Execution Time: 19.932 ms',
+          active: ['hypo', 'ana'],
+          edges: ['hypo-ana'],
+        },
+        {
+          title: 'Size is an estimate',
+          note: 'hypopg_relation_size estimated 56 MB from row count and key width. The real index was 39 MB, most likely because B-tree deduplication (Session 2) stores each order_id once for its two items, which a width-based estimate does not model. Use it for order of magnitude only.',
+          code: 'SELECT index_name, pg_size_pretty(hypopg_relation_size(indexrelid)) FROM hypopg_list_indexes;\n-- <13664>btree_order_items_order_id | 56 MB',
+          active: ['hypo', 'size'],
+          edges: ['hypo-size'],
+        },
+      ],
+    },
+  ]}
+/>
+
+The same check for the CRM query (Q7, latest order per gold customer) predicted `Index Scan using <…>btree_customers_country_tier` instead of a sequential scan of `customers`; once built, finding the 513 gold customers in SG read 377 buffers instead of 854.
+
+## MySQL: invisible, but visible to me
+
+<Flow
+  title="MySQL: testing an invisible index in one session"
+  height={300}
+  nodes={[
+    { id: 'add', label: 'ADD INDEX … INVISIBLE', sub: 'built, maintained', x: 20, y: 20, w: 240 },
+    { id: 'other', label: '✗ Other sessions', sub: 'ignore it', x: 330, y: 20, w: 200 },
+    { id: 'mine', label: '✓ This session', sub: 'use_invisible_indexes', x: 330, y: 150, w: 200 },
+    { id: 'vis', label: 'ALTER INDEX VISIBLE', sub: 'for everyone', x: 600, y: 150, w: 180 },
+  ]}
+  edges={[
+    { id: 'add-other', from: 'add', to: 'other' },
+    { id: 'add-mine', from: 'add', to: 'mine' },
+    { id: 'mine-vis', from: 'mine', to: 'vis' },
+  ]}
+  cases={[
+    {
+      title: 'Test in one session',
+      path: 'invisible index → ✗ other sessions: table scan 211 ms → ✓ my session: index lookup 0.01 ms → VISIBLE',
+      summary: 'order_items (order_id), invisible.',
+      subs: { other: 'table scan, 211 ms', mine: 'lookup, 0.01 ms' },
+      steps: [
+        {
+          title: '✗ Everyone else: unchanged',
+          note: 'With the index invisible, the order-detail query is still a table scan of order_items: cost 205,861, 2M rows read, 211 ms. Production queries are not affected by the test.',
+          code: "ALTER TABLE order_items ADD INDEX order_items_order_idx (order_id) INVISIBLE;\nEXPLAIN ANALYZE SELECT o.id, i.sku FROM orders o JOIN order_items i ON i.order_id = o.id WHERE o.id = 424242;\n-- Table scan on i (cost=205861 rows=1.99e+6) (actual time=0.101..178 rows=2e+6 loops=1)",
+          active: ['add', 'other'],
+          edges: ['add-other'],
+        },
+        {
+          title: '✓ This session: opt in',
+          note: 'use_invisible_indexes=on makes the optimizer treat invisible indexes as visible for this session only: Index lookup on i using order_items_order_idx, cost 1.29, actual 0.011 ms. Run every query that touches the table here, to catch plans that would change for the worse.',
+          code: "SET SESSION optimizer_switch = 'use_invisible_indexes=on';\nEXPLAIN ANALYZE SELECT o.id, i.sku FROM orders o JOIN order_items i ON i.order_id = o.id WHERE o.id = 424242;",
+          active: ['add', 'mine'],
+          edges: ['add-mine'],
+        },
+        {
+          title: 'Release it',
+          note: 'ALTER INDEX … VISIBLE is a metadata change: instant, no rebuild. The catch: the index was fully built and maintained on every write during the test. This tests the read side, not the cost.',
+          code: 'ALTER TABLE order_items ALTER INDEX order_items_order_idx VISIBLE;',
+          active: ['mine', 'vis'],
+          edges: ['mine-vis'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: no hypothetical indexes
+
+<Flow
+  title="MongoDB: test on a copy, compare by hiding"
+  height={300}
+  nodes={[
+    { id: 'copy', label: 'Test copy', sub: 'restore or sample', x: 20, y: 20, w: 220 },
+    { id: 'built', label: 'createIndex', sub: 'on the copy', x: 310, y: 20, w: 200 },
+    { id: 'hide', label: 'hideIndex()', sub: 'planner ignores it', x: 310, y: 150, w: 200 },
+    { id: 'hint', label: '✗ hint(hidden)', sub: 'BadValue', x: 580, y: 150, w: 200 },
+    { id: 'cmp', label: '✓ Hidden vs visible', sub: '', x: 580, y: 20, w: 200 },
+  ]}
+  edges={[
+    { id: 'copy-built', from: 'copy', to: 'built' },
+    { id: 'built-cmp', from: 'built', to: 'cmp' },
+    { id: 'built-hide', from: 'built', to: 'hide' },
+    { id: 'hide-hint', from: 'hide', to: 'hint' },
+  ]}
+  cases={[
+    {
+      title: 'Compare hidden and visible',
+      path: 'copy → createIndex → hideIndex: $lookup 273 ms, 2,000,224 docs → unhideIndex: 0 ms, indexesUsed [order_id]',
+      summary: 'Build where it costs nobody, then switch it off and on.',
+      subs: { cmp: '273 ms → 0 ms' },
+      steps: [
+        {
+          title: 'Build on a copy',
+          note: 'MongoDB has no way to plan with an index that does not exist. Restore a snapshot (or a representative sample) into a test deployment and build the candidate there. On a replica set in production, index builds run on all members at once; a rolling build (one member at a time, out of the set) is the alternative for very large collections.',
+          code: 'db.order_items.createIndex({ order_id: 1 }, { name: "order_id" })',
+          active: ['copy', 'built'],
+          edges: ['copy-built'],
+        },
+        {
+          title: '✓ Hidden vs visible',
+          note: 'Hidden: the $lookup stage did a collection scan (collectionScans 1, 2,000,224 docs, 273 ms). Visible: indexesUsed ["order_id"], 2 keys, 2 documents, 0 ms. Unhiding is instant; the index was maintained while hidden.',
+          code: 'db.order_items.hideIndex("order_id")   // explain: 273 ms\ndb.order_items.unhideIndex("order_id") // explain: 0 ms',
+          active: ['built', 'cmp'],
+          edges: ['built-cmp'],
+        },
+      ],
+    },
+    {
+      title: 'Hint a hidden index',
+      path: 'hideIndex → ✗ find().hint("order_id"): BadValue, planner returned error',
+      summary: 'Unlike MySQL, there is no per-session opt-in.',
+      subs: { hint: 'error' },
+      steps: [
+        {
+          title: '✗ Not hintable',
+          note: 'A hidden index cannot be used even with hint(): the query fails with BadValue ("planner returned error"). So a hidden index cannot be tested by one session while production ignores it.',
+          code: 'db.order_items.hideIndex("order_id");\ndb.order_items.find({ order_id: 424242 }).hint("order_id")   // BadValue',
+          active: ['built', 'hide', 'hint'],
+          edges: ['built-hide', 'hide-hint'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## The other half: write cost
+
+Every method above answers "would reads improve". The write side has to be measured with the writes. `pg_stat_statements.wal_bytes` gives WAL per statement; the checkout script (one order, two items) was run 20,000 times per measurement, with each index set.
+
+| Indexes on the written tables | `order_items` insert (2 rows) | `orders` insert | Notes |
+|---|---|---|---|
+| Before: `orders` pkey, `(customer_id)`, `(status, created_at)`; `order_items` pkey | 326 B in every run | 333–343 B | `(customer_id)` has ≈ 10 entries per key: when a leaf fills, deduplication merges them into posting lists instead of splitting (Session 2) |
+| After, right after building: `orders` pkey, `(customer_id, created_at)`, `(status, created_at)`, BRIN; `order_items` pkey, `(order_id)` | 463 B in every run | 340–378 B | New index pages built 90% full still have room |
+| After, while `(customer_id, created_at)` splits (≈ 60,000–200,000 inserts after the build) | 463 B | 415–593 B | Each order lands in a random place in the index (one customer of 100,000); full leaves split, and splits are logged |
+| After, settled | 463 B | 338–353 B | Leaves at 54% density: 2–4 splits per 20,000 inserts; the index has grown from 30 MB to 72 MB |
+
+`order_items (order_id)` adds a steady **137 bytes** per checkout: `order_id` grows with every order, so its entries go to the rightmost leaf, as with an increasing primary key (Session 2); its leaves stayed at 90% density. `(customer_id, created_at)` costs little per insert once settled, but it paid with **a burst of page splits** and **2.4× its size**, as random-insert B-trees do (Session 2, Concept 6). The BRIN index made no measurable difference in either direction (dropping it did not change the `orders` numbers). Runs that included a checkpoint showed thousands of full-page images and were not compared.
+
+<Pitfall>
+A hypothetical or invisible index answers only the **read** question, and only in **estimated** (hypopg) or **single-session** (MySQL) form. It says nothing about the WAL, page splits, replication lag, buffer-pool pressure or build time the real index brings, and a single benchmark right after building measures none of it correctly: the same index cost almost nothing, then up to +250 bytes per insert, then almost nothing again, over ≈ 300,000 inserts. Measure on a copy with production-like writes, for long enough to see the steady state.
+</Pitfall>
+
+## Real-world scenario: "can we add this index?"
+
+| Question | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| Will the planner use it? | `hypopg` + `EXPLAIN` | Invisible + session switch | Test copy |
+| How much faster? | Build on a copy, `EXPLAIN (ANALYZE, BUFFERS)` | `EXPLAIN ANALYZE` in the switched session | explain on the copy |
+| What does it cost on writes? | `wal_bytes` per statement over time; `pgstatindex` density | Redo bytes (`Innodb_os_log_written`) per workload | Oplog and insert latency on the copy |
+| How do we roll back? | `DROP INDEX CONCURRENTLY` | `INVISIBLE`, then drop | `hideIndex`, then drop |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 4: case study | Every candidate was checked this way before it was built |
+| Session 8: write amplification | The write half of the decision, measured per statement |
+
+## Key takeaways
+
+1. `hypopg` plans with an index that does not exist: the plan and estimated cost, not real pages or size.
+2. MySQL invisible indexes can be tested by one session (`use_invisible_indexes=on`) while others ignore them, but they are fully built and maintained.
+3. MongoDB has no hypothetical indexes and hidden indexes cannot be hinted: test on a copy, compare with hide/unhide.
+4. Write cost depends on the key pattern: an increasing key cost a steady 137 bytes per checkout; a random key cost a burst of splits and 2.4× its size.
+5. Measure the write side over time, not in one run right after the build.
+
+## Check questions
+
+1. What does `hypopg` let you learn without building the index, and what can it not tell you?
+2. Why did `EXPLAIN ANALYZE` ignore the hypothetical index?
+3. Why was the hypothetical size (56 MB) larger than the real one (39 MB)?
+4. How do you test a MySQL index on production data without changing other sessions' plans, and what does that test still cost?
+5. Why can a MongoDB hidden index not be used to test a candidate the way a MySQL invisible index can?
+6. `order_items (order_id)` added a steady 137 bytes per checkout, while the WAL of an `orders` insert went up and then back down. Why the difference?
+7. Why is one benchmark right after building an index not enough to know its write cost?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-11-production-diagnosis/concept-3-test-before-build/answers">Worked answers to Q1–Q7</DeepDive>

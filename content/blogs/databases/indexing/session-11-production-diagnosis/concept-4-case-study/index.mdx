@@ -1,0 +1,342 @@
+---
+title: "Concept 4: Case study: one workload, three engines, three iterations"
+description: "The whole course applied to an 8-query e-commerce workload over orders, customers and order_items. Measure, rank, design with the Session 8 checklist, test, build online, re-measure, repeat. PostgreSQL went from 336 to 5,944 transactions per second in three iterations (database time per transaction 11.3 → 0.37 ms) for four more indexes and ≈ 65 MB; MySQL from 21.9 s to 0.55 s of statement time; MongoDB from 45.5 s to 0.87 s. And the point where adding indexes stops being the answer."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "case-study", "index-design", "capstone"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pgbench.html"
+  - "https://www.postgresql.org/docs/current/runtime-config-query.html#GUC-RANDOM-PAGE-COST"
+  - "https://dev.mysql.com/doc/refman/8.4/en/lateral-derived-tables.html"
+  - "https://www.mongodb.com/docs/manual/core/query-optimization/#covered-query"
+---
+
+<Tldr>
+The workload from Concept 1 (login, order history, order detail, admin search, two weekly reports, a CRM query, checkout), measured, fixed and measured again. **PostgreSQL**, 60 s runs with 4 clients: **336 tps** at the start; **3,333** after iteration 1 (four indexes from the top of `pg_stat_statements`, one redundant index dropped); **5,038** after iteration 2 (a cost-model setting, not an index, fixed the top-SKU report, and a BRIN regression was caught); **5,944** after iteration 3 (one 704 kB index). Database time per transaction fell from **11.3 ms to 0.37 ms**. The price: 5 → 9 indexes on the three tables, ≈ 110 → 175 MB, and a steady **+137 bytes of WAL** per checkout, plus a burst of page splits that grew one new index from 30 to 72 MB (Concept 3). **MySQL** (same design, a B-tree where PostgreSQL used BRIN): 21.9 s → 0.55 s for the same 500 statements. **MongoDB**: 45.5 s → 0.87 s, three report timeouts → none. What remained on top in PostgreSQL were the two weekly reports, **81%** of database time at 2% of calls: the point to stop adding indexes and change how reports are produced.
+</Tldr>
+
+## The loop
+
+| Step | Tool | Course session |
+|---|---|---|
+| 1. Measure a window | pgbench + `pg_stat_statements` / digest diff / profiler | 11 (Concept 1) |
+| 2. Rank by total time, read per-call evidence | Buffers, rows, docs examined | 3, 11 |
+| 3. Capture the plan | `EXPLAIN (ANALYZE, BUFFERS)`, `auto_explain`, explain stages | 3, 11 (Concept 2) |
+| 4. Design | Checklist: operator → type, equality → sort → range, covering, write cost | 2, 4, 5, 7, 8 |
+| 5. Test | `hypopg`, invisible index, copy | 11 (Concept 3) |
+| 6. Build online, verify, re-measure | `CONCURRENTLY`, `ALGORITHM=INPLACE, LOCK=NONE`, rolling builds | 8 |
+
+| Term | Meaning |
+|---|---|
+| Iteration | One pass of measure → rank → fix → re-measure; the ranking changes after every fix |
+| Database time per transaction | Sum of `total_exec_time` over all statements / transactions: how much server time one unit of work costs |
+| **✓ Fixed by an index / ✗ Not an index problem** | Per-call reads fell to what the result needs, or the remaining cost is inherent to the query |
+
+## PostgreSQL: three iterations
+
+<Flow
+  title="PostgreSQL: measure, rank, fix, repeat"
+  height={300}
+  nodes={[
+    { id: 'run', label: 'pgbench 60 s', sub: '4 clients', x: 20, y: 20, w: 180 },
+    { id: 'rank', label: 'pg_stat_statements', sub: 'top by total', x: 270, y: 20, w: 220 },
+    { id: 'fix', label: 'Design + test', sub: 'checklist, hypopg', x: 560, y: 20, w: 220 },
+    { id: 'build', label: 'CREATE INDEX', sub: 'CONCURRENTLY', x: 560, y: 150, w: 220 },
+    { id: 'stop', label: '✗ Not an index problem', sub: '', x: 270, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'run-rank', from: 'run', to: 'rank' },
+    { id: 'rank-fix', from: 'rank', to: 'fix' },
+    { id: 'fix-build', from: 'fix', to: 'build' },
+    { id: 'build-run', from: 'build', to: 'run', quiet: true },
+    { id: 'rank-stop', from: 'rank', to: 'stop' },
+  ]}
+  cases={[
+    {
+      title: 'Iteration 1: the top of the list',
+      path: '336 tps → rank: detail 69%, login 12%, top SKUs 10% → 4 indexes, drop 1 → ✓ 3,333 tps',
+      summary: 'One index per finding, each chosen with the checklist.',
+      subs: { run: '336 tps', rank: 'Q3 69%, Q1 12%' },
+      steps: [
+        {
+          title: 'Rank',
+          note: 'Order detail 69% (16,707 buffers per call), login 12% (854), top SKUs 10%, daily revenue 5%, CRM 4% (Concept 1).',
+          active: ['run', 'rank'],
+          edges: ['run-rank'],
+        },
+        {
+          title: 'Design with the checklist',
+          note: 'Q3, Q6: join column order_items.order_id → B-tree (Session 9). Q1: equality on email, a business rule → UNIQUE (Session 5). Q2, Q7: equality customer_id + ORDER BY created_at → (customer_id, created_at), which makes (customer_id) redundant (Session 4, 8). Q5, Q6: range on created_at, which rises with insert order → BRIN, 24 kB (Session 7). hypopg confirmed the order_items plan before building.',
+          code: "CREATE INDEX CONCURRENTLY order_items_order_idx ON order_items (order_id);\nCREATE UNIQUE INDEX CONCURRENTLY customers_email_key ON customers (email);\nCREATE INDEX CONCURRENTLY orders_cust_created_idx ON orders (customer_id, created_at);\nCREATE INDEX CONCURRENTLY orders_created_brin ON orders USING brin (created_at);\nDROP INDEX CONCURRENTLY orders_customer_idx;",
+          active: ['rank', 'fix', 'build'],
+          edges: ['rank-fix', 'fix-build'],
+        },
+        {
+          title: '✓ Re-measure',
+          note: '3,333 tps (9.9×). Order detail 39 → 0.03 ms, login 4.58 → 0.01 ms. The new ranking: top SKUs 69%, CRM 15%, daily revenue 12%. The top-SKU report still hash-joined a full scan of order_items: the new index was not used for it.',
+          active: ['build', 'run', 'rank'],
+          edges: ['build-run', 'run-rank'],
+          subs: { run: '3,333 tps', rank: 'Q6 69%, Q7 15%' },
+        },
+      ],
+    },
+    {
+      title: 'Iteration 2: the cost model, and a regression',
+      path: 'top SKUs: hash join + full order_items scan → random_page_cost 1.1 → nested loop on order_id, 54.5 → 19.3 ms → ✓ 5,038 tps',
+      summary: 'The index existed; the planner priced random reads as if on a hard disk.',
+      subs: { run: '5,038 tps', rank: 'Q6 44%, Q5 30%' },
+      steps: [
+        {
+          title: 'Why the index was not used',
+          note: 'For the 19,178 orders of a week, the planner compared 19,178 index lookups (random reads at random_page_cost 4) with one sequential scan of order_items, and chose the scan: ≈ 19,300 buffers, 12,800–13,000 of them read from outside shared_buffers, 42–69 ms. Forcing the nested loop gave 77,886 buffers, all hits, 11–14 ms: more buffers, all in memory, faster.',
+          code: "SET enable_hashjoin = off;   -- diagnosis only\nEXPLAIN (ANALYZE, BUFFERS) SELECT i.sku, sum(i.qty) … ;",
+          active: ['rank', 'fix'],
+          edges: ['rank-fix'],
+        },
+        {
+          title: 'Fix the model, not the query',
+          note: 'The data lives on SSD and fits in memory: random_page_cost 1.1 (Session 3) makes the planner choose the nested loop by itself. Set for this database only, then re-run the whole workload, since the setting affects every plan. Top SKUs 54.5 → 19.3 ms in the workload; nothing else got worse.',
+          code: 'ALTER DATABASE shop SET random_page_cost = 1.1;',
+          active: ['fix', 'build'],
+          edges: ['fix-build'],
+        },
+        {
+          title: 'A regression on the way',
+          note: 'The weekly revenue report read 840 buffers per call instead of 408 with an unchanged plan: 7 BRIN ranges added by ≈ 85,000 new orders were unsummarized, so lossy heap blocks rose from 384 to 1,161 (Concept 2). Fixed with brin_summarize_new_values() and autosummarize = on.',
+          code: "ALTER INDEX orders_created_brin SET (autosummarize = on);",
+          active: ['build', 'run', 'rank'],
+          edges: ['build-run', 'run-rank'],
+        },
+      ],
+    },
+    {
+      title: 'Iteration 3: one small index, then stop',
+      path: 'CRM: seq scan of 854 pages per call → (country, tier), 704 kB → 5.0 → 2.5 ms → ✓ 5,944 tps → reports 81% → ✗ stop indexing',
+      summary: 'The last cheap win; what is left is the cost of the reports themselves.',
+      subs: { run: '5,944 tps', rank: 'Q6 49%, Q5 32%', stop: 'reports: 81%' },
+      steps: [
+        {
+          title: 'A small index for the CRM query',
+          note: 'hypopg predicted an index scan on (country, tier), the index the Session 9 lab also used. Built: 704 kB, 377 buffers to find the 513 gold customers in SG instead of the 854-page scan, then 4 buffers per customer on (customer_id, created_at) with no sort. Mean 5.0 → 2.5 ms. customers is written only at sign-up, so the write cost is negligible.',
+          code: 'CREATE INDEX CONCURRENTLY customers_country_tier ON customers (country, tier);',
+          active: ['fix', 'build', 'run'],
+          edges: ['fix-build', 'build-run'],
+        },
+        {
+          title: '✗ What remains is not an index problem',
+          note: 'Final run: top SKUs 49% of database time (17.7 ms, 77,357 buffer hits per call: 19,178 orders × 2 items × a few pages), daily revenue 32% (11.2 ms, 651 buffers). Together 81%, at 2% of calls. They read what they must: a week of data. More indexes would tax every checkout. The fix is a different design: a daily summary table updated by a job, a materialized view, or running reports on a replica.',
+          active: ['run', 'rank', 'stop'],
+          edges: ['run-rank', 'rank-stop'],
+        },
+      ],
+    },
+  ]}
+/>
+
+| Query | Before: mean | Buffers per call | After 3 iterations: mean | Buffers per call | What changed |
+|---|---|---|---|---|---|
+| Q1 login | 4.58 ms | 854 | 0.01 ms | 4 | Unique index on `email` |
+| Q2 order history | 0.05 ms | 13 | 0.03 ms | 14 | `(customer_id, created_at)`: no Sort |
+| Q3 order detail | 39.3 ms | 16,707 | 0.02 ms | 8 | `order_items (order_id)` |
+| Q4 admin search | 0.07 ms | 6 | 0.04 ms | 6 | Already served by `(status, created_at)` |
+| Q5 daily revenue | 61.2 ms | 10,226 | 11.2 ms | 651 | BRIN on `created_at` |
+| Q6 top SKUs | 121 ms | 26,862 | 17.7 ms | 77,357 | Index + `random_page_cost`: more buffers, all hits |
+| Q7 CRM latest order | 21.2 ms | 13,139 | 2.46 ms | 4,473 | `(customer_id, created_at)` + `(country, tier)` |
+| Q8 checkout (2 inserts) | 0.03 + 0.01 ms | 9 + 6 | 0.01 + 0.01 ms | 11 + 8 | +2 index entries per checkout |
+
+| | Start | Iteration 1 | Iteration 2 | Iteration 3 |
+|---|---|---|---|---|
+| Transactions per second | 336 | 3,333 | 5,038 | 5,944 |
+| Database time per transaction | 11.3 ms | 0.80 ms | 0.45 ms | 0.37 ms |
+| Indexes on the three tables | 5 | 8 | 8 | 9 |
+| Index size, freshly built | ≈ 110 MB | ≈ 174 MB | ≈ 174 MB | ≈ 175 MB |
+
+Times are ≈ (other workloads shared the machine); buffer counts are exact. The inserts got faster on average because the server spent less time scanning; their WAL grew (Concept 3).
+
+## MySQL: the same design, a B-tree for dates
+
+<Flow
+  title="MySQL: one iteration on the same mix"
+  height={300}
+  nodes={[
+    { id: 'diff', label: 'Digest diff', sub: '500 statements', x: 20, y: 20, w: 200 },
+    { id: 'alter', label: 'ALTER TABLE', sub: 'INPLACE, LOCK=NONE', x: 290, y: 20, w: 220 },
+    { id: 'after', label: '✓ Re-measured', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'q7', label: 'CRM query', sub: 'lateral + Sort', x: 580, y: 150, w: 200 },
+  ]}
+  edges={[
+    { id: 'diff-alter', from: 'diff', to: 'alter' },
+    { id: 'alter-after', from: 'alter', to: 'after' },
+    { id: 'after-q7', from: 'after', to: 'q7' },
+  ]}
+  cases={[
+    {
+      title: 'Indexes from the ranking',
+      path: 'digest diff 21.9 s (detail 17.1 s) → 4 ADD INDEX, 1 DROP → ✓ 0.55 s, rows examined per call ≈ rows returned',
+      summary: 'MySQL has no BRIN: the date range gets a covering B-tree (created_at, amount).',
+      subs: { diff: '21.9 s', after: '0.55 s' },
+      steps: [
+        {
+          title: 'Same findings',
+          note: 'Order detail 107 × 160 ms (2,000,077 rows examined each), top SKUs 5 × 549 ms, login 146 × 7.9 ms, daily revenue 3 × 89 ms, CRM 9 × 27.5 ms.',
+          active: ['diff'],
+        },
+        {
+          title: 'Build online',
+          note: 'Without the Session 9 foreign key (the lab drops it to start from this state), MySQL has no index on order_items.order_id: InnoDB creates one only for a declared foreign key. For the dates: (created_at, amount), covering for the revenue report and giving the order ids (the primary key is in every secondary entry) for the top-SKU join.',
+          code: "ALTER TABLE customers ADD UNIQUE INDEX customers_email_key (email), ALGORITHM=INPLACE, LOCK=NONE;\nALTER TABLE order_items ADD INDEX order_items_order_idx (order_id), ALGORITHM=INPLACE, LOCK=NONE;\nALTER TABLE orders ADD INDEX orders_cust_created_idx (customer_id, created_at),\n                   ADD INDEX orders_created_amt (created_at, amount),\n                   DROP INDEX orders_customer_idx, ALGORITHM=INPLACE, LOCK=NONE;",
+          active: ['diff', 'alter'],
+          edges: ['diff-alter'],
+        },
+        {
+          title: '✓ Re-measure',
+          note: 'Same 500 statements: 0.55 s. Order detail 0.05 ms (2 rows examined), login 0.03 ms (1), daily revenue 3.8 ms (19,185 rows examined, covering), top SKUs 28.5 ms (57,544). New top: the CRM query (22 ms, still 100,769 rows examined) and COMMIT (2 ms each: the redo log flush, which no index changes).',
+          active: ['alter', 'after'],
+          edges: ['alter-after'],
+        },
+      ],
+    },
+    {
+      title: 'The CRM query',
+      path: 'customers table scan 100,000 rows → (country, tier) covering lookup 513 → 32.7 → 6.4 ms; per customer still a Sort of 10 rows',
+      summary: 'Top after iteration 1, fixed with the same small index as PostgreSQL.',
+      subs: { q7: '32.7 → 6.4 ms' },
+      steps: [
+        {
+          title: 'Read EXPLAIN ANALYZE',
+          note: 'Table scan on customers (100,000 rows) to find 513 gold customers in SG: 32.7 ms. With (country, tier): covering index lookup, 513 rows, 6.4 ms. Inside the lateral derived table MySQL still read the customer\'s ≈ 10 index entries and sorted them for LIMIT 1 ("Sort: orders.created_at DESC, limit input to 1 row(s) per chunk"), where PostgreSQL read one entry backwards. Cheap at 10 orders per customer; not at 10,000.',
+          code: "ALTER TABLE customers ADD INDEX customers_country_tier (country, tier), ALGORITHM=INPLACE, LOCK=NONE;\nEXPLAIN ANALYZE SELECT c.id, o.id, o.created_at, o.amount FROM customers c\nJOIN LATERAL (SELECT id, created_at, amount FROM orders WHERE customer_id = c.id\n              ORDER BY created_at DESC LIMIT 1) o ON TRUE\nWHERE c.tier = 'gold' AND c.country = 'SG';",
+          active: ['after', 'q7'],
+          edges: ['after-q7'],
+        },
+      ],
+    },
+  ]}
+/>
+
+| Query | Before: mean | Rows examined per call | After: mean | Rows examined per call |
+|---|---|---|---|---|
+| Q3 order detail | 160 ms | 2,000,077 | 0.05 ms | 2 |
+| Q6 top SKUs | 549 ms | 4,000,184 | 28.5 ms | 57,544 |
+| Q1 login | 7.9 ms | 100,000 | 0.03 ms | 1 |
+| Q5 daily revenue | 89 ms | 1,000,057 | 3.8 ms | 19,185 |
+| Q7 CRM | 27.5 ms | 100,769 | 22 ms → 6.4 ms with `(country, tier)` | 100,769 → 513 + ≈ 10 per customer |
+| Q2 order history | 0.13 ms | 20 | 0.06 ms | 10 |
+
+## MongoDB: the same design, a covering index for dates
+
+<Flow
+  title="MongoDB: one iteration on the same mix"
+  height={300}
+  nodes={[
+    { id: 'prof', label: 'Profiler', sub: '300 operations', x: 20, y: 20, w: 200 },
+    { id: 'ci', label: 'createIndex × 5', sub: 'dropIndex × 1', x: 290, y: 20, w: 220 },
+    { id: 'after', label: '✓ Re-profiled', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'cov', label: 'Daily revenue', sub: 'covered', x: 580, y: 150, w: 200 },
+  ]}
+  edges={[
+    { id: 'prof-ci', from: 'prof', to: 'ci' },
+    { id: 'ci-after', from: 'ci', to: 'after' },
+    { id: 'after-cov', from: 'after', to: 'cov' },
+  ]}
+  cases={[
+    {
+      title: 'Indexes from the profile',
+      path: 'profiler 45.5 s (3 report timeouts) → 5 indexes, drop customer_id_1 → ✓ 0.87 s, no timeouts',
+      summary: 'Same seeded sequence of 300 operations before and after.',
+      subs: { prof: '45.5 s', after: '0.87 s' },
+      steps: [
+        {
+          title: 'Same findings',
+          note: 'Top SKUs: 3 calls, 3 timeouts at 10 s. Order detail: 54 × 263 ms, 2,000,062 docs per call in $lookup. Login: 99 × 7.3 ms. Daily revenue: COLLSCAN, 156 ms. CRM: COLLSCAN of customers.',
+          active: ['prof'],
+        },
+        {
+          title: 'Build',
+          note: 'The $lookup foreignField gets an index (Session 9). ESR for history: { customer_id: 1, created_at: -1 }. No BRIN: { created_at: 1, amount: 1 } serves both reports and covers the revenue one.',
+          code: 'db.customers.createIndex({ email: 1 }, { unique: true })\ndb.customers.createIndex({ country: 1, tier: 1 })\ndb.order_items.createIndex({ order_id: 1 })\ndb.orders.createIndex({ customer_id: 1, created_at: -1 })\ndb.orders.createIndex({ created_at: 1, amount: 1 })\ndb.orders.dropIndex("customer_id_1")',
+          active: ['prof', 'ci'],
+          edges: ['prof-ci'],
+        },
+        {
+          title: '✓ Re-profile',
+          note: '0.87 s for the same 300 operations (wall time 46 s → 1.2 s). Top SKUs: 251 ms mean, 57,536 docs and keys per call, no timeouts. Order detail: 3 docs per call. Login: 1. CRM: 29 → 15 ms (customers: 100,000 documents scanned → 513).',
+          active: ['ci', 'after'],
+          edges: ['ci-after'],
+        },
+      ],
+    },
+    {
+      title: 'A covered aggregation',
+      path: '$match created_at → $group by day, sum amount → IXSCAN { created_at: 1, amount: 1 }: keys 19,178, docs 0',
+      summary: 'Every field the pipeline uses is in the index.',
+      subs: { cov: 'keys 19,178, docs 0' },
+      steps: [
+        {
+          title: '✓ No documents fetched',
+          note: 'The pipeline uses only created_at and amount, both in the index: keysExamined 19,178, docsExamined 0 (Session 5 covering, Session 10 aggregation). 156 ms → 10.5 ms. The price: 23.8 MB, where PostgreSQL\'s BRIN for the same reports was 24 kB.',
+          active: ['after', 'cov'],
+          edges: ['after-cov'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Final index sets
+
+| Query | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| Q1 login | `UNIQUE (email)` 3.9 MB | `UNIQUE (email)` 3.5 MB | `{ email: 1 }` unique, 2.4 MB |
+| Q2, Q7 per customer | `(customer_id, created_at)` 30 MB, replaces `(customer_id)` | `(customer_id, created_at)` 25.6 MB, replaces `(customer_id)` | `{ customer_id: 1, created_at: -1 }` 13.8 MB, replaces `{ customer_id: 1 }` |
+| Q3, Q6 joins | `order_items (order_id)` 39 MB | `order_items (order_id)` 47.6 MB | `{ order_id: 1 }` 14.4 MB |
+| Q4 admin | `(status, created_at)` (existing) | `(status, created_at)` (existing) | `{ status: 1, created_at: -1 }` (existing) |
+| Q5, Q6 date ranges | BRIN `(created_at)` 24 kB, autosummarize | `(created_at, amount)` 26.6 MB | `{ created_at: 1, amount: 1 }` 23.8 MB |
+| Q7 CRM filter | `(country, tier)` 704 kB | `(country, tier)` 2.5 MB | `{ country: 1, tier: 1 }` 0.6 MB |
+| Not an index | `random_page_cost = 1.1` for the database; reports → summary table | Reports → summary table; COMMIT cost is the redo flush | Reports → `$merge` into a daily summary collection |
+
+Sizes as built (PostgreSQL) or right after the runs (MySQL, MongoDB).
+
+<Pitfall>
+Every fix changes the ranking, so re-measure after each one: the top-SKU report went from 10% to 69% of database time without getting slower, because everything around it got faster. And know when to stop: once the top statements read about what their result needs (a week of orders for a weekly report), further indexes add write cost without removing work. Change what the query has to do instead.
+</Pitfall>
+
+## Real-world scenario: presenting the result
+
+| Slide | Content from this case |
+|---|---|
+| Problem | 336 tps; one join and one login lookup were 81% of database time |
+| Change | 4 indexes added, 1 replaced, 1 per-database setting; all built online |
+| Result | 5,944 tps; database time per transaction 11.3 → 0.37 ms |
+| Cost | ≈ +65 MB of indexes when built (more as random-key indexes split), +137 B of WAL per checkout |
+| Next | Reports are 81% of what is left: daily summary table, not more indexes |
+
+## Why this matters for indexes
+
+| Course part | Where it showed up here |
+|---|---|
+| Sessions 1–3: pages, B-trees, the planner | Buffers per call as evidence; `random_page_cost`; page splits |
+| Sessions 4–5: column order, covering, unique | `(customer_id, created_at)`, `UNIQUE (email)`, `(created_at, amount)` |
+| Sessions 6–7: engines, BRIN | B-tree vs BRIN for the same reports; `$lookup` |
+| Session 8: when indexes hurt | Redundant index dropped, WAL measured, online builds |
+| Sessions 9–10: joins, aggregation | Join-column indexes, lateral top-1, covered `$group` |
+
+## Key takeaways
+
+1. Iterate: measure a window, rank by total time, fix the top, re-measure; the ranking changes every time.
+2. In the lab, four indexes plus one replacement took PostgreSQL from 336 to 3,333 tps; the next 78% came from a cost setting and one small index.
+3. An index that exists is not an index that is used: the top-SKU report needed `random_page_cost` before it used `order_items (order_id)`.
+4. Engine differences change the design: BRIN (24 kB) in PostgreSQL vs a covering B-tree (≈ 24–27 MB) in MySQL and MongoDB.
+5. Stop when the top statements read what their result requires; then change the work (summaries, replicas), not the indexes.
+
+## Check questions
+
+1. Why did the top-SKU report go from 10% to 69% of database time after iteration 1 without getting slower?
+2. `order_items (order_id)` existed after iteration 1, yet the top-SKU report did not use it. Why, and why was changing `random_page_cost` acceptable here?
+3. The fixed top-SKU query reads 77,357 buffers per call instead of 26,862 and is faster. How?
+4. Why was `orders (customer_id)` dropped, and what had to be checked first?
+5. Why did PostgreSQL use BRIN for the date range while MySQL and MongoDB used `(created_at, amount)`?
+6. In the final PostgreSQL run, the two reports were 81% of database time. Why not add more indexes for them?
+7. Write the before/after summary of this case for a non-technical stakeholder in five lines.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-11-production-diagnosis/concept-4-case-study/answers">Worked answers to Q1–Q7</DeepDive>
