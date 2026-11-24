@@ -1,0 +1,71 @@
+---
+title: "Answers: Bloat and unused indexes"
+description: "Worked answers to the Session 8 Concept 2 check questions."
+companion: "answers"
+tags: ["indexing", "bloat", "unused-indexes", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pgstattuple.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/invisible-indexes.html"
+  - "https://www.mongodb.com/docs/manual/core/index-hidden/"
+---
+
+<Tldr>
+Measure usage over a known period, measure density, test removals reversibly, rebuild online.
+</Tldr>
+
+## Q1. idx_scan = 0
+
+**Question:** what does `idx_scan = 0` tell you, and what three things must you check before dropping such an index?
+
+No plan has scanned the index on this server since statistics were last reset. Before dropping: (1) **the counting period**: `stats_reset` in `pg_stat_database`, and whether it covers a full business cycle (month-end, year-end jobs); (2) **replicas**: their counters are separate, and read traffic may use the index there; (3) **constraints**: indexes backing primary keys, unique or exclusion constraints enforce rules even if never scanned.
+
+> **Common mistake:** dropping a unique index because nothing reads through it.
+
+## Q2. Everything unused in MySQL
+
+**Question:** why did MySQL list every secondary index of `orders` as unused in the lab?
+
+`sys.schema_unused_indexes` is based on performance_schema counters that start at zero on every server restart. The lab server had been restarted (cold-cache exercises), so no index had been used **since then**. Always check `Uptime` and let the counters run over representative traffic first.
+
+> **Common mistake:** running the unused-index query right after a deploy or restart.
+
+## Q3. Detecting and fixing bloat
+
+**Question:** how do you detect a bloated B-tree in PostgreSQL, and how do you fix it without blocking writes?
+
+`SELECT avg_leaf_density, leaf_pages FROM pgstatindex('idx')`: a fresh B-tree is ≈ 90% dense; heavy churn or random inserts lower it (≈ 66% for random inserts, lower after deletes). Compare its size with what a fresh build would be. Fix with `REINDEX INDEX CONCURRENTLY idx`: it builds a new copy while writes continue, then swaps it in (lab: 86.2% → 90.1%, 0.43 s).
+
+> **Common mistake:** `REINDEX` without `CONCURRENTLY` on a busy table: it blocks writes for the whole rebuild.
+
+## Q4. Drop vs invisible / hidden
+
+**Question:** what is the difference between dropping an index and making it invisible (MySQL) or hidden (MongoDB)?
+
+Dropping removes it: reverting means rebuilding it (minutes to hours on big tables). An invisible or hidden index is still **maintained** on every write but **ignored** by the planner, so you see how queries behave without it, and revert instantly if something regresses. Once confident, drop it to stop paying the write cost.
+
+> **Common mistake:** leaving indexes invisible forever; they still cost every write.
+
+## Q5. Testing in PostgreSQL
+
+**Question:** why is testing "what if this index did not exist" harder in PostgreSQL?
+
+PostgreSQL has no invisible-index feature. The transactional trick `BEGIN; DROP INDEX …; EXPLAIN …; ROLLBACK;` works for checking plans, but `DROP INDEX` takes an ACCESS EXCLUSIVE lock on the table for the transaction's duration, blocking all reads and writes. Do it on a test copy, or use the `hypopg` extension to reason about hypothetical indexes.
+
+> **Common mistake:** running that transaction on a production table "just for a second".
+
+## Q6. Redundant indexes
+
+**Question:** what makes an index redundant, and which is the one to drop?
+
+An index is redundant when another index starts with the same columns in the same order and serves every query it serves: `(a)` next to `(a, b)`, or `(a, b)` next to `(a, b, c)`. Drop the **shorter** one (the prefix), unless it enforces uniqueness the longer one does not, or is much smaller and critical for a very hot query.
+
+> **Common mistake:** treating `(a, b)` and `(b, a)` as duplicates.
+
+## Q7. Bloat and reads
+
+**Question:** why does a bloated index slow down reads as well as wasting space?
+
+Half-empty leaves mean more pages for the same entries: range scans read more pages, fewer useful entries fit in the cache, and dead entries (until VACUUM or purge removes them) make scans step over entries that lead nowhere or to invisible rows (Session 2, Concept 4). The height can even grow by a level.
+
+> **Common mistake:** "disk is cheap, bloat does not matter"; memory and I/O are not.

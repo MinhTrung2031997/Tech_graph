@@ -1,0 +1,84 @@
+---
+title: "Answers: When indexes hurt session quiz"
+description: "Worked answers to the Session 8 quiz."
+companion: "answers"
+tags: ["indexing", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY"
+  - "https://www.postgresql.org/docs/current/storage-hot.html"
+---
+
+<Tldr>
+Every index is paid for on writes, in locks and in maintenance. The course's skill is knowing when that price buys enough on reads.
+</Tldr>
+
+## Q1. 16 indexes
+
+**Question:** in Exercise 1, WAL grew 4.2× with 8 indexes. Estimate the WAL for 16 similar indexes and explain what assumption you make.
+
+From 0 to 8 indexes WAL rose from 39 to 164 MB: ≈ 15.6 MB per index. Assuming each additional index on similar scattered values adds about the same, 16 indexes ≈ 39 + 16 × 15.6 ≈ **290 MB**, ≈ 7.4× the base. The assumption: similar key widths and randomness, and enough memory that the extra index pages do not start causing reads (which would make it worse than linear in time).
+
+> **Common mistake:** assuming WAL doubles with each index; it grows roughly linearly with the number of indexes touched.
+
+## Q2. Non-HOT updates
+
+**Question:** why does a non-HOT update in PostgreSQL make write amplification worse than an insert with the same indexes?
+
+The update writes a whole new tuple (like an insert) **and** an entry in every index (like an insert), but also leaves a dead tuple and dead index entries that VACUUM must later find and remove, more WAL for that cleanup, and lost visibility-map bits (Session 5). An insert has no cleanup debt.
+
+> **Common mistake:** "an update is cheaper than an insert because the row already exists".
+
+## Q3. idx_scan = 0 after a reset
+
+**Question:** `idx_scan` is 0 for an index created 3 months ago, and `stats_reset` was yesterday. What do you conclude?
+
+Only that it has not been used **in the last day**. That says nothing about weekly, monthly or quarterly jobs, nor about replicas. Wait for a full business cycle of statistics (or check replicas' counters and query logs) before considering a drop, and then drop via a reversible step where the engine allows it.
+
+> **Common mistake:** trusting a zero without reading `stats_reset`.
+
+## Q4. When REINDEX helps a lot
+
+**Question:** after `REINDEX INDEX CONCURRENTLY`, the index shrank only from 35 MB to 34 MB. When would you expect a much bigger gain?
+
+When density is far below the fresh ≈ 90%: indexes on random keys (≈ 66%, Session 2: 29 MB → 21 MB), indexes on heavily updated columns with many dead entries, or after large deletes that left pages mostly empty. At 86% density, a rebuild can only gain ≈ 5%.
+
+> **Common mistake:** scheduling REINDEX for every index; measure density first.
+
+## Q5. Plain vs CONCURRENTLY
+
+**Question:** in Exercise 3, why did the INSERT wait for the plain `CREATE INDEX` but not for `CREATE INDEX CONCURRENTLY`?
+
+The plain build holds a **ShareLock**, which conflicts with the **RowExclusiveLock** an INSERT needs. `CONCURRENTLY` takes a **ShareUpdateExclusiveLock**, which does not conflict with RowExclusive, and copes with concurrent changes by scanning twice and waiting for older transactions.
+
+> **Common mistake:** "CONCURRENTLY is just a faster CREATE INDEX"; it is slower, but non-blocking for writes.
+
+## Q6. The waiting SELECT
+
+**Question:** why did the plain SELECT in the MySQL demo wait, and what single setting limits the damage?
+
+The ALTER was waiting for an exclusive metadata lock behind the long transaction; the SELECT's shared metadata lock request conflicted with the pending exclusive request and queued behind it. `lock_wait_timeout` (set low for the DDL session, e.g. 5 seconds) makes the ALTER give up quickly instead of holding the head of the queue.
+
+> **Common mistake:** setting the timeout globally, which also affects normal statements.
+
+## Q7. Exercise 4 indexes
+
+**Question:** write the three indexes for Exercise 4 and explain the column order once.
+
+| Engine | Index |
+|---|---|
+| PostgreSQL | `CREATE INDEX CONCURRENTLY ON orders (customer_id, status, created_at DESC) INCLUDE (id, amount);` (or partial: `(customer_id, created_at DESC) INCLUDE (id, amount) WHERE status = 'paid'`) |
+| MySQL | `ALTER TABLE orders ADD INDEX (customer_id, status, created_at, amount), ALGORITHM=INPLACE, LOCK=NONE;` |
+| MongoDB | `db.orders.createIndex({ customer_id: 1, status: 1, created_at: -1, amount: 1 })` with projection `{ _id: 1, created_at: 1, amount: 1 }` covered only if `_id` is also indexed; otherwise exclude `_id` and store an `id` field in the index |
+
+Order: equality columns (`customer_id`, `status`) make one contiguous stretch; `created_at` next delivers the requested order so LIMIT stops after 10; `amount` (and `id`) only cover the returned columns.
+
+> **Common mistake:** putting `created_at` first because it appears in `ORDER BY`.
+
+## Q8. When not to add an index
+
+**Question:** name one situation from this course where the right answer was to **not** add an index.
+
+Any of: `status = 'delivered'` (35% of rows): PostgreSQL's planner correctly preferred a bitmap/scan and MySQL's index was slower than a full scan (Session 3); a write-heavy ingestion table where unused indexes doubled WAL (Session 8); a `CASE` expression index in MySQL that saved no space (Session 5); a BRIN on a scattered column (Session 7); a hashed index for range queries (Session 7); fixing a non-sargable condition by rewriting rather than indexing the expression (Session 3).
+
+> **Common mistake:** believing every slow query needs a new index.

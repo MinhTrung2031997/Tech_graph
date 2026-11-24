@@ -1,0 +1,88 @@
+---
+title: "Answers: An index-design checklist"
+description: "Worked answers to the Session 8 Concept 4 check questions."
+companion: "answers"
+tags: ["indexing", "checklist", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pgstatstatements.html"
+  - "https://www.mongodb.com/docs/manual/tutorial/equality-sort-range-guideline/"
+---
+
+<Tldr>
+Queries first, plan second, index type third, column order fourth, cost and deployment last, then verify.
+</Tldr>
+
+## Q1. Total vs mean time
+
+**Question:** why rank queries by total time rather than by mean time?
+
+Total time (calls × mean) is what the database actually spends. A 3 ms query called 5 million times a day uses ≈ 4 hours of database time; a 20 s report run twice uses 40 seconds. Optimising the frequent query frees far more capacity, even though each run looks fast.
+
+> **Common mistake:** chasing the slowest single query in the slow log.
+
+## Q2. Reasons not to add an index
+
+**Question:** a query is slow and has no index on its WHERE column. Give two reasons not to add one.
+
+Any two of: the condition is **not selective** (a large share of rows: a scan is right, Session 3); the table is **write-heavy** and the query is rare (write amplification outweighs the gain, Session 8); the condition is **not sargable** as written (fix the query first); an **existing index** could serve it with a rewrite or a column added; the query runs on a replica or warehouse where the index belongs instead; the table is tiny.
+
+> **Common mistake:** "slow query + no index = add index", without looking at the plan.
+
+## Q3. Covering index for the tenant query
+
+**Question:** design an index in each engine for `WHERE tenant_id = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 20` that never touches the table, returning `id, created_at, total`.
+
+| Engine | Index |
+|---|---|
+| PostgreSQL | `(tenant_id, created_at DESC) INCLUDE (id, total)`; plus VACUUM keeping pages all-visible |
+| MySQL | `(tenant_id, created_at, total)` (`id`, the primary key, is in every entry) |
+| MongoDB | `{ tenant_id: 1, created_at: -1, total: 1 }` with projection `{ _id: 0, created_at: 1, total: 1, id: 1 }` and `id` in the index (or `_id` added to the index if `_id` is the id) |
+
+Equality (`tenant_id`) first, then the sort and range column (`created_at`), then returned columns.
+
+> **Common mistake:** `(created_at, tenant_id)`: the range and sort lead, every tenant's rows are walked.
+
+## Q4. Missing-index signals
+
+**Question:** which plan signals in each engine tell you an index is missing?
+
+| Engine | Signals |
+|---|---|
+| PostgreSQL | `Seq Scan` with `Rows Removed by Filter` ≫ rows; `Sort` under a `Limit`; high Buffers for few rows |
+| MySQL | `type: ALL` with large `rows` and low `filtered`; `Using filesort` with `LIMIT`; rows examined ≫ sent in digests |
+| MongoDB | `COLLSCAN`; `totalDocsExamined` or `totalKeysExamined` ≫ `nReturned`; a `SORT` stage |
+
+> **Common mistake:** treating any Seq Scan or COLLSCAN as a missing index; check the selectivity.
+
+## Q5. Index added, no faster
+
+**Question:** you add an index and the query is no faster. List three things to check.
+
+Any three of: the plan does not use it (EXPLAIN again: statistics updated? condition sargable? types match? partial predicate implied?); it is used but the row fetches dominate (consider covering, or check correlation, Session 1 Concept 4); the column order does not serve the query (equality/sort/range); the cache was cold in one measurement and warm in the other (compare pages, not time); a generic prepared plan behaves differently from your literal test; an INVALID index (failed CONCURRENTLY build).
+
+> **Common mistake:** measuring only wall time once before and once after.
+
+## Q6. The quarterly review
+
+**Question:** what should a quarterly index review include?
+
+Top queries by total time and their plans; unused indexes over a known counting period (and on replicas); redundant (prefix) indexes; bloated indexes (density); invalid indexes; write health (WAL/redo rate, HOT ratio, replication lag); and indexes added since the last review, checked against the queries they were meant for.
+
+> **Common mistake:** reviewing only the slow log.
+
+## Q7. Three common mistakes
+
+**Question:** pick three mistakes from this course you think are most common in production systems, and how to detect each.
+
+One reasonable answer:
+
+| Mistake | Detect |
+|---|---|
+| Function or type mismatch hiding the column (`DATE(created_at) = …`, `id = 7.0`, `sku = 123`) | Plans with a full scan despite an index on the column; check the condition |
+| Range or sort column before equality columns | Index used, but keys/pages examined ≫ rows returned, or a Sort/filesort/SORT under a limit |
+| Too many indexes on write-heavy tables | Unused-index queries over a full cycle; WAL/redo volume; HOT ratio |
+
+Others are equally valid: random primary keys (index density, insert latency), `SELECT *` preventing covering, OFFSET pagination, plain `CREATE INDEX` on busy tables.
+
+> **Common mistake:** listing mistakes without a way to detect them; the detection is what makes the checklist usable.

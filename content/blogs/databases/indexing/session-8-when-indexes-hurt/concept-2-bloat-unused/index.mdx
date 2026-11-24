@@ -1,0 +1,242 @@
+---
+title: "Concept 2: Bloat and unused indexes"
+description: "How to find indexes that cost writes and space without serving reads (pg_stat_user_indexes, sys.schema_unused_indexes, $indexStats), how to spot index bloat (pgstatindex) and rebuild it online, and how to drop safely with invisible or hidden indexes. Measured on the lab after seven sessions of experiments."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "bloat", "unused-indexes", "reindex"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-ALL-INDEXES-VIEW"
+  - "https://www.postgresql.org/docs/current/pgstattuple.html"
+  - "https://www.postgresql.org/docs/current/sql-reindex.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/sys-schema-unused-indexes.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/invisible-indexes.html"
+  - "https://www.mongodb.com/docs/manual/reference/operator/aggregation/indexStats/"
+  - "https://www.mongodb.com/docs/manual/core/index-hidden/"
+---
+
+<Tldr>
+After seven sessions of experiments, the lab's `orders` table has **12 indexes**. `pg_stat_user_indexes` shows one used **300,048** times and one never (`orders_pending_created`, 4.4 MB), with most of the rest used once or twice, by the lab exercises themselves. Every unused index still costs every insert (Concept 1). **Bloat** is the other waste: `orders_status_created_idx` had drifted to **86% leaf density** after updates, and `REINDEX CONCURRENTLY` rebuilt it to **90%** online in 0.4 s. The trap: usage counters **reset** (PostgreSQL on stats reset, MySQL and MongoDB at every restart), so "unused" only means "unused since". Drop safely: make the index **invisible** (MySQL) or **hidden** (MongoDB) first, watch, then drop.
+</Tldr>
+
+## Two kinds of waste
+
+| Waste | Symptom | Measure | Fix |
+|---|---|---|---|
+| Unused index | Never chosen by any plan | PostgreSQL `idx_scan`; MySQL `sys.schema_unused_indexes`; MongoDB `$indexStats.accesses.ops` | Drop (after a hiding period) |
+| Redundant index | A leftmost prefix of another index (Session 4) | MySQL `sys.schema_redundant_indexes`; compare definitions | Drop the shorter one |
+| Bloated index | Low leaf density, many empty or dead entries | `pgstatindex()` `avg_leaf_density`, size vs a fresh build | `REINDEX CONCURRENTLY` (PostgreSQL), `OPTIMIZE TABLE` / rebuild (InnoDB), `compact` (MongoDB) |
+
+Lab, PostgreSQL `orders` after Sessions 1–7:
+
+| Index | `idx_scan` | Size |
+|---|---|---|
+| `orders_customer_idx` | 300,048 | 9 MB |
+| `orders_cust_created_incl` | 13 | 39 MB |
+| `orders_pkey` | 10 | 21 MB |
+| `orders_status_created_idx` | 8 | 35 MB |
+| `orders_sku_trgm` | 2 | 18 MB |
+| `orders_pending_created` | **0** | 4.4 MB |
+| … 6 more | 1–3 each | 24 kB – 30 MB |
+
+| Term | Meaning |
+|---|---|
+| `idx_scan` | Number of index scans started on that index since the last statistics reset |
+| Leaf density | `pgstatindex().avg_leaf_density`: fresh B-trees ≈ 90% (fill factor), random inserts ≈ 66% |
+| Invisible / hidden index | Maintained on writes but ignored by the planner; reversible test before dropping |
+| **✓ Earns its keep / ✗ Waste** | Used by important queries, or not |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: finding and fixing index waste"
+  height={330}
+  nodes={[
+    { id: 'stats', label: 'pg_stat_user_indexes', sub: 'idx_scan per index', x: 20, y: 20, w: 240 },
+    { id: 'keep', label: '✓ Earns its keep', sub: '', x: 330, y: 20, w: 200 },
+    { id: 'waste', label: '✗ Waste', sub: '', x: 600, y: 20, w: 180 },
+    { id: 'bloat', label: 'pgstatindex', sub: 'leaf density', x: 20, y: 150, w: 240 },
+    { id: 'reindex', label: 'REINDEX CONCURRENTLY', sub: 'online rebuild', x: 330, y: 150, w: 200 },
+    { id: 'drop', label: 'DROP INDEX', sub: 'CONCURRENTLY', x: 600, y: 150, w: 180 },
+  ]}
+  edges={[
+    { id: 'stats-keep', from: 'stats', to: 'keep' },
+    { id: 'keep-waste', from: 'keep', to: 'waste', quiet: true },
+    { id: 'waste-drop', from: 'waste', to: 'drop' },
+    { id: 'bloat-reindex', from: 'bloat', to: 'reindex' },
+  ]}
+  cases={[
+    {
+      title: 'Unused index',
+      path: 'idx_scan = 0 since the last reset ✗ → check the reset date and replicas → DROP INDEX CONCURRENTLY',
+      summary: 'orders_pending_created: 0 scans, 4.4 MB, maintained on every insert.',
+      subs: { waste: 'pending_created: 0 scans' },
+      steps: [
+        {
+          title: 'Read the counters',
+          note: 'idx_scan counts scans since the statistics were last reset (pg_stat_reset, or a crash). Check stats_reset in pg_stat_database before trusting a zero.',
+          code: "SELECT indexrelname, idx_scan, pg_size_pretty(pg_relation_size(indexrelid))\nFROM pg_stat_user_indexes WHERE relname = 'orders' ORDER BY idx_scan;",
+          active: ['stats', 'keep', 'waste'],
+          edges: ['stats-keep', 'keep-waste'],
+        },
+        {
+          title: 'Drop without blocking',
+          note: 'Counters are per server: an index unused on the primary may serve queries on a replica. Also keep indexes that back constraints (primary key, unique, exclusion). Then DROP INDEX CONCURRENTLY, which does not block reads or writes.',
+          code: 'DROP INDEX CONCURRENTLY orders_pending_created;',
+          active: ['waste', 'drop'],
+          edges: ['waste-drop'],
+        },
+      ],
+    },
+    {
+      title: 'Bloated index',
+      path: 'avg_leaf_density 86% (4,461 leaves) → REINDEX CONCURRENTLY → 90% (4,270 leaves), 0.4 s',
+      summary: 'After the Session 5 updates, orders_status_created_idx had drifted from its fresh 90%.',
+      subs: { bloat: 'density 86.2%', reindex: '→ 90.1% in 0.43 s' },
+      steps: [
+        {
+          title: 'Measure density',
+          note: 'pgstatindex: 35 MB, 4,461 leaves, avg_leaf_density 86.2%. Mild here; random-insert indexes sit at ≈ 66% (Session 2), and heavy update churn can go much lower.',
+          code: "SELECT leaf_pages, avg_leaf_density FROM pgstatindex('orders_status_created_idx');",
+          active: ['bloat'],
+        },
+        {
+          title: 'Rebuild online',
+          note: 'REINDEX INDEX CONCURRENTLY builds a fresh copy alongside, swaps it in and drops the old one, without blocking writes: 0.43 s here, 4,270 leaves at 90.1%. It needs extra disk space during the build.',
+          code: 'REINDEX INDEX CONCURRENTLY orders_status_created_idx;',
+          active: ['bloat', 'reindex'],
+          edges: ['bloat-reindex'],
+        },
+      ],
+    },
+  ]}
+/>
+
+PostgreSQL has no invisible indexes. To see a plan without an index, you can `BEGIN; DROP INDEX …; EXPLAIN …; ROLLBACK;`, but `DROP INDEX` takes an exclusive lock on the **table** until the rollback: do it only on a test copy.
+
+## MySQL: unused, redundant, invisible
+
+<Flow
+  title="MySQL: dropping an index safely"
+  height={300}
+  nodes={[
+    { id: 'sys', label: 'sys.schema_unused_indexes', sub: 'since server start', x: 20, y: 20, w: 260 },
+    { id: 'inv', label: 'ALTER INDEX … INVISIBLE', sub: 'optimizer ignores it', x: 340, y: 20, w: 220 },
+    { id: 'ok', label: '✓ No regression', sub: 'drop it', x: 620, y: 20, w: 160 },
+    { id: 'bad', label: '✗ Regression', sub: 'VISIBLE again', x: 620, y: 150, w: 160 },
+  ]}
+  edges={[
+    { id: 'sys-inv', from: 'sys', to: 'inv' },
+    { id: 'inv-ok', from: 'inv', to: 'ok' },
+    { id: 'inv-bad', from: 'inv', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'Find and hide',
+      path: 'sys.schema_unused_indexes → INVISIBLE → watch → ✓ DROP or ✗ VISIBLE',
+      summary: 'In the lab, right after a restart, every secondary index of orders was listed as unused.',
+      steps: [
+        {
+          title: 'Unused since when?',
+          note: 'sys.schema_unused_indexes reads performance_schema counters, which reset at every server restart. The lab listed all five secondary indexes of orders, because the server had restarted during earlier exercises: a false alarm. Check uptime first.',
+          code: "SELECT object_name, index_name FROM sys.schema_unused_indexes WHERE object_schema = 'lab';\nSHOW GLOBAL STATUS LIKE 'Uptime';",
+          active: ['sys'],
+        },
+        {
+          title: 'Make it invisible',
+          note: 'An invisible index is still maintained on writes (so making it visible again is instant) but the optimizer ignores it. Run for a full business cycle (month-end included).',
+          code: 'ALTER TABLE orders ALTER INDEX orders_day INVISIBLE;',
+          active: ['sys', 'inv'],
+          edges: ['sys-inv'],
+        },
+        {
+          title: 'Drop, or bring it back',
+          note: '✓ No regressions: ALTER TABLE orders DROP INDEX orders_day. ✗ A query slowed down: ALTER INDEX … VISIBLE, instantly. sys.schema_redundant_indexes lists indexes made redundant by a longer one.',
+          active: ['inv', 'ok', 'bad'],
+          edges: ['inv-ok', 'inv-bad'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: $indexStats and hidden indexes
+
+<Flow
+  title="MongoDB: dropping an index safely"
+  height={300}
+  nodes={[
+    { id: 'st', label: '$indexStats', sub: 'accesses.ops since', x: 20, y: 20, w: 260 },
+    { id: 'hide', label: 'hideIndex()', sub: 'planner ignores it', x: 340, y: 20, w: 220 },
+    { id: 'ok', label: '✓ No regressions', sub: 'dropIndex()', x: 620, y: 20, w: 160 },
+    { id: 'bad', label: '✗ Regression', sub: 'unhideIndex()', x: 620, y: 150, w: 160 },
+  ]}
+  edges={[
+    { id: 'st-hide', from: 'st', to: 'hide' },
+    { id: 'hide-ok', from: 'hide', to: 'ok' },
+    { id: 'hide-bad', from: 'hide', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'Find and hide',
+      path: '$indexStats ops = 0 (check "since") → hideIndex → watch → ✓ drop / ✗ unhide',
+      summary: 'Lab: ers, esr, cust_cov, sku_ci, pending_created showed 0 ops since the last restart.',
+      steps: [
+        {
+          title: 'Count accesses',
+          note: '$indexStats reports ops (uses by queries) and since (when counting began: the last restart or index creation), per mongod. Aggregate across all replica set members before deciding.',
+          code: 'db.orders.aggregate([{ $indexStats: {} }, { $project: { name: 1, ops: "$accesses.ops", since: "$accesses.since" } }])',
+          active: ['st'],
+        },
+        {
+          title: 'Hide, then decide',
+          note: 'A hidden index is maintained but not used by the planner; unhiding is instant and needs no rebuild. Drop only after a full cycle without regressions.',
+          code: 'db.orders.hideIndex("ers")\n// … later\ndb.orders.dropIndex("ers")   // or db.orders.unhideIndex("ers")',
+          active: ['st', 'hide', 'ok', 'bad'],
+          edges: ['st-hide', 'hide-ok', 'hide-bad'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+"0 scans" is not proof. Counters reset (restarts in MySQL and MongoDB, stats resets in PostgreSQL), are per server (replicas have their own), and miss rare-but-critical queries (month-end close, yearly audit). Hide first, wait through a full business cycle, then drop.
+</Pitfall>
+
+## Real-world scenario: the index audit
+
+A team inherits a database with 60 indexes on 12 tables and slow writes.
+
+| Step | Query / tool | Typical finding |
+|---|---|---|
+| Unused | `idx_scan = 0`, `$indexStats`, `sys.schema_unused_indexes` (after checking the counting period) | 15% of indexes never used |
+| Redundant | Prefix duplicates (`(a)` next to `(a, b)`) | Several |
+| Bloated | `pgstatindex` density < 60% on churned tables | A few large ones |
+| Act | Hide / make invisible → wait → drop; `REINDEX CONCURRENTLY` the bloated ones | Faster writes, less WAL, smaller backups |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 3: CREATE INDEX CONCURRENTLY | Rebuilding and dropping online |
+| Concept 4: checklist | Periodic audits are part of index design |
+
+## Key takeaways
+
+1. Unused and redundant indexes cost every write and save nothing.
+2. PostgreSQL `idx_scan`, MySQL `sys.schema_unused_indexes`, MongoDB `$indexStats` show usage, since a reset point.
+3. Check the counting period, replicas and rare jobs before trusting "unused".
+4. `pgstatindex` density reveals bloat; `REINDEX CONCURRENTLY` rebuilds online (86% → 90% in 0.4 s in the lab).
+5. Test removals reversibly: invisible indexes (MySQL), hidden indexes (MongoDB); PostgreSQL has no equivalent.
+
+## Check questions
+
+1. What does `idx_scan = 0` tell you, and what three things must you check before dropping such an index?
+2. Why did MySQL list every secondary index of `orders` as unused in the lab?
+3. How do you detect a bloated B-tree in PostgreSQL, and how do you fix it without blocking writes?
+4. What is the difference between dropping an index and making it invisible (MySQL) or hidden (MongoDB)?
+5. Why is testing "what if this index did not exist" harder in PostgreSQL?
+6. What makes an index redundant, and which is the one to drop?
+7. Why does a bloated index slow down reads as well as wasting space?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-8-when-indexes-hurt/concept-2-bloat-unused/answers">Worked answers to Q1–Q7</DeepDive>

@@ -1,0 +1,70 @@
+---
+title: "Answers: Write amplification"
+description: "Worked answers to the Session 8 Concept 1 check questions."
+companion: "answers"
+tags: ["indexing", "write-amplification", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/wal-intro.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-redo-log.html"
+---
+
+<Tldr>
+An index is a second, third, ninth copy of part of every row, maintained on every write and shipped to every replica.
+</Tldr>
+
+## Q1. 4.2× the WAL
+
+**Question:** why did eight secondary indexes multiply PostgreSQL's WAL by 4.2 for the same rows?
+
+Each row now causes nine index inserts instead of one, each logged. Most of the extra indexes hold scattered values, so their inserts touch many different leaf pages; the first change to each page after a checkpoint writes a full 8 KB page image to the WAL, and page splits log several pages. 39 MB → 164 MB.
+
+> **Common mistake:** expecting WAL to grow only by the size of the index entries.
+
+## Q2. Scattered vs increasing
+
+**Question:** why do indexes on scattered values cost more on insert than an index on an increasing column?
+
+An increasing key always lands on the rightmost leaf: one hot page, already cached, rightmost splits that leave pages full. Scattered values land on random leaves: more pages read into memory, more pages dirtied (and fully logged once per checkpoint), and middle splits (Session 2, Concept 6).
+
+> **Common mistake:** counting only the number of indexes, not their key patterns.
+
+## Q3. Redo vs WAL
+
+**Question:** why did MySQL's redo grow less (2.2×) than PostgreSQL's WAL (4.2×)?
+
+PostgreSQL protects against torn pages with full-page writes in the WAL; InnoDB uses its doublewrite buffer for that and logs compact, physiological records per change in the redo log. So each extra dirty page costs PostgreSQL more log bytes. The time cost (3.1× vs 4.9×) was closer, because both do similar B-tree work.
+
+> **Common mistake:** concluding InnoDB indexes are cheap; the doublewrite buffer and page flushes still cost I/O.
+
+## Q4. Who else pays
+
+**Question:** who besides the inserting session pays for write amplification?
+
+Replicas (they replay the WAL/redo or, in MongoDB, re-apply oplog entries and rebuild index keys), WAL archiving and backups (more bytes to store and ship), checkpoints and the background writer (more dirty pages to flush), the buffer pool (index pages compete with data pages), and VACUUM/purge (more entries to clean later).
+
+> **Common mistake:** measuring only the primary's insert latency.
+
+## Q5. updated_at index
+
+**Question:** why can a PostgreSQL index on `updated_at` slow down updates of every other column?
+
+If every update sets `updated_at`, then every update changes an indexed column, so no update can be HOT. Each update then creates a new tuple with a new ctid and inserts an entry into **every** index on the table. Without that index, many of those updates could have been HOT, touching no index at all (Session 6, Concept 1).
+
+> **Common mistake:** thinking the cost is limited to the `updated_at` index itself.
+
+## Q6. Keep or drop
+
+**Question:** how would you decide whether to keep an index on a write-heavy table?
+
+Weigh both sides with numbers: reads it serves (`idx_scan` / `$indexStats` / `sys.schema_index_statistics` since a known reset, and which queries; their latency with and without it), and writes it costs (insert/update throughput and WAL/redo volume measured with and without it). Drop it if it is unused or redundant (a prefix of another index); keep it if critical queries depend on it; consider moving rare reporting queries to a replica with its own indexes.
+
+> **Common mistake:** keeping indexes "in case someone needs them".
+
+## Q7. Three singles → one composite
+
+**Question:** replacing three single-column indexes with one composite index: what does it save on writes, and what must you check first?
+
+Each row write maintains one index instead of three: fewer B-tree inserts, less WAL and less space. First check that every query served by the old indexes is served by the composite: queries on a non-leading column alone lose their index (leftmost-prefix rule, Session 4), and sort orders may change.
+
+> **Common mistake:** assuming `(a, b, c)` serves a query on `c` alone.

@@ -1,0 +1,265 @@
+---
+title: "Concept 3: CREATE INDEX CONCURRENTLY and locking"
+description: "Adding an index to a live table without stopping writes: PostgreSQL's CREATE INDEX vs CREATE INDEX CONCURRENTLY (and its INVALID leftovers), MySQL online DDL and the metadata-lock queue, MongoDB's hybrid builds. Each failure mode reproduced on the lab."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "locking", "online-ddl", "concurrently"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY"
+  - "https://www.postgresql.org/docs/current/explicit-locking.html"
+  - "https://www.postgresql.org/docs/current/progress-reporting.html#CREATE-INDEX-PROGRESS-REPORTING"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-performance.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/metadata-locking.html"
+  - "https://www.mongodb.com/docs/manual/core/index-creation/"
+---
+
+<Tldr>
+Creating an index on a live table is an operational event. In PostgreSQL, a plain `CREATE INDEX` holds a **ShareLock** for the whole build: in the lab an INSERT sat **waiting** (`wait_event: relation`) until the build's transaction ended. `CREATE INDEX CONCURRENTLY` takes a weaker **ShareUpdateExclusiveLock**: an INSERT during the build went through in 87 ms. It is slower, must wait for older transactions ("waiting for old snapshots"), and if it fails (a duplicate in a unique build) it leaves an **INVALID** index that still costs writes. MySQL's online DDL lets writes continue, but needs a brief **metadata lock**: behind a long transaction the ALTER waited, and a plain SELECT queued behind the ALTER. MongoDB's hybrid builds took a 10 ms insert in their stride.
+</Tldr>
+
+## Lock modes that matter
+
+| Operation | PostgreSQL lock on the table | Blocks |
+|---|---|---|
+| `SELECT` | AccessShare | Only ACCESS EXCLUSIVE |
+| `INSERT` / `UPDATE` / `DELETE` | RowExclusive | Share and stronger |
+| `CREATE INDEX` | **Share** | All writes, for the whole build |
+| `CREATE INDEX CONCURRENTLY` | **ShareUpdateExclusive** | Other DDL and VACUUM; not reads or writes |
+| `ALTER TABLE … ADD COLUMN`, `DROP INDEX` | AccessExclusive | Everything, including SELECT |
+
+| Term | Meaning |
+|---|---|
+| Lock queue | A waiting lock request blocks every later request that conflicts with it, even ones compatible with the current holder |
+| INVALID index | Left by a failed `CONCURRENTLY` build: not used by queries but maintained on writes |
+| Metadata lock (MySQL) | Protects table definitions; DDL needs an exclusive one, at least briefly |
+| `lock_timeout` | PostgreSQL setting that makes a statement give up instead of waiting indefinitely for a lock |
+| **✓ Writes continue / ✗ Writes wait** | During the build |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: building an index on a live table"
+  height={340}
+  nodes={[
+    { id: 'ddl', label: 'Index build', sub: '', x: 20, y: 20, w: 240 },
+    { id: 'lock', label: 'Lock on orders', sub: '', x: 320, y: 20, w: 220 },
+    { id: 'ok', label: '✓ Writes continue', sub: '', x: 600, y: 20, w: 180 },
+    { id: 'wait', label: '✗ Writes wait', sub: 'wait_event: relation', x: 600, y: 150, w: 180 },
+    { id: 'old', label: 'Older transactions', sub: 'must finish first', x: 20, y: 150, w: 240 },
+    { id: 'inv', label: 'INVALID index', sub: 'after a failed build', x: 320, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'ddl-lock', from: 'ddl', to: 'lock' },
+    { id: 'lock-ok', from: 'lock', to: 'ok' },
+    { id: 'lock-wait', from: 'lock', to: 'wait' },
+    { id: 'old-ddl', from: 'old', to: 'ddl', label: 'waits' },
+    { id: 'ddl-inv', from: 'ddl', to: 'inv', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Plain CREATE INDEX',
+      path: 'ShareLock for the whole build → ✗ INSERT waits (RowExclusiveLock not granted)',
+      summary: 'Measured: the INSERT waited until the build\'s transaction ended.',
+      subs: { ddl: 'CREATE INDEX', lock: 'ShareLock (granted)' },
+      steps: [
+        {
+          title: 'The build takes a ShareLock',
+          note: 'In the lab the build ran inside a transaction that then slept, to make the lock visible: pg_locks showed ShareLock, granted.',
+          code: 'BEGIN; CREATE INDEX lock_demo ON orders (amount); SELECT pg_sleep(8); ROLLBACK;',
+          active: ['ddl', 'lock'],
+          edges: ['ddl-lock'],
+        },
+        {
+          title: '✗ The INSERT waits',
+          note: "INSERT INTO orders … : pg_stat_activity wait_event_type Lock, wait_event relation; pg_locks RowExclusiveLock, granted = f. It completed only after the build's transaction ended. On a big table the build itself takes minutes: minutes of blocked writes.",
+          active: ['lock', 'wait'],
+          edges: ['lock-wait'],
+        },
+      ],
+    },
+    {
+      title: 'CREATE INDEX CONCURRENTLY',
+      path: 'ShareUpdateExclusiveLock → ✓ INSERT in 87 ms; build waits for an older transaction first',
+      summary: 'Phase "waiting for old snapshots" while a 10-second transaction was open.',
+      subs: { ddl: 'CREATE INDEX CONCURRENTLY', lock: 'ShareUpdateExclusive' },
+      steps: [
+        {
+          title: 'A weaker lock',
+          note: 'pg_locks: ShareUpdateExclusiveLock, which does not conflict with RowExclusive. The build scans the table twice and waits between phases for concurrent transactions.',
+          code: 'CREATE INDEX CONCURRENTLY cic_demo ON orders (amount);',
+          active: ['ddl', 'lock'],
+          edges: ['ddl-lock'],
+        },
+        {
+          title: '✓ Writes continue',
+          note: 'An INSERT during the build completed in 87 ms.',
+          active: ['lock', 'ok'],
+          edges: ['lock-ok'],
+        },
+        {
+          title: 'It waits for older transactions',
+          note: 'pg_stat_progress_create_index showed phase "waiting for old snapshots" while an older transaction (open for 10 s) was still running. A forgotten idle-in-transaction session can stall a CONCURRENTLY build indefinitely.',
+          code: 'SELECT phase, blocks_done, blocks_total FROM pg_stat_progress_create_index;',
+          active: ['old', 'ddl'],
+          edges: ['old-ddl'],
+        },
+      ],
+    },
+    {
+      title: 'Failed CONCURRENTLY build',
+      path: 'unique build hits a duplicate → ERROR → index left INVALID (indisvalid = false)',
+      summary: 'Measured: uq_demo remained, invalid, until dropped.',
+      subs: { ddl: 'CREATE UNIQUE INDEX CONCURRENTLY', inv: 'uq_demo: indisvalid = f' },
+      steps: [
+        {
+          title: 'The build fails late',
+          note: 'ERROR: could not create unique index "uq_demo" … Key (customer_id)=(51588) is duplicated. A plain CREATE INDEX would roll back cleanly; CONCURRENTLY cannot, because its catalog entries were committed in an earlier phase.',
+          code: 'CREATE UNIQUE INDEX CONCURRENTLY uq_demo ON orders (customer_id);',
+          active: ['ddl', 'inv'],
+          edges: ['ddl-inv'],
+        },
+        {
+          title: 'Clean up the INVALID index',
+          note: 'pg_index.indisvalid = false: queries ignore it, but writes still maintain it. Find them with SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid; then DROP INDEX CONCURRENTLY and retry (or REINDEX INDEX CONCURRENTLY).',
+          code: 'DROP INDEX CONCURRENTLY uq_demo;',
+          active: ['inv'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: online DDL and the metadata-lock queue
+
+<Flow
+  title="MySQL: ALTER TABLE ADD INDEX on a live table"
+  height={330}
+  nodes={[
+    { id: 'long', label: 'Long transaction', sub: 'holds a shared MDL', x: 20, y: 20, w: 240 },
+    { id: 'alter', label: 'ALTER … ADD INDEX', sub: 'needs exclusive MDL briefly', x: 320, y: 20, w: 220 },
+    { id: 'q', label: 'New SELECT', sub: '', x: 600, y: 20, w: 180 },
+    { id: 'wait', label: '✗ Waiting for table', sub: 'metadata lock', x: 320, y: 150, w: 220 },
+    { id: 'ok', label: '✓ Build runs online', sub: 'LOCK=NONE', x: 600, y: 150, w: 180 },
+  ]}
+  edges={[
+    { id: 'long-alter', from: 'long', to: 'alter', label: 'blocks' },
+    { id: 'alter-q', from: 'alter', to: 'q', label: 'blocks' },
+    { id: 'alter-wait', from: 'alter', to: 'wait' },
+    { id: 'alter-ok', from: 'alter', to: 'ok', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'The MDL queue',
+      path: 'open transaction → ALTER waits for exclusive MDL → ✗ a new SELECT waits behind the ALTER',
+      summary: 'Measured: both ALTER and SELECT in state "Waiting for table metadata lock".',
+      steps: [
+        {
+          title: 'A transaction touched the table',
+          note: 'START TRANSACTION; SELECT … FROM orders; then it stays open (here: SLEEP(12)). It holds a shared metadata lock until it ends.',
+          code: 'START TRANSACTION; SELECT COUNT(*) FROM orders WHERE id = 1; SELECT SLEEP(12); COMMIT;',
+          active: ['long'],
+        },
+        {
+          title: 'The ALTER waits for its brief exclusive MDL',
+          note: 'Even with ALGORITHM=INPLACE, LOCK=NONE, the ALTER needs an exclusive metadata lock at the start (and end). processlist: "Waiting for table metadata lock".',
+          code: 'ALTER TABLE orders ADD INDEX mdl_demo (amount), ALGORITHM=INPLACE, LOCK=NONE;',
+          active: ['long', 'alter', 'wait'],
+          edges: ['long-alter', 'alter-wait'],
+        },
+        {
+          title: '✗ Everyone queues behind the ALTER',
+          note: 'A plain SELECT on orders now also waits: its shared MDL request is behind the pending exclusive one. One long transaction plus one ALTER can stall all traffic to the table. Set lock_wait_timeout low for DDL and kill idle transactions first.',
+          code: 'SELECT COUNT(*) FROM orders WHERE id = 2;   -- Waiting for table metadata lock',
+          active: ['alter', 'q', 'wait'],
+          edges: ['alter-q'],
+        },
+      ],
+    },
+    {
+      title: 'Online build',
+      path: 'MDL acquired → ✓ index built while DML continues (online log) → brief MDL at the end',
+      summary: 'Once the queue clears, the build itself does not block writes (Session 2, Concept 2).',
+      steps: [
+        {
+          title: '✓ Writes continue',
+          note: 'After the long transaction committed, the ALTER got its lock, built mdl_demo with concurrent DML recorded in the online log, and finished.',
+          active: ['alter', 'ok'],
+          edges: ['alter-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: hybrid builds
+
+<Flow
+  title="MongoDB: createIndex on a live collection"
+  height={260}
+  nodes={[
+    { id: 'b', label: 'createIndex', sub: 'brief locks at start and end', x: 20, y: 20, w: 240 },
+    { id: 'w', label: 'insertOne during build', sub: '', x: 320, y: 20, w: 220 },
+    { id: 'ok', label: '✓ Writes continue', sub: '10 ms', x: 600, y: 20, w: 180 },
+  ]}
+  edges={[
+    { id: 'b-w', from: 'b', to: 'w', quiet: true },
+    { id: 'w-ok', from: 'w', to: 'ok' },
+  ]}
+  cases={[
+    {
+      title: 'Insert during a build',
+      path: 'build running (838 ms) → insert ✓ 10 ms',
+      summary: 'Writes during the build go to a side-writes table (Session 2, Concept 2).',
+      steps: [
+        {
+          title: '✓ No long lock',
+          note: 'An index build on { amount, channel } took 838 ms; an insert issued meanwhile completed in 10 ms. On replica sets, builds run on all members together and commit by quorum; very large builds can still lag secondaries, so schedule them off-peak.',
+          code: 'db.orders.createIndex({ amount: 1, channel: 1 })\n// in another shell, during the build:\ndb.orders.insertOne({ _id: 3000001, status: "paid" })',
+          active: ['b', 'w', 'ok'],
+          edges: ['b-w', 'w-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+Always set a lock timeout for DDL on production: `SET lock_timeout = '5s'` (PostgreSQL), `SET lock_wait_timeout = 5` (MySQL). A DDL statement that cannot get its lock quickly should fail and be retried, rather than sit in the lock queue blocking every query behind it.
+</Pitfall>
+
+## Real-world scenario: the 2 am index that took the site down
+
+An engineer runs `CREATE INDEX ON orders (merchant_id)` on a 400 GB PostgreSQL table during low traffic. The build takes 25 minutes; all checkouts fail because order INSERTs wait on the ShareLock.
+
+| Better plan | Why |
+|---|---|
+| `SET lock_timeout = '5s'; CREATE INDEX CONCURRENTLY …;` | Writes continue; gives up quickly if blocked |
+| Kill idle-in-transaction sessions first | Otherwise CONCURRENTLY waits on old snapshots |
+| Monitor `pg_stat_progress_create_index` | See the phase and progress |
+| Afterwards: check `indisvalid` | Drop and retry if it failed |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 4: checklist | "How will this index be deployed?" is part of the design |
+
+## Key takeaways
+
+1. PostgreSQL `CREATE INDEX` holds a ShareLock that blocks all writes for the whole build.
+2. `CREATE INDEX CONCURRENTLY` allows writes (87 ms INSERT in the lab) but is slower, waits for older transactions, cannot run in a transaction block, and leaves an INVALID index if it fails.
+3. MySQL online DDL allows writes but needs brief exclusive metadata locks; behind a long transaction, it queues every later query.
+4. MongoDB hybrid builds take only brief locks; writes continue.
+5. Use lock timeouts for DDL, clear long transactions first, and verify the result.
+
+## Check questions
+
+1. Why did the INSERT wait during a plain `CREATE INDEX`, and which lock modes were involved?
+2. What does `CREATE INDEX CONCURRENTLY` do differently, and what does it cost?
+3. Why did the CONCURRENTLY build sit in "waiting for old snapshots"?
+4. What is left behind when a unique CONCURRENTLY build fails, and why is it a problem?
+5. In the MySQL demo, why did a plain SELECT wait, even though SELECTs do not conflict with the long transaction?
+6. What do `lock_timeout` / `lock_wait_timeout` protect against during DDL?
+7. Outline a safe procedure for adding an index to a busy 400 GB PostgreSQL table.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-8-when-indexes-hurt/concept-3-concurrently-locking/answers">Worked answers to Q1–Q7</DeepDive>

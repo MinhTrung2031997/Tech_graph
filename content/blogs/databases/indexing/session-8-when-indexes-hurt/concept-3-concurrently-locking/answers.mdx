@@ -1,0 +1,76 @@
+---
+title: "Answers: CREATE INDEX CONCURRENTLY and locking"
+description: "Worked answers to the Session 8 Concept 3 check questions."
+companion: "answers"
+tags: ["indexing", "locking", "online-ddl", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY"
+  - "https://dev.mysql.com/doc/refman/8.4/en/metadata-locking.html"
+---
+
+<Tldr>
+Know which lock each DDL takes, what waits behind it, and what it leaves behind when it fails.
+</Tldr>
+
+## Q1. Why the INSERT waited
+
+**Question:** why did the INSERT wait during a plain `CREATE INDEX`, and which lock modes were involved?
+
+`CREATE INDEX` takes a **ShareLock** on the table, which conflicts with the **RowExclusiveLock** every INSERT, UPDATE and DELETE needs. The INSERT's lock request was queued (granted = false, wait_event `relation`) until the build's transaction ended. Reads (AccessShareLock) were not blocked.
+
+> **Common mistake:** "CREATE INDEX only blocks the rows being indexed". It blocks all writes to the table.
+
+## Q2. What CONCURRENTLY changes
+
+**Question:** what does `CREATE INDEX CONCURRENTLY` do differently, and what does it cost?
+
+It takes a **ShareUpdateExclusiveLock**, compatible with normal reads and writes, and builds the index in phases: register it, scan the table, wait for concurrent transactions, scan again for rows changed meanwhile, wait again, then mark it valid. Costs: two table scans (slower, more I/O), waiting for every transaction older than each phase, it cannot run inside a transaction block, and a failure leaves an INVALID index behind.
+
+> **Common mistake:** wrapping it in a migration framework's transaction, where it errors out.
+
+## Q3. Waiting for old snapshots
+
+**Question:** why did the CONCURRENTLY build sit in "waiting for old snapshots"?
+
+Before the index can be marked valid, every transaction that might not see it as it was built (any transaction with an older snapshot) must finish, or it could miss index entries. A 10-second transaction was open, so the build waited for it. A long-running query or an idle-in-transaction session can delay the build indefinitely.
+
+> **Common mistake:** assuming a stalled CONCURRENTLY build is "just slow"; check `pg_stat_activity` for old transactions.
+
+## Q4. A failed unique build
+
+**Question:** what is left behind when a unique CONCURRENTLY build fails, and why is it a problem?
+
+An **INVALID** index (`pg_index.indisvalid = false`). Queries never use it, but every INSERT and UPDATE still maintains it (and for a unique one, still checks it), so it adds write cost and can even reject writes, while giving no benefit. Find invalid indexes with `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid`, drop them with `DROP INDEX CONCURRENTLY`, fix the duplicates, and retry.
+
+> **Common mistake:** retrying the same `CREATE INDEX CONCURRENTLY` name and getting "relation already exists".
+
+## Q5. The SELECT that waited
+
+**Question:** in the MySQL demo, why did a plain SELECT wait, even though SELECTs do not conflict with the long transaction?
+
+Metadata lock requests are queued in order. The ALTER asked for an **exclusive** MDL and was waiting behind the long transaction's shared MDL. The new SELECT's **shared** MDL request conflicts with the pending exclusive request, so it queued behind the ALTER. The pending DDL turned a harmless long transaction into a full outage for that table.
+
+> **Common mistake:** "online DDL never blocks anything". The brief MDL at the start and end can, through the queue.
+
+## Q6. Lock timeouts
+
+**Question:** what do `lock_timeout` / `lock_wait_timeout` protect against during DDL?
+
+Against the lock-queue effect: if the DDL cannot get its lock within the timeout, it fails instead of waiting, so it never sits at the head of the queue blocking later queries for long. You retry later. Without it, a DDL waiting on one long transaction can stall all traffic to the table.
+
+> **Common mistake:** setting `statement_timeout` only, which limits the build time but not the wait at the head of the queue in the same way.
+
+## Q7. Safe procedure
+
+**Question:** outline a safe procedure for adding an index to a busy 400 GB PostgreSQL table.
+
+1. Check that it is needed and will be used (plan with a test copy, Concept 4).
+2. Check for long or idle-in-transaction sessions; end them.
+3. `SET lock_timeout = '5s';` (and enough `maintenance_work_mem` for the build).
+4. `CREATE INDEX CONCURRENTLY idx ON big_table (…);` outside any transaction block.
+5. Watch `pg_stat_progress_create_index` and disk space (the build needs room for the new index).
+6. Verify: `indisvalid = true`; if not, `DROP INDEX CONCURRENTLY` and retry.
+7. Confirm with `EXPLAIN (ANALYZE, BUFFERS)` that the target queries use it; monitor write latency and WAL.
+
+> **Common mistake:** skipping step 6 and leaving an invalid index costing writes for months.
