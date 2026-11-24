@@ -1,0 +1,177 @@
+---
+title: "Concept 4: How many partitions is too many"
+description: "The same 5M orders as 24 monthly and 731 daily partitions in PostgreSQL 17. Pruned queries cost the same; everything that touches all partitions does not: a lookup by id locked 1,466 relations instead of 52 and needed 392.7 ms of planning on a fresh connection, a generic plan locked all 1,466 even for one day, and ANALYZE took 4.99 s instead of 0.82 s."
+type: "concept"
+tags: ["partitioning", "postgresql", "locks", "planning", "maintenance"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE-BEST-PRACTICES"
+  - "https://www.postgresql.org/docs/17/runtime-config-locks.html#GUC-MAX-LOCKS-PER-TRANSACTION"
+  - "https://www.postgresql.org/docs/17/view-pg-locks.html"
+---
+
+<Tldr>
+Each partition is a table, and each of its indexes is another relation: **731 daily partitions with one index made 1,464 relations**, against 50 for 24 monthly ones. A query that prunes to one partition while planning does not care (6 locks either way, warm planning 0.031 ms vs 0.017 ms). A query that cannot prune pays per partition: `WHERE id = 777777` locked **1,466 relations instead of 52**, and its first plan on a new connection took **392.7 ms instead of 2.1 ms** while it loaded metadata for every partition. A **generic plan** for a one-day query locked all 1,466 before pruning to one. Only 16 locks per backend fit in the fast path; the rest go to the shared lock table. Maintenance scales too: `ANALYZE` took **4.99 s vs 0.82 s** (0.14 s unpartitioned). Choose the partition size from retention and query ranges, then keep the count in the tens or low hundreds unless queries reliably prune at plan time.
+</Tldr>
+
+## The setup
+
+Two partitioned copies of `orders`, both with an index on `created_at`:
+
+| Table | Partitions | Relations (tables + indexes, incl. parent) | Size | Created in |
+|---|---|---|---|---|
+| `orders_p` | 24 (monthly) | 50 | 474 MB | 23 ms |
+| `orders_d` | 731 (daily) | 1,464 | 514 MB | 503 ms |
+
+Loading 5M rows took 2.75 s into `orders_d`, like `orders_p`. The first `VACUUM ANALYZE` after the load took 13.6 s on `orders_d` and 1.2 s on `orders_p`.
+
+| Term | Meaning |
+|---|---|
+| Relation lock | Every table and index a query uses is locked (`AccessShareLock` for reads) until the transaction ends |
+| Fast-path slot | A per-backend array for weak relation locks: 16 slots in PostgreSQL 17. Locks beyond that go to the shared lock table |
+| Shared lock table | One table in shared memory for all sessions, sized for about `max_locks_per_transaction` (64 here) × the number of connections |
+| Cold / warm | First query on a new connection (metadata for each partition must be loaded into the backend's cache) / later queries on the same connection |
+| **✓ Few / ✗ Many** | Locks or work proportional to the partitions kept / to all partitions |
+
+## What every partition costs
+
+<Flow
+  title="PostgreSQL: what a query on 24 vs 731 partitions touches"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Query', sub: 'orders_p or orders_d', x: 20, y: 20, w: 200 },
+    { id: 'plan', label: 'Planner', sub: 'opens partitions', x: 300, y: 20, w: 200 },
+    { id: 'fast', label: 'Fast-path slots', sub: '16 per backend', x: 580, y: 20, w: 200 },
+    { id: 'parts', label: 'Partitions + indexes', sub: '48 or 1,462', x: 300, y: 200, w: 200 },
+    { id: 'shared', label: 'Shared lock table', sub: 'all sessions', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'q-plan', from: 'q', to: 'plan' },
+    { id: 'plan-parts', from: 'plan', to: 'parts' },
+    { id: 'plan-fast', from: 'plan', to: 'fast' },
+    { id: 'fast-shared', from: 'fast', to: 'shared' },
+  ]}
+  cases={[
+    {
+      title: 'Pruned while planning',
+      path: 'one-day literal → Planner ✓ opens 1 partition → 6 locks, ✓ all in fast path → shared table unused',
+      summary: 'Plan-time pruning makes the partition count almost irrelevant.',
+      subs: { parts: '✓ 1 partition + index', fast: '✓ 6 locks', shared: '✓ unused' },
+      steps: [
+        {
+          title: 'One day, as constants',
+          note: 'Both tables: 6 locks, all fast-path (parent, its index, the partition, its index, plus the pg_locks view being queried and the virtual transaction id). Warm planning 0.017 ms (24) vs 0.031 ms (731); cold planning 0.65 ms vs 6.6 ms.',
+          code: "BEGIN;\nSELECT count(*) FROM orders_d WHERE created_at >= '2025-03-15' AND created_at < '2025-03-16';\nSELECT count(*), count(*) FILTER (WHERE fastpath) FROM pg_locks WHERE pid = pg_backend_pid();   -- 6 | 6",
+          active: ['q', 'plan', 'parts', 'fast'],
+          edges: ['q-plan', 'plan-parts', 'plan-fast'],
+        },
+      ],
+    },
+    {
+      title: 'No key in the WHERE clause',
+      path: 'WHERE id = 777777 → Planner ✗ opens all 731 → 1,466 locks → 16 fast-path, ✗ 1,449 in the shared table',
+      summary: 'Everything that cannot prune scales with the number of partitions.',
+      subs: { parts: '✗ 731 + 731 indexes', fast: '✗ full (16)', shared: '✗ 1,449 entries' },
+      steps: [
+        {
+          title: 'Planning opens every partition',
+          note: 'First query on a new connection: planning 392.7 ms on orders_d, 2.1 ms on orders_p. Warm: 3.8 ms vs 0.14 ms. Execution scans every partition either way (128.9 ms vs 112.1 ms warm).',
+          code: "EXPLAIN (ANALYZE) SELECT count(*), sum(amount) FROM orders_d WHERE id = 777777;\n-- Planning Time: 392.663 ms   (fresh connection)",
+          active: ['q', 'plan', 'parts'],
+          edges: ['q-plan', 'plan-parts'],
+        },
+        {
+          title: 'And locks every one',
+          note: 'pg_locks for the session: 1,466 locks on orders_d (52 on orders_p). Only 17 used the fast path (16 relation slots plus the virtual transaction id); 1,449 went into the shared lock table, which every session shares. The lab did not try to exhaust it, because the resulting "out of shared memory" errors would hit other sessions too.',
+          code: "-- orders_p: locks=52   fastpath=17\n-- orders_d: locks=1466 fastpath=17",
+          active: ['plan', 'fast', 'shared'],
+          edges: ['plan-fast', 'fast-shared'],
+        },
+      ],
+    },
+    {
+      title: 'Generic plan, one day',
+      path: 'prepared, force_generic_plan → plan has all 731 → ✗ 1,466 locks taken → then startup prunes to 1',
+      summary: 'Pruning at executor startup comes after locking.',
+      subs: { parts: '✗ all locked, 1 read', fast: '✗ full (16)', shared: '✗ 1,449 entries' },
+      steps: [
+        {
+          title: 'Locks before pruning',
+          note: 'A generic plan contains all partitions. PostgreSQL 17 locks every relation in the plan when execution starts, then removes the 730 that cannot match. 1,466 locks for a one-day query (52 on orders_p). The first execution took 42.9 ms (custom plan: 4.9 ms); later ones 0.35 ms vs 0.28 ms.',
+          code: "SET plan_cache_mode = force_generic_plan;\nPREPARE q2(timestamptz, timestamptz) AS\n  SELECT count(*) FROM orders_d WHERE created_at >= $1 AND created_at < $2;\nBEGIN; EXECUTE q2('2025-03-15', '2025-03-16');   -- 1,466 locks",
+          active: ['q', 'plan', 'parts', 'fast', 'shared'],
+          edges: ['q-plan', 'plan-parts', 'plan-fast', 'fast-shared'],
+        },
+        {
+          title: 'A half-known custom plan',
+          note: "With a custom plan but the upper bound written as $1 + interval '1 day' (a stable expression), the planner could prune only with the lower bound: 292 partitions from 15 March on stayed in the plan (588 locks, planning 26.7 ms), and startup removed 291. Passing both bounds as parameters: 6 locks.",
+          code: "PREPARE q(timestamptz) AS SELECT count(*) FROM orders_d\n  WHERE created_at >= $1 AND created_at < $1 + interval '1 day';\n-- custom plan: Subplans Removed: 291 · 588 locks",
+          active: ['plan', 'parts', 'fast', 'shared'],
+          edges: ['plan-parts', 'plan-fast', 'fast-shared'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Measured on both layouts
+
+| | `orders` (1 table) | `orders_p` (24) | `orders_d` (731) |
+|---|---|---|---|
+| One day, planning cold / warm | 1.31 / 0.010 ms | 0.65 / 0.017 ms | 6.59 / 0.031 ms |
+| One day, execution warm | 0.45 ms | 0.49 ms | 0.34 ms |
+| `id = 777777`, planning cold / warm | 0.22 / 0.007 ms | 2.06 / 0.14 ms | **392.7 / 3.8 ms** |
+| `id = 777777`, execution warm | 0.009 ms (primary key) | 112.1 ms | 128.9 ms |
+| Whole table, planning cold / warm | 0.42 / 0.034 ms | 2.05 / 0.11 ms | 50.3 / 3.3 ms |
+| Whole table, execution warm | 100.8 ms | 131.9 ms | 159.8 ms |
+| Locks: one day literal / no key / generic plan | 5 / 5 / not measured | 6 / 52 / 52 | 6 / **1,466** / **1,466** |
+| `ANALYZE` (median of 3) | 0.14 s | 0.82 s | **4.99 s** |
+| `VACUUM` with nothing to do | 2.3 ms | 0.9 ms | 42.9 ms |
+
+Cold = first query on a fresh connection; warm = median of the next 5. Timings come from a lab server shared with other sessions. Lock counts include the `pg_locks` view and the virtual transaction id of the session that counts them; the plain table's 5 are the table, its two indexes and those two.
+
+`ANALYZE` on a partitioned table samples each partition for its own statistics and then the whole hierarchy for the parent's, so it grows with the partition count. Autovacuum analyzes partitions but, per the documentation, never the partitioned parent: run `ANALYZE orders_p` yourself after large changes.
+
+<Pitfall>
+Connection poolers hide the cold cost until they recycle connections. With 731 partitions, every new backend paid 392.7 ms on its first query that could not prune. Short-lived connections (serverless functions, a pooler with a short `server_lifetime`) pay it again and again.
+</Pitfall>
+
+## Real-world scenario: daily partitions "for faster deletes"
+
+A team partitions an events table by day and keeps 3 years: 1,096 partitions. Retention is fast. Then:
+
+| Symptom | Cause |
+|---|---|
+| Admin queries by `event_id` take seconds on the first try | Planning opens 1,096 partitions and their indexes on a new connection |
+| Occasional `out of shared memory` with `You might need to increase max_locks_per_transaction` | Many concurrent queries each taking 2,000+ locks |
+| Nightly `ANALYZE` job grows month after month | One more partition every day |
+
+Monthly partitions (36) would still let them drop old data a month at a time, with a twentieth of the overhead. Daily partitions make sense when queries always name the day and old data must go within a day.
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 2 | Executor-startup pruning, which generic plans rely on |
+| Concept 3 | Queries that cannot prune and therefore pay per partition |
+| [Transactions Session 5, row and table locks](/blogs/databases/transactions/session-5-locks-and-indexes/concept-1-row-and-table-locks) | Relation locks and `pg_locks` |
+
+## Key takeaways
+
+1. Each partition and each of its indexes is a relation that is planned, locked and maintained.
+2. Plan-time pruning makes the count nearly irrelevant: 6 locks with 24 or 731 partitions.
+3. Queries that cannot prune pay per partition: 1,466 locks and 392.7 ms of cold planning at 731.
+4. Generic plans lock every partition before pruning at startup.
+5. `ANALYZE` grows with the count (0.82 s → 4.99 s); autovacuum does not analyze the parent.
+6. Size partitions from retention and typical query ranges, then prefer fewer, larger ones.
+
+## Check questions
+
+1. Why did the one-day literal query take 6 locks on both tables, while `WHERE id = 777777` took 52 and 1,466?
+2. What is the fast path, and what happens to lock number 17 and beyond?
+3. Why was the first query on a new connection 100× slower to plan on `orders_d`, and what kinds of deployments pay this often?
+4. A prepared one-day query on `orders_d` prunes correctly. Why does it still lock 1,466 relations, and how do you avoid that?
+5. Why did `$1 + interval '1 day'` leave 292 partitions in a custom plan?
+6. A colleague proposes hourly partitions for an orders table kept for two years. Give three costs from this concept they should weigh.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-2-partitioning-postgresql/concept-4-how-many-partitions/answers">Worked answers to Q1–Q6</DeepDive>

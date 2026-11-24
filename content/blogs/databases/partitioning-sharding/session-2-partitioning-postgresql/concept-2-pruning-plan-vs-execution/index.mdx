@@ -1,0 +1,196 @@
+---
+title: "Concept 2: Partition pruning, at plan time and at execution time"
+description: "How PostgreSQL 17 skips partitions: with a constant it removes them while planning, with a parameter, now() or a generic plan it removes them when the executor starts (Subplans Removed: 23), and inside a nested loop it skips them per outer row (never executed). Measured on 24 monthly partitions of 5M orders: pruning turns a 67 ms full read into 8.5 ms, but a good index on the plain table already gives 8.6 ms."
+type: "concept"
+tags: ["partitioning", "postgresql", "partition-pruning", "explain", "prepared-statements"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html#DDL-PARTITION-PRUNING"
+  - "https://www.postgresql.org/docs/17/runtime-config-query.html#GUC-ENABLE-PARTITION-PRUNING"
+  - "https://www.postgresql.org/docs/17/runtime-config-query.html#GUC-PLAN-CACHE-MODE"
+---
+
+<Tldr>
+**Partition pruning** removes partitions that cannot contain matching rows. PostgreSQL does it at three moments, and EXPLAIN shows each differently. **While planning**, when the key is compared with a constant: the plan lists only `orders_p_2025_03`. **When the executor starts**, when the value is known only then (a parameter in a generic plan, `now()`): `Subplans Removed: 23`. **During execution**, when the value changes per row (a nested loop over two promo days, a sub-select): the other partitions show `(never executed)`. On the month query, pruning read **1,982 buffers in 8.5 ms instead of 46,736 in 71.0 ms** when each partition is read in full. But the plain `orders` table with an index on `created_at` answered the same query in **8.6 ms**: on reads, pruning mostly buys what a good index already gives.
+</Tldr>
+
+## The setup
+
+`orders_p` from Concept 1: 24 monthly partitions, each with its own index on `created_at`. The query sums one month:
+
+```sql
+SELECT count(*), sum(amount) FROM orders_p
+WHERE created_at >= '2025-03-01' AND created_at < '2025-04-01';   -- 212,039 rows
+```
+
+| Term | Meaning |
+|---|---|
+| Plan-time pruning | The planner compares constants in the WHERE clause with each partition's bounds and leaves non-matching partitions out of the plan |
+| Initial (executor-startup) pruning | The plan contains all partitions; when execution starts and parameter values are known, non-matching ones are removed. EXPLAIN: `Subplans Removed: N` |
+| Execution-time pruning | The value changes while the query runs (e.g. per outer row of a nested loop); partitions that never match are skipped. EXPLAIN ANALYZE: `(never executed)` |
+| Generic plan | A plan for a prepared statement built without knowing parameter values, reused across executions |
+| `enable_partition_pruning` | Session setting (default on) that allows all three kinds |
+| **✓ Scanned / ✗ Pruned** | The partition is read / it is skipped |
+
+## How PostgreSQL decides
+
+<Flow
+  title="PostgreSQL: which partitions a query on orders_p reads"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'SELECT … March', sub: 'created_at range', x: 20, y: 20, w: 200 },
+    { id: 'plan', label: 'Planner', sub: 'compares with bounds', x: 300, y: 20, w: 200 },
+    { id: 'exec', label: 'Executor', sub: 'Append node', x: 580, y: 20, w: 200 },
+    { id: 'other', label: 'Other 21 months', sub: '2024_01 … 2025_12', x: 20, y: 200, w: 160 },
+    { id: 'feb', label: '2025_02', sub: '191,518 rows', x: 220, y: 200, w: 160 },
+    { id: 'mar', label: '2025_03', sub: '212,039 rows', x: 420, y: 200, w: 160 },
+    { id: 'apr', label: '2025_04', sub: '205,198 rows', x: 620, y: 200, w: 160 },
+  ]}
+  edges={[
+    { id: 'q-plan', from: 'q', to: 'plan' },
+    { id: 'plan-exec', from: 'plan', to: 'exec' },
+    { id: 'exec-other', from: 'exec', to: 'other', quiet: true },
+    { id: 'exec-feb', from: 'exec', to: 'feb', quiet: true },
+    { id: 'exec-mar', from: 'exec', to: 'mar', quiet: true },
+    { id: 'exec-apr', from: 'exec', to: 'apr', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Constant: pruned while planning',
+      path: "literal '2025-03-01' → Planner ✓ keeps 2025_03 only → Executor scans 1 partition → others ✗ absent from the plan",
+      summary: 'The plan itself has one partition in it.',
+      subs: { other: '✗ not in plan', feb: '✗ not in plan', mar: '✓ Seq Scan', apr: '✗ not in plan' },
+      steps: [
+        {
+          title: 'The planner compares constants with bounds',
+          note: 'Both bounds are constants of the key\'s type, so the planner proves that only orders_p_2025_03 can match. EXPLAIN without ANALYZE already shows a single Seq Scan (the whole partition matches, so no index is needed).',
+          code: "EXPLAIN (COSTS OFF) SELECT count(*), sum(amount) FROM orders_p\nWHERE created_at >= '2025-03-01' AND created_at < '2025-04-01';\n--  Aggregate\n--    ->  Seq Scan on orders_p_2025_03 orders_p",
+          active: ['q', 'plan'],
+          edges: ['q-plan'],
+        },
+        {
+          title: 'One partition read',
+          note: '1,982 buffers, 8.4 ms (median of 5). The other 23 partitions are not opened at all.',
+          active: ['plan', 'exec', 'mar'],
+          edges: ['plan-exec', 'exec-mar'],
+        },
+      ],
+    },
+    {
+      title: 'Parameter or now(): pruned when the executor starts',
+      path: 'generic plan with $1, $2 → Planner keeps all 24 → Executor startup ✗ removes 23 → ✓ 2025_03',
+      summary: 'The plan has every partition; execution throws 23 away before reading.',
+      subs: { other: '✗ Subplans Removed', feb: '✗ Subplans Removed', mar: '✓ Index Scan', apr: '✗ Subplans Removed' },
+      steps: [
+        {
+          title: 'A generic plan cannot know the month',
+          note: 'A prepared statement planned without its parameter values (plan_cache_mode = force_generic_plan here; by default after 5 executions if the generic plan looks no worse) must include all 24 partitions.',
+          code: "PREPARE m(timestamptz, timestamptz) AS\n  SELECT count(*), sum(amount) FROM orders_p WHERE created_at >= $1 AND created_at < $2;\nSET plan_cache_mode = force_generic_plan;",
+          active: ['q', 'plan'],
+          edges: ['q-plan'],
+        },
+        {
+          title: 'Startup removes 23',
+          note: 'When EXECUTE supplies the values, the Append node prunes before reading anything. The same happens for now(), which is constant within a statement but unknown to the planner: created_at >= now() - interval \'11 months\' kept only 2025_12 (51,215 rows), and plain EXPLAIN already printed Subplans Removed: 23.',
+          code: "EXPLAIN (ANALYZE, COSTS OFF) EXECUTE m('2025-03-01', '2025-04-01');\n--  Append (actual rows=212039 loops=1)\n--    Subplans Removed: 23\n--    ->  Index Scan using orders_p_2025_03_created_at_idx on orders_p_2025_03",
+          active: ['plan', 'exec', 'mar'],
+          edges: ['plan-exec', 'exec-mar'],
+        },
+      ],
+    },
+    {
+      title: 'Value per outer row: pruned during execution',
+      path: 'nested loop over promo_days → each outer row ✓ 1 partition → 22 partitions ✗ never executed',
+      summary: 'Pruning repeats for each new value, inside the join.',
+      subs: { other: '✗ 20 never executed', feb: '✗ never executed', mar: '✗ never executed', apr: '✗ never executed' },
+      steps: [
+        {
+          title: 'Join on the partition key',
+          note: 'promo_days has two rows: 11.11 and 12.12 of 2024. For each, the nested loop asks orders_p for one day. Only orders_p_2024_11 and orders_p_2024_12 ran (6,840 rows each, 0.7 ms); the other 22 partitions show (never executed). A scalar sub-select behaves the same way: created_at >= (SELECT …) ran only 2025_12.',
+          code: "SELECT p.name, count(*) FROM promo_days p\nJOIN orders_p o ON o.created_at >= p.day_start AND o.created_at < p.day_end\nGROUP BY p.name;\n--  Nested Loop … ->  Append (actual rows=6840 loops=2)\n--    Index Only Scan … orders_p_2024_01 (never executed)   … × 22",
+          active: ['q', 'plan', 'exec', 'other', 'feb', 'mar', 'apr'],
+          edges: ['q-plan', 'plan-exec'],
+        },
+      ],
+    },
+    {
+      title: 'Pruning switched off',
+      path: 'enable_partition_pruning = off → Planner keeps 24 → ✓ every partition scanned',
+      summary: 'What pruning saves, made visible.',
+      subs: { other: '✓ scanned', feb: '✓ scanned', mar: '✓ scanned', apr: '✓ scanned' },
+      steps: [
+        {
+          title: 'With the per-partition indexes',
+          note: 'The plan has 24 scans: an Index Scan on each of 23 partitions (finding nothing) and a Seq Scan on 2025_03. Because empty index probes are cheap, it still took 8.6 ms.',
+          code: "SET enable_partition_pruning = off;",
+          active: ['q', 'plan', 'exec', 'other', 'feb', 'mar', 'apr'],
+          edges: ['q-plan', 'plan-exec', 'exec-other', 'exec-feb', 'exec-mar', 'exec-apr'],
+        },
+        {
+          title: 'When partitions are read in full',
+          note: 'With index scans disabled for the session (as if the partitions had no created_at index), pruning off read all 46,736 buffers in 71.0 ms; pruning on read 1,982 buffers in 8.5 ms.',
+          code: "SET enable_indexscan = off; SET enable_bitmapscan = off; SET enable_indexonlyscan = off;",
+          active: ['exec', 'other', 'feb', 'mar', 'apr'],
+          edges: ['exec-other', 'exec-feb', 'exec-mar', 'exec-apr'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## What pruning is worth here
+
+Median of 5 runs, `max_parallel_workers_per_gather` at its default (2):
+
+| Query | `orders` (plain, index on `created_at`) | `orders_p` (pruned) | `orders_p` (pruning off) |
+|---|---|---|---|
+| One month (212,039 rows) | **8.6 ms**, 3,113 buffers | **8.4 ms**, 1,982 buffers | 8.6 ms |
+| One day (6,840 rows) | 0.4 ms | 0.5 ms | not measured |
+| Whole table | **92.1 ms** | **118.9 ms** | — |
+| One month, index scans disabled | 67.0 ms, 46,729 buffers | **8.5 ms**, 1,982 buffers | 71.0 ms, 46,736 buffers |
+
+Two honest conclusions:
+
+1. Pruning is a **coarse index**: it skips 23 of 24 partitions, which is worth 8× when the alternative is reading everything.
+2. Here the plain table already had that: `orders` is stored in `created_at` order (ids grow with time), so an index range scan touches only March's pages. Pruning helped reads only marginally (1,982 vs 3,113 buffers), and reading the **whole** table was 29% slower partitioned. The bigger wins of partitioning are elsewhere: dropping a month (Session 4) and per-partition maintenance.
+
+<Pitfall>
+`EXPLAIN` without `ANALYZE` shows plan-time and executor-startup pruning, but not per-row pruning in a join: the plan lists all partitions and only `EXPLAIN ANALYZE` shows which were `(never executed)`. When a query "scans every partition" in a plain EXPLAIN, run it with ANALYZE before concluding pruning failed.
+</Pitfall>
+
+## Real-world scenario: an ORM with prepared statements
+
+A service runs `SELECT … FROM orders_p WHERE created_at >= $1 AND created_at < $2` through a driver that prepares statements. After a few executions PostgreSQL may switch to a generic plan. Reads stay fast (startup pruning removes 23 partitions), but every execution of a generic plan **locks all 24 partitions and their indexes** before pruning, which matters with hundreds of partitions (Concept 4: 1,466 locks instead of 6). Options:
+
+| Option | Effect |
+|---|---|
+| Keep the default (`auto`) | Fine with tens of partitions |
+| `plan_cache_mode = force_custom_plan` for that role or session | Plans every execution with the values: plan-time pruning, few locks, a little more planning time |
+| Fewer, larger partitions | Fewer locks either way |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 3 | Query shapes that defeat all three kinds of pruning |
+| [Indexing Session 9, join algorithms](/blogs/databases/indexing/session-9-indexes-for-joins/concept-1-join-algorithms) | Only a nested loop passes values one row at a time, so only it prunes per row |
+| [Indexing Session 7, BRIN](/blogs/databases/indexing/session-7-specialist-indexes/concept-2-brin) | Another coarse "skip what cannot match" structure for time-ordered data |
+
+## Key takeaways
+
+1. Pruning happens while planning (constants), at executor startup (parameters, `now()`, generic plans) or per row (nested loops, sub-selects).
+2. EXPLAIN shows them as a short plan, `Subplans Removed: N`, and `(never executed)` respectively.
+3. Pruning turned a full read (71.0 ms) into one partition (8.5 ms), much like an index does.
+4. On a time-ordered table with an index on the key, the plain table was just as fast for a month (8.6 ms vs 8.4 ms) and faster for the whole table.
+5. Generic plans prune at startup but lock every partition first.
+
+## Check questions
+
+1. Name the three moments PostgreSQL can prune, and what EXPLAIN shows for each.
+2. Why does `created_at >= now() - interval '11 months'` print `Subplans Removed: 23` even without ANALYZE?
+3. In the promo-days join, why did only 2 partitions run, and why would a plain EXPLAIN mislead you?
+4. Pruning off still took 8.6 ms with indexes and 71.0 ms without. What does that tell you about where pruning pays off?
+5. The month query was as fast on the plain `orders` table. Why, and would that hold if rows were stored in random time order?
+6. What does a generic plan cost on a table with 731 partitions, even though it prunes correctly?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-2-partitioning-postgresql/concept-2-pruning-plan-vs-execution/answers">Worked answers to Q1–Q6</DeepDive>

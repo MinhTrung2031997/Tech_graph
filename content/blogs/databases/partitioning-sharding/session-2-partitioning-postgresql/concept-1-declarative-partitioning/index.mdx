@@ -1,0 +1,201 @@
+---
+title: "Concept 1: Range, list and hash partitions"
+description: "Build a monthly range-partitioned copy of the 5M-row orders table in PostgreSQL 17 and watch rows being routed: the parent holds no data, a row with no matching partition fails with an exact error, an UPDATE of the key moves the row to another partition, and list and hash partitioning split the same rows by marketplace and by seller. Loading 5M rows took the same time partitioned or not (medians 2.95 s vs 2.90 s)."
+type: "concept"
+tags: ["partitioning", "postgresql", "range-partitioning", "list-partitioning", "hash-partitioning"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html"
+  - "https://www.postgresql.org/docs/17/sql-createtable.html"
+---
+
+<Tldr>
+A partitioned table in PostgreSQL is a **parent with no storage** plus one ordinary table per partition. `PARTITION BY RANGE (created_at)` with 24 monthly partitions took 23 ms to create; `INSERT … SELECT` of 5M rows routed every row to its month (212,039 rows in March 2025, 198,358 in February 2024). The parent stayed at **0 bytes**. A row for January 2026 failed: `no partition of relation "orders_p" found for row`. An `UPDATE` of `created_at` **moved** order 777777 from `orders_p_2024_04` to `orders_p_2025_07`. Routing is cheap: bulk loads took a median of 2.95 s partitioned vs 2.90 s plain, within the noise of a shared server. **List** partitioning by marketplace gave 2.50M / 1.50M / 1.00M rows; **hash** partitioning by seller gave 8 partitions of 571k–656k rows, and pruned only for equality (`seller_id = 42` → 1 partition, `BETWEEN 1 AND 10` → all 8).
+</Tldr>
+
+## The setup
+
+The data is the course's `orders` table (5,000,000 rows, 2024-01-01 to 2025-12-31, about 208k per month; setup and seeds in the [Session 1 lab](/blogs/databases/partitioning-sharding/session-1-why-split-data/lab)). We build a partitioned copy, `orders_p`, by month:
+
+```sql
+CREATE TABLE orders_p (
+  id bigint NOT NULL, seller_id integer NOT NULL, marketplace text NOT NULL,
+  status text NOT NULL, amount numeric(12,2) NOT NULL, created_at timestamptz NOT NULL
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE orders_p_2025_03 PARTITION OF orders_p
+  FOR VALUES FROM ('2025-03-01 00:00+00') TO ('2025-04-01 00:00+00');   -- × 24, generated in a DO block
+
+INSERT INTO orders_p SELECT * FROM orders;
+CREATE INDEX ON orders_p (created_at);   -- creates one index per partition
+```
+
+| Term | Meaning |
+|---|---|
+| Parent (partitioned table) | `orders_p`: the name queries use. It has a partition key and bounds, but no rows of its own |
+| Partition | An ordinary table attached to the parent with bounds, e.g. `orders_p_2025_03` |
+| Partition key | The column(s) the bounds are defined on: `created_at` here |
+| Range bounds | `FROM` is inclusive, `TO` is exclusive, so consecutive months share a boundary value without overlap |
+| Tuple routing | On INSERT, PostgreSQL finds the partition whose bounds contain the key and writes the row there |
+| **✓ Routed / ✗ No partition** | A partition exists for the row's key / none does, and the statement fails |
+
+## Routing a row
+
+<Flow
+  title="PostgreSQL: where an INSERT into orders_p goes"
+  height={290}
+  nodes={[
+    { id: 'ins', label: 'INSERT / UPDATE', sub: 'row with created_at', x: 20, y: 20, w: 200 },
+    { id: 'parent', label: 'orders_p (parent)', sub: '0 bytes, bounds only', x: 300, y: 20, w: 200 },
+    { id: 'err', label: 'No partition', sub: 'statement fails', x: 580, y: 20, w: 200 },
+    { id: 'p1', label: '2024_01', sub: '212,039 rows', x: 20, y: 200, w: 140 },
+    { id: 'p2', label: '2024_04', sub: '205,198 rows', x: 180, y: 200, w: 140 },
+    { id: 'p3', label: '2025_03', sub: '212,039 rows', x: 340, y: 200, w: 140 },
+    { id: 'p4', label: '2025_07', sub: '212,038 rows', x: 500, y: 200, w: 140 },
+    { id: 'p5', label: '2025_12', sub: '212,038 rows', x: 660, y: 200, w: 140 },
+  ]}
+  edges={[
+    { id: 'ins-parent', from: 'ins', to: 'parent' },
+    { id: 'parent-err', from: 'parent', to: 'err' },
+    { id: 'parent-p1', from: 'parent', to: 'p1', quiet: true },
+    { id: 'parent-p2', from: 'parent', to: 'p2', quiet: true },
+    { id: 'parent-p3', from: 'parent', to: 'p3', quiet: true },
+    { id: 'parent-p4', from: 'parent', to: 'p4', quiet: true },
+    { id: 'parent-p5', from: 'parent', to: 'p5', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Bulk load: every row finds its month',
+      path: 'INSERT … SELECT 5M rows → parent routes each row by created_at → ✓ 24 partitions filled, parent 0 bytes',
+      summary: 'The parent is a router; the data lives in the partitions.',
+      steps: [
+        {
+          title: 'Load through the parent',
+          note: 'INSERT INTO orders_p SELECT * FROM orders: 5,000,000 rows. Each row is routed by created_at to the partition whose [FROM, TO) range contains it.',
+          code: 'INSERT INTO orders_p SELECT * FROM orders;   -- INSERT 0 5000000',
+          active: ['ins', 'parent', 'p1', 'p2', 'p3', 'p4', 'p5'],
+          edges: ['ins-parent', 'parent-p1', 'parent-p2', 'parent-p3', 'parent-p4', 'parent-p5'],
+        },
+        {
+          title: 'Where the rows are',
+          note: 'tableoid shows the partition each row lives in. pg_relation_size(\'orders_p\') = 0 bytes: the parent has no storage. All 24 partitions plus their created_at indexes: 474 MB (orders: 579 MB, which includes a primary key on id that orders_p does not have; Session 3 explains why).',
+          code: "SELECT tableoid::regclass, count(*) FROM orders_p\nWHERE created_at < '2024-04-01' GROUP BY 1;\n-- orders_p_2024_01 212039 · orders_p_2024_02 198358 · orders_p_2024_03 212039",
+          active: ['parent', 'p1'],
+          edges: ['parent-p1'],
+        },
+      ],
+    },
+    {
+      title: 'A row with no partition',
+      path: 'INSERT created_at 2026-01-05 → parent finds no bounds → ✗ ERROR, nothing written',
+      summary: 'Range partitions must exist before the data arrives.',
+      subs: { err: '✗ ERROR' },
+      steps: [
+        {
+          title: 'January 2026 does not exist yet',
+          note: 'The last partition ends at 2026-01-01. The insert fails; in a batch, the whole statement is rolled back. Creating partitions ahead of time is Session 4.',
+          code: "INSERT INTO orders_p VALUES (5000001, 1, 'shopee', 'delivered', 10, '2026-01-05 10:00+00');\n-- ERROR:  no partition of relation \"orders_p\" found for row\n-- DETAIL:  Partition key of the failing row contains (created_at) = (2026-01-05 10:00:00+00).",
+          active: ['ins', 'parent', 'err'],
+          edges: ['ins-parent', 'parent-err'],
+        },
+      ],
+    },
+    {
+      title: 'UPDATE of the key moves the row',
+      path: 'UPDATE created_at of order 777777 → ✗ leaves 2024_04 → ✓ lands in 2025_07',
+      summary: 'Changing the partition key is a delete plus an insert.',
+      subs: { p2: '✗ row 777777 removed', p4: '✓ row 777777 added' },
+      steps: [
+        {
+          title: 'Before',
+          note: 'Order 777777 was created on 2024-04-23, so it lives in orders_p_2024_04.',
+          code: "SELECT tableoid::regclass, id, created_at FROM orders_p WHERE id = 777777;\n-- orders_p_2024_04 | 777777 | 2024-04-23 17:03:37+00",
+          active: ['parent', 'p2'],
+          edges: ['parent-p2'],
+        },
+        {
+          title: 'After the UPDATE',
+          note: 'PostgreSQL deletes the row from the old partition and inserts it into the new one in the same statement. The UPDATE took 596 ms, because orders_p has no index on id and every partition had to be scanned to find the row (Concept 3).',
+          code: "UPDATE orders_p SET created_at = '2025-07-01 00:00+00' WHERE id = 777777;\nSELECT tableoid::regclass FROM orders_p WHERE id = 777777;   -- orders_p_2025_07",
+          active: ['ins', 'parent', 'p2', 'p4'],
+          edges: ['ins-parent', 'parent-p2', 'parent-p4'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Does routing cost anything?
+
+Each bulk load ran into an empty table with no indexes, three times, on a server shared with other lab sessions:
+
+| Load of 5M rows | Run 1 | Run 2 | Run 3 | Median |
+|---|---|---|---|---|
+| `orders_copy` (plain table) | 2.51 s | 2.90 s | 4.50 s | **2.90 s** |
+| `orders_p` (24 partitions) | 2.79 s | 3.95 s | 2.95 s | **2.95 s** |
+
+100,000 single-row INSERTs from a PL/pgSQL loop: 309 and 538 ms plain, 368 and 400 ms partitioned. The difference is smaller than the run-to-run noise. Finding the partition is a binary search over the bounds; it is not where the time goes.
+
+## List and hash partitioning
+
+The same rows, split two other ways:
+
+```sql
+CREATE TABLE orders_l (LIKE orders) PARTITION BY LIST (marketplace);
+CREATE TABLE orders_l_shopee PARTITION OF orders_l FOR VALUES IN ('shopee');   -- + tiktok, lazada
+CREATE TABLE orders_l_other  PARTITION OF orders_l DEFAULT;                   -- catches anything else
+
+CREATE TABLE orders_h (LIKE orders) PARTITION BY HASH (seller_id);
+CREATE TABLE orders_h_0 PARTITION OF orders_h FOR VALUES WITH (MODULUS 8, REMAINDER 0);   -- … remainder 7
+```
+
+| | Range (`created_at`, monthly) | List (`marketplace`) | Hash (`seller_id`, modulus 8) |
+|---|---|---|---|
+| Rows per partition | 191,518–212,039 (February 2025 smallest) | shopee 2,499,789 · tiktok 1,500,190 · lazada 1,000,021 | 570,664–656,073 |
+| Unknown key | ✗ error (no partition) | ✗ error for `'amazon'` until a `DEFAULT` partition exists | Impossible: every hash has a remainder |
+| Pruned by `=` | ✓ | ✓ `= 'lazada'` → 1 | ✓ `seller_id = 42` → 1, `IN (1, 2)` → 2 |
+| Pruned by a range | ✓ | ✓ for `<>` too: `<> 'shopee'` → 3 of 4 | ✗ `BETWEEN 1 AND 10` → all 8 |
+| Typical use | Time: retention by dropping old months | A few known categories (tenant, region, channel) | Spreading writes or maintenance evenly when no natural range exists |
+
+Hash partitions are only as even as the keys: 5,000 sellers spread over 8 remainders left a 15% gap between the smallest and largest partition. One huge seller would land entirely in one partition.
+
+<Pitfall>
+A `DEFAULT` partition turns "no partition" errors into silently accepted rows. That feels safer, but rows in the default partition are invisible to retention scripts that drop old ranges, and they block attaching a new partition whose range they overlap (Session 4). Use a default partition to catch mistakes you will monitor, not as a substitute for creating partitions.
+</Pitfall>
+
+## Real-world scenario: an orders table by month
+
+A marketplace integration stores 6M orders a month and keeps 24 months. The team partitions `orders` by `created_at` monthly. Day one, three things surprise them:
+
+| Surprise | Cause | Where it is covered |
+|---|---|---|
+| `PRIMARY KEY (id)` is rejected | A unique constraint must include the partition key | Session 3 |
+| `SELECT … WHERE id = $1` got slower | `id` alone does not tell PostgreSQL which partition to read | Concept 3 |
+| The New Year batch failed at 00:00 on 1 January | Nobody created next month's partition | Session 4 |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 1 lab](/blogs/databases/partitioning-sharding/session-1-why-split-data/lab) | The dataset and containers used here |
+| Concept 2 | How a query on `orders_p` reads one partition instead of 24 |
+| [Indexing Session 7, BRIN](/blogs/databases/indexing/session-7-specialist-indexes/concept-2-brin) | Another way to skip most of a table ordered by time, without partitions |
+
+## Key takeaways
+
+1. A partitioned parent stores nothing; each partition is an ordinary table with bounds.
+2. Every inserted row must match a partition, or the statement fails (or lands in `DEFAULT`, if one exists).
+3. Updating the partition key moves the row: a delete in one partition plus an insert in another.
+4. Routing rows costs nothing measurable next to writing them (2.95 s vs 2.90 s for 5M rows).
+5. Range suits time and retention, list suits a few known values, hash spreads load but prunes only on equality.
+
+## Check questions
+
+1. `pg_relation_size('orders_p')` returned 0. Where are the 5M rows, and how do you see which partition a row is in?
+2. What exactly happens to an INSERT for 2026-01-05, and what would change if a `DEFAULT` partition existed?
+3. Why did `UPDATE … SET created_at = '2025-07-01' WHERE id = 777777` take 596 ms, and what did it do to the row?
+4. A colleague says partitioning made their nightly load slower. What did the lab measure, and what would you check first?
+5. Why does `WHERE seller_id BETWEEN 1 AND 10` scan all 8 hash partitions while `seller_id IN (1, 2)` scans 2?
+6. You need to keep 24 months of orders and drop the oldest month every month. Which partitioning method fits, and why not hash?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-2-partitioning-postgresql/concept-1-declarative-partitioning/answers">Worked answers to Q1–Q6</DeepDive>

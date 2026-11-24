@@ -1,0 +1,82 @@
+---
+title: "Answers: Partitioning in PostgreSQL session quiz"
+description: "Worked answers to the Session 2 quiz, with the lab's measured values."
+companion: "answers"
+tags: ["partitioning", "postgresql", "mysql", "mongodb", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-limitations-partitioning-keys-unique-keys.html"
+---
+
+<Tldr>
+Partitioning routes rows by the key and skips partitions only when queries give the bare key a value. Everything else costs one unit of work per partition.
+</Tldr>
+
+## Q1. Zero bytes
+
+**Question:** a partitioned table shows 0 bytes. Where is the data, and what happens to a row whose key matches no partition?
+
+In the partitions: the parent `orders_p` has no storage (`pg_relation_size` = 0), and each partition is an ordinary table (`tableoid::regclass` names it; the 24 together took 474 MB). A row with no matching partition fails: `ERROR: no partition of relation "orders_p" found for row` in PostgreSQL, `ERROR 1526: Table has no partition for value from column_list` in MySQL. With a `DEFAULT` partition (PostgreSQL) or a `MAXVALUE` partition (MySQL), it is stored there instead.
+
+> **Common mistake:** a `DEFAULT` partition as a safety net nobody watches. Its rows are missed by retention and block new partitions (Session 4).
+
+## Q2. Choosing a method
+
+**Question:** which partitioning method would you use for (a) 24-month retention, (b) three marketplaces with different access rules, (c) spreading 5,000 sellers evenly? Name one query each method cannot prune.
+
+(a) Range on `created_at`, monthly: a month is one partition to drop; cannot prune `WHERE seller_id = 42` or `WHERE id = …`. (b) List on `marketplace`: one partition per marketplace (2.50M / 1.50M / 1.00M rows), which can get its own storage or permissions; cannot prune a date range. (c) Hash on `seller_id`: 8 partitions of 571k–656k rows; cannot prune `seller_id BETWEEN 1 AND 10` (all 8 read), only `=` and `IN`.
+
+> **Common mistake:** hash for "even partitions" when the requirement is to delete by time.
+
+## Q3. Three moments
+
+**Question:** give one example each of pruning at plan time, at executor startup and during execution, and how EXPLAIN shows it.
+
+Plan time: constants, `created_at >= '2025-03-01' AND created_at < '2025-04-01'`; the plan contains only `orders_p_2025_03`. Executor startup: a generic plan of `PREPARE m(timestamptz, timestamptz)`, or `created_at >= now() - interval '11 months'`; the plan shows `Subplans Removed: 23`. During execution: a nested loop over `promo_days` (two days), or a scalar sub-select; with ANALYZE, 22 partitions show `(never executed)`.
+
+> **Common mistake:** expecting per-row pruning to be visible in a plain EXPLAIN.
+
+## Q4. 8× faster, and not faster at all
+
+**Question:** pruning made a month query 8× faster when partitions were read in full, yet the plain table with an index was just as fast. Reconcile the two results.
+
+Both are "skip what cannot match". With index scans disabled, the plain and unpruned tables read every page (46,729 and 46,736 buffers, 67.0 and 71.0 ms) and the pruned table read March's 1,982 (8.5 ms). With the `created_at` index, the plain table also read only March: its rows were stored in time order, so the index range covered 3,113 consecutive buffers (8.6 ms vs 8.4 ms). Pruning is a coarse index that is guaranteed to follow the partition key; an ordinary index gives the same benefit when the data layout already follows the key. Partitioning's distinct gains are dropping old partitions and per-partition maintenance.
+
+> **Common mistake:** "partitioning speeds up queries" as a general rule. On a whole-table scan it was slower (118.9 ms vs 92.1 ms).
+
+## Q5. The ::date month
+
+**Question:** rewrite `WHERE created_at::date BETWEEN '2025-03-01' AND '2025-03-31'` so it prunes, and say how many partitions each version reads.
+
+```sql
+WHERE created_at >= '2025-03-01' AND created_at < '2025-04-01'
+```
+
+The `::date` version reads all 24 partitions, because the planner only compares the bare key with bounds (the one-day `::date` query took 99.0 ms and read 24). The half-open range reads 1 partition, pruned while planning (7.2 ms).
+
+> **Common mistake:** `created_at BETWEEN '2025-03-01' AND '2025-03-31'`, which prunes but loses everything after midnight on 31 March.
+
+## Q6. 1,466 locks for one row
+
+**Question:** why did a one-row lookup by `id` take 1,466 locks on the daily-partitioned table, and why can that fail under load?
+
+`id` is not the partition key, so the planner keeps all 731 partitions and locks each partition and each of its indexes until the transaction ends: 1,462 relations plus the parent, its index, the `pg_locks` view and the virtual transaction id. Only 16 relation locks fit in the backend's fast path; the other 1,449 went into the shared lock table, which is sized for about 64 locks × the number of connections. Many such queries at once can fill it, and then any session's next lock fails with `out of shared memory`. The first such query on a new connection also spent 392.7 ms planning.
+
+> **Common mistake:** raising `max_locks_per_transaction` as the first fix. Make the query prunable, or use fewer partitions.
+
+## Q7. MySQL and PRIMARY KEY (id)
+
+**Question:** why can't MySQL partition `orders` while keeping `PRIMARY KEY (id)`, and what does the workaround change?
+
+Each partition has its own primary-key index, so MySQL can only enforce uniqueness if equal key values always land in the same partition, which requires the partitioning column inside every unique key: ERROR 1503 otherwise. The workaround `PRIMARY KEY (id, created_at)` makes only the pair unique, so the same `id` could exist in two months. It also widens every secondary index entry, one reason the partitioned load took 14.6–16.6 s against 10.8–12.3 s.
+
+> **Common mistake:** assuming `id` stays unique because the application never reuses ids. Nothing in the database checks it any more.
+
+## Q8. MySQL, PostgreSQL and MongoDB on the month query
+
+**Question:** why did pruning speed up the month query 5× in MySQL but not in PostgreSQL, and what does MongoDB do instead?
+
+MySQL's unpartitioned plan used the `created_at` secondary index, whose entries hold the primary key, so 212,039 matches meant 212,039 clustered-index lookups (103.9 ms); the partitioned plan read March's partition straight through (19.1 ms). PostgreSQL's index pointed directly at time-ordered heap pages, so its unpartitioned plan was already as cheap as reading the partition (8.6 ms vs 8.4 ms). MongoDB has no table partitioning: the query was an index range scan of 212,039 keys plus the documents, 62 ms.
+
+> **Common mistake:** carrying conclusions about partitioning from one engine to another.

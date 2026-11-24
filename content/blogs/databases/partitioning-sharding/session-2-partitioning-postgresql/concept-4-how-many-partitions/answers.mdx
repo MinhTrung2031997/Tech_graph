@@ -1,0 +1,62 @@
+---
+title: "Answers: How many partitions is too many"
+description: "Worked answers to the Session 2 Concept 4 check questions."
+companion: "answers"
+tags: ["partitioning", "postgresql", "locks", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE-BEST-PRACTICES"
+  - "https://www.postgresql.org/docs/17/view-pg-locks.html"
+---
+
+<Tldr>
+The partition count costs nothing for queries that prune while planning, and costs per partition for everything else.
+</Tldr>
+
+## Q1. 6, 52 and 1,466 locks
+
+**Question:** why did the one-day literal query take 6 locks on both tables, while `WHERE id = 777777` took 52 and 1,466?
+
+With constants on the key, the planner prunes before opening partitions, so it locks only the parent, the parent's index, one partition and its index (plus the `pg_locks` view and the virtual transaction id of the counting session): 6 on both tables. `id` is not the key, so the planner keeps every partition and locks each table and each index for the rest of the transaction: 24 × 2 + 4 = 52 on `orders_p`, 731 × 2 + 4 = 1,466 on `orders_d`.
+
+> **Common mistake:** assuming a query that returns one row takes one partition's worth of locks.
+
+## Q2. The fast path
+
+**Question:** what is the fast path, and what happens to lock number 17 and beyond?
+
+Weak relation locks (such as the `AccessShareLock` a SELECT takes) are first recorded in a small per-backend array, 16 slots in PostgreSQL 17, without touching shared memory. When those are full, further locks go into the shared lock table that all sessions use, which requires more coordination and has a fixed size, about `max_locks_per_transaction` × connections. In the lab 17 locks were fast-path (16 relations plus the virtual transaction id) and 1,449 went to the shared table.
+
+> **Common mistake:** reading `max_locks_per_transaction = 64` as a per-transaction cap. It sizes a shared pool; one transaction may use far more as long as the pool has room, which is why the failure shows up under concurrency.
+
+## Q3. Cold planning
+
+**Question:** why was the first query on a new connection 100× slower to plan on `orders_d`, and what kinds of deployments pay this often?
+
+On its first use, each backend loads the catalog information for every relation it opens (columns, bounds, index definitions, statistics) into its own cache. A query that cannot prune opens 731 partitions and 731 indexes: 392.7 ms of planning the first time, 3.8 ms afterwards. Deployments that open many short-lived connections pay it repeatedly: serverless functions, scripts that connect per task, poolers that recycle server connections often, and every application restart.
+
+> **Common mistake:** benchmarking with one long psql session and seeing only the warm numbers.
+
+## Q4. A generic plan that prunes but locks everything
+
+**Question:** a prepared one-day query on `orders_d` prunes correctly. Why does it still lock 1,466 relations, and how do you avoid that?
+
+A generic plan is built without parameter values, so it includes all 731 partitions. At execution, PostgreSQL 17 locks every relation in the plan, then executor-startup pruning removes 730 of them. Avoid it with `plan_cache_mode = force_custom_plan` for the sessions or roles that run such queries (custom plans prune while planning: 6 locks), by sending both bounds as parameters rather than one parameter plus an expression, or by having fewer partitions.
+
+> **Common mistake:** concluding from `Subplans Removed: 730` that the plan touched only one partition.
+
+## Q5. $1 + interval '1 day'
+
+**Question:** why did `$1 + interval '1 day'` leave 292 partitions in a custom plan?
+
+In a custom plan, `$1` is replaced by its value, so `created_at >= '2025-03-15'` prunes while planning: every partition before 15 March goes. But `timestamptz + interval` is only stable (adding a day depends on the time zone's daylight-saving rules), so the upper bound cannot be evaluated by the planner. 292 partitions from 15 March to 31 December stayed in the plan and were locked (588 locks); executor startup then removed 291.
+
+> **Common mistake:** writing the upper bound as an expression of the lower one in application SQL. Compute both bounds in the application and pass them.
+
+## Q6. Hourly partitions for two years
+
+**Question:** a colleague proposes hourly partitions for an orders table kept for two years. Give three costs from this concept they should weigh.
+
+Two years hourly is about 17,500 partitions, plus one index each. (1) Any query without a plan-time-prunable key (lookup by id, by seller, a generic plan) plans and locks about 35,000 relations: the lab's 731 partitions already needed 392.7 ms of cold planning and 1,466 locks. (2) Concurrent such queries can exhaust the shared lock table (`out of shared memory`). (3) Maintenance grows with the count: `ANALYZE` went from 0.82 s at 24 partitions to 4.99 s at 731, and the catalog holds a row per relation. Hourly partitions only make sense if every query names a narrow time range as constants and old hours must be dropped individually.
+
+> **Common mistake:** picking the partition size from the smallest query range instead of from retention and the number of partitions typical queries touch.

@@ -1,0 +1,271 @@
+---
+title: "Lab and session quiz: Partitioning in PostgreSQL"
+description: "Build monthly, list, hash and daily partitioned copies of the 5M-row orders table, watch rows being routed, see pruning at plan time, at executor startup and per row, break it with functions on the key, count the locks 731 partitions cost, and repeat the month query in MySQL and MongoDB."
+type: "how-to"
+tags: ["partitioning", "postgresql", "mysql", "mongodb", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-pruning.html"
+---
+
+<Tldr>
+Uses the containers and the `parts` database from the [Session 1 lab](/blogs/databases/partitioning-sharding/session-1-why-split-data/lab) (PostgreSQL `idx-pg`, MySQL `idx-mysql`, MongoDB `idx-mongo`), each holding the 5M-row `orders` table. The lab creates `orders_p` (24 monthly partitions), `orders_l` (list), `orders_h` (hash), `orders_d` (731 daily partitions), and two small tables, `promo_days` and `marketplaces`: about 2 GB more in PostgreSQL. Before each step, write down how many partitions you expect to be read.
+</Tldr>
+
+## Setup
+
+```bash
+alias pg='docker exec -it idx-pg psql -U postgres -d parts'
+alias my='docker exec -it idx-mysql mysql -uroot -plab parts'
+alias mg='docker exec -it idx-mongo mongosh --quiet parts'
+```
+
+In psql, turn on `\timing on`. Run timed queries 3–5 times and keep the median.
+
+## Exercise 1: build and route (Concept 1)
+
+```sql
+-- pg
+CREATE TABLE orders_p (
+  id bigint NOT NULL, seller_id integer NOT NULL, marketplace text NOT NULL,
+  status text NOT NULL, amount numeric(12,2) NOT NULL, created_at timestamptz NOT NULL
+) PARTITION BY RANGE (created_at);
+DO $$
+DECLARE m date := '2024-01-01';
+BEGIN
+  WHILE m < '2026-01-01' LOOP
+    EXECUTE format('CREATE TABLE orders_p_%s PARTITION OF orders_p FOR VALUES FROM (%L) TO (%L)',
+                   to_char(m, 'YYYY_MM'), m::timestamptz, (m + interval '1 month')::timestamptz);
+    m := m + interval '1 month';
+  END LOOP;
+END $$;
+INSERT INTO orders_p SELECT * FROM orders;
+CREATE INDEX ON orders_p (created_at);
+VACUUM ANALYZE orders_p;
+
+SELECT pg_relation_size('orders_p');                                   -- the parent
+SELECT tableoid::regclass, count(*) FROM orders_p GROUP BY 1 ORDER BY 1;
+INSERT INTO orders_p VALUES (5000001, 1, 'shopee', 'delivered', 10, '2026-01-05 10:00+00');
+
+BEGIN;
+SELECT tableoid::regclass FROM orders_p WHERE id = 777777;
+UPDATE orders_p SET created_at = '2025-07-01 00:00+00' WHERE id = 777777;
+SELECT tableoid::regclass FROM orders_p WHERE id = 777777;
+ROLLBACK;
+```
+
+Then list and hash:
+
+```sql
+-- pg
+CREATE TABLE orders_l (LIKE orders) PARTITION BY LIST (marketplace);
+CREATE TABLE orders_l_shopee PARTITION OF orders_l FOR VALUES IN ('shopee');
+CREATE TABLE orders_l_tiktok PARTITION OF orders_l FOR VALUES IN ('tiktok');
+CREATE TABLE orders_l_lazada PARTITION OF orders_l FOR VALUES IN ('lazada');
+INSERT INTO orders_l SELECT * FROM orders;
+INSERT INTO orders_l VALUES (5000001, 1, 'amazon', 'delivered', 10, '2025-06-05 10:00+00');   -- fails
+CREATE TABLE orders_l_other PARTITION OF orders_l DEFAULT;
+INSERT INTO orders_l VALUES (5000001, 1, 'amazon', 'delivered', 10, '2025-06-05 10:00+00');   -- works
+
+CREATE TABLE orders_h (LIKE orders) PARTITION BY HASH (seller_id);
+DO $$ BEGIN FOR r IN 0..7 LOOP
+  EXECUTE format('CREATE TABLE orders_h_%s PARTITION OF orders_h FOR VALUES WITH (MODULUS 8, REMAINDER %s)', r, r);
+END LOOP; END $$;
+INSERT INTO orders_h SELECT * FROM orders;
+ANALYZE orders_l; ANALYZE orders_h;
+SELECT tableoid::regclass, count(*) FROM orders_h GROUP BY 1 ORDER BY 1;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM orders_h WHERE seller_id = 42;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM orders_h WHERE seller_id IN (1, 2);
+EXPLAIN (COSTS OFF) SELECT count(*) FROM orders_h WHERE seller_id BETWEEN 1 AND 10;
+```
+
+To compare load times, create `orders_copy (LIKE orders)` and time `TRUNCATE …; INSERT … SELECT * FROM orders` three times into it and into `orders_p` (drop the `created_at` index on `orders_p` first, recreate it afterwards).
+
+| Fill in | Your result |
+|---|---|
+| Parent size | |
+| Rows in March 2025 / February 2024 | |
+| Error for 2026-01-05 | |
+| Partition of order 777777 before / after the UPDATE | |
+| Load medians, plain / partitioned | |
+| Hash partitions read for `= 42`, `IN (1, 2)`, `BETWEEN 1 AND 10` | |
+
+## Exercise 2: three moments of pruning (Concept 2)
+
+```sql
+-- pg
+EXPLAIN (COSTS OFF) SELECT count(*), sum(amount) FROM orders_p
+WHERE created_at >= '2025-03-01' AND created_at < '2025-04-01';
+
+PREPARE m(timestamptz, timestamptz) AS
+  SELECT count(*), sum(amount) FROM orders_p WHERE created_at >= $1 AND created_at < $2;
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (ANALYZE, COSTS OFF) EXECUTE m('2025-03-01', '2025-04-01');
+RESET plan_cache_mode;
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM orders_p WHERE created_at >= now() - interval '11 months';
+
+CREATE TABLE promo_days (name text, day_start timestamptz, day_end timestamptz);
+INSERT INTO promo_days VALUES ('11.11 2024', '2024-11-11', '2024-11-12'), ('12.12 2024', '2024-12-12', '2024-12-13');
+ANALYZE promo_days;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
+SELECT p.name, count(*) FROM promo_days p
+JOIN orders_p o ON o.created_at >= p.day_start AND o.created_at < p.day_end GROUP BY p.name;
+```
+
+Then time the month query on `orders` and `orders_p`, and on `orders_p` again after each of:
+
+```sql
+SET enable_partition_pruning = off;                                   -- then RESET
+SET enable_indexscan = off; SET enable_bitmapscan = off; SET enable_indexonlyscan = off;
+```
+
+Use `EXPLAIN (ANALYZE, BUFFERS)` to note the buffers.
+
+| Run | Partitions in plan | Partitions executed | Buffers | Median |
+|---|---|---|---|---|
+| Literal | | | | |
+| Generic plan | | | | |
+| `now()` | | | | |
+| Promo-days join | | | | |
+| Plain `orders`, index | | | | |
+| Pruning off | | | | |
+| No index scans, pruning on / off | | | | |
+
+## Exercise 3: break pruning (Concept 3)
+
+Run each with `EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)`, count the scan nodes that were not `(never executed)`, then time it:
+
+```sql
+-- pg
+SELECT count(*) FROM orders_p WHERE date_trunc('month', created_at) = '2025-03-01';
+SELECT count(*) FROM orders_p WHERE created_at::date = '2025-03-15';
+SELECT count(*) FROM orders_p WHERE created_at >= '2025-03-15' AND created_at < '2025-03-16';
+SELECT count(*) FROM orders_p WHERE extract(year FROM created_at) = 2025;
+SELECT count(*) FROM orders_p WHERE created_at >= timestamp '2025-03-01' AND created_at < timestamp '2025-04-01';
+SELECT * FROM orders_p WHERE id = 777777;
+SELECT count(*) FROM orders_p WHERE (created_at >= '2025-03-01' AND created_at < '2025-04-01') OR seller_id = 42;
+SELECT count(*) FROM orders_p WHERE (created_at >= '2025-03-01' AND created_at < '2025-04-01')
+                                 OR (created_at >= '2024-03-01' AND created_at < '2024-04-01');
+```
+
+The join through a dimension table:
+
+```sql
+CREATE TABLE marketplaces (code text PRIMARY KEY, owner text);
+INSERT INTO marketplaces VALUES ('shopee', 'sea'), ('tiktok', 'bytedance'), ('lazada', 'alibaba');
+ANALYZE marketplaces;
+CREATE INDEX ON orders_l (marketplace);
+SELECT count(*) FROM orders_l o JOIN marketplaces m ON o.marketplace = m.code WHERE m.owner = 'alibaba';
+SELECT count(*) FROM orders_l o
+WHERE o.marketplace = ANY (ARRAY(SELECT code FROM marketplaces WHERE owner = 'alibaba'));
+SELECT count(*) FROM orders_l o WHERE o.marketplace = 'lazada';
+```
+
+## Exercise 4: 731 partitions (Concept 4)
+
+```sql
+-- pg
+CREATE TABLE orders_d (LIKE orders) PARTITION BY RANGE (created_at);
+DO $$ DECLARE d date := '2024-01-01'; BEGIN WHILE d < '2026-01-01' LOOP
+  EXECUTE format('CREATE TABLE orders_d_%s PARTITION OF orders_d FOR VALUES FROM (%L) TO (%L)',
+                 to_char(d, 'YYYYMMDD'), d::timestamptz, (d + 1)::timestamptz);
+  d := d + 1; END LOOP; END $$;
+INSERT INTO orders_d SELECT * FROM orders;
+CREATE INDEX ON orders_d (created_at);
+VACUUM ANALYZE orders_d;
+```
+
+For `orders_p` and `orders_d`, open a **new** psql connection and run `EXPLAIN ANALYZE` of the query below twice; note planning time cold and warm:
+
+```sql
+SELECT count(*), sum(amount) FROM orders_d WHERE id = 777777;
+```
+
+Count locks inside a transaction, for a one-day literal query, the id query, and a generic plan:
+
+```sql
+BEGIN;
+SELECT count(*) FROM orders_d WHERE id = 777777;
+SELECT count(*), count(*) FILTER (WHERE fastpath) FROM pg_locks WHERE pid = pg_backend_pid();
+COMMIT;
+
+SET plan_cache_mode = force_generic_plan;
+PREPARE q2(timestamptz, timestamptz) AS SELECT count(*) FROM orders_d WHERE created_at >= $1 AND created_at < $2;
+BEGIN; EXECUTE q2('2025-03-15', '2025-03-16');
+SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid();
+COMMIT;
+```
+
+Finally time `ANALYZE orders`, `ANALYZE orders_p`, `ANALYZE orders_d`.
+
+| | `orders_p` (24) | `orders_d` (731) |
+|---|---|---|
+| Cold / warm planning, `id = 777777` | | |
+| Locks: day literal / id / generic plan | | |
+| Fast-path locks | | |
+| `ANALYZE` | | |
+
+Do not try to exhaust the lock table on a shared server: other sessions would get `out of shared memory` too.
+
+## Exercise 5: MySQL and MongoDB (Concept 5)
+
+```sql
+-- my: first with PRIMARY KEY (id) to see the error, then with (id, created_at)
+CREATE TABLE orders_p (
+  id BIGINT NOT NULL, seller_id INT NOT NULL, marketplace VARCHAR(8) NOT NULL, status VARCHAR(10) NOT NULL,
+  amount DECIMAL(12,2) NOT NULL, created_at DATETIME NOT NULL,
+  PRIMARY KEY (id, created_at),
+  KEY orders_p_created_at_idx (created_at)
+) PARTITION BY RANGE COLUMNS (created_at) (
+  PARTITION p2024_01 VALUES LESS THAN ('2024-02-01'),
+  PARTITION p2024_02 VALUES LESS THAN ('2024-03-01'),
+  -- … continue month by month …
+  PARTITION p2025_12 VALUES LESS THAN ('2026-01-01')
+);
+INSERT INTO orders_p SELECT * FROM orders;
+ANALYZE TABLE orders_p;
+INSERT INTO orders_p VALUES (5000001, 1, 'shopee', 'delivered', 10, '2026-01-05 10:00:00');
+
+EXPLAIN SELECT count(*), sum(amount) FROM orders_p WHERE created_at >= '2025-03-01' AND created_at < '2025-04-01';
+EXPLAIN SELECT count(*), sum(amount) FROM orders   WHERE created_at >= '2025-03-01' AND created_at < '2025-04-01';
+EXPLAIN SELECT count(*) FROM orders_p WHERE DATE(created_at) = '2025-03-15';
+PREPARE s FROM 'EXPLAIN SELECT count(*) FROM orders_p WHERE created_at >= ? AND created_at < ?';
+SET @a = '2025-03-01', @b = '2025-04-01'; EXECUTE s USING @a, @b;
+```
+
+```js
+// mg
+const q = { created_at: { $gte: ISODate("2025-03-01"), $lt: ISODate("2025-04-01") } };
+db.orders.explain("executionStats").aggregate([{ $match: q },
+  { $group: { _id: null, n: { $sum: 1 }, s: { $sum: "$amount" } } }]);
+```
+
+| | MySQL `orders` | MySQL `orders_p` | MongoDB |
+|---|---|---|---|
+| Month: access path | | | |
+| Month: median | | | |
+| `DATE()` filter: partitions read | — | | — |
+
+## Clean up
+
+```sql
+-- pg
+DROP TABLE IF EXISTS orders_p, orders_l, orders_h, orders_d, orders_copy, promo_days, marketplaces;
+-- my
+DROP TABLE IF EXISTS orders_p, orders_copy;
+```
+
+## Session quiz
+
+1. A partitioned table shows 0 bytes. Where is the data, and what happens to a row whose key matches no partition?
+2. Which partitioning method would you use for (a) 24-month retention, (b) three marketplaces with different access rules, (c) spreading 5,000 sellers evenly? Name one query each method cannot prune.
+3. Give one example each of pruning at plan time, at executor startup and during execution, and how EXPLAIN shows it.
+4. Pruning made a month query 8× faster when partitions were read in full, yet the plain table with an index was just as fast. Reconcile the two results.
+5. Rewrite `WHERE created_at::date BETWEEN '2025-03-01' AND '2025-03-31'` so it prunes, and say how many partitions each version reads.
+6. Why did a one-row lookup by `id` take 1,466 locks on the daily-partitioned table, and why can that fail under load?
+7. Why can't MySQL partition `orders` while keeping `PRIMARY KEY (id)`, and what does the workaround change?
+8. Why did pruning speed up the month query 5× in MySQL but not in PostgreSQL, and what does MongoDB do instead?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-2-partitioning-postgresql/lab/answers">Answers to the session quiz</DeepDive>
