@@ -1,0 +1,182 @@
+---
+title: "Concept 2: Routing own-writes reads with a session token"
+description: "The same experiment in all three engines: update a random order on the primary, then read it back by three strategies, 300 to 500 times. Reading the replica at once was stale 98–100 % of the time; reading the primary was never stale; waiting for the write's position on the replica was never stale and cost a median of 2.18 ms (PostgreSQL LSN), 2.26 ms (MySQL GTID) and 1.67 ms for write plus read (MongoDB causal session). Under 2,819 writes/s the PostgreSQL wait stayed 2.26 ms median but reached 162 ms; under 1,636 writes/s the MySQL replica fell 105,700 transactions behind and every wait timed out. The router needs a bound and a fallback."
+type: "concept"
+tags: ["replication", "read-your-writes", "routing", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-RECOVERY-INFO-TABLE"
+  - "https://dev.mysql.com/doc/refman/8.4/en/gtid-functions.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html#sysvar_session_track_gtids"
+  - "https://www.mongodb.com/docs/manual/core/read-isolation-consistency-recency/#causal-consistency"
+---
+
+<Tldr>
+To let a user read their own write from a replica, the app keeps the write's **position** in the user's session (a *session token*: PostgreSQL LSN, MySQL GTID set, MongoDB cluster time) and, before reading a replica, waits until the replica has applied it. Measured with the same client against each engine: an immediate replica read was stale **98–100 %** of the time; the position wait removed every stale read and cost a median of **2.18 ms** (PostgreSQL), **2.26 ms** (MySQL) and **1.67 ms** for the whole write-plus-read in a MongoDB causal session (against 0.24 ms for write plus primary read). Under load the tail matters: with 2,819 writes/s on the primary the PostgreSQL wait reached **162 ms**; with 1,636 writes/s the MySQL replica could not keep up, fell **105,700 transactions** behind, and the GTID wait timed out every time. A router therefore needs a **time limit** with a **fallback to the primary**, and must expire tokens.
+</Tldr>
+
+| Term | Meaning |
+|---|---|
+| Session token | Position of the user's last write, stored with their session (cookie, JWT claim, server-side session) |
+| Position wait | Replica-side check that it has applied at least the token: `pg_last_wal_replay_lsn() >= token`, `WAIT_FOR_EXECUTED_GTID_SET(token, timeout)`, MongoDB `afterClusterTime` in a causal session |
+| Fallback | Read the primary when the wait exceeds its limit |
+| Token expiry | After N seconds normal lag is far below N, so the token is dropped and reads go anywhere |
+| **✓ / ✗** | Fresh / stale or timed out |
+
+## The experiment
+
+A Python client in a container on the lab network, one connection to the primary and one to the replica. For each iteration and strategy: update one random order's `status` to a unique token on the primary, then read the row back.
+
+| Strategy | PostgreSQL 17 | MySQL 8.4 | MongoDB 8.0 (write + read timed) |
+|---|---|---|---|
+| Replica at once | **499/500 stale**, p50 0.07 ms | **300/300 stale**, p50 0.07 ms | **295/300 stale**, p50 0.28 ms |
+| Primary | 0 stale, p50 0.04 ms | 0 stale, p50 0.05 ms | 0 stale, p50 0.24 ms |
+| Position wait on the replica | 0 stale, p50 **2.18 ms**, p95 4.28, max 17.5 | 0 stale, p50 **2.26 ms**, p95 8.29, max 29.0 | causal session, w:majority + majority read on a secondary: 0 stale, p50 **1.67 ms**, p95 3.12, max 12.9 |
+| How the position was obtained | `pg_current_wal_lsn()` after the commit | `@@global.gtid_executed` after the commit (with `session_track_gtids = OWN_GTID` set) | the driver's session `operationTime` / `clusterTime` |
+
+PostgreSQL 17 has no built-in "wait for LSN" function, so the client polled `pg_last_wal_replay_lsn()` every 0.5 ms (1.2 polls on average). Session 3 wrapped the same loop in a server-side function; MySQL's `WAIT_FOR_EXECUTED_GTID_SET` waits on the server; MongoDB's driver attaches `afterClusterTime` to reads in a causal session automatically.
+
+<Flow
+  title="Own-writes read with a session token (PostgreSQL)"
+  height={330}
+  nodes={[
+    { id: 'user', label: 'Seller browser', sub: 'cookie: last LSN', x: 20, y: 20, w: 200 },
+    { id: 'app', label: 'App server', sub: 'read router', x: 300, y: 20, w: 200 },
+    { id: 'primary', label: 'Primary rpd-pg1', sub: 'writes', x: 580, y: 20, w: 200 },
+    { id: 'replica', label: 'Standby rpd-pg2', sub: 'replays WAL', x: 580, y: 250, w: 200 },
+    { id: 'fallback', label: 'Fallback rule', sub: 'limit 100 ms', x: 300, y: 250, w: 200 },
+  ]}
+  edges={[
+    { id: 'user-app', from: 'user', to: 'app' },
+    { id: 'app-primary', from: 'app', to: 'primary' },
+    { id: 'primary-replica', from: 'primary', to: 'replica' },
+    { id: 'app-replica', from: 'app', to: 'replica' },
+    { id: 'app-fallback', from: 'app', to: 'fallback' },
+  ]}
+  cases={[
+    {
+      title: 'Healthy standby',
+      path: 'UPDATE on primary ✓ → token = LSN → standby replayed ≥ LSN after ~2 ms ✓ → read standby ✓ fresh',
+      summary: 'Two milliseconds buys a fresh read without loading the primary.',
+      steps: [
+        {
+          title: 't0: write and remember',
+          note: 'The seller changes a price. After COMMIT the app reads pg_current_wal_lsn() (pg_current_wal_insert_lsn() also works) and stores it in the session.',
+          code: "UPDATE orders SET status = 's17r' WHERE id = 52731;\nSELECT pg_current_wal_lsn();   -- e.g. 0/1D0027B0",
+          active: ['user', 'app', 'primary'],
+          edges: ['user-app', 'app-primary'],
+          subs: { user: 'token 0/1D0027B0' },
+        },
+        {
+          title: 't1: wait on the standby',
+          note: 'Before the next read the router asks the standby whether it has replayed the token. Idle: 1.2 polls on average, p50 2.18 ms including the read; only 4 of 500 needed no wait at all.',
+          code: "SELECT pg_last_wal_replay_lsn() >= '0/1D0027B0'::pg_lsn;",
+          active: ['app', 'primary', 'replica'],
+          edges: ['primary-replica', 'app-replica'],
+          subs: { replica: '✓ replayed' },
+        },
+        {
+          title: 't2: read',
+          note: '0 of 500 reads were stale. Without the wait, 499 of 500 were.',
+          active: ['app', 'replica'],
+          edges: ['app-replica'],
+          subs: { replica: '✓ fresh' },
+        },
+      ],
+    },
+    {
+      title: 'Standby under write load',
+      path: 'pgbench 2,819 writes/s → wait p50 2.26 ms, p95 6.47, max 162 ms ✗ over limit → fallback to primary ✓',
+      summary: 'The median hardly moves; the tail is what the limit is for.',
+      steps: [
+        {
+          title: 'Load',
+          note: 'pgbench with 8 clients updating random orders: 211,426 transactions in 75 s (2,819 per second). The wait needed 2.38 polls on average, up to 63.',
+          active: ['primary', 'replica'],
+          edges: ['primary-replica'],
+          subs: { primary: '2,819 writes/s' },
+        },
+        {
+          title: 'Bounded wait, then primary',
+          note: 'Max wait 162 ms. With a 100 ms limit, those reads fall back to the primary; the user sees fresh data and the page is at most 100 ms slower.',
+          active: ['app', 'fallback', 'primary'],
+          edges: ['app-fallback', 'app-primary'],
+          subs: { fallback: '✗ 162 ms > 100 ms', primary: '✓ fallback read' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## When the replica cannot keep up (MySQL)
+
+On the MySQL pair, eight threads updated random orders on the source at 1,562–1,636 updates/s. The replica (4 parallel applier workers, the 8.4 default) applied about **1,165 transactions/s** on this laptop, so the gap grew for as long as the load ran:
+
+| Time | Missing on the replica (`GTID_SUBTRACT`) |
+|---|---|
+| About 20 s into the load | 56,095 transactions |
+| About 87 s (load ends at 90 s) | 105,686 |
+| 90 s after the load ended | 0 |
+
+`WAIT_FOR_EXECUTED_GTID_SET(token, 1)` returned 1 (timeout) on the first iteration; with a 10 s limit it timed out too. `Seconds_Behind_Source` showed 3 s and later 37 s. For own-writes routing that is fine **if** the router falls back to the source; without a fallback every own-writes read would have waited 10 s or failed. For bounded-staleness routing (Concept 1, class 3) this replica should have been taken out of the pool.
+
+| Engine | Wait primitive | Bounded | Fallback needed |
+|---|---|---|---|
+| PostgreSQL 17 | Poll `pg_last_wal_replay_lsn()` (client loop or a PL/pgSQL function) | Your loop's limit | Yes |
+| MySQL 8.4 | `WAIT_FOR_EXECUTED_GTID_SET(gtid_set, timeout)` returns 0 or 1 | Timeout argument | Yes |
+| MongoDB 8.0 | Causal session; reads carry `afterClusterTime` | `maxTimeMS` on the read | Driver retries elsewhere only with your logic |
+
+<Pitfall>
+A position wait without a limit turns replica lag into page latency, and lag can be minutes (the MySQL replica above, or any replica blocked by a lock as in Session 3). Always bound the wait (50–200 ms is typical for user pages), fall back to the primary, and count fallbacks: a rising fallback rate is an early lag alarm and a warning that the primary is about to receive the replicas' load.
+</Pitfall>
+
+## Designing the token
+
+| Decision | Recommendation |
+|---|---|
+| Scope | Per user (or per tenant/seller), not global: other users do not need this user's write |
+| Content | Highest position the user wrote: LSN, GTID set (only this server's UUID interval if possible), or MongoDB cluster time |
+| Transport | Server-side session or a signed cookie; must survive load balancers sending the next request to another app server |
+| Expiry | 10–30 s after the write: normal lag is milliseconds, and an expired token means "any replica" |
+| Multi-region | A token from region A means nothing to a replica in region B unless both replicate from the same primary |
+| Failover | Positions from the old primary may never appear on the new one (Session 5 rollbacks, errant GTIDs): drop tokens after a failover |
+
+## Real-world scenario: seller edits a price
+
+A seller changes the price of a SKU from 199,000 VND to 179,000 VND and is redirected to the listing page, which reads from a replica. Without a token they see 199,000 and edit again; two price-change events go to the marketplaces.
+
+| With a token | Measured basis |
+|---|---|
+| Write returns LSN; app stores it in the seller's session for 30 s | `pg_current_wal_lsn()` after commit |
+| Listing page waits up to 100 ms for the replica | p50 2.18 ms idle, p95 6.47 ms under 2,819 writes/s |
+| Timeout → read primary, increment `own_writes_fallback_total` | Max 162 ms under load; MySQL replica timed out under sustained load |
+| Other sellers' reads unaffected | Token is per session |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 3, Concept 4](/blogs/databases/replication/session-3-replica-lag/concept-4-reading-your-own-writes) | The same strategies against replicas delayed on purpose |
+| [Session 3, Concept 2](/blogs/databases/replication/session-3-replica-lag/concept-2-what-causes-lag) | Why a replica falls behind |
+| [Session 4, Concept 1](/blogs/databases/replication/session-4-read-write-concerns/concept-1-read-concern-levels) | Majority read concern used by the causal session |
+| [Session 4, Concept 3](/blogs/databases/replication/session-4-read-write-concerns/concept-3-causal-consistency) | MongoDB causal sessions in detail |
+| Concept 4 | Alerting on the fallback rate and on position lag |
+
+## Key takeaways
+
+1. Immediate replica reads were stale 98–100 % of the time; a position wait made them 0 %.
+2. The wait cost about 2 ms median in PostgreSQL and MySQL, and a MongoDB causal session cost 1.67 ms for write plus read.
+3. Under load the tail grew to 162 ms (PostgreSQL), and a MySQL replica that could not keep up made every wait time out.
+4. Bound the wait, fall back to the primary, and count fallbacks.
+5. Scope tokens per user, expire them, and drop them after a failover.
+
+## Check questions
+
+1. What exactly does the app store after a write in each engine, and where does it come from?
+2. Why did the MongoDB causal strategy use w:'majority' and majority read concern?
+3. The PostgreSQL wait had a median of 2.26 ms under load but a maximum of 162 ms. Which number sets the timeout, and what happens to reads over it?
+4. The MySQL replica fell 105,700 transactions behind. What should the router do for own-writes reads, and what for bounded-staleness reads?
+5. Why should session tokens expire, and why should they be dropped after a failover?
+6. A user writes in one browser tab and reads in another. What does that mean for where the token lives?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-8-designing-for-replicas/concept-2-routing-and-session-tokens/answers">Worked answers to Q1–Q6</DeepDive>

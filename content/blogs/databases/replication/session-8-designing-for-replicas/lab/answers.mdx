@@ -1,0 +1,98 @@
+---
+title: "Answers: Designing for replicas session quiz"
+description: "Worked answers to the Session 8 quiz and one worked design for the Part B order management system, with the course's measured values."
+companion: "answers"
+tags: ["replication", "architecture", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/warm-standby.html#SYNCHRONOUS-REPLICATION"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html"
+  - "https://www.mongodb.com/docs/manual/core/read-preference/"
+---
+
+<Tldr>
+The course in one sentence: replicas are always a little behind and sometimes a lot, so every read and every write must say how much it can tolerate, and the system must notice when the replicas stop meeting it.
+</Tldr>
+
+## Worked design for Part B
+
+| Workload | Decision | Evidence |
+|---|---|---|
+| Checkout, order import, stock reservation | Primary; the stock check is an atomic `UPDATE … WHERE stock > 0` in the order transaction | Replica reads right after writes were stale 98–100 % |
+| Buyer/seller order pages | Class 2 with a session token: replica if it reaches the token within 100 ms, else primary; token expires after 30 s | Position wait p50 2.18–2.26 ms, max 162 ms under 2,819 writes/s |
+| Seller dashboard tiles | Class 3: near replica only, removed from the pool when position lag exceeds 30 s; stick each seller to one replica | Session 4: a lagging member served 19–23 of 40 reads stale until bounded |
+| Stock sync to marketplaces | CDC (PostgreSQL slot / MySQL binlog / MongoDB change stream), consumer confirms after each marketplace API call, idempotent by change id | Session 7: duplicates after restart, never loss, when confirming after acting |
+| Carrier tracking updates | Asynchronous commit for these transactions only (`SET LOCAL synchronous_commit = local` or w:1) | 1.05 ms vs 26.2 ms per commit; rebuildable from carriers |
+| Finance export | A third, analytics replica or the warehouse fed by CDC; never the two OLTP replicas | Long queries on a serving replica are cancelled or bloat the primary (Session 6) |
+| Durability for orders and stock | Quorum: `ANY 1 (near, far)` / semi-sync with 2 replicas / w:'majority' | Async lost 8,207–15,883 (PostgreSQL), 1,615 (MySQL), 19,333 (MongoDB w:1) at failover; quorum commits cost 23–26 ms and fell back to the far replica at 53–55 ms |
+| First five alerts | Replica position lag; streaming synchronous replicas below 2 (or semi-sync OFF); inactive slot / retained WAL; CDC consumer lag vs retention window; own-writes fallback rate | Concept 4 |
+| 14-hour sync pause | PostgreSQL: the slot keeps WAL (watch the disk, cap with `max_slot_wal_keep_size`); MySQL/MongoDB: works only if binlog age / oplog window exceeds 14 h, else error 1236 / 286 and a full stock resync | Session 7 |
+
+The 300 orders/s × 26 ms quorum wait is not a throughput limit: commits from different sessions wait in parallel. It is a latency floor of about one round trip to the nearest replica per order, which is why the near replica sits in another zone at 1 ms if the zone layout allows it, and the far one is the spare.
+
+## Q1. Stale with millisecond lag
+
+**Question:** why did an immediate replica read return the old value almost every time in all three engines, even with millisecond lag?
+
+The read reached the replica within a fraction of a millisecond of the commit acknowledgement, and the replica needed about 1–3 ms to receive and apply the change (the position waits' medians). Lag is never zero, and the user who just wrote reads sooner than anyone else, so they almost always lose the race: 499/500, 300/300, 295/300.
+
+> **Common mistake:** "the replica is only 2 ms behind, it's effectively consistent". Not for the writer.
+
+## Q2. Reads that must use the primary
+
+**Question:** which marketplace reads must never use a replica, and why is "route all SELECTs to replicas" unsafe?
+
+Reads that decide a write: stock availability at checkout, voucher or promotion usage counts, payment and refund status before acting, any row read before updating it (optimistic version checks), and every read inside a write transaction. A replica returns the past, so these decisions use old data: overselling, double voucher use, double refunds. "All SELECTs to replicas" routes these by syntax, not by purpose.
+
+> **Common mistake:** fixing overselling by "making the replica faster". Any lag above zero is enough to oversell in a flash sale.
+
+## Q3. Session tokens
+
+**Question:** describe a session token for read-your-writes in each engine and the two safeguards it needs.
+
+PostgreSQL: the primary's LSN after the commit; wait until `pg_last_wal_replay_lsn() >= token` on the standby. MySQL: the GTID set after the commit; `WAIT_FOR_EXECUTED_GTID_SET(token, timeout)` on the replica. MongoDB: the session's operation/cluster time, used by a causal session (w:'majority' writes and majority reads) that sends `afterClusterTime` to the secondary. Safeguards: a **time limit with fallback to the primary** (the wait reached 162 ms under load and timed out completely on a replica that could not keep up), and **expiry/drop** of tokens after N seconds and after any failover.
+
+> **Common mistake:** a token kept in one app server's memory; the next request hits another server.
+
+## Q4. A replica that cannot keep up
+
+**Question:** the MySQL replica fell 105,686 transactions behind under 1,636 writes/s. What happens to own-writes reads and to bounded-staleness reads, with a correct router?
+
+Own-writes reads wait their limit, time out, and read the source: users see fresh data, pages are slower by the limit, and the source takes those reads. Bounded-staleness reads stop going to that replica because its lag exceeds the bound; they use other replicas, or the source if it has headroom, or a cache. Meanwhile alerts fire on position lag and on the fallback rate, and the runbook's third branch applies: apply rate (about 1,165/s) is below the write rate, so add apply capacity or move the write burst.
+
+> **Common mistake:** a router that only checks "is the replica up?".
+
+## Q5. Cost and benefit of waiting
+
+**Question:** what does waiting for one replica cost per commit, and what does not waiting lose at failover? Use the course's numbers.
+
+Cost (Session 2, replica 20 ms away): 26.2 ms (PostgreSQL `on`) vs 1.05 ms (`local`); 25.0 ms (MySQL semi-sync) vs 2.5 ms; 26.7 ms (MongoDB w:'majority') vs 0.19 ms (w:1). Loss without waiting (Session 5): 8,207 and 15,883 acknowledged PostgreSQL commits; 1,615 of 2,818 MySQL transactions; 19,333 MongoDB w:1 writes rolled back. With waiting, none were lost.
+
+> **Common mistake:** comparing the costs and forgetting that the loss numbers are acknowledged, customer-visible writes.
+
+## Q6. Single synchronous standby
+
+**Question:** why is a single synchronous standby an availability risk, and what is the quorum configuration in each engine?
+
+Every commit needs that one standby: when it was paused, PostgreSQL commits waited indefinitely (statement_timeout did not end the wait). MySQL instead waited 10 s once and silently went asynchronous, trading the durability away. Quorum with a spare: PostgreSQL `synchronous_standby_names = 'ANY 1 (s1, s2)'`; MySQL semi-sync with two replicas and `rpl_semi_sync_source_wait_for_replica_count = 1`; MongoDB a 3-member replica set with w:'majority'. With the near replica down, commits used the far one at 53–55 ms in all three engines.
+
+> **Common mistake:** a two-member MongoDB set: a majority of two is both members, so one failure stops majority writes and elections.
+
+## Q7. Signals a seconds dashboard misses
+
+**Question:** name three monitoring signals that a "lag in seconds" dashboard misses, and the session that showed each.
+
+- Transactions missing while `Seconds_Behind_Source` is 0 after a network cut (Session 3): use `GTID_SUBTRACT`.
+- WAL retained by an inactive logical slot, 206 MB and growing (Session 7): `pg_replication_slots`.
+- Semi-sync silently switched to asynchronous after 10 s (Session 2): `Rpl_semi_sync_source_status`.
+Also: a subscription stuck on an apply error every 5 s (Session 7), and PostgreSQL `replay_lag` frozen at 0.23 s with 15 MB unreplayed (Session 3).
+
+> **Common mistake:** one green "replication OK" light per cluster.
+
+## Q8. Failover order
+
+**Question:** write the order of steps in a failover runbook and explain why fencing comes before promotion.
+
+Confirm the failure from more than one vantage point; fence the old primary; promote the most up-to-date candidate; repoint applications, replicas and CDC (check slots on the new primary, drop session tokens); record what was lost; rebuild the old primary as a replica. Fencing comes first because otherwise two servers accept writes: Session 5 promoted a PostgreSQL standby with the old primary still running and got rows from different clients on two timelines that neither server knew about. MongoDB steps a primary down by itself when it loses the majority; PostgreSQL and MySQL do not.
+
+> **Common mistake:** promoting first "to restore service quickly", then discovering the old primary kept taking writes from clients with cached connections.

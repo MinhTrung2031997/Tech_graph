@@ -1,0 +1,239 @@
+---
+title: "Lab and session quiz: Designing for replicas"
+description: "Capstone lab. Measure read-your-writes routing in all three engines with one Python client: stale reads from a replica read at once, fresh reads from the primary, and the cost of waiting for the write's position on the replica, idle and under write load; watch a MySQL replica fall behind a sustained write rate. Then design replica routing, durability and monitoring for a marketplace order system, using the evidence from Sessions 1 to 7."
+type: "how-to"
+tags: ["replication", "read-your-writes", "architecture", "postgresql", "mysql", "mongodb", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-RECOVERY-INFO-TABLE"
+  - "https://dev.mysql.com/doc/refman/8.4/en/gtid-functions.html"
+  - "https://www.mongodb.com/docs/manual/core/causal-consistency-read-write-concerns/"
+  - "https://www.postgresql.org/docs/current/pgbench.html"
+---
+
+<Tldr>
+Uses the clusters from the [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) (`rp-setup.sh <prefix> pg|mysql|mongo`, prefix `rp`, one engine at a time) loaded with the 100,000-order seed printed in the [Session 7 lab](/blogs/databases/replication/session-7-logical-replication-cdc/lab), plus one Python container on the same network. Part A measures; Part B is a design exercise that you answer with numbers from Part A and from Sessions 1 to 7. The course lab's results are quoted after each step; they came from a laptop running other containers, so compare ratios.
+</Tldr>
+
+## Setup
+
+```bash
+docker run -d --name rp-cli --network rp-net python:3.12-slim sleep infinity
+docker exec rp-cli pip install -q "psycopg[binary]" pymysql pymongo
+# copy each script below into the container, e.g.:
+docker cp ryw_pg.py rp-cli:/ryw_pg.py
+```
+
+## Part A1: PostgreSQL
+
+```bash
+./rp-setup.sh rp pg
+docker exec -i rp-pg1 psql -U postgres < orders-100k.sql
+docker exec rp-cli python /ryw_pg.py 500
+```
+
+`ryw_pg.py`:
+
+```python
+# Read-your-writes on a PostgreSQL standby: write on the primary, then read the same row by three strategies.
+#   replica  : read the standby immediately
+#   primary  : read the primary
+#   lsn-wait : remember the primary's WAL position after the commit, wait until the standby has replayed it, read the standby
+import random, statistics, sys, time
+import psycopg
+
+N = int(sys.argv[1]) if len(sys.argv) > 1 else 500
+p = psycopg.connect("host=rp-pg1 user=postgres dbname=postgres", autocommit=True)
+r = psycopg.connect("host=rp-pg2 user=postgres dbname=postgres", autocommit=True)
+res = {"replica": [], "primary": [], "lsn-wait": []}
+stale = {k: 0 for k in res}
+polls = []
+for i in range(N):
+    for strategy in res:
+        k = random.randint(1, 100000)
+        token = f"s{i}{strategy[0]}"
+        p.execute("UPDATE orders SET status = %s WHERE id = %s", (token, k))
+        t0 = time.perf_counter()
+        if strategy == "primary":
+            got = p.execute("SELECT status FROM orders WHERE id = %s", (k,)).fetchone()[0]
+        elif strategy == "replica":
+            got = r.execute("SELECT status FROM orders WHERE id = %s", (k,)).fetchone()[0]
+        else:
+            lsn = p.execute("SELECT pg_current_wal_lsn()").fetchone()[0]
+            n = 0
+            while not r.execute("SELECT pg_last_wal_replay_lsn() >= %s::pg_lsn", (lsn,)).fetchone()[0]:
+                n += 1
+                time.sleep(0.0005)
+            polls.append(n)
+            got = r.execute("SELECT status FROM orders WHERE id = %s", (k,)).fetchone()[0]
+        res[strategy].append((time.perf_counter() - t0) * 1000)
+        stale[strategy] += got != token
+for s, v in res.items():
+    v.sort()
+    print(f"{s:9s} n={len(v)} stale={stale[s]} ({100*stale[s]/len(v):.1f}%) p50={statistics.median(v):.2f} ms p95={v[int(len(v)*0.95)]:.2f} ms max={v[-1]:.2f} ms")
+print(f"lsn-wait polls: mean {statistics.mean(polls):.2f}, max {max(polls)}, zero-wait {sum(1 for x in polls if x == 0)}")
+```
+
+Course lab, idle: replica **499/500 stale** (p50 0.07 ms), primary 0 stale (p50 0.04 ms), LSN wait 0 stale, p50 **2.18 ms**, p95 4.28 ms, max 17.5 ms.
+
+Now add write load from inside the primary container and run it again while the load runs:
+
+```bash
+printf '\\set k random(1, 100000)\nUPDATE orders SET amount = amount + 1 WHERE id = :k;\n' > load.sql
+docker cp load.sql rp-pg1:/tmp/load.sql
+docker exec rp-pg1 pgbench -U postgres -n -c 8 -j 4 -T 75 -f /tmp/load.sql postgres &
+sleep 3; docker exec rp-cli python /ryw_pg.py 300
+```
+
+Course lab: pgbench 2,819 tps; replica 300/300 stale; LSN wait p50 2.26 ms, p95 6.47 ms, **max 162 ms**. Tear down with `./rp-teardown.sh rp` (keep `rp-cli` or recreate it).
+
+## Part A2: MySQL
+
+```bash
+./rp-setup.sh rp mysql
+docker exec -i rp-my1 mysql -uroot -plab < mysql-orders-100k.sql
+docker exec rp-cli python /ryw_my.py 300
+```
+
+`ryw_my.py`:
+
+```python
+# Read-your-writes on a MySQL replica: replica immediately, source, and WAIT_FOR_EXECUTED_GTID_SET on the replica.
+import random, statistics, sys, time
+import pymysql
+
+N = int(sys.argv[1]) if len(sys.argv) > 1 else 500
+cfg = dict(user="root", password="lab", database="shop", autocommit=True)
+s = pymysql.connect(host="rp-my1", **cfg); r = pymysql.connect(host="rp-my2", **cfg)
+sc, rc = s.cursor(), r.cursor()
+sc.execute("SET SESSION session_track_gtids = OWN_GTID")   # the server reports the GTID of our own commit
+res = {"replica": [], "source": [], "gtid-wait": []}; stale = {k: 0 for k in res}
+for i in range(N):
+    for strategy in res:
+        k = random.randint(1, 100000); token = f"s{i}{strategy[0]}"
+        sc.execute("UPDATE orders SET status = %s WHERE id = %s", (token, k))
+        gtid = sc.execute("SELECT @@global.gtid_executed") and sc.fetchone()[0]
+        t0 = time.perf_counter()
+        if strategy == "source":
+            sc.execute("SELECT status FROM orders WHERE id = %s", (k,)); got = sc.fetchone()[0]
+        elif strategy == "replica":
+            rc.execute("SELECT status FROM orders WHERE id = %s", (k,)); got = rc.fetchone()[0]
+        else:
+            rc.execute("SELECT WAIT_FOR_EXECUTED_GTID_SET(%s, 10)", (gtid,)); assert rc.fetchone()[0] == 0
+            rc.execute("SELECT status FROM orders WHERE id = %s", (k,)); got = rc.fetchone()[0]
+        res[strategy].append((time.perf_counter() - t0) * 1000); stale[strategy] += got != token
+for st, v in res.items():
+    v.sort()
+    print(f"{st:9s} n={len(v)} stale={stale[st]} ({100*stale[st]/len(v):.1f}%) p50={statistics.median(v):.2f} ms p95={v[int(len(v)*0.95)]:.2f} ms max={v[-1]:.2f} ms")
+```
+
+Course lab, idle: replica 300/300 stale, source 0, GTID wait p50 **2.26 ms**, p95 8.29 ms, max 29 ms.
+
+Then run 90 s of load with `load_my.py` and watch the replica fall behind:
+
+```python
+# Background write load on the MySQL source: 8 threads of single-row updates for a fixed time.
+import random, sys, threading, time
+import pymysql
+T = float(sys.argv[1]); done = [0]
+def work():
+    c = pymysql.connect(host="rp-my1", user="root", password="lab", database="shop", autocommit=True).cursor()
+    end = time.time() + T
+    while time.time() < end:
+        c.execute("UPDATE orders SET amount = amount + 1 WHERE id = %s", (random.randint(1, 100000),)); done[0] += 1
+th = [threading.Thread(target=work) for _ in range(8)]; [t.start() for t in th]; [t.join() for t in th]
+print(f"load: {done[0]} updates in {T:.0f} s = {done[0]/T:.0f}/s")
+```
+
+```bash
+docker exec rp-cli python /load_my.py 90 &
+# every 5 s: transactions the replica is still missing
+R=$(docker exec rp-my2 mysql -uroot -plab -N -e 'SELECT @@global.gtid_executed' 2>/dev/null | tr -d '\n')
+docker exec rp-my1 mysql -uroot -plab -N -e "SELECT GTID_SUBTRACT(@@global.gtid_executed, '$R')" 2>/dev/null
+```
+
+Course lab: 1,636 updates/s on the source, about 1,165/s applied; 56,095 missing after about 20 s, 105,686 at the end of the load, caught up about 90 s later. `ryw_my.py` run during the load stopped at its assertion: `WAIT_FOR_EXECUTED_GTID_SET` timed out at 1 s and at 10 s.
+
+## Part A3: MongoDB
+
+```bash
+./rp-setup.sh rp mongo
+RS='mongodb://rp-mongo1:27017,rp-mongo2:27017,rp-mongo3:27017/shop?replicaSet=rprs'
+docker cp mongo-orders-100k.js rp-mongo1:/tmp/seed.js && docker exec rp-mongo1 mongosh --quiet "$RS" /tmp/seed.js
+docker exec rp-cli python /ryw_mg.py 300
+```
+
+`ryw_mg.py`:
+
+```python
+# Read-your-writes on MongoDB secondaries (timed: write + read): secondary read, primary read, causal session on a secondary.
+import random, statistics, sys, time
+from pymongo import MongoClient, ReadPreference
+from pymongo.read_concern import ReadConcern
+from pymongo.write_concern import WriteConcern
+
+N = int(sys.argv[1]) if len(sys.argv) > 1 else 500
+c = MongoClient("mongodb://rp-mongo1,rp-mongo2,rp-mongo3/?replicaSet=rprs")
+db = c.shop
+w1 = db.get_collection("orders", write_concern=WriteConcern(w=1))
+wm = db.get_collection("orders", write_concern=WriteConcern(w="majority"))
+prim = db.get_collection("orders", read_preference=ReadPreference.PRIMARY)
+sec = db.get_collection("orders", read_preference=ReadPreference.SECONDARY)
+secm = db.get_collection("orders", read_preference=ReadPreference.SECONDARY, read_concern=ReadConcern("majority"))
+res = {"secondary": [], "primary": [], "causal-secondary": []}; stale = {k: 0 for k in res}
+for i in range(N):
+    for strategy in res:
+        k = random.randint(1, 100000); token = f"s{i}{strategy[0]}"
+        if strategy == "causal-secondary":
+            # Causal consistency: majority write + majority read in one session; the secondary waits for the session's clusterTime.
+            with c.start_session(causal_consistency=True) as ses:
+                t0 = time.perf_counter()
+                wm.update_one({"_id": k}, {"$set": {"status": token}}, session=ses)
+                got = secm.find_one({"_id": k}, session=ses)["status"]
+        else:
+            t0 = time.perf_counter()
+            w1.update_one({"_id": k}, {"$set": {"status": token}})
+            got = (prim if strategy == "primary" else sec).find_one({"_id": k})["status"]
+        res[strategy].append((time.perf_counter() - t0) * 1000); stale[strategy] += got != token
+for st, v in res.items():
+    v.sort()
+    print(f"{st:16s} n={len(v)} stale={stale[st]} ({100*stale[st]/len(v):.1f}%) p50={statistics.median(v):.2f} ms p95={v[int(len(v)*0.95)]:.2f} ms max={v[-1]:.2f} ms")
+```
+
+Course lab (write + read): secondary **295/300 stale** (p50 0.28 ms), primary 0 (p50 0.24 ms), causal session on a secondary with w:'majority' and majority reads: 0 stale, p50 **1.67 ms**, p95 3.12 ms, max 12.9 ms.
+
+Clean up: `./rp-teardown.sh rp` and `docker rm -f rp-cli`.
+
+## Part B: design exercise
+
+An order management system for brands selling on Shopee, Lazada and TikTok Shop. One primary database, two replicas in the same region (one 1 ms away, one 20 ms away in another zone), one CDC pipeline to a warehouse. Workloads:
+
+| Workload | Volume |
+|---|---|
+| Checkout and order import from marketplaces (writes orders, order items, stock reservations) | 300 orders/s at peak sales |
+| Buyer and seller order pages | 3,000 reads/s |
+| Seller dashboard tiles (today's orders, GMV, cancellations) | 500 reads/s, refreshed every 30 s |
+| Stock sync to the three marketplaces | every stock change, within 5 s |
+| Carrier tracking updates | 6,000 writes/s at peak |
+| Finance reconciliation export | nightly, scans a month of orders |
+
+Answer with a table and cite a measurement for each choice:
+
+1. For each workload, the read class (Concept 1) and where it is served.
+2. The own-writes design for the seller order page: what is stored, the wait limit, the fallback, the expiry (Concept 2; Part A numbers).
+3. The commit durability for orders, stock reservations and tracking updates, and the replica topology that keeps commits available when one replica fails (Concept 3; Session 2 and 5 numbers).
+4. The five alerts you would create first, with their queries (Concept 4).
+5. How stock sync is delivered and what happens after a 14-hour pause of the sync service (Session 7).
+
+## Session quiz
+
+1. Why did an immediate replica read return the old value almost every time in all three engines, even with millisecond lag?
+2. Which marketplace reads must never use a replica, and why is "route all SELECTs to replicas" unsafe?
+3. Describe a session token for read-your-writes in each engine and the two safeguards it needs.
+4. The MySQL replica fell 105,686 transactions behind under 1,636 writes/s. What happens to own-writes reads and to bounded-staleness reads, with a correct router?
+5. What does waiting for one replica cost per commit, and what does not waiting lose at failover? Use the course's numbers.
+6. Why is a single synchronous standby an availability risk, and what is the quorum configuration in each engine?
+7. Name three monitoring signals that a "lag in seconds" dashboard misses, and the session that showed each.
+8. Write the order of steps in a failover runbook and explain why fencing comes before promotion.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-8-designing-for-replicas/lab/answers">Quiz answers and a worked design</DeepDive>

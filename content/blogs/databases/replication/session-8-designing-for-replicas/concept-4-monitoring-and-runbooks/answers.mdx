@@ -1,0 +1,73 @@
+---
+title: "Answers: Monitoring and runbooks for replicas"
+description: "Worked answers to the Session 8 Concept 4 check questions."
+companion: "answers"
+tags: ["replication", "monitoring", "runbook", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/monitoring-stats.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-semisync-monitoring.html"
+  - "https://www.mongodb.com/docs/manual/administration/replica-set-maintenance/"
+---
+
+<Tldr>
+Positions for lag, retention for history, quorum state for durability, fallback rate for users. Then a runbook that asks "receiving? applying? fast enough?" in that order.
+</Tldr>
+
+## Q1. A lying seconds metric
+
+**Question:** give one example from this course where a lag value in seconds was wrong, and the position-based check that would have been right.
+
+Session 3: MySQL `Seconds_Behind_Source` showed 0 with the I/O thread "Yes" for 40–50 s after a network cut, while 5 transactions were missing. `GTID_SUBTRACT(source gtid_executed, replica gtid_executed)` would have returned those 5 GTIDs. Also in Session 3, PostgreSQL's `replay_lag` stayed at 0.23 s while 15 MB of WAL waited; `pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)` on the primary showed the 15 MB.
+
+> **Common mistake:** setting the alert threshold on `Seconds_Behind_Source > 30` and nothing else.
+
+## Q2. A slot about to fill the disk
+
+**Question:** which PostgreSQL query finds a slot that is about to fill the WAL volume, and what two settings limit the damage?
+
+```sql
+SELECT slot_name, slot_type, active, wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained,
+       pg_size_pretty(safe_wal_size) AS safe
+FROM pg_replication_slots ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC;
+```
+
+Alert on inactive slots and on retained bytes against free space on the WAL volume. `max_slot_wal_keep_size` caps how much WAL any slot may keep (the slot is invalidated instead of the disk filling: Session 7 went from `unreserved` to `lost` at 256 MB). `idle_replication_slot_timeout` does not exist in 17 (it arrives in PostgreSQL 18, from the documentation), so dropping abandoned slots is a monitoring job.
+
+> **Common mistake:** watching only `pg_stat_replication`, which shows connected replicas; an abandoned slot has no connection.
+
+## Q3. Semi-sync no longer protecting commits
+
+**Question:** which MySQL status tells you semi-sync is no longer protecting commits?
+
+`Rpl_semi_sync_source_status = OFF`: the source has fallen back to asynchronous replication (Session 2 saw this after the 10 s `rpl_semi_sync_source_timeout`). `Rpl_semi_sync_source_no_tx` counts commits acknowledged without a replica's confirmation; any increase means acknowledged transactions exist only on the source. `Rpl_semi_sync_source_clients` shows how many semi-sync replicas are connected.
+
+> **Common mistake:** checking `rpl_semi_sync_source_enabled` (the configuration), which stays ON after the fallback.
+
+## Q4. Received but not applied
+
+**Question:** a replica's received position moves but its applied position does not. List three causes from this course.
+
+1. A lock on the replica blocking the applier: in Session 3 one locked row held 6 transactions and pushed `Seconds_Behind_Source` to 17 s.
+2. An apply error: a duplicate key from a write on a writable replica (Session 1, error 1062), or a logical subscription missing a column (Session 7).
+3. A query on a PostgreSQL hot standby holding back replay up to `max_standby_streaming_delay` (Session 6; recovery conflicts).
+A deliberate delay (`recovery_min_apply_delay`, `SOURCE_DELAY`, a delayed MongoDB member) looks the same and is not a fault.
+
+> **Common mistake:** restarting the replica. That clears a lock but not an apply error, and loses the evidence.
+
+## Q5. Fencing
+
+**Question:** why must the old primary be fenced before promotion, and what does Session 5 show happens otherwise?
+
+If the old primary is still running and reachable by some clients, promoting a replica creates two servers that accept writes. Session 5 promoted a PostgreSQL standby while the old primary ran: rows from client 201 went to timeline 1, rows from client 202 to timeline 2, and neither server knew about the other's writes; merging them is manual. MongoDB fences itself (the old primary stepped down 9.7 s after losing the majority, before the new one was elected), but PostgreSQL and MySQL rely on the failover tooling to stop, isolate or make read-only the old primary.
+
+> **Common mistake:** "the old primary is down" based on one health check from one network location.
+
+## Q6. The early-warning application metric
+
+**Question:** which application-side metric warns that replicas lag before users complain, and why?
+
+The own-writes **fallback rate** from Concept 2: the share of position waits that time out and go to the primary. It rises as soon as replicas cannot reach a fresh position within the limit, before staleness is visible (users are protected by the fallback), and it also predicts load moving onto the primary. A rising rate with healthy-looking lag-in-seconds is a strong hint that the seconds metric is lying.
+
+> **Common mistake:** treating fallbacks as success and not counting them; the system degrades silently until the primary saturates.

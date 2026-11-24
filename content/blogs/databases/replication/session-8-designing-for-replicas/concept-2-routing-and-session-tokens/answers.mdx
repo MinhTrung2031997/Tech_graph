@@ -1,0 +1,65 @@
+---
+title: "Answers: Routing own-writes reads with a session token"
+description: "Worked answers to the Session 8 Concept 2 check questions."
+companion: "answers"
+tags: ["replication", "read-your-writes", "routing", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/functions-admin.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/gtid-functions.html"
+  - "https://www.mongodb.com/docs/manual/core/causal-consistency-read-write-concerns/"
+---
+
+<Tldr>
+A session token is a position, a limit and a fallback. Without the limit and the fallback it is a latency bug waiting for the first lag spike.
+</Tldr>
+
+## Q1. What to store
+
+**Question:** what exactly does the app store after a write in each engine, and where does it come from?
+
+- PostgreSQL: an LSN, from `pg_current_wal_lsn()` (or `pg_current_wal_insert_lsn()`) on the primary right after the commit returns. Any position at or after the commit record works; a slightly later one only waits a little longer.
+- MySQL: a GTID set. With `session_track_gtids = OWN_GTID` the server returns the session's own GTIDs in the OK packet (connectors expose it); the lab simply read `@@global.gtid_executed` after the commit, which includes it.
+- MongoDB: the session's `operationTime` / `$clusterTime`. A causal session in the driver keeps it and sends `afterClusterTime` with later reads; to carry it across requests, store it and call `advance_operation_time` / `advance_cluster_time` on a new session.
+
+> **Common mistake:** storing the replica's position at read time instead of the primary's position at write time.
+
+## Q2. Why majority in the causal strategy
+
+**Question:** why did the MongoDB causal strategy use w:'majority' and majority read concern?
+
+MongoDB guarantees read-your-writes in a causal session only when the write is acknowledged by a majority and the read uses majority read concern (from the documentation of causal consistency guarantees). With w:1 and local reads a secondary could return data the session has not seen, and a failover could roll the write back (Session 5) so the token points at history that no longer exists. The cost is in the write: w:'majority' waits for a secondary (1.67 ms median for write plus read here, against 0.24 ms for a w:1 write plus primary read).
+
+> **Common mistake:** using a causal session with default w:1 settings in older drivers and assuming the guarantee holds.
+
+## Q3. Choosing the timeout
+
+**Question:** the PostgreSQL wait had a median of 2.26 ms under load but a maximum of 162 ms. Which number sets the timeout, and what happens to reads over it?
+
+Neither statistic alone: the timeout is a product decision, "how much extra latency may this page add", typically 50–200 ms. The tail (p95 6.47 ms, max 162 ms here) tells you what fraction of reads will exceed it and fall back to the primary: with a 100 ms limit, a handful per thousand under this load. Reads over the limit go to the primary, which is always fresh, so correctness does not depend on the limit, only latency and primary load do.
+
+> **Common mistake:** setting the timeout from the median ("2 ms is plenty"), sending a large share of reads to the primary during every small spike.
+
+## Q4. A replica that cannot keep up
+
+**Question:** the MySQL replica fell 105,700 transactions behind. What should the router do for own-writes reads, and what for bounded-staleness reads?
+
+Own-writes reads: wait up to the limit, time out (every wait did), read the source. Correct but expensive: those reads now hit the source, which is already busy. Bounded-staleness reads: the replica's lag (37 s by `Seconds_Behind_Source`, more by GTID count) exceeds any sensible bound, so the router must remove it from the pool until it catches up (about 90 s after the load stopped). If all replicas are out, serve class-3 reads from the source only if it has capacity; otherwise from a cache, or degrade the page.
+
+> **Common mistake:** keeping a lagging replica in the pool because "it still answers queries". Answering with minute-old data is the failure.
+
+## Q5. Expiry and failover
+
+**Question:** why should session tokens expire, and why should they be dropped after a failover?
+
+Expiry: after a few seconds every healthy replica has passed the token, so checking it only costs a round trip; and a token kept forever forces waits during unrelated lag spikes for users who wrote long ago. After a failover: a token may name a position that the new primary never had (an async write lost with the old primary, Session 5's 8,207–15,883 missing commits, or rolled-back MongoDB writes). Replicas of the new primary may never reach that position, so every read with the old token would time out and fall back, or wait forever without a limit.
+
+> **Common mistake:** comparing PostgreSQL LSNs across timelines. After promotion, LSNs continue on a new timeline; a position from the old primary's timeline beyond the switch point does not exist on the new one.
+
+## Q6. Two browser tabs
+
+**Question:** a user writes in one browser tab and reads in another. What does that mean for where the token lives?
+
+The token must belong to the user (or their session), not to a connection, a request or a single page. Store it server-side, keyed by user/session id (for example in Redis with a 30 s TTL), or in a cookie shared by all tabs. If it lived only in the page that made the write, the other tab would read a replica without waiting and show the old data.
+
+> **Common mistake:** keeping the token in the app server's memory; the next request lands on another app server behind the load balancer.
