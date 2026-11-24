@@ -1,0 +1,425 @@
+---
+title: "Concept 4: From index entry to table row"
+description: "What happens after the leaf entry is found: PostgreSQL follows a ctid to a heap page and checks visibility, InnoDB searches the clustered index by primary key, MongoDB fetches by RecordId. And how each engine can skip that step entirely."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "b-tree", "heap", "covering"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-index-only-scans.html"
+  - "https://www.postgresql.org/docs/current/storage-hot.html"
+  - "https://www.postgresql.org/docs/current/storage-vm.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/index-condition-pushdown-optimization.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html"
+  - "https://www.mongodb.com/docs/manual/core/query-optimization/#covered-query"
+---
+
+<Tldr>
+An index entry is only a pointer. Getting the row costs a second step, and it is often the expensive one: **PostgreSQL** reads the heap page named by the ctid and checks that the row version is visible to the query; **InnoDB** takes the primary key from the secondary entry and descends the clustered index; **MongoDB** takes the RecordId and descends the collection B-tree. For 7 rows of one customer, PostgreSQL's index part cost 3 pages and the heap part 7. Each engine can skip the second step when the index alone answers the query: an index-only scan, a covering index, a covered query.
+</Tldr>
+
+## The second step in each engine
+
+| | PostgreSQL | InnoDB (secondary index) | MongoDB |
+|---|---|---|---|
+| Leaf entry holds | key → ctid `(page, slot)` | key + primary key | key → RecordId |
+| Second step | Read heap page, follow line pointer | Descend the clustered index by primary key | Descend the collection B-tree by RecordId |
+| Cost per row | 1 page (if not already read) | ≈ 3 pages | ≈ 3 pages |
+| Visibility (MVCC) | Checked on the heap row: the index has no visibility information | Checked on the clustered record (undo log for old versions) | Handled by WiredTiger's own versioning |
+| Skipping it | Index-only scan (needs the visibility map) | Covering index (`Using index`) | Covered query (`PROJECTION_COVERED`) |
+
+## PostgreSQL: ctid → heap
+
+| Term | Meaning |
+|---|---|
+| ctid | `(page, slot)`: heap page number and line pointer number |
+| Visibility check | Is this row version visible to my snapshot? Based on the row's `xmin` / `xmax` (Session 1, Concept 2) |
+| HOT chain | After a HOT update, the index still points at the old slot; the old slot leads to the new version on the same page |
+| Redirect line pointer | Once VACUUM removes the old version, its line pointer is left as a redirect to the chain's live version |
+| Visibility map | One bit per heap page: "all rows on this page are visible to everyone"; lets an index-only scan skip the heap |
+| **✓ Visible / ✗ Not visible** | The version belongs to the query's snapshot or not; an invisible one is skipped |
+| **✓ All-visible / ✗ Not** | Visibility-map bit set or not, for index-only scans |
+
+<Flow
+  title="PostgreSQL: from leaf entry to heap row"
+  height={360}
+  nodes={[
+    { id: 'entry', label: 'Leaf entry', sub: '', x: 20, y: 20, w: 200 },
+    { id: 'vm', label: 'Visibility map', sub: '1 bit per heap page', x: 300, y: 20, w: 200 },
+    { id: 'allvis', label: '✓ All-visible', sub: 'skip the heap', x: 580, y: 20, w: 200 },
+    { id: 'page', label: 'Heap page', sub: '', x: 20, y: 140, w: 200 },
+    { id: 'lp', label: 'Line pointer', sub: '', x: 300, y: 140, w: 200 },
+    { id: 'redirect', label: 'Redirect', sub: 'to the live version', x: 580, y: 140, w: 200 },
+    { id: 'vis', label: '✓ Visible', sub: 'return the row', x: 100, y: 270, w: 200 },
+    { id: 'invis', label: '✗ Not visible', sub: 'skip this version', x: 420, y: 270, w: 220 },
+  ]}
+  edges={[
+    { id: 'entry-vm', from: 'entry', to: 'vm' },
+    { id: 'vm-allvis', from: 'vm', to: 'allvis' },
+    { id: 'entry-page', from: 'entry', to: 'page', label: 'ctid' },
+    { id: 'vm-page', from: 'vm', to: 'page', quiet: true },
+    { id: 'page-lp', from: 'page', to: 'lp' },
+    { id: 'lp-redirect', from: 'lp', to: 'redirect' },
+    { id: 'lp-vis', from: 'lp', to: 'vis' },
+    { id: 'lp-invis', from: 'lp', to: 'invis' },
+    { id: 'redirect-vis', from: 'redirect', to: 'vis', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Live row',
+      path: 'entry 7 → (19,49) → heap page 19 → line pointer 49 ✓ visible → row',
+      summary: 'customer_id = 7, first of 7 rows: one heap page per row.',
+      subs: { entry: '7 → (19,49)', page: 'page 19', lp: 'slot 49' },
+      steps: [
+        {
+          title: 'The leaf entry gives a ctid',
+          note: 'orders_customer_idx has a posting list for customer 7 with 7 ctids, in ctid order: (19,49), (1363,89), (3459,10), … The first points at heap page 19.',
+          code: 'SET enable_bitmapscan = off;\nSELECT * FROM orders WHERE customer_id = 7;',
+          active: ['entry', 'page'],
+          edges: ['entry-page'],
+        },
+        {
+          title: 'Read heap page 19, follow slot 49',
+          note: 'Postgres pins heap page 19 and follows line pointer 49 to the row\'s bytes.',
+          active: ['page', 'lp'],
+          edges: ['page-lp'],
+        },
+        {
+          title: '✓ Visible: return the row',
+          note: 'The row\'s xmin committed before the query\'s snapshot and xmax is empty: it is visible. Then the next ctid, (1363,89), another heap page.',
+          active: ['lp', 'vis'],
+          edges: ['lp-vis'],
+        },
+        {
+          title: 'Total: 3 index pages + 7 heap pages',
+          note: 'EXPLAIN: Index Scan using orders_customer_idx, rows=7, Buffers: shared hit=10. The 7 rows sit on 7 different heap pages, so the heap part costs more than the index part.',
+          active: ['vis'],
+          subs: { vis: '7 rows, 10 pages' },
+        },
+      ],
+    },
+    {
+      title: 'HOT chain',
+      path: 'entry 7 → (10101,2) → redirect → (10101,3) ✓ visible',
+      summary: 'Row id 7 after the Session 1 lab: a non-HOT then a HOT update, then VACUUM.',
+      subs: { entry: 'pkey: 7 → (10101,2)', page: 'page 10,101', lp: 'slot 2' },
+      steps: [
+        {
+          title: 'The index points at slot 2',
+          note: 'The first (non-HOT) update moved id 7 to (10101,2) and gave orders_pkey the entry 7 → (10101,2). The second update was HOT: the new version went to (10101,3) and no index entry was added.',
+          code: 'SELECT * FROM orders WHERE id = 7;',
+          active: ['entry', 'page'],
+          edges: ['entry-page'],
+        },
+        {
+          title: 'Slot 2 is a redirect',
+          note: 'VACUUM removed the dead version in slot 2 but kept its line pointer as a redirect (heap_page_items: lp_flags = 2, pointing to 3). The index entry remains valid.',
+          active: ['page', 'lp', 'redirect'],
+          edges: ['page-lp', 'lp-redirect'],
+          subs: { redirect: 'slot 2 → slot 3' },
+        },
+        {
+          title: '✓ Visible at slot 3',
+          note: 'Slot 3 holds the live version (status = delivered). Following a HOT chain stays inside one heap page: no extra page read.',
+          active: ['redirect', 'vis'],
+          edges: ['redirect-vis'],
+        },
+      ],
+    },
+    {
+      title: 'Version not visible',
+      path: 'entry → heap page → line pointer ✗ not visible (deleted, or not yet committed) → skip',
+      summary: 'The index still has entries for dead or uncommitted versions; only the heap can tell.',
+      subs: { entry: '7 → (0,7)', page: 'page 0', lp: 'slot 7' },
+      steps: [
+        {
+          title: 'An entry for an old version',
+          note: 'Right after the first update of id 7 (before VACUUM), orders_pkey had two entries: 7 → (0,7) (old) and 7 → (10101,2) (new). Index entries carry no visibility information.',
+          code: 'SELECT * FROM orders WHERE id = 7;',
+          active: ['entry', 'page', 'lp'],
+          edges: ['entry-page', 'page-lp'],
+        },
+        {
+          title: '✗ Not visible: skip',
+          note: 'The version at (0,7) has an xmax from a committed transaction: it was replaced. The query skips it, at the cost of a heap page read for nothing. The entry for (10101,2) then finds the live row.',
+          active: ['lp', 'invis'],
+          edges: ['lp-invis'],
+        },
+        {
+          title: 'Why bloated indexes cost heap reads',
+          note: 'Until VACUUM removes dead entries, every lookup through them pays for heap visits that return nothing. Heavy UPDATE traffic without enough VACUUM makes index scans slower over time (Session 8).',
+          active: ['invis'],
+        },
+      ],
+    },
+    {
+      title: 'Index-only scan',
+      path: 'entry → visibility map ✓ all-visible → value from the index, no heap page',
+      summary: 'SELECT customer_id … WHERE customer_id = 7: Buffers: shared hit=4, Heap Fetches: 0.',
+      subs: { entry: '7 → 7 ctids', vm: 'pages 19, 1363, …' },
+      steps: [
+        {
+          title: 'Only indexed columns are needed',
+          note: 'The query asks for customer_id, which the index already holds. Postgres can skip the heap, but only if it can prove visibility some other way.',
+          code: 'SELECT customer_id FROM orders WHERE customer_id = 7;',
+          active: ['entry', 'vm'],
+          edges: ['entry-vm'],
+        },
+        {
+          title: '✓ All-visible: skip the heap',
+          note: 'For each ctid, Postgres checks the heap page\'s bit in the visibility map. VACUUM set the bits for pages 19, 1363, … so every row there is visible to everyone. Heap Fetches: 0.',
+          active: ['vm', 'allvis'],
+          edges: ['vm-allvis'],
+        },
+        {
+          title: '✗ Not all-visible: back to the heap',
+          note: 'If a page was modified since the last VACUUM, its bit is cleared and that row needs a heap visit after all (counted in Heap Fetches). Session 5 covers how VACUUM keeps index-only scans index-only.',
+          active: ['vm', 'page'],
+          edges: ['vm-page'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL InnoDB: secondary entry → clustered index
+
+| Term | Meaning |
+|---|---|
+| Primary-key lookup | Descend the clustered index with the primary key taken from the secondary entry: ≈ 3 page requests per row |
+| Covering index | Every column the query needs is in the secondary entry (indexed columns + primary key): no clustered lookup. EXPLAIN shows `Using index` |
+| Index condition pushdown (ICP) | Conditions on indexed columns are checked on the secondary entry **before** the primary-key lookup. EXPLAIN shows `Using index condition` |
+| **✓ Passes / ✗ Fails ICP** | Only entries that pass the pushed-down condition pay for the row lookup |
+
+<Flow
+  title="InnoDB: from secondary entry to row"
+  height={350}
+  nodes={[
+    { id: 'sec', label: 'Secondary leaf', sub: '(customer_id, id)', x: 20, y: 20, w: 200 },
+    { id: 'cover', label: '✓ Covering', sub: 'answer from the entry', x: 300, y: 20, w: 200 },
+    { id: 'icpno', label: '✗ Fails ICP', sub: 'skip, no lookup', x: 580, y: 20, w: 200 },
+    { id: 'icpok', label: '✓ Passes ICP', sub: 'needs the row', x: 20, y: 140, w: 200 },
+    { id: 'root', label: 'Clustered root', sub: 'by primary key', x: 300, y: 140, w: 200 },
+    { id: 'leaf', label: 'Clustered leaf', sub: 'the full row', x: 580, y: 140, w: 200 },
+    { id: 'row', label: 'Row returned', sub: '', x: 300, y: 270, w: 200 },
+  ]}
+  edges={[
+    { id: 'sec-cover', from: 'sec', to: 'cover' },
+    { id: 'sec-icpok', from: 'sec', to: 'icpok' },
+    { id: 'icpok-root', from: 'icpok', to: 'root', label: 'id' },
+    { id: 'root-leaf', from: 'root', to: 'leaf' },
+    { id: 'leaf-row', from: 'leaf', to: 'row' },
+    { id: 'cover-icpno', from: 'cover', to: 'icpno', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Lookup per row',
+      path: 'secondary entry (7, 55046) → clustered root → … → leaf: the row; repeated for each of 10 rows',
+      summary: 'SELECT id, customer_id, status … WHERE customer_id = 7: ≈ 50 page requests for 10 rows.',
+      subs: { sec: '(7, 55046)' },
+      steps: [
+        {
+          title: 'The secondary entry gives a primary key',
+          note: 'The customer_id index has 10 entries for customer 7, each (7, id). The first is (7, 55046). status is not in the index, so the row is needed.',
+          code: 'SELECT id, customer_id, status FROM orders WHERE customer_id = 7;',
+          active: ['sec', 'icpok'],
+          edges: ['sec-icpok'],
+        },
+        {
+          title: 'Descend the clustered index by id 55,046',
+          note: 'A full descent: root, internal page, leaf. The secondary index stores no page address, so there is no shortcut.',
+          active: ['icpok', 'root', 'leaf'],
+          edges: ['icpok-root', 'root-leaf'],
+        },
+        {
+          title: 'The row, then the next entry',
+          note: 'The leaf holds the full row. Then (7, 155046), another descent, and so on 10 times. The lab measured ≈ 50 page requests: ≈ 9 for the secondary index (plus the optimizer\'s index dive) and ≈ 4 per row.',
+          active: ['leaf', 'row'],
+          edges: ['leaf-row'],
+          subs: { row: '10 rows, ≈ 50 page requests' },
+        },
+      ],
+    },
+    {
+      title: 'Covering index',
+      path: 'secondary entry (7, 55046) ✓ covering → answer from the index, no clustered lookup',
+      summary: 'SELECT id … WHERE customer_id = 7: ≈ 9 page requests, EXPLAIN Extra: Using index.',
+      subs: { sec: '(7, 55046)' },
+      steps: [
+        {
+          title: 'The entry has everything',
+          note: 'The query needs id and filters on customer_id. A secondary entry holds exactly (customer_id, id), so the answer is in the index.',
+          code: 'SELECT id FROM orders WHERE customer_id = 7;',
+          active: ['sec', 'cover'],
+          edges: ['sec-cover'],
+        },
+        {
+          title: '✓ No clustered lookups',
+          note: 'Measured ≈ 9 page requests instead of ≈ 50. InnoDB still checks that the secondary page is not newer than the transaction\'s read view; if it is, it must consult the clustered record for that row (secondary indexes keep no row versions).',
+          active: ['cover'],
+          subs: { cover: '≈ 9 page requests' },
+        },
+      ],
+    },
+    {
+      title: 'Index condition pushdown',
+      path: 'index on (customer_id, created_at): entry ✗ fails created_at test → skipped without a lookup',
+      summary: 'Conditions on indexed columns are checked before paying for the row.',
+      subs: { sec: '(customer_id, created_at, id)', icpno: "created_at in March? ✗" },
+      steps: [
+        {
+          title: 'A condition the index can check',
+          note: 'With an index on (customer_id, created_at), the condition on created_at can be evaluated on the secondary entry itself (EXPLAIN Extra: Using index condition).',
+          code: "SELECT * FROM orders\nWHERE customer_id = 7 AND created_at >= '2025-03-01';",
+          active: ['sec'],
+        },
+        {
+          title: '✗ Fails: skipped',
+          note: 'An entry from January fails the test; InnoDB moves to the next entry without descending the clustered index.',
+          active: ['sec', 'cover', 'icpno'],
+          edges: ['cover-icpno'],
+        },
+        {
+          title: '✓ Passes: one lookup',
+          note: 'Only entries that pass pay for the clustered descent and the full row. Without ICP, every entry for customer 7 would be looked up and filtered afterwards.',
+          active: ['icpok', 'root', 'leaf', 'row'],
+          edges: ['sec-icpok', 'icpok-root', 'root-leaf', 'leaf-row'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: RecordId → FETCH
+
+| Term | Meaning |
+|---|---|
+| `IXSCAN` | Reads index entries: key → RecordId |
+| `FETCH` | Descends the collection B-tree by RecordId to load the document, then applies any remaining filter |
+| Covered query | Every field the query filters on and returns is in the index, and `_id` is excluded from the projection: `PROJECTION_COVERED`, `totalDocsExamined: 0` |
+| **✓ Covered / ✗ Needs the document** | Whether the FETCH stage can be skipped |
+
+<Flow
+  title="MongoDB: from index entry to document"
+  height={330}
+  nodes={[
+    { id: 'ix', label: 'IXSCAN', sub: 'customer_id_1', x: 20, y: 20, w: 200 },
+    { id: 'covered', label: '✓ Covered', sub: 'PROJECTION_COVERED', x: 300, y: 20, w: 220 },
+    { id: 'need', label: '✗ Needs the document', sub: 'other fields asked for', x: 20, y: 140, w: 220 },
+    { id: 'croot', label: 'Collection root', sub: 'keyed by RecordId', x: 320, y: 140, w: 200 },
+    { id: 'cleaf', label: 'Collection leaf', sub: 'the document', x: 580, y: 140, w: 200 },
+    { id: 'out', label: 'Document returned', sub: '', x: 320, y: 260, w: 200 },
+  ]}
+  edges={[
+    { id: 'ix-covered', from: 'ix', to: 'covered' },
+    { id: 'ix-need', from: 'ix', to: 'need' },
+    { id: 'need-croot', from: 'need', to: 'croot', label: 'FETCH' },
+    { id: 'croot-cleaf', from: 'croot', to: 'cleaf' },
+    { id: 'cleaf-out', from: 'cleaf', to: 'out' },
+  ]}
+  cases={[
+    {
+      title: 'FETCH each document',
+      path: 'IXSCAN 7 → RecordId ✗ needs the document → FETCH: collection descent → document',
+      summary: 'find({ customer_id: 7 }): keys examined 10, documents examined 10.',
+      steps: [
+        {
+          title: 'Index entries for customer 7',
+          note: 'The index yields 10 entries, each customer_id 7 → a RecordId.',
+          code: 'db.orders.find({ customer_id: 7 })',
+          active: ['ix', 'need'],
+          edges: ['ix-need'],
+        },
+        {
+          title: 'FETCH: descend the collection',
+          note: 'Each RecordId is looked up in the collection B-tree: root, internal, leaf.',
+          active: ['need', 'croot', 'cleaf'],
+          edges: ['need-croot', 'croot-cleaf'],
+        },
+        {
+          title: 'Documents returned',
+          note: 'explain: FETCH <- IXSCAN, totalKeysExamined 10, totalDocsExamined 10.',
+          active: ['cleaf', 'out'],
+          edges: ['cleaf-out'],
+          subs: { out: '10 documents' },
+        },
+      ],
+    },
+    {
+      title: 'Covered query',
+      path: 'IXSCAN 7 ✓ covered → values from the index, no FETCH',
+      summary: 'find({ customer_id: 7 }, { _id: 0, customer_id: 1 }): documents examined 0.',
+      steps: [
+        {
+          title: 'Project only indexed fields',
+          note: 'The projection asks for customer_id only and excludes _id (which is not in this index). Everything comes from the index entries.',
+          code: 'db.orders.find({ customer_id: 7 }, { _id: 0, customer_id: 1 })',
+          active: ['ix', 'covered'],
+          edges: ['ix-covered'],
+        },
+        {
+          title: '✓ No documents read',
+          note: 'explain: PROJECTION_COVERED <- IXSCAN, totalKeysExamined 10, totalDocsExamined 0. Forgetting { _id: 0 } turns it back into a FETCH.',
+          active: ['covered'],
+          subs: { covered: 'docs examined: 0' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## The engines side by side
+
+Customer 7 in the lab:
+
+| | Rows | Index part | Row part | Without the row part |
+|---|---|---|---|---|
+| PostgreSQL | 7 | 3 pages | 7 heap pages (10 in total) | Index-only scan: 4 pages, Heap Fetches 0 |
+| InnoDB | 10 | ≈ 9 page requests | ≈ 4 per row (≈ 50 in total) | Covering: ≈ 9 page requests |
+| MongoDB | 10 | 10 keys | 10 documents fetched | Covered: 0 documents |
+
+<Pitfall>
+`SELECT *` turns every index lookup into "index + row". On a query returning thousands of rows through a secondary index, the row part dominates: in InnoDB each row is a full clustered-index descent. Select only the columns you need; it is the precondition for covering indexes (Session 5).
+</Pitfall>
+
+## Real-world scenario: the index scan that got slower every week
+
+An order-status dashboard runs `SELECT * FROM orders WHERE customer_id = $1`. It is fast after a deploy and slower every week. The table receives heavy `UPDATE`s to `status` and `updated_at`.
+
+| Cause | Effect on the second step |
+|---|---|
+| Non-HOT updates (pages full, or an indexed column changed) | Every update adds a new entry to every index; old entries point at dead versions |
+| VACUUM not keeping up | Index lookups visit heap pages only to find invisible versions (✗ not visible) |
+| Visibility map bits cleared | Index-only scans fall back to heap fetches |
+
+**Fixes:** tune autovacuum for the table (Session 8), lower `fillfactor` so updates stay HOT, don't index frequently updated columns unless needed, and check `n_tup_hot_upd / n_tup_upd` and `Heap Fetches` in plans.
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 3: cost model | The planner prices the row part with `random_page_cost` and correlation |
+| Session 5: covering indexes | Removing the second step is the whole point |
+| Session 5: index-only scans | Need the visibility map, which needs VACUUM |
+| Session 6: engine differences | InnoDB's "two descents" vs PostgreSQL's "direct ctid" trade-off |
+
+## Key takeaways
+
+1. An index entry is a pointer; fetching the row is a second step that often costs more than the index part.
+2. PostgreSQL follows a ctid to a heap page and checks visibility there; indexes have no visibility information.
+3. HOT chains and redirect line pointers keep index entries valid across same-page updates.
+4. Index entries for dead versions cost heap reads until VACUUM removes them.
+5. InnoDB secondary entries hold the primary key; every row costs a clustered-index descent unless the index covers the query.
+6. ICP checks indexed conditions before the row lookup.
+7. MongoDB FETCHes by RecordId; a covered query (with `_id: 0`) skips it.
+
+## Check questions
+
+1. For `SELECT * FROM orders WHERE customer_id = 7` in PostgreSQL, `Buffers: shared hit=10` for 7 rows. Break down the 10 pages.
+2. Why can't PostgreSQL decide from the index alone whether a row is visible to a query?
+3. The index points at `(10101,2)`, but slot 2 holds no row. What is it, and how does the lookup still find the row?
+4. What does an index-only scan need besides an index containing all requested columns, and what does `Heap Fetches: 386` mean?
+5. In InnoDB, why does `SELECT id FROM orders WHERE customer_id = 7` cost ≈ 9 page requests but `SELECT id, status …` ≈ 50?
+6. What does index condition pushdown save, and in which EXPLAIN column do you see it?
+7. A MongoDB query projects `{ customer_id: 1 }` on an index on `customer_id` but still shows `FETCH`. Why?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-2-btree-internals/concept-4-index-to-row/answers">Worked answers to Q1–Q7</DeepDive>

@@ -1,0 +1,82 @@
+---
+title: "Answers: A point lookup, level by level"
+description: "Worked answers to the Session 2 Concept 3 check questions, traced on the lab's orders_pkey."
+companion: "answers"
+tags: ["indexing", "b-tree", "lookup", "answers"]
+status: "draft"
+sources:
+  - "https://github.com/postgres/postgres/blob/master/src/backend/access/nbtree/README"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-physical-structure.html"
+  - "https://www.mongodb.com/docs/manual/core/clustered-collections/"
+---
+
+<Tldr>
+One page per level, a binary search inside each page, then (in PostgreSQL and normal MongoDB collections) one more hop to the row. A missing key stops at the leaf.
+</Tldr>
+
+## Q1. Trace id = 500,000
+
+**Question:** trace `WHERE id = 500000` in the lab: name each page read, what it contains, and how the next page is chosen.
+
+| # | Page | Contains | Choice |
+|---|---|---|---|
+| 0 | Metapage, block 0 (first access per connection) | Root = block 412, level 2 | Go to block 412 |
+| 1 | Root, block 412 | 10 separators: −∞, 104,311, … 417,241, 521,551, … | 417,241 ≤ 500,000 < 521,551 → block 1,270 |
+| 2 | Internal, block 1,270 | 286 separators, one per leaf | 499,957 ≤ 500,000 < next → block 1,373 |
+| 3 | Leaf, block 1,373 | Entries for ids 499,957–500,322; high key 500,323 | Binary search finds 500,000 → (5050,50) |
+| 4 | Heap page 5,050 | The row, at line pointer 50 | Return it |
+
+`Buffers: shared hit=4` counts pages 1–4 (the metapage location is cached after the first query on the connection).
+
+> **Common mistake:** counting the metapage on every lookup, or forgetting the heap page.
+
+## Q2. Comparisons on a leaf
+
+**Question:** how many key comparisons does a binary search need on a leaf with 366 entries, and why does it barely matter for performance?
+
+⌈log₂(366)⌉ = **9 comparisons**. Each is a few nanoseconds on data already in the CPU cache, so about 20 comparisons for the whole descent cost far less than a microsecond. One page read from `shared_buffers` costs more, and one from disk costs 100–10,000× more.
+
+> **Common mistake:** "366 comparisons": a leaf is sorted, so it is never scanned linearly.
+
+## Q3. A missing key costs 3
+
+**Question:** `WHERE id = 1500000` shows `Buffers: shared hit=3`. Why 3, and why no heap page?
+
+The descent is the same length as for any key: root 412 → internal 2,700 → rightmost leaf 2,744. The leaf has no entry for 1,500,000, so there is no ctid to follow and the heap is never read. A missing-key lookup costs exactly the index height.
+
+> **Common mistake:** "the index stops early at the root". It cannot know the key is missing until it reaches the leaf where the key would be.
+
+## Q4. High key smaller than the search key
+
+**Question:** a reader arrives at a leaf whose high key is smaller than the key it is looking for. What happened, and what does it do?
+
+The leaf **split** after the reader read its parent: the upper part of its keys moved to a new right neighbour and the high key was lowered. The reader follows the page's **right-link** to the neighbour and continues there ("move right", Lehman–Yao). It costs one extra page and never blocks or fails.
+
+> **Common mistake:** "it restarts from the root". Moving right is enough; restarting is needed only in rare corner cases.
+
+## Q5. 3 pages vs 4 pages
+
+**Question:** why does an InnoDB primary-key lookup read 3 pages while the PostgreSQL one reads 4?
+
+The InnoDB primary-key B-tree **is** the table: its leaf holds the full row, so the descent ends with the data (root, internal, leaf). PostgreSQL's primary key is a separate index whose leaf holds a ctid; the row is on a heap page, one more read.
+
+> **Common mistake:** "InnoDB's tree is shorter". Both trees are 3 levels; the difference is the extra heap hop.
+
+## Q6. MongoDB descents
+
+**Question:** a MongoDB `find({ _id: x })` on a normal collection and on a clustered collection: how many B-tree descents each?
+
+| Collection | Descents | Path |
+|---|---|---|
+| Normal | **2** | `_id` index (x → RecordId), then the collection B-tree (RecordId → document) |
+| Clustered | **1** | The collection B-tree is keyed by `_id`; its leaf holds the document |
+
+> **Common mistake:** "one, because `_id` is the primary key". In a normal collection `_id` is only an index; the documents are stored by RecordId.
+
+## Q7. 7 buffers vs 4
+
+**Question:** the same lookup shows 7 buffers in one test and 4 in another. Give a likely reason.
+
+The 7-buffer run was the **first index access on a new connection**: Postgres read the metapage to find the root and loaded relation information before the 4 pages of the lookup itself. Running a warm-up query on the same connection first gives the steady-state 4.
+
+> **Common mistake:** "the data was not cached". Cache state changes `hit` vs `read`, not the total number of buffers.

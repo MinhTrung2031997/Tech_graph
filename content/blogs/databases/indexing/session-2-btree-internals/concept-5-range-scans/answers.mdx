@@ -1,0 +1,82 @@
+---
+title: "Answers: Range scans along the leaves"
+description: "Worked answers to the Session 2 Concept 5 check questions: descend-walk-stop, buffer counts, backward scans, secondary ranges, SORT stages and keyset pagination."
+companion: "answers"
+tags: ["indexing", "b-tree", "range-scan", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-ordering.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/range-optimization.html"
+  - "https://www.mongodb.com/docs/manual/tutorial/sort-results-with-indexes/"
+---
+
+<Tldr>
+Descend to the lower bound, walk the leaves, stop past the upper bound. Index cost = height + leaves covered; row cost depends on where the rows live.
+</Tldr>
+
+## Q1. The three phases
+
+**Question:** describe the three phases of `WHERE id BETWEEN 200000 AND 201000` on `orders_pkey`, naming the lab's pages.
+
+| Phase | Pages |
+|---|---|
+| Descend to 200,000 | Root 412 → internal 411 (separator 199,837) → leaf 550 |
+| Walk right | Leaf 550 (from 200,000) → 551 → 552 → 553 via right-links |
+| Stop | On leaf 553 at 201,001, the first entry above 201,000 |
+
+Each in-range entry's row is fetched from the heap (pages 2,020–2,030).
+
+> **Common mistake:** "one descent per row". After the first descent the scan only moves sideways.
+
+## Q2. Why not go back up
+
+**Question:** why does a range scan never need to go back up to the internal pages?
+
+Leaves are linked in key order: each leaf knows its right (and left) neighbour. Once the scan is positioned at the first key, every following key is either later on the same leaf or on the next leaf in the chain. Internal pages are only needed to **find** a starting point.
+
+> **Common mistake:** "internal pages are needed to know where the next leaf is". That is exactly what the right-link stores.
+
+## Q3. 7 buffers and 20 buffers
+
+**Question:** the index-only version of that query shows 7 buffers and the normal version 20. Account for both numbers.
+
+| | Index pages | Visibility map | Heap pages | Total |
+|---|---|---|---|---|
+| Index-only scan | 6 (root, internal, leaves 550–553) | 1 | 0 | **7** |
+| Index scan | 6 | — | 11 distinct (2,020–2,030) + 3 counted again when the scan moves to the next leaf | **20** |
+
+> **Common mistake:** counting one heap page per row (1,001). Consecutive ids share heap pages: 99 per page.
+
+## Q4. ORDER BY DESC LIMIT 10
+
+**Question:** how does `ORDER BY id DESC LIMIT 10` avoid sorting 1M rows, and how many pages does it read?
+
+The index already holds ids in order. The scan descends to the **rightmost** leaf and walks **left** (Index Scan Backward), returning entries in descending order; the Limit stops it after 10. Pages: 3 index (root, internal 2,700, leaf 2,744) + 2 heap (10,101 and 10,100) = **5**.
+
+> **Common mistake:** "the database sorts, then takes 10". A Sort node appears only when no index provides the order.
+
+## Q5. Clustered vs secondary range
+
+**Question:** why does an InnoDB range on the primary key not need a second step, while a range on `customer_id` does?
+
+The clustered index's leaves **are** the rows, so walking them returns rows directly. A `customer_id` leaf holds only `(customer_id, id)`; for any other column, each entry needs a primary-key descent of the clustered index. For `customer_id BETWEEN 1 AND 1000` that is 10,000 descents, scattered across the table.
+
+> **Common mistake:** "both are range scans, so they cost the same". The walk costs the same; the per-row lookups do not.
+
+## Q6. A SORT stage in MongoDB
+
+**Question:** a MongoDB plan for `find({ status: 'paid' }).sort({ created_at: -1 }).limit(10)` shows a `SORT` stage. What does that tell you about the indexes?
+
+No index delivers "status = paid, ordered by created_at". With an index on `status` alone, the paid documents come out in RecordId order; with one on `created_at` alone, MongoDB would have to skip non-paid documents. The planner chose to collect all paid documents and sort them in memory, reading every one before returning ten. A compound index `{ status: 1, created_at: -1 }` makes the paid entries contiguous **and** ordered by date: `IXSCAN` → `LIMIT`, 10 keys (Session 4, ESR rule).
+
+> **Common mistake:** "add an index on created_at". It gives the order but not the filter; the compound index gives both.
+
+## Q7. OFFSET pagination
+
+**Question:** why is `OFFSET 100000` slow even with an index, and what is the fix?
+
+The database cannot jump to the 100,000th entry: a B-tree has no positional index. It walks 100,020 entries, fetching each row (it must apply filters and visibility before counting it), then discards 100,000. Cost grows linearly with the page number.
+
+**Fix:** keyset pagination. Pass the last id seen and query `WHERE id < :last_id ORDER BY id DESC LIMIT 20`: one descent to `:last_id`, then 20 entries, whatever the page number.
+
+> **Common mistake:** "the index makes OFFSET free". The index removes the sort, not the walk over skipped rows.

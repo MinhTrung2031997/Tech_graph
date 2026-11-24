@@ -1,0 +1,91 @@
+---
+title: "Answers: Why a B-tree"
+description: "Worked answers to the Session 2 Concept 1 check questions: page reads, fan-out, height and why hashes cannot do ranges."
+companion: "answers"
+tags: ["indexing", "b-tree", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/btree.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-adaptive-hash.html"
+  - "https://www.mongodb.com/docs/manual/core/indexes/index-types/index-hashed/"
+---
+
+<Tldr>
+Height = 1 + ⌈log_fanout(N / keys per leaf)⌉, and every level is one page read. Fan-out is the lever: 2 for a binary tree, ≈ 286 for an 8-byte B-tree key.
+</Tldr>
+
+## Q1. Why count page reads
+
+**Question:** why is "number of page reads" the right way to compare index structures, rather than number of key comparisons?
+
+A key comparison inside a page costs nanoseconds; a page read costs 0.1 µs (cached) to milliseconds (disk). Twenty comparisons inside one page are far cheaper than two page reads. So a structure that does more comparisons per page (a B-tree binary-searches 286 keys in a page) but reads fewer pages wins.
+
+> **Common mistake:** "a binary tree does fewer comparisons, so it is faster". Comparisons are nearly free; the pages they live on are not.
+
+## Q2. Binary tree vs B-tree
+
+**Question:** a balanced binary search tree and a B-tree with fan-out 286 both index 1M keys. How many page reads does each need for one lookup? Show the formula.
+
+| Structure | Formula | Reads |
+|---|---|---|
+| Binary tree (1 key per node, each node its own page) | log₂(1,000,000) | ≈ **20** |
+| B-tree (≈ 366 keys per leaf, fan-out 286) | 1 + ⌈log₂₈₆(1,000,000 / 366)⌉ = 1 + ⌈log₂₈₆(2,732)⌉ = 1 + 2 | **3** |
+
+log₂₈₆(2,732) ≈ 1.4, rounded up to 2 internal levels above the leaves: root + 1 internal level + leaf = 3, as `bt_metap` shows.
+
+> **Common mistake:** log₂₈₆(1,000,000) ≈ 2.4 → 3, which happens to give the right answer here but ignores that a leaf holds hundreds of keys; with bigger leaves the shortcut overestimates.
+
+## Q3. Why not keep the table sorted
+
+**Question:** why can't a database keep a large table physically sorted by `id` and binary-search it instead of building an index?
+
+Reads would be fine (≈ 14 for 10,102 pages), but writes would not. Inserting `id = 250` must place it between 249 and 251: every later row shifts, or pages must be split and the file reorganised, which costs as much as maintaining a B-tree but without its cheap balancing. Updates that change `id` move rows too. And a table can only be sorted one way; every other column still needs its own structure.
+
+> **Common mistake:** "sorting takes too long". Sorting once is fine (`CLUSTER` does it); keeping it sorted under constant inserts is the problem.
+
+## Q4. Hash index and a range
+
+**Question:** a query runs `WHERE created_at BETWEEN '2025-03-01' AND '2025-03-02' ORDER BY created_at`. Why can a hash index on `created_at` not help, while a B-tree can?
+
+A hash scatters neighbouring values into unrelated buckets: `hash('2025-03-01 10:00')` and `hash('2025-03-01 10:01')` have no relationship, so there is no way to visit "all values between X and Y" without checking every bucket. A B-tree keeps keys sorted: descend once to the first key ≥ 2025-03-01, then walk the linked leaves until the key passes 2025-03-02; the entries come out already in `created_at` order, so the `ORDER BY` needs no sort.
+
+> **Common mistake:** "the hash index would find each timestamp quickly". It would, if you knew every timestamp in the range in advance; a range has unknown members.
+
+## Q5. When does orders_pkey get a 4th level
+
+**Question:** with ≈ 366 keys per leaf and fan-out 286, at roughly how many keys does `orders_pkey` need a 4th level?
+
+3 levels reach 286 internal pages × 286 leaves × 366 keys:
+
+**286 × 286 × 366 ≈ 30 million keys.**
+
+Beyond ≈ 30M keys the root's children cannot point to enough leaves, the root splits, and the tree grows to 4 levels (good for ≈ 8.6 billion keys). In practice it happens a little earlier, since pages are not perfectly full.
+
+> **Common mistake:** 286³ ≈ 23M. That counts leaves reachable with 4 levels; multiply by keys per leaf and use the right number of levels.
+
+## Q6. Adaptive hash and hashed indexes
+
+**Question:** MySQL has an "adaptive hash index" and MongoDB a "hashed index". Is either a hash table you query instead of a B-tree? Explain each in one sentence.
+
+| Feature | What it really is |
+|---|---|
+| InnoDB adaptive hash index | An in-memory hash that InnoDB builds by itself over frequently searched B-tree pages to skip the descent; you cannot create or query it directly, and the B-tree remains the real index |
+| MongoDB hashed index | A normal B-tree whose keys are hashes of the field's values, used to spread a shard key evenly; it supports equality but, like any hash, no ranges or sorting |
+
+Neither replaces a B-tree: one is a cache in front of it, the other is a B-tree over hashed values.
+
+> **Common mistake:** "MongoDB has hash tables for indexes". Every MongoDB index is a WiredTiger B-tree; "hashed" describes the key, not the structure.
+
+## Q7. Why a long text key adds a level
+
+**Question:** why does a 120-byte text key make an index taller than an 8-byte integer key on the same rows?
+
+Fewer entries fit in a page, so fan-out drops and more levels are needed for the same N.
+
+| | 8-byte key | 120-byte key |
+|---|---|---|
+| Entries per leaf | ≈ 366 | ≈ 55 |
+| Fan-out of internal pages | ≈ 286 | ≈ 55 |
+| Height for 50M rows | 4 | 5 |
+
+> **Common mistake:** "the index is bigger but the height is the same". Size and height both follow from entries per page.

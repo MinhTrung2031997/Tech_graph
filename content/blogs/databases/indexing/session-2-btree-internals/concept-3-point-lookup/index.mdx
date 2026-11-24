@@ -1,0 +1,459 @@
+---
+title: "Concept 3: A point lookup, level by level"
+description: "What happens on each page when a B-tree finds one key: the metapage, the root, internal pages, the leaf, the binary search inside each page, and what changes when the key is missing, a split races the search, or the engine has a shortcut. Traced on real lab pages."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "b-tree", "lookup"]
+status: "draft"
+sources:
+  - "https://github.com/postgres/postgres/blob/master/src/backend/access/nbtree/README"
+  - "https://www.postgresql.org/docs/current/pageinspect.html#PAGEINSPECT-B-TREE-FUNCS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-physical-structure.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-adaptive-hash.html"
+  - "https://www.mongodb.com/docs/manual/core/clustered-collections/"
+  - "https://www.mongodb.com/docs/manual/reference/explain-results/"
+---
+
+<Tldr>
+A point lookup reads **one page per level**: root, internal pages, leaf. On each page it binary-searches the sorted keys (about 9 comparisons for 300 keys) to pick the one child to follow. In the lab, `WHERE id = 500000` reads root block 412 → internal block 1,270 → leaf block 1,373 → heap page 5,050: **4 pages**, `Buffers: shared hit=4`. A missing key costs the same descent and **no** table visit (3 pages). InnoDB ends at the leaf because the leaf is the row; MongoDB, on a normal collection, descends two B-trees: the `_id` index, then the collection.
+</Tldr>
+
+## One page per level
+
+| Level | What the page holds | What the search does on it |
+|---|---|---|
+| Root | A few separators (10 in `orders_pkey`) | Binary search → the child whose range contains the key |
+| Internal | Hundreds of separators (286 in block 1,270) | Same, one level down |
+| Leaf | Entries `key → row pointer` (366 in block 1,373) | Binary search → the entry, or the place it would be |
+| Table (PostgreSQL heap, MongoDB collection) | The row | Fetch it by its pointer (Concept 4) |
+
+Inside a page, the keys are sorted, so the search is a **binary search**: ⌈log₂(366)⌉ = 9 comparisons on the leaf, 9 on the internal page, 4 on the root. About 20 comparisons in total, a few hundred nanoseconds. The page reads are what cost.
+
+## PostgreSQL: descending orders_pkey
+
+| Term | Meaning |
+|---|---|
+| Metapage | Block 0: holds the root's block number (412) and level (2). Read once per connection, then cached |
+| Separator | An internal-page key: "everything from this key up to the next separator is under this child" |
+| High key | The first item of a non-rightmost page: the upper bound of keys on that page (Concept 2) |
+| **✓ Found** | The leaf has an entry for the key; Postgres fetches the heap row |
+| **✗ Not found** | The leaf has no entry; the search stops with no heap visit |
+| **Move right** | The key is above this page's high key (a split happened during the descent): follow the right-link |
+
+<Flow
+  title="PostgreSQL: a point lookup in orders_pkey"
+  height={360}
+  nodes={[
+    { id: 'q', label: 'Index Scan', sub: 'orders_pkey', x: 20, y: 20, w: 170 },
+    { id: 'meta', label: 'Metapage', sub: 'block 0: root = 412', x: 280, y: 20, w: 200 },
+    { id: 'root', label: 'Root', sub: 'block 412, 10 keys', x: 570, y: 20, w: 210 },
+    { id: 'int', label: 'Internal', sub: '', x: 570, y: 140, w: 210 },
+    { id: 'leaf', label: 'Leaf', sub: '', x: 290, y: 140, w: 200 },
+    { id: 'right', label: 'Right neighbour', sub: '', x: 20, y: 140, w: 190 },
+    { id: 'found', label: '✓ Found', sub: '', x: 20, y: 270, w: 180 },
+    { id: 'nf', label: '✗ Not found', sub: 'no heap visit', x: 560, y: 270, w: 220 },
+    { id: 'heap', label: 'Heap page', sub: '', x: 260, y: 270, w: 150 },
+  ]}
+  edges={[
+    { id: 'q-meta', from: 'q', to: 'meta' },
+    { id: 'meta-root', from: 'meta', to: 'root' },
+    { id: 'root-int', from: 'root', to: 'int' },
+    { id: 'int-leaf', from: 'int', to: 'leaf' },
+    { id: 'leaf-right', from: 'leaf', to: 'right', label: 'move right' },
+    { id: 'leaf-found', from: 'leaf', to: 'found' },
+    { id: 'right-found', from: 'right', to: 'found', quiet: true },
+    { id: 'leaf-nf', from: 'leaf', to: 'nf' },
+    { id: 'found-heap', from: 'found', to: 'heap', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Key found: id = 500,000',
+      path: 'root 412 → internal 1,270 → leaf 1,373 ✓ found → heap (5050,50)',
+      summary: 'Buffers: shared hit=4: three index pages and one heap page.',
+      steps: [
+        {
+          title: 'Where is the root?',
+          note: 'The first index access in a connection reads the metapage (block 0) to learn that the root is block 412 at level 2, and caches it. That is why the very first lookup in a new connection shows a few extra buffers.',
+          code: 'SELECT * FROM orders WHERE id = 500000;',
+          active: ['q', 'meta'],
+          edges: ['q-meta'],
+        },
+        {
+          title: 'Root (block 412): pick a child',
+          note: 'Separators: −∞, 104,311, 208,621, … 417,241, 521,551 … Binary search: 500,000 ≥ 417,241 and < 521,551, so follow the downlink of 417,241 to block 1,270. Four comparisons.',
+          active: ['meta', 'root'],
+          edges: ['meta-root'],
+          subs: { root: 'block 412: → 1,270' },
+        },
+        {
+          title: 'Internal (block 1,270): pick a leaf',
+          note: '286 separators, one per leaf, ≈ 366 ids apart. Binary search finds 499,957 ≤ 500,000 < 500,323: follow it to leaf block 1,373. Nine comparisons.',
+          active: ['root', 'int'],
+          edges: ['root-int'],
+          subs: { int: 'block 1,270: → 1,373' },
+        },
+        {
+          title: 'Leaf (block 1,373): find the entry',
+          note: 'The leaf holds ids 499,957–500,322, high key 500,323. 500,000 is below the high key, so it belongs here. Binary search over 366 entries finds 500,000 → ctid (5050,50).',
+          active: ['int', 'leaf'],
+          edges: ['int-leaf'],
+          subs: { leaf: '1,373: 500,000 → (5050,50)' },
+        },
+        {
+          title: '✓ Found: fetch the heap row',
+          note: 'One more page: heap page 5,050, line pointer 50. Total 3 index pages + 1 heap page = Buffers: shared hit=4.',
+          active: ['leaf', 'found', 'heap'],
+          edges: ['leaf-found', 'found-heap'],
+          subs: { heap: 'page 5,050, slot 50' },
+        },
+      ],
+    },
+    {
+      title: 'Key missing: id = 1,500,000',
+      path: 'root 412 → internal 2,700 → rightmost leaf 2,744 ✗ not found → stop',
+      summary: 'Buffers: shared hit=3: the full descent, but no heap page.',
+      steps: [
+        {
+          title: 'Root: the last child',
+          note: 'The root location is already cached from the metapage. 1,500,000 is above every separator, so the search follows the last downlink, 938,791 → block 2,700.',
+          code: 'SELECT * FROM orders WHERE id = 1500000;',
+          active: ['q', 'meta', 'root'],
+          edges: ['meta-root'],
+          subs: { root: 'block 412: → 2,700' },
+        },
+        {
+          title: 'Internal (block 2,700): the last leaf',
+          note: 'This is the rightmost internal page (168 separators). The last separator, 999,913, leads to block 2,744.',
+          active: ['root', 'int'],
+          edges: ['root-int'],
+          subs: { int: 'block 2,700: → 2,744' },
+        },
+        {
+          title: 'Leaf (block 2,744): no entry',
+          note: 'The rightmost leaf holds ids 999,913–1,000,000 and has no high key (nothing is to its right). The binary search ends past the last entry: 1,500,000 is not here.',
+          active: ['int', 'leaf', 'nf'],
+          edges: ['int-leaf', 'leaf-nf'],
+          subs: { leaf: 'block 2,744: last 88 ids' },
+        },
+        {
+          title: '✗ Not found: 3 pages',
+          note: 'No entry means no ctid, so the heap is never touched: Buffers: shared hit=3, rows=0. A missing-key lookup costs the index height, nothing more. This is also how a unique index checks an INSERT for duplicates.',
+          active: ['nf'],
+        },
+      ],
+    },
+    {
+      title: 'A split races the search',
+      path: 'internal points to leaf A → A split meanwhile → key above A\'s high key → move right to B ✓ found',
+      summary: 'Lehman–Yao: readers take no lock on the tree; a split never makes them fail, they just move right.',
+      subs: { int: 'block 1,270', leaf: 'leaf A (was 1,373)', right: 'leaf B (new)' },
+      steps: [
+        {
+          title: 'The search reads the internal page',
+          note: 'A reader looking for id 500,300 reads block 1,270, which says: 499,957 → leaf 1,373. It releases block 1,270 before reading the leaf; no lock is held across levels.',
+          code: 'SELECT * FROM orders WHERE id = 500300;',
+          active: ['root', 'int'],
+          edges: ['root-int'],
+        },
+        {
+          title: 'Meanwhile, the leaf splits',
+          note: 'An insert fills leaf 1,373 and splits it: the upper half (from 500,150, say) moves to a new page B, leaf A\'s high key becomes 500,150, and A\'s right-link now points to B. The parent gets its new separator a moment later.',
+          active: ['leaf', 'right'],
+          subs: { leaf: 'leaf A: high key 500,150' },
+        },
+        {
+          title: 'Key above the high key: move right',
+          note: 'The reader arrives at leaf A, compares 500,300 with A\'s high key 500,150, sees the key cannot be here, and follows the right-link to B.',
+          active: ['leaf', 'right'],
+          edges: ['leaf-right'],
+        },
+        {
+          title: '✓ Found on the right neighbour',
+          note: 'Leaf B has 500,300 → its ctid. The cost was one extra page. This "move right" rule is why PostgreSQL B-tree reads never block on splits.',
+          active: ['right', 'found', 'heap'],
+          edges: ['right-found', 'found-heap'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL InnoDB: descending the clustered index
+
+| Term | Meaning |
+|---|---|
+| Page directory | An array of slots at the end of each InnoDB page, each pointing at every 4th–8th record; InnoDB binary-searches the slots, then walks at most 8 records |
+| Leaf = row | The clustered index leaf holds the whole row (Session 1, Concept 2), so the descent ends with the data |
+| Adaptive hash index (AHI) | An in-memory hash InnoDB builds over B-tree pages it sees searched repeatedly; a hit jumps straight to the record |
+| **✓ AHI hit / ✗ AHI miss** | Hit: skip the descent. Miss (or AHI off): descend normally |
+| **✓ Found / ✗ Not found** | Whether the leaf has a record with that key |
+
+<Flow
+  title="InnoDB: a point lookup by primary key"
+  height={350}
+  nodes={[
+    { id: 'q', label: 'WHERE id = 42', sub: 'type: const', x: 20, y: 20, w: 170 },
+    { id: 'ahiHit', label: '✓ AHI hit', sub: 'jump to the record', x: 280, y: 20, w: 200 },
+    { id: 'ahiMiss', label: '✗ AHI miss', sub: 'descend the tree', x: 20, y: 140, w: 170 },
+    { id: 'root', label: 'Root', sub: 'level 2', x: 280, y: 140, w: 150 },
+    { id: 'int', label: 'Internal', sub: 'level 1', x: 480, y: 140, w: 140 },
+    { id: 'leaf', label: 'Leaf = row', sub: 'level 0, 16 KB', x: 660, y: 140, w: 120 },
+    { id: 'found', label: '✓ Found', sub: 'full row in the leaf', x: 380, y: 270, w: 200 },
+    { id: 'nf', label: '✗ Not found', sub: '3 pages, empty result', x: 620, y: 270, w: 160 },
+  ]}
+  edges={[
+    { id: 'q-hit', from: 'q', to: 'ahiHit' },
+    { id: 'q-miss', from: 'q', to: 'ahiMiss' },
+    { id: 'miss-root', from: 'ahiMiss', to: 'root' },
+    { id: 'root-int', from: 'root', to: 'int' },
+    { id: 'int-leaf', from: 'int', to: 'leaf' },
+    { id: 'leaf-found', from: 'leaf', to: 'found' },
+    { id: 'leaf-nf', from: 'leaf', to: 'nf' },
+  ]}
+  cases={[
+    {
+      title: 'Normal descent',
+      path: '✗ AHI miss → root → internal → leaf ✓ found: the row itself',
+      summary: 'Measured: 3 page requests (Innodb_buffer_pool_read_requests).',
+      steps: [
+        {
+          title: 'Adaptive hash index: ✗ miss',
+          note: 'InnoDB first checks whether the AHI has a shortcut for this key on this index. For a key nobody has looked up recently, it does not.',
+          code: 'SELECT * FROM orders WHERE id = 42;',
+          active: ['q', 'ahiMiss'],
+          edges: ['q-miss'],
+        },
+        {
+          title: 'Root page: page directory search',
+          note: 'The root\'s page directory slots are binary-searched to the node pointer record covering id 42, which names the child page. With 4,203 leaves and ≈ 900 node pointers per 16 KB page, there is one internal level.',
+          active: ['ahiMiss', 'root'],
+          edges: ['miss-root'],
+        },
+        {
+          title: 'Internal page',
+          note: 'Same search one level down: the node pointer for ids 1–238 points at the first leaf.',
+          active: ['root', 'int'],
+          edges: ['root-int'],
+        },
+        {
+          title: 'Leaf: the row',
+          note: 'The leaf\'s directory narrows to a group of ≤ 8 records; a short walk finds id 42. The record is the whole row (customer_id, status, …).',
+          active: ['int', 'leaf'],
+          edges: ['int-leaf'],
+        },
+        {
+          title: '✓ Found: 3 pages, no extra hop',
+          note: 'The lab measured exactly 3 page requests: root, internal, leaf. PostgreSQL needs a 4th page (the heap) for the same query.',
+          active: ['leaf', 'found'],
+          edges: ['leaf-found'],
+        },
+      ],
+    },
+    {
+      title: 'Adaptive hash shortcut',
+      path: '✓ AHI hit → straight to the record on the leaf; no root or internal page',
+      summary: 'Hot keys searched again and again can skip the descent entirely.',
+      steps: [
+        {
+          title: 'Repeated lookups on the same pages',
+          note: 'InnoDB notices that searches keep landing on the same leaf page with the same search pattern, and builds hash entries for its records (innodb_adaptive_hash_index is ON by default in 8.0, OFF by default since 8.4).',
+          code: 'SET GLOBAL innodb_adaptive_hash_index = ON;\nSELECT * FROM orders WHERE id = 42;  -- many times',
+          active: ['q'],
+        },
+        {
+          title: '✓ AHI hit',
+          note: 'hash(42) on this index → a pointer to the record in the cached leaf page.',
+          active: ['q', 'ahiHit'],
+          edges: ['q-hit'],
+        },
+        {
+          title: '✓ Found without descending',
+          note: 'One page touched instead of three. The AHI is a cache: it only covers pages already in the buffer pool and is dropped and rebuilt as the workload changes. Under heavy concurrent writes its latches can become a bottleneck, which is why 8.4 turned it off by default.',
+          active: ['ahiHit', 'found'],
+        },
+      ],
+    },
+    {
+      title: 'Key missing',
+      path: '✗ AHI miss → root → internal → leaf ✗ not found',
+      summary: 'Same three pages, empty result.',
+      steps: [
+        {
+          title: 'Descend as usual',
+          note: 'Root, then the internal page for the highest range.',
+          code: 'SELECT * FROM orders WHERE id = 2000000;',
+          active: ['q', 'ahiMiss', 'root', 'int'],
+          edges: ['q-miss', 'miss-root', 'root-int'],
+        },
+        {
+          title: '✗ Not found on the last leaf',
+          note: 'The rightmost leaf ends at id 1,000,000. Three pages read, no row.',
+          active: ['int', 'leaf', 'nf'],
+          edges: ['int-leaf', 'leaf-nf'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: _id lookup
+
+| Term | Meaning |
+|---|---|
+| `EXPRESS_IXSCAN` | MongoDB 8.0's fast path for simple equality lookups on `_id` (and some unique indexes): skips query planning |
+| Two B-trees | Normal collection: `_id` index (key → RecordId), then the collection B-tree (RecordId → document) |
+| Clustered collection | The collection B-tree is keyed by `_id` itself: one descent (Session 1, Concept 2) |
+| **✓ Found / ✗ Not found** | Whether the `_id` index has the key |
+
+<Flow
+  title="MongoDB: find({ _id: 42 })"
+  height={350}
+  nodes={[
+    { id: 'q', label: 'find({ _id: 42 })', sub: 'EXPRESS_IXSCAN', x: 20, y: 20, w: 200 },
+    { id: 'iroot', label: '_id index root', sub: '', x: 300, y: 20, w: 190 },
+    { id: 'ileaf', label: '_id index leaf', sub: '42 → RecordId 42', x: 570, y: 20, w: 210 },
+    { id: 'nf', label: '✗ Not found', sub: 'no collection visit', x: 570, y: 140, w: 210 },
+    { id: 'croot', label: 'Collection root', sub: 'keyed by RecordId', x: 300, y: 140, w: 190 },
+    { id: 'cleaf', label: 'Collection leaf', sub: 'the document', x: 20, y: 140, w: 200 },
+    { id: 'found', label: '✓ Found', sub: '1 key, 1 document', x: 20, y: 270, w: 200 },
+  ]}
+  edges={[
+    { id: 'q-iroot', from: 'q', to: 'iroot' },
+    { id: 'iroot-ileaf', from: 'iroot', to: 'ileaf', label: 'descend' },
+    { id: 'ileaf-nf', from: 'ileaf', to: 'nf' },
+    { id: 'ileaf-croot', from: 'ileaf', to: 'croot', label: 'RecordId' },
+    { id: 'croot-cleaf', from: 'croot', to: 'cleaf', label: 'descend' },
+    { id: 'cleaf-found', from: 'cleaf', to: 'found' },
+    { id: 'q-croot', from: 'q', to: 'croot', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Normal collection',
+      path: '_id index root → … → leaf ✓ → RecordId → collection root → … → leaf: the document',
+      summary: 'Two descents (depth 3 each in the lab): keys examined 1, documents examined 1.',
+      steps: [
+        {
+          title: 'Express path, no planning',
+          note: 'An equality on _id is answered by the express path: there is only one sensible plan, so MongoDB skips plan selection.',
+          code: 'db.orders.find({ _id: 42 })',
+          active: ['q', 'iroot'],
+          edges: ['q-iroot'],
+        },
+        {
+          title: 'Descend the _id index',
+          note: 'The _id_ index has depth 3 in the lab. The leaf entry is 42 → RecordId 42 (equal here, because the seed inserted _id in order).',
+          active: ['iroot', 'ileaf'],
+          edges: ['iroot-ileaf'],
+        },
+        {
+          title: 'Descend the collection B-tree',
+          note: 'The RecordId is a key into a second B-tree, the collection itself, also depth 3. Its leaf holds the BSON document.',
+          active: ['ileaf', 'croot', 'cleaf'],
+          edges: ['ileaf-croot', 'croot-cleaf'],
+        },
+        {
+          title: '✓ Found',
+          note: 'explain: EXPRESS_IXSCAN, totalKeysExamined 1, totalDocsExamined 1. Two descents, like PostgreSQL\'s index + heap, but the second step is a full tree descent rather than a direct page address.',
+          active: ['cleaf', 'found'],
+          edges: ['cleaf-found'],
+        },
+      ],
+    },
+    {
+      title: 'Clustered collection',
+      path: 'collection B-tree keyed by _id: root → … → leaf ✓ the document',
+      summary: 'No separate _id index: one descent, like InnoDB.',
+      subs: { croot: 'keyed by _id', iroot: '(none)', ileaf: '(none)' },
+      steps: [
+        {
+          title: 'Straight into the collection',
+          note: 'In a clustered collection, documents are stored in _id order in the collection B-tree. There is no _id index to search first.',
+          code: 'db.createCollection("orders_c", { clusteredIndex: { key: { _id: 1 }, unique: true } })\ndb.orders_c.find({ _id: 42 })',
+          active: ['q', 'croot'],
+          edges: ['q-croot'],
+        },
+        {
+          title: '✓ Found in one descent',
+          note: 'Root → internal → leaf holding _id 42. The price is paid on inserts: random _id values split collection pages, like UUIDv4 in InnoDB.',
+          active: ['croot', 'cleaf', 'found'],
+          edges: ['croot-cleaf', 'cleaf-found'],
+        },
+      ],
+    },
+    {
+      title: 'Key missing',
+      path: '_id index root → … → leaf ✗ not found → collection never visited',
+      summary: 'Keys examined 0, documents examined 0.',
+      steps: [
+        {
+          title: 'Descend the _id index',
+          note: 'Same first descent.',
+          code: 'db.orders.find({ _id: 2000000 })',
+          active: ['q', 'iroot', 'ileaf'],
+          edges: ['q-iroot', 'iroot-ileaf'],
+        },
+        {
+          title: '✗ Not found',
+          note: 'No entry, no RecordId, so the collection B-tree is not touched.',
+          active: ['ileaf', 'nf'],
+          edges: ['ileaf-nf'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## The engines side by side
+
+`WHERE id = 42` / `{ _id: 42 }` on the lab's 1M rows:
+
+| | PostgreSQL | InnoDB | MongoDB (normal) | MongoDB (clustered) |
+|---|---|---|---|---|
+| Trees descended | 1 (index), then a direct heap page | 1 (the table) | 2 (`_id` index, collection) | 1 |
+| Pages for a found key | 3 + 1 heap = 4 | 3 | ≈ 3 + 3 | ≈ 3 |
+| Pages for a missing key | 3 | 3 | ≈ 3 | ≈ 3 |
+| Shortcut | Root location cached per connection | Adaptive hash index (off by default in 8.4) | Express path skips planning, not pages |
+
+<Pitfall>
+Measuring a lookup with a fresh connection each time (`psql -c` in a loop, a connection pool that reconnects) overstates its cost: the first index access in a PostgreSQL connection also reads the metapage and builds relation caches. In the lab, the same lookup showed 7 buffers on a new connection and 4 after a warm-up query.
+</Pitfall>
+
+## Real-world scenario: why "it's indexed" can still mean 5 ms
+
+A lookup by primary key takes 0.05 ms in testing and 5 ms in production under load, with the same plan.
+
+| Cause | Why | Check |
+|---|---|---|
+| Leaf and heap pages not cached | 3 index levels are hot, but with a big table the leaf and heap page come from disk: 2 random reads | `Buffers: shared read=` in `EXPLAIN (ANALYZE, BUFFERS)` |
+| New connection per request | Metapage and catalog reads on every first query | Use a connection pool that keeps connections open |
+| Many lookups instead of one | An N+1 loop of 200 lookups × 4 pages | Batch: `WHERE id = ANY($1)` |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 4: index entry to row | What happens after "✓ found" |
+| Concept 5: range scans | Start with this descent, then walk the leaves |
+| Session 5: unique indexes | A duplicate check is exactly the "missing key" descent |
+| Session 3: cost model | The planner prices an index lookup as height + table pages |
+
+## Key takeaways
+
+1. A point lookup reads one page per level: root, internal pages, leaf; a few levels even for millions of rows.
+2. Inside each page, a binary search over sorted keys picks the child; comparisons are cheap, page reads are not.
+3. PostgreSQL finds the root via the metapage (cached per connection); `id = 500000` costs 3 index pages + 1 heap page.
+4. A missing key costs the descent only: no table visit.
+5. Lehman–Yao high keys and right-links let readers move right instead of blocking on splits.
+6. InnoDB ends at the leaf because the leaf is the row; its adaptive hash index can skip the descent for hot keys.
+7. A normal MongoDB collection needs two descents (`_id` index, then collection); a clustered one needs one.
+
+## Check questions
+
+1. Trace `WHERE id = 500000` in the lab: name each page read, what it contains, and how the next page is chosen.
+2. How many key comparisons does a binary search need on a leaf with 366 entries, and why does it barely matter for performance?
+3. `WHERE id = 1500000` shows `Buffers: shared hit=3`. Why 3, and why no heap page?
+4. A reader arrives at a leaf whose high key is smaller than the key it is looking for. What happened, and what does it do?
+5. Why does an InnoDB primary-key lookup read 3 pages while the PostgreSQL one reads 4?
+6. A MongoDB `find({ _id: x })` on a normal collection and on a clustered collection: how many B-tree descents each?
+7. The same lookup shows 7 buffers in one test and 4 in another. Give a likely reason.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-2-btree-internals/concept-3-point-lookup/answers">Worked answers to Q1–Q7</DeepDive>

@@ -1,0 +1,357 @@
+---
+title: "Lab and session quiz: B-tree internals"
+description: "Open the lab's B-trees page by page: find the root, follow a lookup to its leaf, look inside pages, build indexes with and without deduplication, walk a range, and cause page splits on purpose in PostgreSQL, MySQL and MongoDB."
+type: "how-to"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "b-tree", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pageinspect.html"
+  - "https://www.postgresql.org/docs/current/pgstattuple.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-information-schema-metrics-table.html"
+  - "https://www.mongodb.com/docs/manual/reference/command/collStats/"
+---
+
+<Tldr>
+Uses the containers and `orders` data from the [Session 1 lab](/blogs/databases/indexing/session-1-storage-basics/lab). Every page number below comes from a fresh seed on `postgres:17` and should match yours exactly, because the data and insert order are deterministic. If you ran the Session 1 exercises, reseed first (`docker exec -i idx-pg psql -U postgres < pg-seed.sql`).
+</Tldr>
+
+## Setup
+
+```sql
+-- pg
+CREATE EXTENSION IF NOT EXISTS pageinspect;   -- read raw pages
+CREATE EXTENSION IF NOT EXISTS pgstattuple;   -- index statistics
+
+-- Decode a little-endian bigint key from bt_page_items().data (NULL for the minus-infinity downlink).
+CREATE OR REPLACE FUNCTION bt_key(data text) RETURNS bigint LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE WHEN coalesce(data, '') = '' THEN NULL
+              ELSE ('x' || string_agg(b, '' ORDER BY i DESC))::bit(64)::bigint END
+  FROM unnest(string_to_array(data, ' ')) WITH ORDINALITY AS t(b, i)
+$$;
+```
+
+## Exercise 1: the shape of orders_pkey (Concept 1)
+
+```sql
+-- pg
+SELECT root, level FROM bt_metap('orders_pkey');
+SELECT tree_level, internal_pages, leaf_pages, avg_leaf_density FROM pgstatindex('orders_pkey');
+```
+
+```text
+ root | level
+------+-------
+  412 |     2
+
+ tree_level | internal_pages | leaf_pages | avg_leaf_density
+------------+----------------+------------+------------------
+          2 |             11 |       2733 |            90.06
+```
+
+**What to notice:** level 2 means three levels: root (level 2), internal pages (level 1), leaves (level 0). 11 internal pages = the root + 10 children. 1M keys / 2,733 leaves ≈ 366 keys per leaf.
+
+In MySQL and MongoDB:
+
+```sql
+-- my
+SELECT index_name, stat_name, stat_value FROM mysql.innodb_index_stats
+WHERE table_name = 'orders' AND stat_name IN ('n_leaf_pages', 'size');
+-- PRIMARY n_leaf_pages 4203, size 4263
+```
+
+```js
+// mg
+db.orders.stats({ indexDetails: true }).indexDetails._id_.btree['maximum tree depth']   // 3
+```
+
+## Exercise 2: follow a lookup by hand (Concept 3)
+
+Read the root and pick the child for `id = 500000`:
+
+```sql
+-- pg
+SELECT itemoffset, ctid, bt_key(data) AS key FROM bt_page_items('orders_pkey', 412);
+```
+
+```text
+ itemoffset |   ctid   |  key
+------------+----------+--------
+          1 | (3,0)    |            ← minus infinity
+          2 | (411,1)  | 104311
+          …
+          5 | (1270,1) | 417241     ← 417,241 ≤ 500,000 < 521,551: go to block 1,270
+          6 | (1556,1) | 521551
+          …
+```
+
+On internal pages, the ctid's first number is the **child block**. Next level:
+
+```sql
+SELECT itemoffset, ctid, bt_key(data) AS key FROM bt_page_items('orders_pkey', 1270)
+WHERE bt_key(data) BETWEEN 499000 AND 500400;
+```
+
+```text
+ itemoffset |   ctid   |  key
+------------+----------+--------
+        227 | (1372,1) | 499591
+        228 | (1373,1) | 499957     ← go to leaf 1,373
+        229 | (1374,1) | 500323
+```
+
+And the leaf:
+
+```sql
+SELECT itemoffset, ctid, bt_key(data) AS key FROM bt_page_items('orders_pkey', 1373)
+WHERE itemoffset IN (1, 2, 45, 367);
+```
+
+```text
+ itemoffset |   ctid    |  key
+------------+-----------+--------
+          1 | (5053,1)  | 500323     ← high key: the next leaf's first key
+          2 | (5050,7)  | 499957
+         45 | (5050,50) | 500000     ← the entry: heap page 5,050, slot 50
+        367 | (5053,75) | 500322
+```
+
+Now let Postgres do it, with a warm-up query first so the metapage lookup is not counted:
+
+```sql
+SELECT 1 FROM orders WHERE id = 1;  -- warm-up on this connection
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE id = 500000;   -- Buffers: shared hit=4
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE id = 1500000;  -- Buffers: shared hit=3, rows=0
+```
+
+## Exercise 3: inside a page (Concept 2)
+
+```sql
+-- pg
+SELECT lower, upper, special FROM page_header(get_raw_page('orders_pkey', 1373));
+SELECT live_items, free_size, btpo_prev, btpo_next, btpo_level FROM bt_page_stats('orders_pkey', 1373);
+SELECT live_items, free_size, btpo_prev, btpo_next, btpo_level FROM bt_page_stats('orders_pkey', 1270);
+```
+
+```text
+ lower | upper | special
+-------+-------+---------
+  1492 |  2304 |    8176
+
+ leaf 1373:     live_items 367, free_size 808,  prev 1372, next 1374, level 0
+ internal 1270: live_items 286, free_size 2436, prev 984,  next 1556, level 1
+```
+
+**What to notice:** 24 + 367 × 4 = 1,492 (`lower`); entries from 2,304 to 8,175; 16 bytes of special space with the links. The leaf has 10% free (fill factor 90), the internal page 30% (built 70% full).
+
+## Exercise 4: build indexes, with and without deduplication (Concept 2)
+
+```sql
+-- pg
+\timing on
+CREATE INDEX orders_customer_idx     ON orders (customer_id);
+CREATE INDEX orders_customer_nodedup ON orders (customer_id) WITH (deduplicate_items = off);
+CREATE INDEX orders_status_idx       ON orders (status);
+CREATE INDEX orders_status_nodedup   ON orders (status) WITH (deduplicate_items = off);
+
+SELECT c.relname, pg_size_pretty(pg_relation_size(c.oid)) AS size, s.leaf_pages
+FROM pg_class c, pgstatindex(c.oid::regclass) s
+WHERE c.relname LIKE 'orders_%' AND c.relkind = 'i' ORDER BY 1;
+
+SELECT itemoffset, itemlen, tids[1:3] FROM bt_page_items('orders_customer_idx', 1) LIMIT 3;
+```
+
+```text
+ orders_customer_idx     | 9088 kB | 1130
+ orders_customer_nodedup | 21 MB   | 2733
+ orders_pkey             | 21 MB   | 2733
+ orders_status_idx       | 6840 kB |  848
+ orders_status_nodedup   | 25 MB   | 3172
+
+ itemoffset | itemlen | tids
+------------+---------+---------------------------------------
+          1 |      16 |                                          ← high key
+          2 |      88 | {"(1041,36)","(2565,90)","(2574,51)"}   ← customer 1: 12 ctids in 88 bytes
+```
+
+Each build took 110–200 ms. Force a sort spill and compare:
+
+```sql
+SET maintenance_work_mem = '1MB';
+SET client_min_messages = log;
+SET trace_sort = on;
+CREATE INDEX tmp_amount ON orders (amount);   -- "switching to external sort", 44 runs, ≈ 340 ms
+RESET maintenance_work_mem;
+DROP INDEX tmp_amount;
+CREATE INDEX tmp_amount ON orders (amount);   -- "internal sort … ended, 40202 KB used", ≈ 290 ms
+DROP INDEX tmp_amount, orders_customer_nodedup, orders_status_idx, orders_status_nodedup;
+```
+
+The same index in the other engines:
+
+```sql
+-- my
+CREATE INDEX orders_customer_idx ON orders (customer_id);   -- ≈ 1.5 s, 1,078 leaves
+```
+
+```js
+// mg
+db.orders.createIndex({ customer_id: 1 });   // ≈ 0.6 s
+db.orders.stats().indexSizes                  // customer_id_1: ≈ 6.8 MB
+```
+
+## Exercise 5: from entry to row (Concept 4)
+
+```sql
+-- pg
+SELECT 1;   -- warm-up
+SET enable_bitmapscan = off;   -- force a plain Index Scan for this experiment
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE customer_id = 7;            -- rows=7, Buffers: shared hit=10
+EXPLAIN (ANALYZE, BUFFERS) SELECT customer_id FROM orders WHERE customer_id = 7;  -- Index Only Scan, Heap Fetches: 0, hit=4
+RESET enable_bitmapscan;
+SELECT id, ctid FROM orders WHERE customer_id = 7 ORDER BY id;   -- 7 rows on 7 different heap pages
+```
+
+A HOT chain, using id 7 (the Session 1 lab's Exercise 3 updates, then a VACUUM):
+
+```sql
+UPDATE orders SET status = 'shipped'   WHERE id = 7;   -- not HOT: moves to page 10,101
+UPDATE orders SET status = 'delivered' WHERE id = 7;   -- HOT: same page
+VACUUM orders;
+SELECT lp, lp_flags, t_ctid FROM heap_page_items(get_raw_page('orders', 10101));
+```
+
+```text
+ lp | lp_flags |  t_ctid
+----+----------+-----------
+  1 |        1 | (10101,1)   ← id 1,000,000
+  2 |        2 |             ← redirect (to slot 3): the index still points here
+  3 |        1 | (10101,3)   ← id 7, the live version
+```
+
+In MySQL, compare a covering and a non-covering query by page requests (the `@b` pattern from Session 1, Exercise 4):
+
+```text
+SELECT id FROM orders WHERE customer_id = 7;              → ≈ 9 page requests  (Extra: Using index)
+SELECT id, customer_id, status FROM orders WHERE …;       → ≈ 50 page requests (10 primary-key lookups)
+```
+
+In MongoDB:
+
+```js
+// mg
+db.orders.find({ customer_id: 7 }).explain('executionStats').executionStats.totalDocsExamined                        // 10
+db.orders.find({ customer_id: 7 }, { _id: 0, customer_id: 1 }).explain('executionStats').executionStats.totalDocsExamined  // 0
+```
+
+## Exercise 6: walk a range (Concept 5)
+
+```sql
+-- pg
+SELECT 1;
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE id BETWEEN 200000 AND 201000;   -- rows=1001, ≈ 20 buffers
+EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM orders WHERE id BETWEEN 200000 AND 201000;  -- Index Only Scan, 7 buffers
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders ORDER BY id DESC LIMIT 10;            -- Index Scan Backward, 5 buffers
+SELECT btpo_next FROM bt_page_stats('orders_pkey', 550);   -- 551: the right-link the scan follows
+```
+
+```js
+// mg
+db.orders.find({ _id: { $gte: 100000, $lte: 101000 } }).explain('executionStats').executionStats.totalKeysExamined   // 1001
+db.orders.find().sort({ _id: -1 }).limit(10).explain('executionStats').executionStats.totalKeysExamined             // 10
+```
+
+## Exercise 7: cause page splits (Concept 6)
+
+A root split, then a middle split, on a small table of multiples of 10:
+
+```sql
+-- pg
+CREATE TABLE split_demo (id bigint PRIMARY KEY);
+INSERT INTO split_demo SELECT g * 10 FROM generate_series(1, 400) g;
+SELECT root, level FROM bt_metap('split_demo_pkey');                     -- root 1, level 0: one page
+INSERT INTO split_demo SELECT g * 10 FROM generate_series(401, 420) g;
+SELECT root, level FROM bt_metap('split_demo_pkey');                     -- root 3, level 1: the root split
+SELECT blkno, live_items, free_size, btpo_next FROM bt_page_stats('split_demo_pkey', 1)
+UNION ALL SELECT blkno, live_items, free_size, btpo_next FROM bt_page_stats('split_demo_pkey', 2);
+-- block 1: 367 items (366 + high key), 808 B free · block 2: 54 items
+```
+
+Grow it, then overfill one leaf in the middle:
+
+```sql
+INSERT INTO split_demo SELECT g * 10 FROM generate_series(421, 100000) g;
+SELECT pg_relation_size('split_demo_pkey') / 8192 AS blocks;                                   -- 276
+SELECT live_items, free_size, btpo_next FROM bt_page_stats('split_demo_pkey', 138);            -- 367, 808, 139
+-- 41 keys between the multiples of 10 inside leaf 138's range (497,770–501,420):
+INSERT INTO split_demo SELECT k FROM generate_series(500001, 500050) k WHERE k % 10 <> 0 LIMIT 40;
+SELECT live_items, free_size FROM bt_page_stats('split_demo_pkey', 138);                       -- 407, 8: full
+INSERT INTO split_demo VALUES (500051);
+SELECT pg_relation_size('split_demo_pkey') / 8192 AS blocks;                                   -- 277: one new page
+SELECT blkno, live_items, free_size, btpo_prev, btpo_next FROM bt_page_stats('split_demo_pkey', 138)
+UNION ALL SELECT blkno, live_items, free_size, btpo_prev, btpo_next FROM bt_page_stats('split_demo_pkey', 276);
+-- 138: 204 items, 4,068 B free, next 276 · 276: 205 items, 4,048 B free, prev 138, next 139
+```
+
+Sequential vs random, 1M keys each, in all three engines:
+
+```sql
+-- pg
+CREATE TABLE seq_keys (id bigint PRIMARY KEY);
+CREATE TABLE rnd_keys (id bigint PRIMARY KEY);
+INSERT INTO seq_keys SELECT g FROM generate_series(1, 1000000) g;
+INSERT INTO rnd_keys SELECT g FROM generate_series(1, 1000000) g ORDER BY random();
+SELECT 'seq', leaf_pages, avg_leaf_density, leaf_fragmentation FROM pgstatindex('seq_keys_pkey')
+UNION ALL SELECT 'rnd', leaf_pages, avg_leaf_density, leaf_fragmentation FROM pgstatindex('rnd_keys_pkey');
+-- seq 2733 90.06 0 · rnd ≈ 3711 ≈ 66.4 ≈ 50
+REINDEX INDEX rnd_keys_pkey;   -- back to 2733 leaves, 90.06
+```
+
+```sql
+-- my
+SET GLOBAL innodb_monitor_enable = 'index_page_splits';
+CREATE TABLE seq_keys (id BIGINT PRIMARY KEY, pad CHAR(40) NOT NULL DEFAULT '');
+CREATE TABLE rnd_keys LIKE seq_keys;
+SET SESSION cte_max_recursion_depth = 1000;
+SET GLOBAL innodb_monitor_reset = 'index_page_splits';
+INSERT INTO seq_keys (id) WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM s WHERE n < 999)
+  SELECT a.n * 1000 + b.n + 1 FROM s a, s b ORDER BY 1;
+SELECT count FROM information_schema.innodb_metrics WHERE name = 'index_page_splits';   -- ≈ 4,449
+SET GLOBAL innodb_monitor_reset = 'index_page_splits';
+INSERT INTO rnd_keys (id) WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM s WHERE n < 999)
+  SELECT a.n * 1000 + b.n + 1 FROM s a, s b ORDER BY RAND();
+SELECT count FROM information_schema.innodb_metrics WHERE name = 'index_page_splits';   -- ≈ 10,800
+ANALYZE TABLE seq_keys, rnd_keys;
+SELECT table_name, stat_value AS leaf_pages FROM mysql.innodb_index_stats
+WHERE table_name IN ('seq_keys', 'rnd_keys') AND index_name = 'PRIMARY' AND stat_name = 'n_leaf_pages';
+-- seq_keys 4445 · rnd_keys ≈ 6347
+```
+
+```js
+// mg: save as mongo-splits.js, docker cp it in, run with mongosh --quiet /mongo-splits.js
+db = db.getSiblingDB('lab');
+const ids = Array.from({ length: 1000000 }, (_, i) => i + 1);
+const shuffled = ids.slice();
+for (let i = shuffled.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]]; }
+for (const [name, order] of [['seq_keys', ids], ['rnd_keys', shuffled]]) {
+  db[name].drop();
+  for (let i = 0; i < order.length; i += 10000) db[name].insertMany(order.slice(i, i + 10000).map(id => ({ _id: id })), { ordered: false });
+}
+db.adminCommand({ fsync: 1 });
+for (const name of ['seq_keys', 'rnd_keys']) printjson({ name, idIndexBytes: db[name].stats().indexSizes._id_ });
+// seq_keys ≈ 11.9 MB · rnd_keys ≈ 12.5 MB
+```
+
+Clean up: `DROP TABLE split_demo, seq_keys, rnd_keys;` in both SQL databases, `db.seq_keys.drop(); db.rnd_keys.drop()` in MongoDB.
+
+## Session quiz
+
+1. `bt_metap('orders_pkey')` says level 2. How many pages does a lookup read in the index, and how many in total for a row that exists?
+2. On root block 412, which child does a search for `id = 650000` follow, and why?
+3. Leaf 1,373's item 1 points at `(5053,1)` with key 500,323. Why does a leaf entry point into page 5,053 when the page's real entries start at page 5,050?
+4. Deduplication shrank `orders_status_idx` from 25 MB to 6.8 MB but `orders_customer_idx` only from 21 MB to 9.1 MB. Why the difference?
+5. `SELECT * FROM orders WHERE customer_id = 7` costs 10 buffers. What would you change so it costs 4, and what is the precondition?
+6. The range `id BETWEEN 200000 AND 201000` read 4 leaves. How many would `id BETWEEN 200000 AND 210000` read, roughly?
+7. In Exercise 7, why did the root split leave block 1 with 366 entries and block 2 with 54, rather than about 210 each?
+8. A table with a UUIDv4 primary key has 30% more leaf pages in PostgreSQL after a year. Would the same table in MongoDB show the same growth in its `_id` index? Why or why not?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-2-btree-internals/lab/answers">Answers to the session quiz</DeepDive>

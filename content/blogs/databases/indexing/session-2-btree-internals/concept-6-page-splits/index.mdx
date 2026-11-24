@@ -1,0 +1,390 @@
+---
+title: "Concept 6: Page splits on insert"
+description: "What happens when an insert lands on a full B-tree page: the page splits, half its entries move to a new page, the parent gets a separator, and occasionally the root splits and the tree grows a level. Measured split by split in PostgreSQL, with sequential vs random inserts compared in all three engines."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "b-tree", "page-split"]
+status: "draft"
+sources:
+  - "https://github.com/postgres/postgres/blob/master/src/backend/access/nbtree/README"
+  - "https://www.postgresql.org/docs/current/pgstattuple.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/index-page-merge-threshold.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-information-schema-metrics-table.html"
+  - "https://source.wiredtiger.com/develop/arch-btree.html"
+---
+
+<Tldr>
+A B-tree stays balanced by **splitting** pages, never by rebalancing the whole tree. When an insert finds its leaf full, the leaf's entries are divided between it and a **new page**, and the parent gets a separator for the new page. If the parent is full it splits too, and a root split adds a level. Where the insert lands decides the split: at the **right edge** (sequential keys) PostgreSQL leaves the old page 90% full; in the **middle** (random keys) it divides 50/50. In the lab, 1M random inserts left the index 38% bigger and 66% full; 1M sequential inserts left it 90% full.
+</Tldr>
+
+## Three kinds of split
+
+| Split | When | Result |
+|---|---|---|
+| **Middle split** | An insert lands inside a full leaf | Entries divided roughly in half: two pages ≈ 50% full |
+| **Rightmost split** | An insert lands at the right end of the rightmost leaf (increasing keys) | PostgreSQL keeps the old page at the fill factor (90%) and starts a nearly empty new page |
+| **Root split** | The root itself is full | A new root above the two halves: the tree is one level taller |
+
+The new page always takes the next free block, usually at the **end of the index file**, so after many middle splits, leaves that are neighbours in key order are far apart on disk.
+
+## PostgreSQL: splits measured on split_demo
+
+The lab table `split_demo (id bigint PRIMARY KEY)` was filled with multiples of 10 (10, 20, 30, …), so there is room to insert keys in between.
+
+| Term | Meaning |
+|---|---|
+| Split point | Where the entries are divided; chosen to balance free space (middle) or to respect the fill factor (rightmost) |
+| Downlink | The parent's new entry: separator key → new page |
+| **✓ Room** | The leaf has enough free space for the entry: insert in place |
+| **✗ Full** | Not enough space: split (PostgreSQL first tries cheaper fixes, such as removing dead duplicates or deduplicating) |
+
+<Flow
+  title="PostgreSQL: inserting into a B-tree leaf"
+  height={360}
+  nodes={[
+    { id: 'ins', label: 'INSERT', sub: '', x: 20, y: 20, w: 170 },
+    { id: 'parent', label: 'Parent', sub: '', x: 560, y: 20, w: 220 },
+    { id: 'newroot', label: 'New root', sub: 'tree +1 level', x: 300, y: 20, w: 200 },
+    { id: 'leaf', label: 'Target leaf', sub: '', x: 20, y: 140, w: 200 },
+    { id: 'room', label: '✓ Room', sub: 'insert in place', x: 20, y: 270, w: 200 },
+    { id: 'full', label: '✗ Full', sub: 'split', x: 300, y: 140, w: 220 },
+    { id: 'left', label: 'Left half', sub: '', x: 300, y: 270, w: 200 },
+    { id: 'right', label: 'New page', sub: '', x: 560, y: 270, w: 220 },
+  ]}
+  edges={[
+    { id: 'ins-leaf', from: 'ins', to: 'leaf' },
+    { id: 'leaf-room', from: 'leaf', to: 'room' },
+    { id: 'leaf-full', from: 'leaf', to: 'full', quiet: true },
+    { id: 'full-left', from: 'full', to: 'left' },
+    { id: 'full-right', from: 'full', to: 'right' },
+    { id: 'left-right', from: 'left', to: 'right', both: true, label: 'links' },
+    { id: 'right-parent', from: 'right', to: 'parent', label: 'downlink' },
+    { id: 'parent-newroot', from: 'parent', to: 'newroot' },
+  ]}
+  cases={[
+    {
+      title: 'Middle split',
+      path: 'leaf 138 ✗ full (407 entries, 8 B free) → split 204 / 209 → new block 276 → parent gets 499,800 → 276',
+      summary: 'Measured: one insert into a full leaf of split_demo_pkey.',
+      subs: { leaf: 'block 138', parent: 'block 3: 274 entries', left: 'block 138', right: 'block 276' },
+      steps: [
+        {
+          title: 'The leaf is nearly full',
+          note: 'Leaf 138 covers ids 497,770–501,420. After 41 inserts of keys between the multiples of 10, it holds 407 entries with 8 bytes free. An entry needs 20 bytes (16 B + 4 B line pointer).',
+          code: 'INSERT INTO split_demo VALUES (500083);',
+          active: ['ins', 'leaf'],
+          edges: ['ins-leaf'],
+          subs: { leaf: '138: 407 entries, 8 B free' },
+        },
+        {
+          title: '✗ Full: split',
+          note: 'The entry does not fit. Postgres picks a split point that leaves both halves about equally free, near the middle of the key range.',
+          active: ['leaf', 'full'],
+          edges: ['leaf-full'],
+        },
+        {
+          title: 'Half the entries move to a new page',
+          note: 'Block 138 keeps 204 entries (497,770–499,790, new high key 499,800). The upper 209 entries go to block 276, which did not exist before: the index file grew from 276 to 277 blocks. Both pages are now about half full (4,068 and 3,968 B free).',
+          active: ['full', 'left', 'right'],
+          edges: ['full-left', 'full-right'],
+          subs: { left: '138: 204 entries, 50%', right: '276: 209 entries, 50%' },
+        },
+        {
+          title: 'Re-link the leaves',
+          note: 'Block 138\'s right-link now points to 276, and 276\'s to 139, which used to follow 138. Key order is 138 → 276 → 139, but on disk 276 is at the end of the file.',
+          active: ['left', 'right'],
+          edges: ['left-right'],
+        },
+        {
+          title: 'The parent gets a downlink',
+          note: 'Internal block 3 gains the entry 499,800 → block 276 (274 → 275 entries). Searches for keys ≥ 499,800 now go straight to 276. Until this step finishes, the high key and right-link let searches find the moved keys (Concept 3, "move right").',
+          active: ['right', 'parent'],
+          edges: ['right-parent'],
+          subs: { parent: 'block 3: 275 entries' },
+        },
+      ],
+    },
+    {
+      title: 'Rightmost split',
+      path: 'rightmost leaf ✗ full → old page kept 90% full (fill factor) → new rightmost page → parent downlink',
+      summary: 'Measured: increasing keys keep leaves 90% full.',
+      subs: { leaf: 'rightmost leaf', parent: 'parent', left: 'old leaf', right: 'new rightmost leaf' },
+      steps: [
+        {
+          title: 'Increasing keys always hit the right edge',
+          note: 'With sequential ids, every insert goes to the rightmost leaf. Most of the time ✓ there is room and the entry is simply added. When it fills, it must split.',
+          code: 'INSERT INTO split_demo VALUES (1000010);  -- above every existing key',
+          active: ['ins', 'leaf', 'room'],
+          edges: ['ins-leaf', 'leaf-room'],
+        },
+        {
+          title: '✗ Full: split at the fill factor',
+          note: 'Postgres recognises a split of the rightmost page caused by an insert at its end, and splits so that the old page keeps exactly fillfactor (90%) worth of entries.',
+          active: ['leaf', 'full'],
+          edges: ['leaf-full'],
+        },
+        {
+          title: 'Old page 90%, new page almost empty',
+          note: 'Nothing will ever be inserted into the old page again (keys only grow), so leaving it 90% full wastes little. The new page receives all future inserts.',
+          active: ['full', 'left', 'right'],
+          edges: ['full-left', 'full-right'],
+          subs: { left: 'old: 90% full', right: 'new: a few entries' },
+        },
+        {
+          title: 'Parent downlink',
+          note: 'The parent gets a separator for the new page. After 100,000 sequential inserts, split_demo_pkey had 274 leaves at 89.8% average density.',
+          active: ['right', 'parent'],
+          edges: ['right-parent'],
+        },
+      ],
+    },
+    {
+      title: 'Root split',
+      path: 'single leaf = root ✗ full (400 entries) → split 367 / 54 → new root block 3 at level 1',
+      summary: 'Measured: the 401st–420th inserts into an empty index make it 2 levels.',
+      subs: { leaf: 'block 1: root + leaf', left: 'block 1', right: 'block 2', parent: '(none yet)' },
+      steps: [
+        {
+          title: 'A small index is a single page',
+          note: 'With 400 keys, split_demo_pkey is one page, block 1: both root and leaf (bt_metap: root 1, level 0), 148 bytes free.',
+          code: 'INSERT INTO split_demo SELECT g * 10 FROM generate_series(401, 420) g;',
+          active: ['ins', 'leaf'],
+          edges: ['ins-leaf'],
+        },
+        {
+          title: '✗ Full: split the root',
+          note: 'The 408th key or so does not fit. Since increasing keys hit the right end, it is a rightmost split: block 1 keeps 366 entries (90%) plus a high key, new block 2 gets the rest: 54 after all 20 inserts.',
+          active: ['leaf', 'full', 'left', 'right'],
+          edges: ['leaf-full', 'full-left', 'full-right'],
+          subs: { left: 'block 1: 366 entries', right: 'block 2: 54 entries' },
+        },
+        {
+          title: 'A new root above both',
+          note: 'There is no parent to receive a downlink, so Postgres creates one: block 3, level 1, with 2 entries (−∞ → 1, 3,670 → 2). bt_metap now says root 3, level 1. The tree grew at the top, so every leaf is still at the same depth.',
+          active: ['right', 'parent', 'newroot'],
+          edges: ['right-parent', 'parent-newroot'],
+          subs: { newroot: 'block 3, level 1', parent: 'block 3: 2 entries' },
+        },
+      ],
+    },
+  ]}
+/>
+
+### Sequential vs random: 1M inserts each
+
+| `bigint` primary key, 1M rows | Sequential inserts | Random-order inserts | After `REINDEX` of the random one |
+|---|---|---|---|
+| Leaf pages | 2,733 | 3,711 | 2,733 |
+| Average leaf density | 90.1% | 66.4% | 90.1% |
+| Leaf fragmentation (leaves out of disk order) | 0% | 50% | 0% |
+| Index size | 21 MB | 29 MB | 21 MB |
+
+Random inserts split pages in the middle, and half-full pages fill up again only partly before splitting again: the steady state is about **⅔ full** (66.4% measured, ln 2 ≈ 69% in theory). `REINDEX` rebuilds from sorted input (Concept 2) and restores 90%.
+
+## MySQL InnoDB: splits and merges
+
+| Term | Meaning |
+|---|---|
+| `index_page_splits` | InnoDB metric counting splits (enable with `innodb_monitor_enable`) |
+| Sequential insert split | When the last page fills during increasing inserts, InnoDB starts a new page without moving records; the metric still counts it as a split |
+| `MERGE_THRESHOLD` | When a page drops below 50% full (default) after deletes or updates, InnoDB tries to merge it with a neighbour |
+| **✓ Room / ✗ Full** | As in PostgreSQL |
+
+<Flow
+  title="InnoDB: inserting into the clustered index"
+  height={340}
+  nodes={[
+    { id: 'ins', label: 'INSERT', sub: '', x: 20, y: 20, w: 170 },
+    { id: 'parent', label: 'Parent', sub: 'node pointer added', x: 560, y: 20, w: 220 },
+    { id: 'leaf', label: 'Target leaf', sub: '16 KB', x: 20, y: 140, w: 200 },
+    { id: 'room', label: '✓ Room', sub: 'insert in place', x: 20, y: 260, w: 200 },
+    { id: 'full', label: '✗ Full', sub: '', x: 300, y: 140, w: 220 },
+    { id: 'left', label: 'Old page', sub: '', x: 300, y: 260, w: 200 },
+    { id: 'right', label: 'New page', sub: '', x: 560, y: 260, w: 220 },
+  ]}
+  edges={[
+    { id: 'ins-leaf', from: 'ins', to: 'leaf' },
+    { id: 'leaf-room', from: 'leaf', to: 'room' },
+    { id: 'leaf-full', from: 'leaf', to: 'full', quiet: true },
+    { id: 'full-left', from: 'full', to: 'left' },
+    { id: 'full-right', from: 'full', to: 'right' },
+    { id: 'right-parent', from: 'right', to: 'parent', label: 'node pointer' },
+  ]}
+  cases={[
+    {
+      title: 'Sequential primary key',
+      path: 'last leaf ✗ full → new page, no records moved → parent node pointer',
+      summary: 'Measured on 1M sequential inserts: 4,449 splits counted, 4,445 leaves, 70 MB.',
+      subs: { full: 'new page, nothing moves', left: 'stays 15/16 full', right: 'next inserts go here' },
+      steps: [
+        {
+          title: 'Inserts go to the last leaf',
+          note: 'AUTO_INCREMENT-style keys always land after the last record. Usually ✓ there is room and the row is appended to the page.',
+          code: 'INSERT INTO seq_keys (id) VALUES (1000001);',
+          active: ['ins', 'leaf', 'room'],
+          edges: ['ins-leaf', 'leaf-room'],
+        },
+        {
+          title: '✗ Full: start a new page',
+          note: 'InnoDB detects the sequential pattern and splits at the insert point, which is the end of the page: no records move. The old page stays about 15/16 full.',
+          active: ['leaf', 'full', 'left', 'right'],
+          edges: ['leaf-full', 'full-left', 'full-right'],
+        },
+        {
+          title: 'Parent gets a node pointer',
+          note: 'index_page_splits rose by 4,449 over 1M inserts: one per new page, though nothing was moved. 4,445 leaves for 1M rows.',
+          active: ['right', 'parent'],
+          edges: ['right-parent'],
+        },
+      ],
+    },
+    {
+      title: 'Random primary key',
+      path: 'random leaf ✗ full → about half the records move to a new page → parent node pointer',
+      summary: 'Measured on 1M random-order inserts: 10,803 splits, 6,347 leaves, 114 MB.',
+      subs: { full: 'move half the records', left: '≈ 50% after the split', right: '≈ 50%, anywhere on disk' },
+      steps: [
+        {
+          title: 'Inserts land anywhere',
+          note: 'A random key belongs in a random leaf, usually one that is not at the end.',
+          code: 'INSERT INTO rnd_keys (id) VALUES (731942);',
+          active: ['ins', 'leaf'],
+          edges: ['ins-leaf'],
+        },
+        {
+          title: '✗ Full: split in the middle',
+          note: 'About half the records (whole rows: this is the clustered index) move to a new page. Both pages are now about half full.',
+          active: ['leaf', 'full', 'left', 'right'],
+          edges: ['leaf-full', 'full-left', 'full-right'],
+        },
+        {
+          title: 'Parent node pointer, and the bill',
+          note: '10,803 splits vs 4,449; 6,347 leaves vs 4,445 (1.43×); 114 MB vs 70 MB. Every split also writes redo for both pages and the parent. This is the UUIDv4 problem from Session 1, measured.',
+          active: ['right', 'parent'],
+          edges: ['right-parent'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: WiredTiger splits in memory
+
+| Term | Meaning |
+|---|---|
+| In-memory page | WiredTiger edits pages in its cache, in a different format from the on-disk blocks |
+| In-memory split | A cached page that grows too large is split in memory (`memory_page_max`) |
+| Reconciliation | When a page is evicted or checkpointed, WiredTiger writes it out as freshly packed blocks of up to `leaf_page_max` |
+| **✓ Room / ✗ Too large** | Whether the in-memory page can take the insert without splitting |
+
+<Flow
+  title="MongoDB: inserting into a WiredTiger index"
+  height={340}
+  nodes={[
+    { id: 'ins', label: 'insertOne', sub: '', x: 20, y: 20, w: 170 },
+    { id: 'disk', label: 'On-disk blocks', sub: 'packed by reconciliation', x: 540, y: 20, w: 240 },
+    { id: 'page', label: 'Page in cache', sub: '', x: 20, y: 140, w: 200 },
+    { id: 'room', label: '✓ Room', sub: 'add to the page', x: 20, y: 260, w: 200 },
+    { id: 'big', label: '✗ Too large', sub: 'split in memory', x: 300, y: 140, w: 220 },
+    { id: 'halves', label: 'Smaller pages', sub: 'in cache', x: 560, y: 260, w: 220 },
+  ]}
+  edges={[
+    { id: 'ins-page', from: 'ins', to: 'page' },
+    { id: 'page-room', from: 'page', to: 'room' },
+    { id: 'page-big', from: 'page', to: 'big', quiet: true },
+    { id: 'big-halves', from: 'big', to: 'halves' },
+    { id: 'halves-disk', from: 'halves', to: 'disk', label: 'checkpoint' },
+  ]}
+  cases={[
+    {
+      title: 'Random _id inserts',
+      path: 'insert into a random cached page ✓ room … ✗ too large → split in memory → checkpoint writes packed blocks',
+      summary: 'Measured: _id index 12.5 MB after 1M random inserts vs 11.9 MB sequential (+4%).',
+      steps: [
+        {
+          title: 'The insert finds its page in cache',
+          note: 'A random _id goes to a random index page, which must be in the WiredTiger cache (read from disk first if not).',
+          code: 'db.rnd_keys.insertOne({ _id: 731942 })',
+          active: ['ins', 'page'],
+          edges: ['ins-page'],
+        },
+        {
+          title: '✓ Room: add the key',
+          note: 'Inserts go into the in-memory page structure; most fit without restructuring.',
+          active: ['page', 'room'],
+          edges: ['page-room'],
+        },
+        {
+          title: '✗ Too large: split in memory',
+          note: 'When an in-memory page grows past its limit, WiredTiger splits it into smaller in-memory pages and updates the parent.',
+          active: ['page', 'big', 'halves'],
+          edges: ['page-big', 'big-halves'],
+        },
+        {
+          title: 'Checkpoint writes packed blocks',
+          note: 'At eviction or checkpoint, reconciliation writes each page as new, densely packed blocks. Half-empty pages do not persist as half-empty blocks the way they do in PostgreSQL and InnoDB, so the on-disk index grew only 4%. The costs that remain are cache misses on random pages and rewriting whole pages at each checkpoint.',
+          active: ['halves', 'disk'],
+          edges: ['halves-disk'],
+          subs: { disk: '12.5 MB vs 11.9 MB' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## The engines side by side
+
+1M integer keys, inserted in order vs in random order:
+
+| | PostgreSQL index | InnoDB clustered index | MongoDB `_id` index |
+|---|---|---|---|
+| Sequential | 21 MB, 90% full | 70 MB (4,445 leaves) | 11.9 MB |
+| Random | 29 MB, 66% full (+38%) | 114 MB (6,347 leaves, +43%) | 12.5 MB (+4%) |
+| What splits | Index pages only (the heap is unaffected) | The table itself | In-memory pages; disk blocks rewritten packed |
+| Undo the damage | `REINDEX` (`CONCURRENTLY` online) | `OPTIMIZE TABLE` (rebuilds the table) | Usually unnecessary; `compact` releases free space |
+
+<Pitfall>
+Splits are not only a space problem. Each split writes two pages plus the parent, logs them (WAL / redo), and briefly locks the pages involved. Random keys on a hot table mean a steady stream of splits on many different pages, and in PostgreSQL each first change to a page after a checkpoint writes the full 8 KB page to WAL.
+</Pitfall>
+
+## Real-world scenario: an index that keeps growing on a table that does not
+
+An `events` table keeps a steady 10M rows: new events in, old ones deleted. Its index on `(user_id)` grows every month although the row count is flat.
+
+| Cause | Why |
+|---|---|
+| Random-key inserts | `user_id` values arrive in random order: middle splits, pages ≈ ⅔ full |
+| Deletes do not merge PostgreSQL pages | Emptied leaves are only recycled once completely empty; partly empty leaves stay partly empty |
+| Old dead entries | Index entries for deleted rows stay until VACUUM removes them |
+
+**Check:** `SELECT avg_leaf_density, leaf_fragmentation FROM pgstatindex('events_user_idx')`. **Fix:** `REINDEX INDEX CONCURRENTLY events_user_idx` during a quiet period; consider `fillfactor` below 90 for indexes with random inserts, so new keys find room before splitting.
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 6: choosing a primary key | Sequential vs random keys, in InnoDB above all |
+| Session 8: write amplification | Every index adds splits and WAL to every insert |
+| Session 8: bloat | Half-empty pages are one kind of index bloat |
+| Session 8: REINDEX CONCURRENTLY | How to rebuild without blocking writes |
+
+## Key takeaways
+
+1. A full leaf splits: entries are divided between it and a new page, and the parent gets a downlink; a root split adds a level at the top.
+2. Middle splits leave two pages about half full; PostgreSQL's rightmost split keeps the old page at the fill factor (90%).
+3. The new page goes wherever a free block is, usually the end of the file, so leaf order and disk order drift apart.
+4. Random inserts settle at ≈ ⅔ full: +38% size in the PostgreSQL index, +43% in the InnoDB table.
+5. InnoDB counts a page split for every new page, even sequential ones that move nothing; it merges pages below 50% full.
+6. WiredTiger splits in memory and writes packed blocks, so random inserts barely grow a MongoDB index on disk.
+7. `REINDEX` / `OPTIMIZE TABLE` rebuild from sorted input and restore compact pages.
+
+## Check questions
+
+1. Leaf 138 had 407 entries and 8 bytes free when one more insert arrived. Describe the split: how the entries were divided, where the new page went, and what changed in the parent.
+2. Why does PostgreSQL keep the old page 90% full on a rightmost split but split 50/50 in the middle?
+3. How does a B-tree grow taller, and why does that keep every leaf at the same depth?
+4. 1M random inserts gave 3,711 leaves at 66.4%; sequential gave 2,733 at 90.1%. Explain the ratio.
+5. InnoDB counted 4,449 page splits for 1M **sequential** inserts. Were rows moved? What do those splits represent?
+6. Why did random inserts grow the MongoDB `_id` index by only 4%?
+7. An index's `avg_leaf_density` is 55% and `leaf_fragmentation` 60%. What probably happened, and what would you do?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-2-btree-internals/concept-6-page-splits/answers">Worked answers to Q1–Q7</DeepDive>
