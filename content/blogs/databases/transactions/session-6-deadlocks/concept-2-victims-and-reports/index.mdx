@@ -1,0 +1,252 @@
+---
+title: "Concept 2: Who gets killed, and how to read the report"
+description: "PostgreSQL aborts whichever transaction runs the deadlock check, even if it did 50 times more work; InnoDB rolls back the transaction that is cheapest to undo. How to read PostgreSQL's server-log entry and log_lock_waits lines, InnoDB's LATEST DETECTED DEADLOCK section, and MongoDB's conflict counters. Measured with a 51-row transaction against a 1-row one."
+type: "concept"
+tags: ["transactions", "deadlocks", "monitoring", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/runtime-config-logging.html#GUC-LOG-LOCK-WAITS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-deadlock-example.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-parameters.html#sysvar_innodb_print_all_deadlocks"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-information-schema-metrics-table.html"
+  - "https://www.mongodb.com/docs/manual/reference/command/serverStatus/#transactions"
+---
+
+<Tldr>
+The victim policies differ. In the lab, a **big** transaction (50 rows updated, then account 1, then account 2) deadlocked with a **small** one (account 2, then account 1). **InnoDB** rolled back the **small** one (1 undo entry, 2 row locks) even though the big one closed the cycle: it picks the transaction with the least to undo. **PostgreSQL** aborted the **big** one, losing all 50 updates, because the victim is simply the session whose `deadlock_timeout` check finds the cycle. For diagnosis, PostgreSQL writes both statements to the **server log** (the client only gets "See server log for query details"); `log_lock_waits` also logs every wait longer than `deadlock_timeout`. InnoDB keeps only the **latest** deadlock in `SHOW ENGINE INNODB STATUS` (any newer deadlock, from any schema, overwrites it); `innodb_print_all_deadlocks` sends all of them to the error log. MongoDB has no deadlock report: count aborted transactions and write conflicts in `serverStatus()`.
+</Tldr>
+
+## The experiment
+
+| t | T1 "big" | T2 "small" |
+|---|---|---|
+| 0.0 s | UPDATE 50 accounts (100–149), then account 1 | |
+| 0.5 s | | UPDATE account 2, then account 1 → waits for T1 |
+| 2.0 s | UPDATE account 2 → waits for T2: **cycle closed by T1** | |
+
+| Term | Meaning |
+|---|---|
+| Victim weight (InnoDB) | Roughly the number of rows changed and locked; the lighter transaction is rolled back |
+| `deadlock_timeout` check (PostgreSQL) | The waiter whose timer fires runs the search and, on finding a cycle, aborts itself |
+| `log_lock_waits` | PostgreSQL logs a message when a wait exceeds `deadlock_timeout` |
+| `LATEST DETECTED DEADLOCK` | Section of `SHOW ENGINE INNODB STATUS`; holds one deadlock only |
+| **✓ Survivor / ✗ Victim** | |
+
+## MySQL InnoDB: the cheaper one dies
+
+<Flow
+  title="InnoDB: big vs small transaction"
+  height={330}
+  nodes={[
+    { id: 'big', label: 'T1 big', sub: '51 rows changed', x: 20, y: 20, w: 220 },
+    { id: 'small', label: 'T2 small', sub: '1 row changed', x: 20, y: 200, w: 220 },
+    { id: 'cycle', label: 'Cycle', sub: 'closed by T1 at 2 s', x: 300, y: 110, w: 200 },
+    { id: 'ok', label: '✓ T1 commits', sub: '50 + 2 rows kept', x: 580, y: 20, w: 200 },
+    { id: 'dead', label: '✗ T2 rolled back', sub: 'undo log entries 1', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'big-cycle', from: 'big', to: 'cycle' },
+    { id: 'small-cycle', from: 'small', to: 'cycle' },
+    { id: 'cycle-ok', from: 'cycle', to: 'ok' },
+    { id: 'cycle-dead', from: 'cycle', to: 'dead' },
+  ]}
+  cases={[
+    {
+      title: 'Victim selection',
+      path: 'T1 closes the cycle → InnoDB compares weights → ✗ T2 (1 undo entry) rolled back → ✓ T1 (51) commits',
+      summary: 'Not "whoever closed the cycle": the transaction with less to undo.',
+      steps: [
+        {
+          title: 'Two very different transactions',
+          note: 'The report lists both: TRANSACTION 251131 … 52 row lock(s), undo log entries 51 (T1) and TRANSACTION 251132 … 2 row lock(s), undo log entries 1 (T2).',
+          active: ['big', 'small', 'cycle'],
+          edges: ['big-cycle', 'small-cycle'],
+        },
+        {
+          title: 'The small one is chosen',
+          note: '*** WE ROLL BACK TRANSACTION (1), and (1) is 251132, T2. T2 got ERROR 1213 although it had been waiting quietly for 1.5 s; T1, whose request closed the cycle, continued and committed: accounts 100–149 all had version 2 afterwards, and accounts 1/2 = 900/1,100.',
+          code: '*** (1) TRANSACTION:\nTRANSACTION 251132, ACTIVE 1 sec starting index read\nLOCK WAIT 3 lock struct(s), heap size 1128, 2 row lock(s), undo log entries 1\n…\n*** WE ROLL BACK TRANSACTION (1)',
+          active: ['cycle', 'ok', 'dead', 'small', 'big'],
+          edges: ['cycle-ok', 'cycle-dead'],
+        },
+      ],
+    },
+    {
+      title: 'Reading LATEST DETECTED DEADLOCK',
+      path: 'for each transaction: statement → HOLDS THE LOCK(S) → WAITING FOR THIS LOCK → table and index → victim',
+      summary: 'Captured with SHOW ENGINE INNODB STATUS right after the error, for the simple 1 → 2 / 2 → 1 case.',
+      subs: { big: '(1) trx 251125', small: '(2) trx 251126', cycle: 'PRIMARY of accounts', ok: '✓ (1) continues', dead: '✗ WE ROLL BACK (2)' },
+      steps: [
+        {
+          title: 'Statement and locks per transaction',
+          note: '(1): UPDATE … WHERE id = 2; HOLDS lock_mode X locks rec but not gap on heap no 2; WAITING FOR the same mode on heap no 3. (2): UPDATE … WHERE id = 1; holds heap no 3, waits for heap no 2. "index PRIMARY of table `bank`.`accounts`" names the index; "heap no" is the record\'s slot in the page, so compare them to see which records cross.',
+          code: "*** (1) HOLDS THE LOCK(S):\nRECORD LOCKS space id 75 page no 5 n bits 400 index PRIMARY of table `bank`.`accounts`\n  trx id 251125 lock_mode X locks rec but not gap\nRecord lock, heap no 2 …\n*** (1) WAITING FOR THIS LOCK TO BE GRANTED:\n… lock_mode X locks rec but not gap waiting\nRecord lock, heap no 3 …",
+          active: ['big', 'small', 'cycle'],
+          edges: ['big-cycle', 'small-cycle'],
+        },
+        {
+          title: 'Only the latest one is kept',
+          note: 'The section holds one deadlock for the whole server. In the lab, other databases on the same server deadlocked too, so the report had to be captured immediately and checked for the right table name. For production, innodb_print_all_deadlocks = ON (a global setting) writes every deadlock to the error log; information_schema.INNODB_METRICS counter lock_deadlocks counts them (take deltas: it is server-wide).',
+          code: "SELECT NAME, COUNT FROM information_schema.INNODB_METRICS\nWHERE NAME IN ('lock_deadlocks', 'lock_timeouts', 'lock_row_lock_waits');",
+          active: ['cycle', 'ok', 'dead'],
+          edges: ['cycle-ok', 'cycle-dead'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## PostgreSQL: the one that checks dies
+
+<Flow
+  title="PostgreSQL: big vs small transaction"
+  height={330}
+  nodes={[
+    { id: 'big', label: 'T1 big', sub: '51 rows changed', x: 20, y: 20, w: 220 },
+    { id: 'small', label: 'T2 small', sub: '1 row changed', x: 20, y: 200, w: 220 },
+    { id: 'cycle', label: 'Cycle', sub: 'closed by T1 at 2 s', x: 300, y: 110, w: 200 },
+    { id: 'dead', label: '✗ T1 aborted', sub: '50 updates lost', x: 580, y: 20, w: 200 },
+    { id: 'ok', label: '✓ T2 commits', sub: '', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'big-cycle', from: 'big', to: 'cycle' },
+    { id: 'small-cycle', from: 'small', to: 'cycle' },
+    { id: 'cycle-dead', from: 'cycle', to: 'dead' },
+    { id: 'cycle-ok', from: 'cycle', to: 'ok' },
+  ]}
+  cases={[
+    {
+      title: 'Victim selection',
+      path: 'T2 waits from 0.5 s (its check at 1.5 s finds no cycle) → T1 waits from 2.0 s → T1 checks at 3.0 s → ✗ T1 aborted',
+      summary: 'No weighing: the session that discovers the cycle is the one aborted.',
+      steps: [
+        {
+          title: 'T2\'s check comes too early',
+          note: 'T2 started waiting at 0.5 s. Its deadlock check ran at 1.5 s, when T1 was not yet waiting: no cycle, T2 keeps waiting (and is not checked again).',
+          active: ['small', 'cycle'],
+          edges: ['small-cycle'],
+        },
+        {
+          title: 'T1 finds the cycle and dies',
+          note: 'T1 starts waiting at 2.0 s; at 3.0 s its own check finds the cycle and aborts T1: ERROR: deadlock detected, both finished at second 12.63. Afterwards zero accounts had version > 1: all 50 updates of the big transaction were lost, and T2 committed (accounts 1/2 = 1,050/950).',
+          code: "SELECT count(*) FROM accounts WHERE version > 1;   -- 0",
+          active: ['big', 'cycle', 'dead', 'ok'],
+          edges: ['big-cycle', 'cycle-dead', 'cycle-ok'],
+        },
+      ],
+    },
+    {
+      title: 'Reading the server log',
+      path: 'client: ERROR + DETAIL (pids, xids) + HINT → server log: also both statements + STATEMENT',
+      summary: 'The queries are only in the server log, never in the client error.',
+      subs: { big: 'pid 54428', small: 'pid 54440', dead: '✗ 54428 aborted', ok: '✓ 54440' },
+      steps: [
+        {
+          title: 'What the client gets',
+          note: 'ERROR: deadlock detected; DETAIL: Process 54428 waits for ShareLock on transaction 1731673; blocked by process 54440. Process 54440 waits for ShareLock on transaction 1731672; blocked by process 54428. HINT: See server log for query details. CONTEXT: while updating tuple (0,2) in relation "accounts".',
+          active: ['big', 'small', 'cycle'],
+          edges: ['big-cycle', 'small-cycle'],
+        },
+        {
+          title: 'What the server log adds',
+          note: 'The log entry repeats the DETAIL and adds each process\'s current statement ("Process 54428: UPDATE accounts SET balance = balance + 100 WHERE id = 2", "Process 54440: UPDATE … WHERE id = 1"), then STATEMENT. It shows the statements that were waiting, not the earlier ones that took the locks: you still need the application code to see the order.',
+          code: "LOG/ERROR line from docker logs idx-pg:\n  Process 54428: UPDATE accounts SET balance = balance + 100 WHERE id = 2\n  Process 54440: UPDATE accounts SET balance = balance + 50 WHERE id = 1",
+          active: ['cycle', 'dead', 'ok'],
+          edges: ['cycle-dead', 'cycle-ok'],
+        },
+        {
+          title: 'Log long waits too',
+          note: 'With log_lock_waits = on, a wait longer than deadlock_timeout is logged even without a deadlock. With deadlock_timeout = 200ms: "process 55008 still waiting for ShareLock on transaction 1829053 after 200.264 ms, DETAIL: Process holding the lock: 55002. Wait queue: 55008", then "acquired ShareLock … after 2478.091 ms".',
+          code: "SET log_lock_waits = on;       -- superuser; usually set in postgresql.conf\nSET deadlock_timeout = '200ms';",
+          active: ['small', 'cycle'],
+          edges: ['small-cycle'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: counters instead of reports
+
+<Flow
+  title="MongoDB: where conflicts show up"
+  height={280}
+  nodes={[
+    { id: 'txn', label: 'Transactions', sub: 'conflict, abort, retry', x: 20, y: 20, w: 220 },
+    { id: 'ss', label: 'serverStatus()', sub: 'transactions, metrics', x: 300, y: 20, w: 200 },
+    { id: 'op', label: '$currentOp', sub: 'writeConflicts per op', x: 580, y: 20, w: 200 },
+    { id: 'rate', label: 'Abort rate', sub: 'totalAborted / totalStarted', x: 300, y: 170, w: 200 },
+  ]}
+  edges={[
+    { id: 'txn-ss', from: 'txn', to: 'ss' },
+    { id: 'ss-op', from: 'ss', to: 'op' },
+    { id: 'ss-rate', from: 'ss', to: 'rate' },
+  ]}
+  cases={[
+    {
+      title: 'Measuring contention',
+      path: 'no deadlock report → serverStatus counters (deltas) → $currentOp for a live operation',
+      summary: 'Conflicts are normal events in MongoDB; watch their rate.',
+      steps: [
+        {
+          title: 'Server-wide counters',
+          note: 'serverStatus().transactions gives totalStarted, totalCommitted, totalAborted; metrics.operation.writeConflicts counts conflicts of all operations. They are cumulative and server-wide: sample twice and subtract.',
+          code: 'const s = db.serverStatus();\n({ aborted: s.transactions.totalAborted, committed: s.transactions.totalCommitted,\n   writeConflicts: s.metrics.operation.writeConflicts })',
+          active: ['txn', 'ss', 'rate'],
+          edges: ['txn-ss', 'ss-rate'],
+        },
+        {
+          title: 'A live operation',
+          note: 'For a stuck single-document write, $currentOp shows writeConflicts and numYields growing while waitingForLock stays false (Session 5, Concept 1: 215 conflicts in 3 s).',
+          active: ['ss', 'op'],
+          edges: ['ss-op'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Comparison
+
+| | PostgreSQL | MySQL InnoDB | MongoDB |
+|---|---|---|---|
+| Victim | The waiter whose check finds the cycle | The transaction cheapest to roll back | The transaction that hits the conflict |
+| Lab: big (51 rows) vs small (1 row) | Big aborted, 50 updates lost | Small rolled back | n/a |
+| Report with statements | Server log (every deadlock) | `SHOW ENGINE INNODB STATUS` (latest only); error log with `innodb_print_all_deadlocks` | None |
+| Counters | `pg_stat_database.deadlocks` | `INNODB_METRICS.lock_deadlocks` | `serverStatus().transactions.totalAborted`, `metrics.operation.writeConflicts` |
+| Long waits | `log_lock_waits` | `sys.innodb_lock_waits` (live) | `$currentOp` (live) |
+
+<Pitfall>
+Both SQL reports show the statements that were **waiting** when the cycle closed, not the statements that **took** the locks earlier in each transaction. "UPDATE … WHERE id = 2 deadlocked with UPDATE … WHERE id = 1" does not tell you why each transaction already held the other row: find that in the application code (or statement history) before "fixing" the queries in the report.
+</Pitfall>
+
+## Real-world scenario: deadlocks you cannot see
+
+A team on MySQL sees `1213` in application logs a few times an hour, but `SHOW ENGINE INNODB STATUS` always shows a deadlock from a different service's tables.
+
+| Step | Action |
+|---|---|
+| 1 | `SET PERSIST innodb_print_all_deadlocks = ON` (a server-wide change, by the DBA) |
+| 2 | Group error-log entries by table and statement pair |
+| 3 | The pair `UPDATE wallets … id = ?` / `UPDATE wallets … id = ?` dominates: opposite-order transfers |
+| 4 | Fix with ordering (Concept 4); watch `lock_deadlocks` deltas drop |
+
+## Key takeaways
+
+1. InnoDB rolls back the transaction with the least to undo; in the lab, the 1-row one, not the one that closed the cycle.
+2. PostgreSQL aborts the session whose deadlock check finds the cycle, regardless of its size; a big batch can lose all its work.
+3. PostgreSQL logs every deadlock with both statements in the server log; enable `log_lock_waits` to see long waits too.
+4. InnoDB keeps only the latest deadlock in `SHOW ENGINE INNODB STATUS`; use `innodb_print_all_deadlocks` and `lock_deadlocks` deltas.
+5. MongoDB has no deadlock report; track abort and write-conflict rates from `serverStatus()`.
+
+## Check questions
+
+1. In the big-vs-small experiment, which transaction did each SQL engine roll back, and by what rule?
+2. Why did T2's own deadlock check in PostgreSQL not find the cycle?
+3. What does the client see for a PostgreSQL deadlock, and where are the statements?
+4. In an InnoDB deadlock report, how do you tell which records the two transactions cross on?
+5. Why is `SHOW ENGINE INNODB STATUS` unreliable for counting or auditing deadlocks?
+6. Which statements do both SQL reports show, and which important ones do they leave out?
+7. How would you measure how often MongoDB transactions are conflicting in production?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-6-deadlocks/concept-2-victims-and-reports/answers">Worked answers to Q1–Q7</DeepDive>

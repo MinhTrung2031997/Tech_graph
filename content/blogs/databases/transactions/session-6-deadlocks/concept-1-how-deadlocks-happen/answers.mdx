@@ -1,0 +1,75 @@
+---
+title: "Answers: How a deadlock happens"
+description: "Worked answers to the Session 6 Concept 1 check questions."
+companion: "answers"
+tags: ["transactions", "deadlocks", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-DEADLOCKS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-deadlock-detection.html"
+---
+
+<Tldr>
+Cycle of waits → engine kills one → application retries it.
+</Tldr>
+
+## Q1. The wait-for graph
+
+**Question:** draw the wait-for graph at t = 1.3 s for the two transfers.
+
+```text
+T1 ──waits for account 2 (held by T2)──▶ T2
+T2 ──waits for account 1 (held by T1)──▶ T1
+```
+
+Two edges, one cycle. Neither transaction can make progress without the other ending first.
+
+> **Common mistake:** drawing edges to the rows instead of to the transactions. The graph is between transactions; rows only explain why each edge exists.
+
+## Q2. Late vs immediate detection
+
+**Question:** why did PostgreSQL report the deadlock only after about 1 s, while MySQL reported it immediately?
+
+PostgreSQL runs the (relatively expensive) cycle search only when a session has waited `deadlock_timeout` (1 s by default), on the theory that most waits end by themselves. InnoDB, with `innodb_deadlock_detect = ON`, checks every time a lock request is about to wait, so the request that closes the cycle fails immediately. The trade-off: PostgreSQL saves CPU on normal waits but lets a real deadlock hold its locks for a second; InnoDB's per-wait check can itself become a bottleneck with hundreds of waiters on one row, which is why it can be switched off (then only `innodb_lock_wait_timeout` breaks cycles).
+
+> **Common mistake:** thinking PostgreSQL "waits 1 s before killing". It waits 1 s before **looking**.
+
+## Q3. Why T1 was the PostgreSQL victim
+
+**Question:** in the PostgreSQL run, why was T1 the victim and not T2?
+
+PostgreSQL aborts the transaction **whose own check finds the cycle**. T1 started waiting 0.3 s before T2, so its `deadlock_timeout` expired first; it found the cycle and aborted itself. T2's timer never fired, because T1's rollback released account 1 647 ms into T2's wait. There is no weighing of which transaction did more work (Concept 2 shows that cost).
+
+> **Common mistake:** assuming the newer or smaller transaction is always chosen, as in MySQL.
+
+## Q4. T2's first UPDATE in MySQL
+
+**Question:** after MySQL's 1213, what happened to T2's first UPDATE (account 2 − 50)?
+
+It was rolled back with the rest of T2. A deadlock rolls back the victim's **entire** transaction, and the balances confirmed it: 1 = 900, 2 = 1,100 (only transfer A). The client must start the transaction again from the beginning.
+
+> **Common mistake:** retrying only the statement that got 1213; the earlier statements are gone.
+
+## Q5. No deadlock in MongoDB
+
+**Question:** why can two MongoDB transactions not deadlock on documents? What do you get instead?
+
+A deadlock needs each transaction to **wait** for the other. A MongoDB transaction that writes a document already modified by another uncommitted transaction does not wait: it fails immediately with `WriteConflict` and the label `TransientTransactionError`, and the transaction is aborted. With no waits there are no edges, so no cycle. You get conflicts and retries instead.
+
+> **Common mistake:** concluding MongoDB has "no concurrency problems". Under contention it aborts and retries transactions constantly (Concept 4: about one retry per two commits).
+
+## Q6. Ignoring the error
+
+**Question:** what would the balances be if the application simply ignored the deadlock error and moved on?
+
+The victim's transfer would be silently missing. In the MySQL run: account 1 = 900 and account 2 = 1,100, as if only A happened, while the user of transfer B was probably told it succeeded (or got a generic error). The database stays consistent; the business record is wrong.
+
+> **Common mistake:** logging deadlocks as warnings without retrying.
+
+## Q7. Raising deadlock_timeout
+
+**Question:** a colleague proposes raising `deadlock_timeout` to 10 s "so fewer transactions are killed". What happens?
+
+The same number of transactions are killed (every real cycle still needs a victim), but each deadlock now holds its locks for 10 s instead of 1 s, and every other session that needs those rows queues behind them. Concept 4 measured the effect of the 1 s default under contention: 27 transactions/s instead of 2,689 for the deadlock-free version. Lowering it (100 ms) raised that to 169/s. The real fix is to remove the cycle.
+
+> **Common mistake:** treating `deadlock_timeout` as "how often deadlocks happen".

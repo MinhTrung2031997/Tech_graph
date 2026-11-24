@@ -1,0 +1,218 @@
+---
+title: "Lab and session quiz: Deadlocks"
+description: "Reproduce the opposite-order deadlock in three engines, see which transaction each one kills, read the PostgreSQL log and InnoDB's deadlock report, trigger three deadlocks that have no opposite order, and measure throughput with random vs ordered locking using pgbench, a MySQL stored procedure and mongosh."
+type: "how-to"
+tags: ["transactions", "deadlocks", "postgresql", "mysql", "mongodb", "pgbench", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pgbench.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-deadlock-example.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-in-applications/"
+---
+
+<Tldr>
+Uses the containers and the `bank` database from the [Session 1 lab](/blogs/databases/transactions/session-1-transaction-guarantees/lab), with the same aliases as the [Session 5 lab](/blogs/databases/transactions/session-5-locks-and-indexes/lab) (`pg`, `my`, `mg`). Exercises 1–3 need **two terminals** (three for the duplicate insert); run each terminal's lines a few hundred milliseconds apart, as the timelines show. Exercise 4 runs load generators for 15 s each.
+</Tldr>
+
+## Exercise 1: the opposite-order deadlock (Concept 1)
+
+| t | Terminal 1 | Terminal 2 |
+|---|---|---|
+| 0 | `BEGIN;` `UPDATE accounts SET balance = balance - 100 WHERE id = 1;` | |
+| 1 | | `BEGIN;` `UPDATE accounts SET balance = balance - 50 WHERE id = 2;` |
+| 2 | `UPDATE accounts SET balance = balance + 100 WHERE id = 2;` (waits) | |
+| 3 | | `UPDATE accounts SET balance = balance + 50 WHERE id = 1;` |
+| 4 | `COMMIT;` | `COMMIT;` |
+
+Run it in PostgreSQL (`pg`, note how long the deadlocked statement takes), in MySQL (`my`, `START TRANSACTION` instead of `BEGIN`) and in MongoDB:
+
+```js
+// mg, terminal 1 (terminal 2: swap 1 and 2, use 50)
+const s = db.getMongo().startSession(); s.startTransaction();
+const acc = s.getDatabase("bank").accounts;
+acc.updateOne({ _id: 1 }, { $inc: { balance: NumberDecimal("-100") } });
+// … wait until terminal 2 has done its first update …
+acc.updateOne({ _id: 2 }, { $inc: { balance: NumberDecimal("100") } });
+s.commitTransaction();
+```
+
+Record: which terminal got the error, after how long, and the final balances of accounts 1 and 2. Reset with `UPDATE accounts SET balance = 1000 WHERE id <= 10;` (`updateMany` in MongoDB).
+
+## Exercise 2: victims and reports (Concept 2)
+
+Terminal 1 (the big one): `BEGIN; UPDATE accounts SET version = version + 1 WHERE id BETWEEN 100 AND 149; UPDATE accounts SET balance = balance - 100 WHERE id = 1;`, then after terminal 2 is waiting, `UPDATE accounts SET balance = balance + 100 WHERE id = 2;`.
+Terminal 2 (the small one), in between: `BEGIN; UPDATE accounts SET balance = balance - 50 WHERE id = 2; UPDATE accounts SET balance = balance + 50 WHERE id = 1;`.
+
+```sql
+-- afterwards, in both engines: did the big transaction survive?
+SELECT count(*) FROM accounts WHERE version > 1;
+
+-- pg: the full report is in the server log
+--   docker logs --since 2m idx-pg 2>&1 | grep -A8 "deadlock detected"
+SELECT deadlocks FROM pg_stat_database WHERE datname = 'bank';
+
+-- my: capture right away (only the latest deadlock is kept)
+SHOW ENGINE INNODB STATUS\G
+SELECT NAME, COUNT FROM information_schema.INNODB_METRICS WHERE NAME = 'lock_deadlocks';
+```
+
+Also try `SET log_lock_waits = on; SET deadlock_timeout = '200ms';` in a PostgreSQL session that waits for a row, and find the "still waiting" line in the log.
+
+## Exercise 3: deadlocks without opposite order (Concept 3)
+
+```sql
+-- my, check-then-insert: terminal 1 uses 20001, terminal 2 uses 20002
+START TRANSACTION;
+SELECT id FROM accounts WHERE id = 20001 FOR UPDATE;      -- empty
+-- (both terminals run the SELECT before either INSERTs)
+INSERT INTO accounts VALUES (20001, 'new', 'B01', 0, 1);
+COMMIT;
+```
+
+```sql
+-- my, three terminals insert the same key
+-- T1: START TRANSACTION; INSERT INTO accounts VALUES (20005, 'a', 'B01', 0, 1);
+-- T2: START TRANSACTION; INSERT INTO accounts VALUES (20005, 'b', 'B01', 0, 1);   -- waits
+-- T3: START TRANSACTION; INSERT INTO accounts VALUES (20005, 'c', 'B01', 0, 1);   -- waits
+-- watch: SELECT ENGINE_TRANSACTION_ID, LOCK_MODE, LOCK_STATUS, LOCK_DATA
+--        FROM performance_schema.data_locks WHERE OBJECT_SCHEMA = 'bank' AND LOCK_TYPE = 'RECORD';
+-- T1: ROLLBACK;   → one of T2/T3 gets 1213
+```
+
+```sql
+-- my and pg: child insert, then parent update
+CREATE TABLE ledger (id BIGINT AUTO_INCREMENT PRIMARY KEY, account_id INT NOT NULL,
+  amount DECIMAL(12,2) NOT NULL, FOREIGN KEY (account_id) REFERENCES accounts (id));      -- my
+CREATE TABLE ledger (id bigserial PRIMARY KEY,
+  account_id int NOT NULL REFERENCES accounts (id), amount numeric(12,2) NOT NULL);        -- pg
+-- both terminals, 0.3 s apart:
+START TRANSACTION;                                   -- pg: BEGIN;
+INSERT INTO ledger (account_id, amount) VALUES (5, -10);
+-- (after the other terminal's INSERT)
+UPDATE accounts SET balance = balance - 10 WHERE id = 5;
+COMMIT;
+```
+
+Repeat the first two in PostgreSQL, then fix the check-then-insert with `INSERT … ON DUPLICATE KEY UPDATE id = id` / `INSERT … ON CONFLICT DO NOTHING` and run it again. Clean up: `DELETE FROM accounts WHERE id > 10000; DROP TABLE ledger;`.
+
+## Exercise 4: ordering under load (Concept 4)
+
+**PostgreSQL** (pgbench is in the container):
+
+```bash
+docker exec idx-pg sh -c 'cat > /tmp/transfer_random.sql <<EOF
+\set a random(1, 10)
+\set b 1 + (:a + random(0, 8)) % 10
+BEGIN;
+UPDATE accounts SET balance = balance - 1 WHERE id = :a;
+UPDATE accounts SET balance = balance + 1 WHERE id = :b;
+END;
+EOF
+cat > /tmp/transfer_ordered.sql <<EOF
+\set a random(1, 10)
+\set b 1 + (:a + random(0, 8)) % 10
+\set lo least(:a, :b)
+\set hi greatest(:a, :b)
+BEGIN;
+UPDATE accounts SET balance = balance + CASE WHEN :lo = :a THEN -1 ELSE 1 END WHERE id = :lo;
+UPDATE accounts SET balance = balance + CASE WHEN :hi = :a THEN -1 ELSE 1 END WHERE id = :hi;
+END;
+EOF'
+for s in random ordered; do
+  docker exec idx-pg pgbench -U postgres -n -c 8 -j 4 -T 15 --failures-detailed --max-tries=1 \
+    -f /tmp/transfer_$s.sql bank | grep -E "processed|deadlock|tps|latency average"
+done
+# variants: PGOPTIONS="-c deadlock_timeout=100ms" (docker exec -e …), or --max-tries=10
+```
+
+(`b` is computed so that it never equals `a`: with `a = b` the ordered script would debit the same account twice.)
+
+**MySQL** (a stored procedure that counts victims):
+
+```sql
+CREATE TABLE bench_results (run VARCHAR(20), conn INT, ok INT, deadlocks INT, timeouts INT);
+DELIMITER //
+-- Random transfers between 10 hot accounts for p_seconds; counts commits and deadlock victims.
+CREATE PROCEDURE transfer_loop(IN p_run VARCHAR(20), IN p_seconds INT, IN p_ordered BOOL)
+BEGIN
+  DECLARE v_ok, v_dead, v_timeout INT DEFAULT 0;
+  DECLARE v_failed BOOL DEFAULT FALSE;
+  DECLARE a, b, first_id, second_id INT;
+  DECLARE v_end DATETIME(6) DEFAULT NOW(6) + INTERVAL p_seconds SECOND;
+  DECLARE CONTINUE HANDLER FOR 1213 BEGIN SET v_dead = v_dead + 1; SET v_failed = TRUE; END;
+  DECLARE CONTINUE HANDLER FOR 1205 BEGIN SET v_timeout = v_timeout + 1; SET v_failed = TRUE; ROLLBACK; END;
+  WHILE NOW(6) < v_end DO
+    SET a = 1 + FLOOR(RAND() * 10);
+    SET b = 1 + (a + FLOOR(RAND() * 9)) % 10;                 -- always a different account
+    SET first_id = IF(p_ordered, LEAST(a, b), a);
+    SET second_id = IF(p_ordered, GREATEST(a, b), b);
+    SET v_failed = FALSE;
+    START TRANSACTION;
+    UPDATE accounts SET balance = balance + IF(first_id = a, -1, 1) WHERE id = first_id;
+    IF NOT v_failed THEN
+      UPDATE accounts SET balance = balance + IF(second_id = a, -1, 1) WHERE id = second_id;
+    END IF;
+    IF NOT v_failed THEN COMMIT; SET v_ok = v_ok + 1; END IF;
+  END WHILE;
+  INSERT INTO bench_results VALUES (p_run, CONNECTION_ID(), v_ok, v_dead, v_timeout);
+END //
+DELIMITER ;
+```
+
+```bash
+for i in 1 2 3 4 5 6 7 8; do
+  docker exec idx-mysql mysql -uroot -plab bank -e "CALL transfer_loop('random', 15, 0)" &
+done; wait
+# then the same with 'ordered', 15, 1
+docker exec idx-mysql mysql -uroot -plab bank -e "SELECT run, SUM(ok)/15 tps, SUM(deadlocks) FROM bench_results GROUP BY run"
+```
+
+**MongoDB** (save as `transfer.js`, copy into the container, run 8 at once):
+
+```js
+// Random transfers between 10 hot accounts for 10 s; counts commits and retried attempts.
+const ordered = typeof ORDERED !== "undefined" && ORDERED;
+const s = db.getMongo().startSession();
+const acc = s.getDatabase("bank").accounts;
+let commits = 0, attempts = 0;
+const end = Date.now() + 10000;
+while (Date.now() < end) {
+  const a = 1 + Math.floor(Math.random() * 10), b = 1 + (a + Math.floor(Math.random() * 9)) % 10;
+  const [first, second] = ordered ? [Math.min(a, b), Math.max(a, b)] : [a, b];
+  s.withTransaction(() => {
+    attempts++;
+    acc.updateOne({ _id: first }, { $inc: { balance: NumberDecimal(first === a ? "-1" : "1") } });
+    acc.updateOne({ _id: second }, { $inc: { balance: NumberDecimal(second === a ? "-1" : "1") } });
+  });
+  commits++;
+}
+db.getSiblingDB("bank").bench.insertOne({ run: ordered ? "ordered" : "random", commits, retries: attempts - commits });
+```
+
+```bash
+docker cp transfer.js tx-mongo:/tmp/transfer.js
+for i in 1 2 3 4 5 6 7 8; do
+  docker exec tx-mongo mongosh --quiet bank --eval "var ORDERED = false" /tmp/transfer.js &
+done; wait
+```
+
+| Engine | Random: txn/s, deadlocks or retries | Ordered: txn/s, deadlocks or retries |
+|---|---|---|
+| PostgreSQL | | |
+| MySQL | | |
+| MongoDB | | |
+
+Check after every run that `SELECT sum(balance) FROM accounts WHERE id <= 10` is still 10,000.00.
+
+## Session quiz
+
+1. In PostgreSQL, the deadlocked statement returned after about 1 s; in MySQL, at once. Which setting explains each?
+2. In the big-vs-small experiment, which transaction lost its work in each engine? Which policy would you prefer for a nightly batch, and how do you protect the batch either way?
+3. A PostgreSQL deadlock error says "See server log for query details". What exactly is in the log entry, and what is still missing from it?
+4. Why can InnoDB deadlock on two `INSERT`s of **different** keys?
+5. Three sessions insert the same primary key and the first rolls back. What do the other two get in MySQL, and in PostgreSQL?
+6. Rewrite the order-items flow (insert item, update order total) so that it cannot deadlock on MySQL.
+7. Lock ordering raised PostgreSQL's throughput by 100× in the lab but barely changed MySQL's and not at all MongoDB's. Explain all three.
+8. List the errors a retry loop must handle in each engine, and one error it must **not** retry.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-6-deadlocks/lab/answers">Answers to the session quiz</DeepDive>

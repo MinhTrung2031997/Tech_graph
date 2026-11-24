@@ -1,0 +1,257 @@
+---
+title: "Concept 3: Deadlocks without opposite order"
+description: "Three deadlocks that do not come from locking rows in opposite order, all reproduced in InnoDB: check-then-insert on a missing key (two gap locks), three sessions inserting the same key (shared locks after a rollback), and a child insert followed by a parent update (foreign-key shared locks). PostgreSQL and MongoDB run the same sequences without deadlocking."
+type: "concept"
+tags: ["transactions", "deadlocks", "gap-locks", "foreign-keys", "mysql", "postgresql", "mongodb"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locks-set.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-deadlock-example.html"
+  - "https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS"
+---
+
+<Tldr>
+Some deadlocks happen even when both transactions touch rows "in the same order", because InnoDB takes **shared** or **gap** locks you did not write. **Check-then-insert**: two sessions `SELECT … FOR UPDATE` two *different* missing ids above the last row; both get the same supremum next-key lock (gap locks are compatible), then each INSERT's insert-intention lock waits for the other's gap lock: `1213`. **Duplicate insert**: T1 inserts id 20005; T2 and T3 insert the same id and wait with **S** locks; T1 rolls back, both S locks are granted, both want **X** to insert: `1213` for T3, T2 inserts. **Child then parent**: two transactions insert a `ledger` row for account 5 (the foreign-key check takes **S** on `accounts` row 5) and then update account 5 (needs **X**): `1213`. In **PostgreSQL** the same three sequences gave: both inserts succeed; T2 inserts and T3 gets a duplicate-key error; both transactions commit (the FK's `FOR KEY SHARE` does not conflict with a balance update). **MongoDB**: no gap or FK locks; a duplicate insert inside a transaction fails at once with `WriteConflict`.
+</Tldr>
+
+## Locks you did not ask for
+
+| Statement | InnoDB takes | PostgreSQL takes |
+|---|---|---|
+| `SELECT … FOR UPDATE` on a missing key | Gap / next-key lock (compatible with other gap locks) | Nothing |
+| `INSERT` | Insert-intention lock in the gap, then `X` on the new record | Row is new; unique check waits for the in-progress inserter |
+| `INSERT` hitting a duplicate in progress | `S` lock on the existing record, waiting | Waits for the other transaction to end |
+| `INSERT` child with a foreign key | `S` lock on the parent record | `FOR KEY SHARE` on the parent row |
+| **✓ Commits / ✗ 1213** | | |
+
+## MySQL InnoDB: three hidden deadlocks
+
+<Flow
+  title="InnoDB: deadlocks from implicit locks"
+  height={330}
+  nodes={[
+    { id: 't1', label: 'Session A', sub: '', x: 20, y: 20, w: 220 },
+    { id: 't2', label: 'Session B', sub: '', x: 20, y: 200, w: 220 },
+    { id: 'res', label: 'Shared resource', sub: '', x: 300, y: 110, w: 200 },
+    { id: 'ok', label: '✓ Survivor', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'dead', label: '✗ Victim', sub: 'ERROR 1213', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-res', from: 't1', to: 'res' },
+    { id: 't2-res', from: 't2', to: 'res' },
+    { id: 'res-ok', from: 'res', to: 'ok' },
+    { id: 'res-dead', from: 'res', to: 'dead' },
+  ]}
+  cases={[
+    {
+      title: 'Check, then insert',
+      path: 'T1 FOR UPDATE id 20001 + T2 FOR UPDATE id 20002 → both hold the supremum gap → both INSERT → ✗ 1213',
+      summary: 'Different keys, same gap.',
+      subs: { t1: 'T1: check + insert 20001', t2: 'T2: check + insert 20002', res: 'supremum gap', ok: '✓ T1 inserts 20001', dead: '✗ T2: 1213' },
+      steps: [
+        {
+          title: 'Both checks succeed',
+          note: 'Neither id exists, and both sort after 10000, the last row. Each SELECT … FOR UPDATE takes a next-key lock on the supremum. Gap locks never conflict with each other, so both are granted.',
+          code: "-- T1                                        -- T2 (0.3 s later)\nSTART TRANSACTION;                            START TRANSACTION;\nSELECT id FROM accounts WHERE id = 20001      SELECT id FROM accounts WHERE id = 20002\n  FOR UPDATE;   -- empty                        FOR UPDATE;   -- empty",
+          active: ['t1', 't2', 'res'],
+          edges: ['t1-res', 't2-res'],
+        },
+        {
+          title: 'Both inserts wait for each other',
+          note: 'Each INSERT needs an insert-intention lock in that gap, which conflicts with the other transaction\'s gap lock. Report: (1) INSERT … 20001, HOLDS lock_mode X on supremum, WAITING FOR lock_mode X insert intention waiting on supremum; (2) the same for 20002. WE ROLL BACK TRANSACTION (2). Only 20001 was inserted.',
+          code: "*** (1) WAITING FOR THIS LOCK TO BE GRANTED:\n… lock_mode X insert intention waiting\n 0: len 8; hex 73757072656d756d; asc supremum;;",
+          active: ['t1', 't2', 'res', 'ok', 'dead'],
+          edges: ['res-ok', 'res-dead'],
+        },
+      ],
+    },
+    {
+      title: 'Three sessions insert the same key',
+      path: 'T1 inserts 20005 → T2, T3 insert 20005 → S locks waiting → T1 rolls back → both S granted → both want X → ✗ 1213',
+      summary: 'A rollback of the first inserter turns two waiters into a deadlock.',
+      subs: { t1: 'T2: insert 20005 (owner b)', t2: 'T3: insert 20005 (owner c)', res: 'record 20005', ok: '✓ T2 inserts', dead: '✗ T3: 1213' },
+      steps: [
+        {
+          title: 'Duplicates wait with shared locks',
+          note: 'T1 inserted 20005 and keeps it uncommitted (X,REC_NOT_GAP GRANTED on 20005). T2\'s insert of the same id finds the duplicate and requests S,REC_NOT_GAP on it: WAITING. T3 does the same.',
+          code: "trx 251143  X,REC_NOT_GAP  GRANTED  20005   -- T1\ntrx 251144  S,REC_NOT_GAP  WAITING  20005   -- T2",
+          active: ['t1', 't2', 'res'],
+          edges: ['t1-res', 't2-res'],
+        },
+        {
+          title: 'T1 rolls back',
+          note: 'The record disappears and both waiting S locks are granted. Each of T2 and T3 now needs an insert-intention lock (X) to insert 20005, which conflicts with the other\'s S lock: a cycle. Report: both "lock mode S" held, "lock_mode X insert intention waiting"; WE ROLL BACK TRANSACTION (2), which was T3. Final row: 20005, owner b.',
+          active: ['t1', 't2', 'res', 'ok', 'dead'],
+          edges: ['res-ok', 'res-dead'],
+        },
+      ],
+    },
+    {
+      title: 'Insert child, then update parent',
+      path: 'T1, T2 INSERT ledger(account 5) → both S on accounts 5 → both UPDATE account 5 → need X → ✗ 1213',
+      summary: 'Foreign-key checks take a shared lock on the parent row.',
+      subs: { t1: 'T1: ledger −10, balance −10', t2: 'T2: ledger −20, balance −20', res: 'accounts record 5', ok: '✓ T1 commits', dead: '✗ T2: 1213' },
+      steps: [
+        {
+          title: 'FK checks share the parent',
+          note: 'ledger.account_id references accounts(id). Each INSERT checks the parent: data_locks showed two S,REC_NOT_GAP GRANTED on accounts record 5, one per transaction.',
+          code: "CREATE TABLE ledger (id BIGINT AUTO_INCREMENT PRIMARY KEY, account_id INT NOT NULL,\n  amount DECIMAL(12,2) NOT NULL, FOREIGN KEY (account_id) REFERENCES accounts (id));\nINSERT INTO ledger (account_id, amount) VALUES (5, -10);",
+          active: ['t1', 't2', 'res'],
+          edges: ['t1-res', 't2-res'],
+        },
+        {
+          title: 'Both upgrade to X',
+          note: 'Each then runs UPDATE accounts … WHERE id = 5, which needs X on the record, blocked by the other\'s S. Report: "lock mode S locks rec but not gap" held, "lock_mode X locks rec but not gap waiting" for both; T2 rolled back. One ledger row remained.',
+          code: "UPDATE accounts SET balance = balance - 10 WHERE id = 5;",
+          active: ['t1', 't2', 'res', 'ok', 'dead'],
+          edges: ['res-ok', 'res-dead'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## PostgreSQL: the same three sequences
+
+<Flow
+  title="PostgreSQL: no deadlock in any of the three"
+  height={330}
+  nodes={[
+    { id: 't1', label: 'Session A', sub: '', x: 20, y: 20, w: 220 },
+    { id: 't2', label: 'Session B', sub: '', x: 20, y: 200, w: 220 },
+    { id: 'res', label: 'Shared resource', sub: '', x: 300, y: 110, w: 200 },
+    { id: 'ok1', label: 'Session A result', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'ok2', label: 'Session B result', sub: '', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-res', from: 't1', to: 'res' },
+    { id: 't2-res', from: 't2', to: 'res' },
+    { id: 'res-ok1', from: 'res', to: 'ok1' },
+    { id: 'res-ok2', from: 'res', to: 'ok2' },
+  ]}
+  cases={[
+    {
+      title: 'Check, then insert',
+      path: 'FOR UPDATE on missing ids locks nothing → ✓ both INSERTs → ✓ both commit',
+      summary: 'No gap locks, so nothing to cross.',
+      subs: { t1: 'T1: check + insert 20001', t2: 'T2: check + insert 20002', res: 'no lock taken', ok1: '✓ 20001 inserted', ok2: '✓ 20002 inserted' },
+      steps: [
+        {
+          title: 'Both commit',
+          note: 'SELECT … WHERE id = 20001 FOR UPDATE returns no row and locks nothing. Both INSERTs and COMMITs succeeded. (Two sessions inserting the same id would instead get a duplicate-key error for one of them.)',
+          active: ['t1', 't2', 'res', 'ok1', 'ok2'],
+          edges: ['t1-res', 't2-res', 'res-ok1', 'res-ok2'],
+        },
+      ],
+    },
+    {
+      title: 'Three sessions insert the same key',
+      path: 'T2, T3 wait for T1 → T1 rolls back → ✓ T2 inserts (1.66 s) → T3 waits for T2 → ✗ duplicate key (2.38 s)',
+      summary: 'Waiters queue on the first inserter\'s transaction; no shared locks.',
+      subs: { t1: 'T2: insert 20005 (b)', t2: 'T3: insert 20005 (c)', res: 'unique index, 20005', ok1: '✓ T2 inserted', ok2: '✗ T3 duplicate key' },
+      steps: [
+        {
+          title: 'One wins, one gets a clean error',
+          note: 'T2 inserted after waiting 1,656 ms (until T1 rolled back). T3 then waited for T2 and, when T2 committed, failed with ERROR: duplicate key value violates unique constraint "accounts_pkey" after 2,378 ms. A constraint error, not a deadlock: the application knows the id is taken.',
+          active: ['t1', 't2', 'res', 'ok1', 'ok2'],
+          edges: ['t1-res', 't2-res', 'res-ok1', 'res-ok2'],
+        },
+      ],
+    },
+    {
+      title: 'Insert child, then update parent',
+      path: 'both INSERT ledger → FOR KEY SHARE on account 5 → UPDATE balance (FOR NO KEY UPDATE) ✓ compatible → ✓ both commit',
+      summary: 'Session 5 Concept 1: KEY SHARE does not block non-key updates.',
+      subs: { t1: 'T1: ledger −10, balance −10', t2: 'T2: ledger −20, balance −20', res: 'account 5: KEY SHARE × 2', ok1: '✓ T1 commits', ok2: '✓ T2 commits (waited)' },
+      steps: [
+        {
+          title: 'Updates serialize, no cycle',
+          note: 'Both FK checks hold FOR KEY SHARE on account 5. T1\'s UPDATE of balance takes FOR NO KEY UPDATE, compatible with T2\'s KEY SHARE; T2\'s UPDATE then waits only for T1 to commit. Both committed: 2 ledger rows, balance 1,000 − 10 − 20 = 970.',
+          active: ['t1', 't2', 'res', 'ok1', 'ok2'],
+          edges: ['t1-res', 't2-res', 'res-ok1', 'res-ok2'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: same _id inserted three times"
+  height={300}
+  nodes={[
+    { id: 't1', label: 'T1 transaction', sub: 'insert _id 20005', x: 20, y: 20, w: 220 },
+    { id: 'doc', label: '_id 20005', sub: 'uncommitted', x: 300, y: 110, w: 200 },
+    { id: 'tx2', label: '✗ T2 in a transaction', sub: 'WriteConflict, 6 ms', x: 580, y: 20, w: 200 },
+    { id: 'p3', label: '✓ T3 plain insert', sub: 'after 1,529 ms', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-doc', from: 't1', to: 'doc' },
+    { id: 'doc-tx2', from: 'doc', to: 'tx2' },
+    { id: 'doc-p3', from: 'doc', to: 'p3' },
+  ]}
+  cases={[
+    {
+      title: 'Duplicate insert in progress',
+      path: 'T1 txn inserts 20005 → T2 txn ✗ WriteConflict at once → T3 plain insert retries → T1 aborts → ✓ T3 inserts',
+      summary: 'No shared locks, so no cycle; conflicts and retries instead.',
+      steps: [
+        {
+          title: 'Conflict, not wait',
+          note: 'T2\'s insert of the same _id inside a transaction failed after 6 ms with WriteConflict (TransientTransactionError).',
+          active: ['t1', 'doc', 'tx2'],
+          edges: ['t1-doc', 'doc-tx2'],
+        },
+        {
+          title: 'The plain insert waits it out',
+          note: 'T3, outside a transaction, retried until T1 aborted, then inserted (1,529 ms). The final document has owner "c". Had T1 committed, T3 would have got a duplicate key error (E11000).',
+          active: ['doc', 'p3'],
+          edges: ['doc-p3'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Comparison
+
+| Sequence | InnoDB (REPEATABLE READ) | PostgreSQL | MongoDB |
+|---|---|---|---|
+| Check missing key, then insert | ✗ 1213 | ✓ both | ✓ both (no read locks) |
+| 3 × insert same key, first rolls back | ✗ 1213 for one waiter | ✓ one, duplicate-key error for the other | `WriteConflict` (txn) / retry (plain) |
+| Insert child, then update parent | ✗ 1213 | ✓ both (`KEY SHARE` vs `NO KEY UPDATE`) | No FKs |
+
+<Pitfall>
+"Check whether it exists, then insert" is the most common source of InnoDB deadlocks in application code (`get_or_create`, `find_or_create_by`, idempotency checks). The check is not a lock you can rely on, and in InnoDB it is a gap lock that sets up the deadlock. Let the unique index decide: `INSERT … ON DUPLICATE KEY UPDATE` (MySQL), `INSERT … ON CONFLICT` (PostgreSQL), `updateOne(…, { upsert: true })` with a unique index (MongoDB), and handle the duplicate-key result.
+</Pitfall>
+
+## Real-world scenario: order items and order totals
+
+An order service inserts `order_items` (FK to `orders`) and then updates `orders.total` in the same transaction. Two items added to the same order at once (double click, two tabs) deadlock on MySQL a few times a day; the same code on PostgreSQL never does.
+
+| Fix | Why it works |
+|---|---|
+| Lock the parent first: `SELECT … FROM orders WHERE id = ? FOR UPDATE`, then insert items, then update the total | Both transactions queue on the parent's `X` lock before taking any `S` |
+| Update the total first, then insert the item | The `X` lock is taken first; the FK check's `S` is then compatible with your own `X` |
+| Compute totals on read (or asynchronously) | No parent update in the write path |
+
+## Key takeaways
+
+1. InnoDB adds locks you did not write: gap locks for locking reads of missing keys, `S` locks for duplicate checks and foreign-key checks.
+2. Shared and gap locks are compatible with each other, so two transactions can both hold one and then both need to upgrade: a deadlock.
+3. Check-then-insert, concurrent duplicate inserts and "insert child, update parent" all deadlocked in InnoDB and none did in PostgreSQL.
+4. Prefer atomic upserts and unique constraints over check-then-insert.
+5. When a parent row will be updated, lock it first (`FOR UPDATE`) so every transaction queues on the same lock.
+
+## Check questions
+
+1. Two sessions check different missing ids (20001, 20002) and then insert them. Why do they deadlock in InnoDB although the ids differ?
+2. In the three-session duplicate insert, why does the deadlock appear only **after** T1 rolls back?
+3. What did PostgreSQL do with the same three sessions, and why is that error easier to handle?
+4. Why does "insert child, then update parent" deadlock in InnoDB but not in PostgreSQL?
+5. Give two ways to change the order-items code so it cannot deadlock on MySQL.
+6. Rewrite "SELECT … FOR UPDATE; if missing, INSERT" as one statement for each SQL engine.
+7. A MongoDB transaction inserts an `_id` that another transaction has inserted but not committed. What happens, and what should the application do?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-6-deadlocks/concept-3-hidden-deadlocks/answers">Worked answers to Q1–Q7</DeepDive>
