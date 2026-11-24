@@ -1,0 +1,357 @@
+---
+title: "Lab and session quiz: Partition lifecycle"
+description: "Build monthly partitioned copies of orders, then remove a month by DELETE and by DROP (measuring WAL, binlog and VACUUM), watch DROP queue behind a reader while DETACH CONCURRENTLY does not, add future partitions with and without a DEFAULT or MAXVALUE partition, and convert an existing 5M-row table in place."
+type: "how-to"
+tags: ["partitioning", "retention", "locking", "postgresql", "mysql", "mongodb", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html"
+  - "https://www.postgresql.org/docs/17/sql-altertable.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-management-range-list.html"
+  - "https://www.mongodb.com/docs/manual/core/index-ttl/"
+---
+
+<Tldr>
+Uses the containers and the `parts` database from the [Session 1 lab](/blogs/databases/partitioning-sharding/session-1-why-split-data/lab) (PostgreSQL `idx-pg`, MySQL `idx-mysql`, MongoDB `idx-mongo`, table `orders` with 5,000,000 rows). Exercise 2 needs **three terminals**. Every exercise ends with the data restored, so they can run in any order. Lab results quoted below were measured on the course machine with other loads running; compare ratios, not absolute times.
+</Tldr>
+
+## Setup
+
+```bash
+alias ppg='docker exec -it idx-pg psql -U postgres -d parts'
+alias pmy='docker exec -it idx-mysql mysql -uroot -plab parts'
+alias pmg='docker exec -it idx-mongo mongosh --quiet parts'
+```
+
+The monthly partitioned copy, `orders_p`, in PostgreSQL (12 s in the lab, including VACUUM ANALYZE):
+
+```sql
+-- ppg
+CREATE TABLE orders_p (
+  id          bigint        NOT NULL,
+  seller_id   integer       NOT NULL,
+  marketplace text          NOT NULL,
+  status      text          NOT NULL,
+  amount      numeric(12,2) NOT NULL,
+  created_at  timestamptz   NOT NULL,
+  PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
+CREATE INDEX orders_p_created_at_idx ON orders_p (created_at);
+DO $$
+DECLARE m date := date '2024-01-01';
+BEGIN
+  WHILE m < date '2026-01-01' LOOP
+    EXECUTE format('CREATE TABLE orders_p_%s PARTITION OF orders_p FOR VALUES FROM (%L) TO (%L)',
+                   to_char(m, 'YYYY_MM'), m::timestamptz, (m + interval '1 month')::timestamptz);
+    m := m + interval '1 month';
+  END LOOP;
+END $$;
+INSERT INTO orders_p SELECT * FROM orders;
+VACUUM ANALYZE orders_p;
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;   -- the lab server preloads it
+```
+
+And in MySQL (23 s in the lab). The primary key includes `created_at` because MySQL requires it (Concept 4):
+
+```sql
+-- pmy
+CREATE TABLE orders_p (
+  id BIGINT NOT NULL, seller_id INT NOT NULL, marketplace VARCHAR(8) NOT NULL,
+  status VARCHAR(10) NOT NULL, amount DECIMAL(12,2) NOT NULL, created_at DATETIME NOT NULL,
+  PRIMARY KEY (id, created_at), KEY orders_p_created_at_idx (created_at)
+) ENGINE = InnoDB
+PARTITION BY RANGE COLUMNS (created_at) (
+  PARTITION p2024_01 VALUES LESS THAN ('2024-02-01'), PARTITION p2024_02 VALUES LESS THAN ('2024-03-01'),
+  PARTITION p2024_03 VALUES LESS THAN ('2024-04-01'), PARTITION p2024_04 VALUES LESS THAN ('2024-05-01'),
+  PARTITION p2024_05 VALUES LESS THAN ('2024-06-01'), PARTITION p2024_06 VALUES LESS THAN ('2024-07-01'),
+  PARTITION p2024_07 VALUES LESS THAN ('2024-08-01'), PARTITION p2024_08 VALUES LESS THAN ('2024-09-01'),
+  PARTITION p2024_09 VALUES LESS THAN ('2024-10-01'), PARTITION p2024_10 VALUES LESS THAN ('2024-11-01'),
+  PARTITION p2024_11 VALUES LESS THAN ('2024-12-01'), PARTITION p2024_12 VALUES LESS THAN ('2025-01-01'),
+  PARTITION p2025_01 VALUES LESS THAN ('2025-02-01'), PARTITION p2025_02 VALUES LESS THAN ('2025-03-01'),
+  PARTITION p2025_03 VALUES LESS THAN ('2025-04-01'), PARTITION p2025_04 VALUES LESS THAN ('2025-05-01'),
+  PARTITION p2025_05 VALUES LESS THAN ('2025-06-01'), PARTITION p2025_06 VALUES LESS THAN ('2025-07-01'),
+  PARTITION p2025_07 VALUES LESS THAN ('2025-08-01'), PARTITION p2025_08 VALUES LESS THAN ('2025-09-01'),
+  PARTITION p2025_09 VALUES LESS THAN ('2025-10-01'), PARTITION p2025_10 VALUES LESS THAN ('2025-11-01'),
+  PARTITION p2025_11 VALUES LESS THAN ('2025-12-01'), PARTITION p2025_12 VALUES LESS THAN ('2026-01-01'));
+INSERT INTO orders_p SELECT * FROM orders;
+ANALYZE TABLE orders_p;
+```
+
+Keep a copy of January 2024 to restore after destructive steps:
+
+```sql
+-- ppg and pmy
+CREATE TABLE keep_2024_01 AS SELECT * FROM orders WHERE created_at < '2024-02-01';   -- 212,039 rows
+```
+
+## Exercise 1: DELETE vs DROP (Concept 1)
+
+```sql
+-- ppg: the DELETE, measured and rolled back (run it 3 times; note fpi on the first run)
+BEGIN;
+EXPLAIN (ANALYZE, WAL, BUFFERS, COSTS OFF) DELETE FROM orders WHERE created_at < '2024-02-01';
+ROLLBACK;
+-- now for real, then look at what is left behind
+DELETE FROM orders WHERE created_at < '2024-02-01';
+SELECT pg_stat_force_next_flush();
+SELECT n_dead_tup, pg_size_pretty(pg_relation_size('orders')) FROM pg_stat_user_tables WHERE relname = 'orders';
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) SELECT count(*) FROM orders WHERE created_at < '2024-02-01';
+VACUUM (VERBOSE) orders;   -- read "pages: … removed" and "WAL usage"
+SELECT pg_size_pretty(pg_relation_size('orders'));
+-- the partition way
+SELECT pg_stat_statements_reset(0, (SELECT oid FROM pg_database WHERE datname = 'parts'), 0);
+DROP TABLE orders_p_2024_01;
+SELECT query, mean_exec_time, wal_records, wal_bytes FROM pg_stat_statements
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'parts') AND query LIKE 'DROP%';
+```
+
+```sql
+-- pmy
+SHOW BINARY LOG STATUS;
+DELETE FROM orders WHERE created_at < '2024-02-01';
+SHOW BINARY LOG STATUS;                     -- difference = binlog bytes of the DELETE
+SELECT FILE_SIZE FROM information_schema.INNODB_TABLESPACES WHERE NAME = 'parts/orders';
+ALTER TABLE orders_p DROP PARTITION p2024_01;
+SHOW BINARY LOG STATUS;
+```
+
+```js
+// pmg
+db.orders.aggregate([{ $match: { created_at: { $lt: ISODate('2024-02-01') } } }, { $out: 'keep_2024_01' }]);
+db.orders.aggregate([{ $match: { created_at: { $lt: ISODate('2024-02-01') } } }, { $out: 'orders_2024_01' }]);
+const st = () => db.orders.aggregate([{ $collStats: { storageStats: { freeStorage: 1 } } }]).toArray()[0].storageStats;
+printjson({ storage: st().storageSize, free: st().freeStorageSize });
+let t = Date.now(); db.orders.deleteMany({ created_at: { $lt: ISODate('2024-02-01') } }); print(Date.now() - t, 'ms');
+t = Date.now(); db.orders_2024_01.drop(); print(Date.now() - t, 'ms');
+```
+
+| Fill in | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| DELETE time / log volume | | | |
+| Cleanup after DELETE (VACUUM / purge) | | | n/a |
+| File size before → after DELETE | | | |
+| DROP time / log volume | | | |
+
+Expected (lab): PostgreSQL DELETE 88–104 ms, 11.4 MB WAL (27.6 MB cold), VACUUM 0.69 s and 10.9 MB, file still 365 MB; DROP 4–16 ms, about 44 KB. MySQL DELETE 0.47 s, 8.7 MB binlog, file unchanged; DROP PARTITION 0.02–0.06 s, 215 bytes. MongoDB deleteMany 0.76–1.17 s; drop 1–2 ms.
+
+Restore:
+
+```sql
+-- ppg
+INSERT INTO orders SELECT * FROM keep_2024_01;
+CREATE TABLE orders_p_2024_01 PARTITION OF orders_p FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+INSERT INTO orders_p_2024_01 SELECT * FROM keep_2024_01;
+-- pmy
+INSERT INTO orders SELECT * FROM keep_2024_01;
+ALTER TABLE orders_p REORGANIZE PARTITION p2024_02 INTO (
+  PARTITION p2024_01 VALUES LESS THAN ('2024-02-01'), PARTITION p2024_02 VALUES LESS THAN ('2024-03-01'));
+INSERT INTO orders_p SELECT * FROM keep_2024_01;
+```
+
+```js
+// pmg
+db.keep_2024_01.aggregate([{ $merge: { into: 'orders', whenMatched: 'fail' } }]);
+db.orders.countDocuments();   // 5000000
+```
+
+Optional TTL run: copy January and February into `orders_ttl`, create `{ created_at: 1 }` with `expireAfterSeconds` set to the seconds between 2024-02-01 and now, and poll `countDocuments({ created_at: { $lt: ISODate('2024-02-01') } })` every 5 s. Expected: the month disappears in one pass within about a minute.
+
+## Exercise 2: the lock queue (Concept 2)
+
+Three terminals on PostgreSQL. Start them a second apart.
+
+```sql
+-- terminal 1: a reader of December 2025 that stays open
+BEGIN;
+SELECT count(*) FROM orders_p WHERE created_at >= '2025-12-01';
+SELECT pg_sleep(20);
+COMMIT;
+-- terminal 2: the retention job
+\timing on
+DROP TABLE orders_p_2024_01;
+-- terminal 3: a new reader of December 2025
+\timing on
+SELECT count(*) FROM orders_p WHERE created_at >= '2025-12-01';
+```
+
+While they run, from a fourth session (or terminal 3 before step 3):
+
+```sql
+SELECT a.pid, a.wait_event_type, pg_blocking_pids(a.pid), l.relation::regclass, l.mode, l.granted
+FROM pg_stat_activity a JOIN pg_locks l ON l.pid = a.pid
+WHERE a.datname = 'parts' AND l.locktype = 'relation' AND l.relation::regclass::text = 'orders_p';
+```
+
+Restore January (Exercise 1), then repeat with terminal 2 running `ALTER TABLE orders_p DETACH PARTITION orders_p_2024_01 CONCURRENTLY;` followed by `DROP TABLE orders_p_2024_01;`. Then try it inside `BEGIN … COMMIT`, and once with `SET statement_timeout = '3s'` before it; look at `SELECT inhdetachpending FROM pg_inherits WHERE inhrelid = 'orders_p_2024_01'::regclass` and finish with `… DETACH PARTITION orders_p_2024_01 FINALIZE`. Remove the CHECK constraint that CONCURRENTLY left on the table (`\d orders_p_2024_01`) before re-attaching it, if you want Exercise 3's ATTACH timings to be honest.
+
+MySQL, same three terminals:
+
+```sql
+-- terminal 1
+START TRANSACTION; SELECT count(*) FROM orders_p WHERE created_at >= '2025-12-01'; SELECT SLEEP(20); COMMIT;
+-- terminal 2 (run once as is, once after SET SESSION lock_wait_timeout = 2;)
+ALTER TABLE orders_p DROP PARTITION p2024_01;
+-- terminal 3
+SELECT count(*) FROM orders_p WHERE created_at >= '2025-12-01';
+-- watcher
+SELECT OWNER_THREAD_ID, LOCK_TYPE, LOCK_STATUS FROM performance_schema.metadata_locks
+WHERE OBJECT_SCHEMA = 'parts' AND OBJECT_NAME = 'orders_p';
+```
+
+| Fill in | T2 waited | T3 waited | Lock T2 waited for |
+|---|---|---|---|
+| PostgreSQL `DROP TABLE` partition | | | |
+| PostgreSQL `DETACH … CONCURRENTLY` | | | |
+| MySQL `DROP PARTITION` | | | |
+| MySQL with `lock_wait_timeout = 2` | | | |
+
+Expected (lab, 12 s reader): 11.2 s / 10.2 s / AccessExclusiveLock on orders_p; 11.1 s / 0.10 s / T1's virtualxid; 11.2 s / 10.2 s / EXCLUSIVE metadata lock; ERROR 1205 after 2.09 s / 1.08 s.
+
+MongoDB: open a cursor with `batchSize(100)` on a month collection, call `next()` once, drop the collection, then keep iterating.
+
+## Exercise 3: future partitions and DEFAULT (Concept 3)
+
+```sql
+-- ppg
+INSERT INTO orders_p VALUES (5000001, 1, 'shopee', 'delivered', 10, '2026-01-05 10:00+00');   -- error
+-- creating a month: compare the locks with terminal 1 of Exercise 2 running
+CREATE TABLE orders_p_2026_08 PARTITION OF orders_p FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+DROP TABLE orders_p_2026_08;
+CREATE TABLE orders_p_2026_08 (LIKE orders_p INCLUDING ALL);
+ALTER TABLE orders_p ATTACH PARTITION orders_p_2026_08 FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+-- the DEFAULT trap
+CREATE TABLE orders_p_default PARTITION OF orders_p DEFAULT;
+INSERT INTO orders_p
+SELECT 5000000 + g, 1, 'shopee', 'delivered', 10,
+       timestamptz '2026-01-01 00:00:00+00' + ((g - 1) * 1263168 / 100000) * interval '1 second'
+FROM generate_series(1::bigint, 1000000) AS g;                       -- 2026-01-01 … 2026-05-27
+CREATE TABLE orders_p_2026_01 PARTITION OF orders_p
+  FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');                   -- error
+\timing on
+SET client_min_messages = debug1;
+CREATE TABLE orders_p_2026_07 (LIKE orders_p INCLUDING ALL);
+ALTER TABLE orders_p ATTACH PARTITION orders_p_2026_07 FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
+ALTER TABLE orders_p DETACH PARTITION orders_p_2026_07;
+ALTER TABLE orders_p_default ADD CONSTRAINT orders_p_default_upto_2026_06 CHECK (created_at < '2026-07-01');
+ALTER TABLE orders_p ATTACH PARTITION orders_p_2026_07 FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
+RESET client_min_messages;
+```
+
+Then move January 2026 out of DEFAULT in one transaction (DETACH DEFAULT, CREATE the partition, INSERT … SELECT, DELETE, ATTACH DEFAULT) and time each step.
+
+```sql
+-- pmy
+INSERT INTO orders_p VALUES (5000001, 1, 'shopee', 'delivered', 10, '2026-01-05 10:00:00');   -- ERROR 1526
+ALTER TABLE orders_p ADD PARTITION (PARTITION p2026_01 VALUES LESS THAN ('2026-02-01'));
+ALTER TABLE orders_p ADD PARTITION (PARTITION pmax VALUES LESS THAN (MAXVALUE));
+ALTER TABLE orders_p ADD PARTITION (PARTITION p2026_02 VALUES LESS THAN ('2026-03-01'));      -- ERROR 1493
+SET SESSION cte_max_recursion_depth = 1000;
+INSERT INTO orders_p
+WITH RECURSIVE a(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM a WHERE n < 999),
+               s(g) AS (SELECT x.n * 1000 + y.n + 1 FROM a x CROSS JOIN a y)
+SELECT 5000000 + g, 1, 'shopee', 'delivered', 10,
+       TIMESTAMP '2026-02-01 00:00:00' + INTERVAL ((g - 1) * 1263168 DIV 100000) SECOND FROM s;
+ALTER TABLE orders_p REORGANIZE PARTITION pmax INTO (
+  PARTITION p2026_02 VALUES LESS THAN ('2026-03-01'), PARTITION pmax VALUES LESS THAN (MAXVALUE));
+-- repeat for p2026_03, p2026_04 …, and run an INSERT dated 2025-12-31 in another terminal during one
+```
+
+```js
+// pmg
+db.orders_2026_01.insertOne({ _id: 5000001, created_at: ISODate('2026-01-05T10:00:00Z') });
+db.orders_2026_01.getIndexes();
+db.orders_2026_01.find({ created_at: { $gte: ISODate('2026-01-05') } }).explain().queryPlanner.winningPlan.stage;
+```
+
+| Fill in | Time | Lock / scan |
+|---|---|---|
+| PG `CREATE … PARTITION OF` with a reader open | | |
+| PG `LIKE` + `ATTACH` with a reader open | | |
+| PG ATTACH with DEFAULT (1M rows), no CHECK | | |
+| PG ATTACH with DEFAULT, CHECK on DEFAULT | | |
+| MySQL REORGANIZE pmax, 1M rows / empty | | |
+
+Expected (lab): 11.1 s and blocks readers; 0.09 s, nobody blocked; 26–30 ms, "verifying table "orders_p_default""; 1.5 ms, "implied by existing constraints"; 1.56 s with writes waiting 1.43 s / 0.04–0.05 s.
+
+## Exercise 4: convert an existing table (Concept 4)
+
+```sql
+-- ppg: a copy to convert
+CREATE TABLE orders_c (LIKE orders INCLUDING ALL);
+INSERT INTO orders_c SELECT * FROM orders;
+VACUUM ANALYZE orders_c;
+\timing on
+CREATE UNIQUE INDEX CONCURRENTLY orders_c_id_created_at ON orders_c (id, created_at);
+ALTER TABLE orders_c ADD CONSTRAINT orders_c_range CHECK (created_at < '2026-01-01') NOT VALID;
+ALTER TABLE orders_c VALIDATE CONSTRAINT orders_c_range;
+BEGIN;
+ALTER TABLE orders_c DROP CONSTRAINT orders_c_pkey,
+  ADD CONSTRAINT orders_c_pkey PRIMARY KEY USING INDEX orders_c_id_created_at;
+ALTER TABLE orders_c RENAME TO orders_legacy;
+ALTER INDEX orders_c_pkey RENAME TO orders_legacy_pkey;
+CREATE TABLE orders_c (
+  id bigint NOT NULL, seller_id integer NOT NULL, marketplace text NOT NULL, status text NOT NULL,
+  amount numeric(12,2) NOT NULL, created_at timestamptz NOT NULL
+) PARTITION BY RANGE (created_at);
+ALTER TABLE orders_c ATTACH PARTITION orders_legacy FOR VALUES FROM (MINVALUE) TO ('2026-01-01');
+ALTER TABLE orders_c ADD PRIMARY KEY (id, created_at);
+CREATE INDEX orders_c_created_at ON orders_c (created_at);
+CREATE TABLE orders_c_2026_01 PARTITION OF orders_c FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+COMMIT;
+\d+ orders_c
+```
+
+Also try the switch without the `DROP CONSTRAINT … USING INDEX` line (read the error), and an ATTACH of `orders_legacy` after dropping `orders_c_range` (time the scan).
+
+```sql
+-- pmy: a copy to convert
+CREATE TABLE orders_c LIKE orders;
+INSERT INTO orders_c SELECT * FROM orders;
+ALTER TABLE orders_c PARTITION BY RANGE COLUMNS (created_at) (
+  PARTITION p2025 VALUES LESS THAN ('2026-01-01'), PARTITION p2026_01 VALUES LESS THAN ('2026-02-01'));   -- ERROR 1503
+ALTER TABLE orders_c DROP PRIMARY KEY, ADD PRIMARY KEY (id, created_at);
+ALTER TABLE orders_c ALGORITHM=INPLACE PARTITION BY RANGE COLUMNS (created_at) (
+  PARTITION p2025 VALUES LESS THAN ('2026-01-01'), PARTITION p2026_01 VALUES LESS THAN ('2026-02-01'));   -- ERROR 1845
+-- then the real one with the 24 monthly partitions from the setup, and an INSERT in another terminal
+```
+
+```js
+// pmg
+db.orders.aggregate([{ $match: { created_at: { $gte: ISODate('2025-12-01'), $lt: ISODate('2026-01-01') } } }, { $out: 'orders_2025_12' }]);
+db.orders.aggregate([{ $match: { created_at: { $lt: ISODate('2024-03-01') } } }, { $out: 'orders_ttl' }]);
+db.orders_ttl.createIndex({ created_at: 1 });
+db.runCommand({ collMod: 'orders_ttl', index: { keyPattern: { created_at: 1 }, expireAfterSeconds: 34214400 } });
+```
+
+## Reset
+
+```sql
+-- ppg
+DROP TABLE IF EXISTS orders_p_default, orders_p_2026_01, orders_p_2026_07, orders_p_2026_08, orders_c, keep_2024_01 CASCADE;
+SELECT count(*) FROM orders;   -- 5000000
+SELECT count(*) FROM orders_p; -- 5000000
+-- pmy
+ALTER TABLE orders_p DROP PARTITION p2026_01, p2026_02, pmax;   -- plus any others you added
+DROP TABLE IF EXISTS orders_c, keep_2024_01;
+```
+
+```js
+// pmg
+['orders_2024_01', 'orders_2025_12', 'orders_ttl', 'orders_2026_01', 'keep_2024_01'].forEach(c => db.getCollection(c).drop());
+db.orders.countDocuments();   // 5000000
+```
+
+`orders_p` stays in PostgreSQL and MySQL for later sessions.
+
+## Session quiz
+
+1. Removing one month cost 11.4 MB of WAL by DELETE and about 44 KB by DROP in PostgreSQL. Name two more costs of the DELETE that the DROP does not have.
+2. Why did the table file stay the same size after the DELETE and its VACUUM?
+3. Why did `DROP TABLE orders_p_2024_01` make a read of December 2025 wait 10 seconds?
+4. What does `DETACH PARTITION … CONCURRENTLY` change about that, and what are its two restrictions?
+5. In MySQL, how do you stop `DROP PARTITION` from freezing the table behind a long reader?
+6. Why is `CREATE TABLE … (LIKE …)` + `ATTACH PARTITION` preferred over `CREATE TABLE … PARTITION OF` for next month's partition?
+7. Give two ways a DEFAULT partition causes trouble when you add a partition later, and how a CHECK constraint helps.
+8. Outline the steps to partition an existing 5M-row PostgreSQL table without copying it, with the lock each step takes.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-4-partition-lifecycle/lab/answers">Answers to the session quiz</DeepDive>

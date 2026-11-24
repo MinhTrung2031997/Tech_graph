@@ -1,0 +1,63 @@
+---
+title: "Answers: Retention by DROP, not DELETE"
+description: "Worked answers to the Session 4 Concept 1 check questions."
+companion: "answers"
+tags: ["partitioning", "retention", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/wal-reliability.html"
+  - "https://www.postgresql.org/docs/17/routine-vacuuming.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html#sysvar_binlog_row_image"
+---
+
+<Tldr>
+DELETE costs per row, now and again at cleanup. DROP costs per partition.
+</Tldr>
+
+## Q1. 27.6 MB of WAL, then 11.4 MB
+
+**Question:** why did the first DELETE run write 27.6 MB of WAL and the next ones 11.4 MB?
+
+The first time a page is modified after a checkpoint, PostgreSQL writes the whole 8 KB page into the WAL (a full-page image), so that a torn page can be repaired after a crash. The first run modified 1,983 heap pages for the first time since the last checkpoint: `fpi=1983`, 1,983 × 8 KB ≈ 16 MB on top of the 11.4 MB of row records. The later runs (rolled back, same pages) touched pages that already had an image in the WAL since the checkpoint, so only the 212,039 small records were written.
+
+> **Common mistake:** benchmarking a DELETE twice and keeping the cheap number. In production the retention job usually touches cold pages: expect the full-page images.
+
+## Q2. A count of zero that reads 212,039 rows
+
+**Question:** after the DELETE committed, a `count(*)` over January returned 0 but still visited 212,039 heap rows. Why?
+
+A PostgreSQL DELETE only sets `xmax` on the heap tuple. The index entries in `orders_created_at_idx` still point at the dead tuples, and the visibility map no longer marks those pages all-visible. An index-only scan therefore had to fetch each heap tuple to check visibility: `Heap Fetches: 212039`. Only VACUUM removes the index entries.
+
+> **Common mistake:** thinking a committed DELETE makes reads of that range free. Until VACUUM, it makes them more expensive.
+
+## Q3. VACUUM did not shrink the file
+
+**Question:** VACUUM removed 212,039 tuples but the file stayed 365 MB. Why could it not shrink?
+
+Plain VACUUM can only truncate **empty pages at the end** of the file. January's rows were inserted first, so they sit at the start of the heap; the pages after them are full. VACUUM reported `pages: 0 removed`. The space is recorded in the free space map and reused by new inserts. Only `VACUUM FULL` or a rewrite (`pg_repack`) returns it, and both rewrite the table (VACUUM FULL under an ACCESS EXCLUSIVE lock).
+
+> **Common mistake:** expecting disk usage to drop after a retention DELETE. With time-ordered data, the deleted rows are always the oldest, at the start of the file.
+
+## Q4. 8.7 MB vs 215 bytes of binlog
+
+**Question:** why does MySQL's DELETE write 8.7 MB of binlog when DROP PARTITION writes 215 bytes?
+
+With `binlog_format = ROW` (the default) a DML statement is logged as the rows it changed, and `binlog_row_image = FULL` puts every column of each deleted row into the event: 212,039 rows in 1,066 `Delete_rows` events. DDL is always logged as a statement, so `ALTER TABLE orders_p DROP PARTITION p2024_01` is the statement text, 215 bytes. Replicas replay what is in the binlog: 212,039 row deletes in one case, one DDL in the other.
+
+> **Common mistake:** measuring only the primary. The binlog volume is what every replica (and every CDC consumer) has to process.
+
+## Q5. TTL vs a month collection
+
+**Question:** a TTL index removes the month with no job to run. What does it cost compared with dropping a month collection?
+
+The TTL monitor runs a delete per expired document: the same index and storage work as `deleteMany`, one oplog entry per document on a replica set, and the space stays inside the collection's file. It is spread over time (one pass every 60 s) instead of a burst. Dropping `orders_2024_01` took 1–2 ms and removed the files. The month collection's cost is elsewhere: the application must route writes to the right collection, create the next one with its indexes, and query across months with `$unionWith`.
+
+> **Common mistake:** treating TTL as free retention. It is a background deleteMany.
+
+## Q6. Scaling to 50 million rows a month
+
+**Question:** estimate the WAL of the DELETE for a month of 50 million rows. What else grows with it?
+
+The WAL per deleted row measured 11,450,106 / 212,039 ≈ 54 bytes without full-page images. 50 million rows × 54 bytes ≈ 2.7 GB, plus full-page images for every page touched for the first time after a checkpoint (up to the size of the month's data). Also growing linearly: the DELETE's run time, the VACUUM after it (which reads both whole indexes: VACUUM's index pass scales with the index size, not only the deleted part), its WAL (10.9 MB here), replica replay, and the time the transaction holds back cleanup of everything else. DROP of the partition stays at milliseconds.
+
+> **Common mistake:** extrapolating only the DELETE time. The VACUUM and replication costs grow with it.

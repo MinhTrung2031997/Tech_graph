@@ -1,0 +1,273 @@
+---
+title: "Concept 2: Removing a partition without stopping traffic"
+description: "DROP of a partition is milliseconds of work behind a strong lock. With one 12-second reader on December 2025, DROP TABLE orders_p_2024_01 queued for ACCESS EXCLUSIVE on the parent and a 1 ms read of December waited 10.2 s behind it. DETACH PARTITION … CONCURRENTLY waited for the reader too, but the read finished in 0.10 s. MySQL's DROP PARTITION queued on the metadata lock the same way; lock_wait_timeout = 2 turned the stall into ERROR 1205 after 2.09 s. MongoDB's drop takes 2 ms and kills open cursors."
+type: "concept"
+tags: ["partitioning", "locking", "retention", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/sql-altertable.html#SQL-ALTERTABLE-DETACH-PARTITION"
+  - "https://www.postgresql.org/docs/17/explicit-locking.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/metadata-locking.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html#sysvar_lock_wait_timeout"
+---
+
+<Tldr>
+Dropping a partition needs **ACCESS EXCLUSIVE on the parent table**, not just on the partition. One open transaction that read **any** partition (here: December 2025) makes the DROP wait, and every query that arrives after the DROP waits behind it: a read of December that normally takes milliseconds took **10.2 s**. `ALTER TABLE … DETACH PARTITION … CONCURRENTLY` takes only SHARE UPDATE EXCLUSIVE on the parent: it still waited 11 s for the old reader to finish, but new reads ran in **0.10 s**. It cannot run inside a transaction block; if interrupted, it leaves the partition "pending detach" until `… FINALIZE`. **MySQL** `DROP PARTITION` queues on the table's metadata lock the same way (reader 10.2 s); `SET SESSION lock_wait_timeout = 2` made the job fail with **ERROR 1205** after 2.09 s and the reader waited 1.08 s. **MongoDB** `drop()` took **2 ms**; an open cursor on the dropped collection failed with **QueryPlanKilled**.
+</Tldr>
+
+## The setup
+
+Three sessions on `orders_p` (24 monthly partitions):
+
+- **T1** reads December 2025 (`count(*) … WHERE created_at >= '2025-12-01'`) and keeps its transaction open for 12 s: a report, or a request whose transaction is left open.
+- **T2**, one second later, removes January 2024.
+- **T3**, one more second later, runs the same December read as T1.
+
+| Term | Meaning |
+|---|---|
+| ACCESS EXCLUSIVE | PostgreSQL's strongest table lock: conflicts with everything, including plain SELECT |
+| SHARE UPDATE EXCLUSIVE | Conflicts with schema changes and VACUUM, not with SELECT, INSERT, UPDATE, DELETE |
+| Lock queue | A waiting lock request blocks later requests that conflict with it, even if they are compatible with the current holder |
+| Metadata lock (MDL) | MySQL's table-level lock held by every statement and kept by a transaction until it ends; DDL needs it EXCLUSIVE |
+| **✓ / ✗** | Runs at once / waits |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: remove January while December is being read"
+  height={350}
+  nodes={[
+    { id: 't1', label: 'T1 reader', sub: 'Dec 2025, open 12 s', x: 20, y: 20, w: 200 },
+    { id: 't2', label: 'T2 retention', sub: 'remove Jan 2024', x: 300, y: 20, w: 200 },
+    { id: 't3', label: 'T3 reader', sub: 'Dec 2025, new', x: 580, y: 20, w: 200 },
+    { id: 'parent', label: 'orders_p', sub: 'parent table lock', x: 300, y: 160, w: 200 },
+    { id: 'dec', label: 'orders_p_2025_12', sub: 'read by T1 and T3', x: 580, y: 280, w: 200 },
+    { id: 'jan', label: 'orders_p_2024_01', sub: 'to be removed', x: 20, y: 280, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-parent', from: 't1', to: 'parent' },
+    { id: 't2-parent', from: 't2', to: 'parent' },
+    { id: 't3-parent', from: 't3', to: 'parent' },
+    { id: 'parent-dec', from: 'parent', to: 'dec' },
+    { id: 'parent-jan', from: 'parent', to: 'jan' },
+  ]}
+  cases={[
+    {
+      title: 'DROP TABLE orders_p_2024_01',
+      path: 'T1 AccessShare on orders_p ✓ → T2 AccessExclusive on orders_p ✗ waits → T3 AccessShare ✗ queued behind T2 (10.2 s)',
+      summary: 'The DROP never touches December, yet it stops every read of December.',
+      steps: [
+        {
+          title: 't0: T1 reads December',
+          note: 'T1 holds AccessShareLock on orders_p and on orders_p_2025_12 (pruning skipped the other 23 partitions). Locks are kept until the transaction ends.',
+          code: "BEGIN;\nSELECT count(*) FROM orders_p WHERE created_at >= '2025-12-01';\nSELECT pg_sleep(12);",
+          active: ['t1', 'parent', 'dec'],
+          edges: ['t1-parent', 'parent-dec'],
+          subs: { parent: '✓ T1 AccessShare' },
+        },
+        {
+          title: 't1: T2 drops January and waits',
+          note: 'Dropping a partition locks the parent in ACCESS EXCLUSIVE mode. pg_locks: T2 AccessExclusiveLock on orders_p, granted = f, pg_blocking_pids = T1. T2 never got as far as the January partition.',
+          code: 'DROP TABLE orders_p_2024_01;   -- waits',
+          active: ['t2', 'parent', 'jan'],
+          edges: ['t2-parent'],
+          subs: { parent: '✗ T2 AccessExclusive waits', jan: 'not reached yet' },
+        },
+        {
+          title: 't2: T3 queues behind T2',
+          note: 'T3 needs only AccessShareLock, which is compatible with T1. But T2\'s pending AccessExclusiveLock is ahead of it in the queue: pg_blocking_pids(T3) = T2. T3 finished 10.2 s after it started; T2 11.2 s after. Every request to orders_p in those seconds piles up, and a connection pool runs dry.',
+          code: "SELECT count(*) FROM orders_p WHERE created_at >= '2025-12-01';   -- 10.2 s",
+          active: ['t3', 'parent', 'dec'],
+          edges: ['t3-parent'],
+          subs: { parent: '✗ T3 queued behind T2' },
+        },
+      ],
+    },
+    {
+      title: 'DETACH PARTITION … CONCURRENTLY',
+      path: 'T2 ShareUpdateExclusive on orders_p ✓ → waits for T1\'s transaction (virtualxid) → T3 ✓ 0.10 s → partition detached',
+      summary: 'The retention job waits; nobody waits for the retention job.',
+      steps: [
+        {
+          title: 'T2 detaches concurrently',
+          note: 'First transaction: SHARE UPDATE EXCLUSIVE on the parent and the partition, mark the partition "detach pending", commit. Second transaction: wait until every transaction that might still see the partition has finished. pg_locks showed T2 waiting for a ShareLock on T1\'s virtualxid, not on orders_p.',
+          code: 'ALTER TABLE orders_p DETACH PARTITION orders_p_2024_01 CONCURRENTLY;',
+          active: ['t1', 't2', 'parent', 'jan'],
+          edges: ['t2-parent', 'parent-jan'],
+          subs: { parent: '✓ T2 ShareUpdateExclusive', jan: 'detach pending' },
+        },
+        {
+          title: 'T3 is not blocked',
+          note: 'T3 ran in 0.104 s. T2 finished after 11.1 s, when T1 committed. orders_p_2024_01 is now a standalone table; DROP TABLE on it locks only itself.',
+          code: 'DROP TABLE orders_p_2024_01;   -- no lock on orders_p any more',
+          active: ['t3', 'parent', 'dec'],
+          edges: ['t3-parent', 'parent-dec'],
+          subs: { parent: '✓ T3 AccessShare' },
+        },
+        {
+          title: 'If it is interrupted',
+          note: 'With statement_timeout = 3s, DETACH … CONCURRENTLY of February was cancelled during the wait. pg_inherits.inhdetachpending = t: new queries already skip the partition, and another DETACH on orders_p failed: "partition "orders_p_2024_02" already pending detach in partitioned table "public.orders_p"" with HINT "Use ALTER TABLE ... DETACH PARTITION ... FINALIZE". FINALIZE took 2.8 ms once T1 was gone.',
+          code: 'ALTER TABLE orders_p DETACH PARTITION orders_p_2024_02 FINALIZE;',
+          active: ['t2', 'parent', 'jan'],
+          edges: ['t2-parent', 'parent-jan'],
+          subs: { jan: 'pending → FINALIZE' },
+        },
+      ],
+    },
+  ]}
+/>
+
+| T2 statement | Lock on `orders_p` | T2 waited | T3 (new December read) |
+|---|---|---|---|
+| `DROP TABLE orders_p_2024_01` | AccessExclusiveLock | 11.2 s | ✗ 10.2 s |
+| `DETACH PARTITION … CONCURRENTLY` | ShareUpdateExclusiveLock | 11.1 s (for T1 to end) | ✓ 0.104 s |
+| `DETACH … CONCURRENTLY` inside `BEGIN` | — | ERROR: cannot run inside a transaction block | — |
+
+`DETACH … CONCURRENTLY` also adds a CHECK constraint to the detached table that copies its old bound (`orders_p_2024_01_created_at_check`). That matters if you attach it again (Concept 3).
+
+## MySQL InnoDB
+
+<Flow
+  title="InnoDB: DROP PARTITION while December is being read"
+  height={350}
+  nodes={[
+    { id: 't1', label: 'T1 reader', sub: 'Dec 2025, open 12 s', x: 20, y: 20, w: 200 },
+    { id: 't2', label: 'T2 retention', sub: 'DROP PARTITION', x: 300, y: 20, w: 200 },
+    { id: 't3', label: 'T3 reader', sub: 'Dec 2025, new', x: 580, y: 20, w: 200 },
+    { id: 'mdl', label: 'MDL orders_p', sub: 'whole table', x: 300, y: 160, w: 200 },
+    { id: 'err', label: 'ERROR 1205', sub: 'after lock_wait_timeout', x: 300, y: 280, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-mdl', from: 't1', to: 'mdl' },
+    { id: 't2-mdl', from: 't2', to: 'mdl' },
+    { id: 't3-mdl', from: 't3', to: 'mdl' },
+    { id: 'mdl-err', from: 'mdl', to: 'err' },
+  ]}
+  cases={[
+    {
+      title: 'Default lock_wait_timeout',
+      path: 'T1 SHARED_READ ✓ → T2 EXCLUSIVE ✗ pending → T3 SHARED_READ ✗ "Waiting for table metadata lock" (10.2 s)',
+      summary: 'Same queue as PostgreSQL, under a different name.',
+      steps: [
+        {
+          title: 'The queue in performance_schema',
+          note: 'metadata_locks on orders_p: T1 SHARED_READ GRANTED (TRANSACTION duration); T2 SHARED_UPGRADABLE GRANTED + EXCLUSIVE PENDING; T3 SHARED_READ PENDING. PROCESSLIST state "Waiting for table metadata lock" for T2 and T3. T3 finished after 10.17 s, T2 after 11.22 s.',
+          code: "SELECT OWNER_THREAD_ID, LOCK_TYPE, LOCK_STATUS FROM performance_schema.metadata_locks\nWHERE OBJECT_SCHEMA = 'pt4' AND OBJECT_NAME = 'orders_p';",
+          active: ['t1', 't2', 't3', 'mdl'],
+          edges: ['t1-mdl', 't2-mdl', 't3-mdl'],
+          subs: { mdl: '✗ EXCLUSIVE pending' },
+        },
+      ],
+    },
+    {
+      title: 'lock_wait_timeout = 2',
+      path: 'T2 EXCLUSIVE ✗ pending 2 s → ERROR 1205 → T3 ✓ after 1.08 s',
+      summary: 'Fail fast and retry later instead of freezing the table.',
+      steps: [
+        {
+          title: 'Give up quickly',
+          note: 'ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction, after 2.09 s. T3, queued behind it, completed in 1.08 s. The default lock_wait_timeout is 31,536,000 s (one year).',
+          code: 'SET SESSION lock_wait_timeout = 2;\nALTER TABLE orders_p DROP PARTITION p2024_01;   -- ERROR 1205 after 2.09 s',
+          active: ['t2', 'mdl', 'err', 't3'],
+          edges: ['t2-mdl', 'mdl-err', 't3-mdl'],
+          subs: { mdl: 'T2 gave up, T3 ✓' },
+        },
+      ],
+    },
+  ]}
+/>
+
+MySQL has no `DROP PARTITION CONCURRENTLY`. `DROP PARTITION` accepts `ALGORITHM=INPLACE, LOCK=NONE` (tested), which allows concurrent DML **while it runs**, but like every DDL it still needs the exclusive metadata lock to start and finish: the queue above happens anyway. The defence is a short `lock_wait_timeout` and a retry loop.
+
+## MongoDB
+
+<Flow
+  title="MongoDB: drop a month collection"
+  height={260}
+  nodes={[
+    { id: 'job', label: 'Retention job', sub: 'drop()', x: 20, y: 20, w: 200 },
+    { id: 'coll', label: 'orders_2024_01', sub: 'collection X lock', x: 300, y: 20, w: 200 },
+    { id: 'cur', label: 'Open cursor', sub: 'batchSize 100', x: 580, y: 20, w: 200 },
+    { id: 'killed', label: 'QueryPlanKilled', sub: 'next getMore fails', x: 580, y: 160, w: 200 },
+  ]}
+  edges={[
+    { id: 'job-coll', from: 'job', to: 'coll' },
+    { id: 'cur-coll', from: 'cur', to: 'coll' },
+    { id: 'cur-killed', from: 'cur', to: 'killed' },
+  ]}
+  cases={[
+    {
+      title: 'Drop with a reader in the middle',
+      path: 'drop ✓ 2 ms → open cursor ✗ QueryPlanKilled',
+      summary: 'No queue: the drop wins and the reader gets an error.',
+      steps: [
+        {
+          title: 'Drop',
+          note: 'A cursor had read the first document of a 100-document batch. drop() took 2 ms; it did not wait for the cursor.',
+          code: 'const c = db.orders_2024_01.find().batchSize(100); c.next();\ndb.orders_2024_01.drop();   // 2 ms',
+          active: ['job', 'coll', 'cur'],
+          edges: ['job-coll', 'cur-coll'],
+        },
+        {
+          title: 'The cursor fails',
+          note: 'Iterating further: QueryPlanKilled - collection dropped. A report reading old data must tolerate this, or the job must run when no reader needs that month.',
+          active: ['cur', 'killed'],
+          edges: ['cur-killed'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Comparison
+
+| | PostgreSQL DROP | PostgreSQL DETACH CONCURRENTLY | MySQL DROP PARTITION | MongoDB drop() |
+|---|---|---|---|---|
+| Lock on the whole table | ACCESS EXCLUSIVE | SHARE UPDATE EXCLUSIVE | EXCLUSIVE metadata lock | collection X lock, brief |
+| Waits for an old reader | yes | yes (for its transaction to end) | yes | no |
+| Blocks new readers while waiting | **yes** | no | **yes** | no |
+| Effect on the old reader | none | none | none | cursor killed |
+| Inside a transaction | yes | no | n/a (DDL commits implicitly) | n/a |
+
+<Pitfall>
+"It only takes 5 ms" is about the work, not the wait. A retention job that runs `DROP TABLE` on a partition at 02:00, while a 30-minute report is reading the table, freezes **every** query on that table for up to 30 minutes. In PostgreSQL use `DETACH … CONCURRENTLY` then drop the detached table, or at least `SET lock_timeout = '2s'` and retry. In MySQL set `lock_wait_timeout` to a few seconds for the job's session. The same lock queue hits `CREATE INDEX` and other DDL: see [Indexing Session 8, Concept 3](/blogs/databases/indexing/session-8-when-indexes-hurt/concept-3-concurrently-locking).
+</Pitfall>
+
+## Real-world scenario: the retention job and the BI extract
+
+A nightly BI extract opens a transaction at 01:00 and reads all orders of the last month until 01:40. The retention job runs at 01:30: `ALTER TABLE orders DETACH PARTITION orders_2024_09; DROP TABLE orders_2024_09;`. From 01:30 to 01:40 checkout cannot read or write `orders`, the connection pool fills, and the on-call engineer sees "too many clients".
+
+| Fix | Effect |
+|---|---|
+| `DETACH PARTITION … CONCURRENTLY`, then `DROP TABLE` the detached table | The job waits until 01:40; checkout never waits |
+| `SET lock_timeout = '2s'` in the job and retry every few minutes | If something must take ACCESS EXCLUSIVE, the stall is at most 2 s |
+| Monitor `inhdetachpending` | A cancelled detach is visible and finished with `FINALIZE` |
+| Keep the extract out of a single long transaction | Fewer old snapshots to wait for (also helps VACUUM) |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Indexing Session 8, Concept 3](/blogs/databases/indexing/session-8-when-indexes-hurt/concept-3-concurrently-locking) | The same lock queue, caused by CREATE INDEX without CONCURRENTLY |
+| [Transactions Session 8, Concept 1](/blogs/databases/transactions/session-8-when-transactions-hurt/concept-1-idle-in-transaction) | Idle and long transactions are what the DROP ends up waiting for |
+| Concept 1 | Why DROP is still the right tool: no per-row work |
+| Concept 3 | Adding partitions has the same lock question: CREATE … PARTITION OF vs ATTACH |
+
+## Key takeaways
+
+1. Dropping or detaching a partition (non-concurrently) locks the **parent** in ACCESS EXCLUSIVE mode, so it waits for readers of any partition.
+2. A waiting ACCESS EXCLUSIVE request blocks every later query on the table: a millisecond read took 10.2 s.
+3. `DETACH … CONCURRENTLY` takes SHARE UPDATE EXCLUSIVE and waits for old transactions without blocking new ones. It cannot run in a transaction block, and an interrupted one needs `FINALIZE`.
+4. MySQL's `DROP PARTITION` queues on the metadata lock; there is no concurrent variant, so use a short `lock_wait_timeout`.
+5. MongoDB's `drop()` does not wait: it kills open cursors on the collection.
+
+## Check questions
+
+1. T1 read only December 2025. Why did a DROP of January 2024 wait for it?
+2. T3 needed only a share lock, compatible with T1's. Why did it wait 10.2 s?
+3. What does `DETACH … CONCURRENTLY` wait for, and why does that not block T3?
+4. A cancelled `DETACH … CONCURRENTLY` left a partition pending detach. What do queries see, and how do you finish?
+5. MySQL's `DROP PARTITION` accepts `LOCK=NONE`. Why did it still block T3?
+6. Write the PostgreSQL retention step you would schedule, including what happens when a long reader is present.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-4-partition-lifecycle/concept-2-detach-without-blocking/answers">Worked answers to Q1–Q6</DeepDive>

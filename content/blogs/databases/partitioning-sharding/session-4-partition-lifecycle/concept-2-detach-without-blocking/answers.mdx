@@ -1,0 +1,71 @@
+---
+title: "Answers: Removing a partition without stopping traffic"
+description: "Worked answers to the Session 4 Concept 2 check questions."
+companion: "answers"
+tags: ["partitioning", "locking", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/sql-altertable.html#SQL-ALTERTABLE-DETACH-PARTITION"
+  - "https://dev.mysql.com/doc/refman/8.4/en/metadata-locking.html"
+---
+
+<Tldr>
+The work is cheap; the lock is not. Choose the operation by the lock it takes on the parent.
+</Tldr>
+
+## Q1. Waiting for a reader of another month
+
+**Question:** T1 read only December 2025. Why did a DROP of January 2024 wait for it?
+
+A query on a partitioned table locks the **parent** as well as the partitions it reads: T1 held AccessShareLock on `orders_p`, `orders_p_2025_12` and their indexes. Dropping a partition changes the parent's partition list, so PostgreSQL takes AccessExclusiveLock on the parent, which conflicts with every other lock, including T1's AccessShareLock. Pruning keeps T1's locks off January, but not off the parent.
+
+> **Common mistake:** "nobody is using January, so dropping it is safe". Anyone using the table is using the parent.
+
+## Q2. A compatible lock that still waited
+
+**Question:** T3 needed only a share lock, compatible with T1's. Why did it wait 10.2 s?
+
+PostgreSQL grants locks in queue order. T2's AccessExclusiveLock request was already waiting, and T3's AccessShareLock conflicts with T2's request. Letting T3 jump the queue could starve T2 forever, so T3 queues behind T2: `pg_blocking_pids(T3)` returned T2's pid, not T1's. T3 ran only after T1 committed and T2 had finished.
+
+> **Common mistake:** looking for the blocker among lock holders only. The blocker can be a waiter.
+
+## Q3. What CONCURRENTLY waits for
+
+**Question:** what does `DETACH … CONCURRENTLY` wait for, and why does that not block T3?
+
+It runs as two transactions. The first takes SHARE UPDATE EXCLUSIVE on the parent and the partition, marks the partition "detach pending" in `pg_inherits`, and commits. The second waits for every transaction whose snapshot might still include the partition: in the lab, a ShareLock on T1's virtual transaction id. Neither step holds a lock on `orders_p` that conflicts with SELECT, INSERT, UPDATE or DELETE, so T3 ran in 0.104 s while T2 waited 11.1 s.
+
+> **Common mistake:** expecting CONCURRENTLY to finish faster. It finishes later; it just does not block anyone while it waits.
+
+## Q4. Pending detach
+
+**Question:** a cancelled `DETACH … CONCURRENTLY` left a partition pending detach. What do queries see, and how do you finish?
+
+New queries already exclude the partition: after the cancel, `count(*) FROM orders_p WHERE created_at < '2024-03-01'` returned 0 although February's 198,358 rows were still in `orders_p_2024_02`. Only one partition per parent can be pending: the next DETACH on `orders_p` failed with "already pending detach". Finish with `ALTER TABLE orders_p DETACH PARTITION orders_p_2024_02 FINALIZE` (2.8 ms here, once the old transaction was gone), which also waits for old snapshots.
+
+> **Common mistake:** retrying the same `DETACH … CONCURRENTLY` in a loop. It fails until FINALIZE runs.
+
+## Q5. LOCK=NONE and still blocking
+
+**Question:** MySQL's `DROP PARTITION` accepts `LOCK=NONE`. Why did it still block T3?
+
+`LOCK=NONE` controls concurrency **during** the DDL's execution. Every DDL statement still needs the table's EXCLUSIVE metadata lock to start (briefly, to install the change). That request waits for T1's SHARED_READ metadata lock, which a transaction keeps until it commits; while it waits, it is ahead of T3's SHARED_READ request in the queue. performance_schema showed exactly that: EXCLUSIVE PENDING (T2), SHARED_READ PENDING (T3).
+
+> **Common mistake:** reading `LOCK=NONE` as "takes no lock".
+
+## Q6. A safe PostgreSQL retention step
+
+**Question:** write the PostgreSQL retention step you would schedule, including what happens when a long reader is present.
+
+```sql
+-- Runs outside a transaction block (required by CONCURRENTLY).
+SET lock_timeout = '5s';            -- bounds the first, short lock step
+SET statement_timeout = '30min';    -- give up if old snapshots never go away
+ALTER TABLE orders_p DETACH PARTITION orders_p_2024_01 CONCURRENTLY;
+-- archive orders_p_2024_01 if needed (pg_dump -t), then:
+DROP TABLE orders_p_2024_01;        -- locks only the detached table
+```
+
+With a long reader present, the DETACH waits for it without blocking anyone. If it hits `statement_timeout`, the partition stays pending detach and invisible to new queries; the next run must check `pg_inherits.inhdetachpending` and run `… DETACH PARTITION … FINALIZE` instead.
+
+> **Common mistake:** wrapping the job in `BEGIN … COMMIT` (many job runners do). CONCURRENTLY fails with "cannot run inside a transaction block".

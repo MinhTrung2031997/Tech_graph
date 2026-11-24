@@ -1,0 +1,292 @@
+---
+title: "Concept 4: Partitioning a table that already exists"
+description: "Turning the 5M-row orders table into a partitioned one. PostgreSQL copy: 6.1 s, 1.22 GB of WAL and 624 MB of new space. PostgreSQL attach-in-place: the old table becomes one partition after a concurrent unique index (0.88 s) and a validated CHECK (0.14 s), both without blocking writes; the switch transaction took about 33 ms and no row moved. MySQL can only rebuild: ERROR 1503 until the primary key includes created_at (6.3 s rebuild), then PARTITION BY copied all rows (9.4–10.3 s) with writes waiting 8.5 s. MongoDB has nothing to convert: $out moved one month in 0.44–0.78 s and collMod made an existing index a TTL index in 1 ms."
+type: "concept"
+tags: ["partitioning", "migration", "online-ddl", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/sql-altertable.html#SQL-ALTERTABLE-ATTACH-PARTITION"
+  - "https://www.postgresql.org/docs/17/sql-altertable.html#SQL-ALTERTABLE-DESC-ADD-TABLE-CONSTRAINT"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-limitations-partitioning-keys-unique-keys.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html#online-ddl-partitioning"
+  - "https://www.mongodb.com/docs/manual/reference/command/collMod/"
+---
+
+<Tldr>
+Partitioning is decided when a table is created. Converting `orders` (5,000,000 rows, 579 MB with indexes) later, three ways:
+
+- **PostgreSQL, copy:** create a partitioned table and `INSERT … SELECT`: **6.1 s**, **1.22 GB of WAL**, **624 MB** of new space, and the writes made during the copy still have to be caught up.
+- **PostgreSQL, attach in place:** the old table becomes **one partition** covering everything before 2026, and new months get their own partitions. The slow steps run without blocking writes: `CREATE UNIQUE INDEX CONCURRENTLY (id, created_at)` **0.88 s**, `ADD CONSTRAINT … CHECK … NOT VALID` + `VALIDATE` **0.14 s**. The switch transaction took **about 33 ms**, because ATTACH found the range "implied by existing constraints". Without the CHECK, ATTACH scanned the 5M rows (140–276 ms) under ACCESS EXCLUSIVE.
+- **MySQL:** `PARTITION BY` failed with **ERROR 1503** until the primary key included `created_at`. That took a **6.3 s** rebuild; then `PARTITION BY` copied every row (**9.4–10.3 s**). Only ALGORITHM=COPY with LOCK=SHARED is allowed, so an insert waited **8.5 s**.
+- **MongoDB:** no partitioned collections to convert to. `$out` copied one month to its own collection in 0.44–0.78 s, and `collMod` made the existing `created_at` index a TTL index in **1 ms**.
+</Tldr>
+
+## The setup
+
+`orders_c` is a copy of `orders`: `PRIMARY KEY (id)`, index on `created_at`, 5,000,000 rows from 2024-01-01 to 2025-12-31. The target is monthly partitions on `created_at`, with the application still writing.
+
+| Term | Meaning |
+|---|---|
+| Copy migration | Build the partitioned table next to the old one and copy all rows |
+| Attach in place | Make the existing table one (large) partition of a new partitioned parent |
+| `NOT VALID` + `VALIDATE` | Add a constraint without checking old rows (instant), then check them under a lock that allows writes |
+| `CONCURRENTLY` | Build an index without blocking writes |
+| **✓ / ✗** | Writes continue / writes blocked |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: partition the existing orders_c"
+  height={360}
+  nodes={[
+    { id: 'old', label: 'orders_c', sub: '5M rows, PK (id)', x: 20, y: 20, w: 200 },
+    { id: 'app', label: 'Application', sub: 'keeps writing', x: 580, y: 20, w: 200 },
+    { id: 'copy', label: 'New partitioned', sub: 'INSERT … SELECT', x: 20, y: 280, w: 200 },
+    { id: 'prep', label: 'Online prep', sub: 'index + CHECK', x: 300, y: 150, w: 200 },
+    { id: 'parent', label: 'New parent', sub: 'RANGE (created_at)', x: 580, y: 150, w: 200 },
+    { id: 'legacy', label: 'orders_legacy', sub: 'MINVALUE → 2026-01-01', x: 300, y: 280, w: 200 },
+    { id: 'jan', label: 'orders_c_2026_01', sub: 'new months', x: 580, y: 280, w: 200 },
+  ]}
+  edges={[
+    { id: 'old-copy', from: 'old', to: 'copy' },
+    { id: 'old-prep', from: 'old', to: 'prep' },
+    { id: 'app-parent', from: 'app', to: 'parent' },
+    { id: 'prep-legacy', from: 'prep', to: 'legacy' },
+    { id: 'parent-legacy', from: 'parent', to: 'legacy' },
+    { id: 'parent-jan', from: 'parent', to: 'jan' },
+  ]}
+  cases={[
+    {
+      title: 'Copy into a new partitioned table',
+      path: 'INSERT … SELECT 5M rows → ✗ 6.1 s, 1.22 GB WAL, 624 MB new space → ✗ writes during the copy must be replayed',
+      summary: 'Simple, and every row is written again.',
+      steps: [
+        {
+          title: 'Copy',
+          note: 'orders_new with 24 monthly partitions. EXPLAIN (ANALYZE, WAL): 6,080 ms, WAL records 15,032,918 (heap + 2 indexes per row), 1,221,363,383 bytes. New partitions total 624 MB next to the old 579 MB.',
+          code: 'EXPLAIN (ANALYZE, WAL, COSTS OFF)\n  INSERT INTO orders_new SELECT * FROM orders_c;',
+          active: ['old', 'copy'],
+          edges: ['old-copy'],
+          subs: { copy: '6.1 s, 1.22 GB WAL' },
+        },
+        {
+          title: 'The hard part is not measured here',
+          note: 'Rows inserted or updated in orders_c during those seconds (hours, at production size) are not in the copy. You need a trigger or CDC to replay them, or a write freeze for the final swap. Replicas also receive the full 1.22 GB.',
+          active: ['app', 'old', 'copy'],
+          edges: ['old-copy'],
+        },
+      ],
+    },
+    {
+      title: 'Attach the old table as one partition',
+      path: 'CREATE UNIQUE INDEX CONCURRENTLY ✓ 0.88 s → CHECK NOT VALID + VALIDATE ✓ 0.14 s → switch ≈ 33 ms → new months ✓',
+      summary: 'No row is copied; the old data ages out as one partition.',
+      steps: [
+        {
+          title: 'Unique index for the new primary key',
+          note: 'A partitioned table\'s primary key must include the partition key (Session 3), so the old table needs a unique index on (id, created_at). Built concurrently: 880 ms, writes allowed.',
+          code: 'CREATE UNIQUE INDEX CONCURRENTLY orders_c_id_created_at\n  ON orders_c (id, created_at);',
+          active: ['old', 'prep', 'app'],
+          edges: ['old-prep'],
+        },
+        {
+          title: 'CHECK constraint for the bound',
+          note: 'NOT VALID: 3.3 ms, checks only new rows. VALIDATE CONSTRAINT: 141.7 ms, a full scan under SHARE UPDATE EXCLUSIVE, so INSERT, UPDATE and DELETE continue.',
+          code: "ALTER TABLE orders_c ADD CONSTRAINT orders_c_range\n  CHECK (created_at < '2026-01-01') NOT VALID;\nALTER TABLE orders_c VALIDATE CONSTRAINT orders_c_range;",
+          active: ['old', 'prep'],
+          edges: ['old-prep'],
+        },
+        {
+          title: 'The switch, one short transaction',
+          note: 'Swap the primary key to the new index (3.2 ms), rename, create the parent, ATTACH (0.64 ms: "partition constraint for table "orders_legacy" is implied by existing constraints"), add the parent\'s primary key and index (0.4 and 0.2 ms: the partition\'s existing indexes are adopted, nothing is built), create January 2026 (1.6 ms), COMMIT (26 ms). About 33 ms in all, under ACCESS EXCLUSIVE on orders_c.',
+          code: "BEGIN;\nALTER TABLE orders_c DROP CONSTRAINT orders_c_pkey,\n  ADD CONSTRAINT orders_c_pkey PRIMARY KEY USING INDEX orders_c_id_created_at;\nALTER TABLE orders_c RENAME TO orders_legacy;\nCREATE TABLE orders_c (/* same columns */) PARTITION BY RANGE (created_at);\nALTER TABLE orders_c ATTACH PARTITION orders_legacy\n  FOR VALUES FROM (MINVALUE) TO ('2026-01-01');\nALTER TABLE orders_c ADD PRIMARY KEY (id, created_at);\nCREATE INDEX orders_c_created_at ON orders_c (created_at);\nCREATE TABLE orders_c_2026_01 PARTITION OF orders_c\n  FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');\nCOMMIT;",
+          active: ['app', 'parent', 'legacy', 'jan', 'prep'],
+          edges: ['prep-legacy', 'app-parent', 'parent-legacy', 'parent-jan'],
+          subs: { legacy: '5M rows, not moved' },
+        },
+      ],
+    },
+  ]}
+/>
+
+| Step (attach in place) | Time | Lock on the old table | Writes |
+|---|---|---|---|
+| `CREATE UNIQUE INDEX CONCURRENTLY` | 880 ms | SHARE UPDATE EXCLUSIVE | ✓ |
+| `ADD CONSTRAINT … NOT VALID` | 3.3 ms | ACCESS EXCLUSIVE, brief | ✗ for 3 ms |
+| `VALIDATE CONSTRAINT` | 141.7 ms | SHARE UPDATE EXCLUSIVE | ✓ |
+| Switch transaction | ≈ 33 ms | ACCESS EXCLUSIVE | ✗ for 33 ms |
+| Same ATTACH **without** the CHECK (3 runs) | 276, 141, 139 ms | ACCESS EXCLUSIVE | ✗ for the whole scan |
+
+What went wrong on the first try: keeping the old `PRIMARY KEY (id)` and adding the parent's key failed with **"multiple primary keys for table "orders_legacy" are not allowed"**. The old key must be replaced by the (id, created_at) index inside the switch, which also means `id` alone is no longer enforced unique by the database (Session 3, Concept 3 covers ways to keep it).
+
+After the switch, `orders_legacy` holds 2024–2025 and every new month gets its own partition. When the newest row in `orders_legacy` passes the retention period, the whole legacy partition is dropped at once. No row ever has to be moved.
+
+## MySQL InnoDB
+
+<Flow
+  title="InnoDB: ALTER TABLE orders_c PARTITION BY RANGE COLUMNS (created_at)"
+  height={330}
+  nodes={[
+    { id: 'alter', label: 'ALTER TABLE', sub: 'PARTITION BY …', x: 20, y: 20, w: 200 },
+    { id: 'pk', label: 'PRIMARY KEY (id)', sub: 'no created_at', x: 300, y: 20, w: 200 },
+    { id: 'writer', label: 'Writers', sub: 'INSERT', x: 580, y: 20, w: 200 },
+    { id: 'err', label: '✗ ERROR 1503', sub: 'PK must include it', x: 20, y: 200, w: 200 },
+    { id: 'copy', label: 'Copy to tmp table', sub: 'all 5M rows', x: 300, y: 200, w: 200 },
+    { id: 'wait', label: '✗ Writers wait', sub: 'metadata lock', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'alter-pk', from: 'alter', to: 'pk' },
+    { id: 'alter-err', from: 'alter', to: 'err' },
+    { id: 'pk-copy', from: 'pk', to: 'copy' },
+    { id: 'writer-wait', from: 'writer', to: 'wait' },
+  ]}
+  cases={[
+    {
+      title: 'Primary key without the partition column',
+      path: 'PARTITION BY on PK (id) → ✗ ERROR 1503',
+      summary: 'MySQL checks the key rule before doing anything.',
+      steps: [
+        {
+          title: 'Refused',
+          note: 'ERROR 1503 (HY000): A PRIMARY KEY must include all columns in the table\'s partitioning function (prefixed columns are not considered).',
+          code: "ALTER TABLE orders_c PARTITION BY RANGE COLUMNS (created_at) (\n  PARTITION p2024_01 VALUES LESS THAN ('2024-02-01'), …);",
+          active: ['alter', 'pk', 'err'],
+          edges: ['alter-pk', 'alter-err'],
+        },
+      ],
+    },
+    {
+      title: 'Change the key, then rebuild into partitions',
+      path: 'PK (id, created_at): 6.3 s rebuild → PARTITION BY ✗ ALGORITHM=COPY 9.4–10.3 s → writers ✗ wait 8.5 s',
+      summary: 'Two full rebuilds, the second one blocking writes.',
+      steps: [
+        {
+          title: 'Rebuild the primary key',
+          note: 'DROP PRIMARY KEY, ADD PRIMARY KEY (id, created_at): 6.31 s (a clustered-index rebuild).',
+          code: 'ALTER TABLE orders_c DROP PRIMARY KEY, ADD PRIMARY KEY (id, created_at);',
+          active: ['alter', 'pk'],
+          edges: ['alter-pk'],
+          subs: { pk: 'PRIMARY KEY (id, created_at)' },
+        },
+        {
+          title: 'Partition: a full copy',
+          note: '5,000,000 rows affected, 9.36 s and 10.30 s (REMOVE PARTITIONING back: 6.95–7.42 s). ALGORITHM=INPLACE: ERROR 1845 "Try ALGORITHM=COPY". LOCK=NONE: ERROR 1846 "COPY algorithm requires a lock. Try LOCK=SHARED."',
+          code: 'ALTER TABLE orders_c LOCK=SHARED PARTITION BY RANGE COLUMNS (created_at) (…);',
+          active: ['alter', 'pk', 'copy'],
+          edges: ['alter-pk', 'pk-copy'],
+        },
+        {
+          title: 'Writes stop for the copy',
+          note: 'During a 9.47 s PARTITION BY: PROCESSLIST "copy to tmp table" for the ALTER, "Waiting for table metadata lock" for an INSERT, which finished after 8.47 s. A read during it took 0.10 s.',
+          active: ['writer', 'wait', 'copy'],
+          edges: ['writer-wait'],
+        },
+      ],
+    },
+  ]}
+/>
+
+For a large MySQL table, the usual route is an online schema-change tool (gh-ost or pt-online-schema-change) that builds the partitioned copy in the background, replays changes from the binlog or triggers, and swaps the tables at the end. Neither was run here.
+
+## MongoDB
+
+<Flow
+  title="MongoDB: two ways to get retention on an existing collection"
+  height={260}
+  nodes={[
+    { id: 'orders', label: 'orders', sub: '5M docs, created_at index', x: 20, y: 20, w: 220 },
+    { id: 'month', label: 'orders_2025_12', sub: '$out, one month', x: 300, y: 20, w: 200 },
+    { id: 'ttl', label: 'TTL index', sub: 'collMod on created_at', x: 300, y: 160, w: 200 },
+    { id: 'expire', label: 'Background deletes', sub: 'TTL monitor', x: 580, y: 160, w: 200 },
+  ]}
+  edges={[
+    { id: 'orders-month', from: 'orders', to: 'month' },
+    { id: 'orders-ttl', from: 'orders', to: 'ttl' },
+    { id: 'ttl-expire', from: 'ttl', to: 'expire' },
+  ]}
+  cases={[
+    {
+      title: 'Move months into collections',
+      path: '$out per month → ✓ 0.44–0.78 s for 212,038 docs → application must read and write by month',
+      summary: 'The copy migration, one month at a time.',
+      steps: [
+        {
+          title: 'Copy one month',
+          note: 'aggregate([$match December 2025, $out orders_2025_12]): 777, 441, 453 ms. $out replaces the target and keeps the indexes it already had.',
+          code: "db.orders.aggregate([\n  { $match: { created_at: { $gte: ISODate('2025-12-01'), $lt: ISODate('2026-01-01') } } },\n  { $out: 'orders_2025_12' }]);",
+          active: ['orders', 'month'],
+          edges: ['orders-month'],
+        },
+      ],
+    },
+    {
+      title: 'Make the existing index a TTL index',
+      path: 'collMod created_at index → ✓ 1 ms → TTL monitor deletes expired documents',
+      summary: 'No copy at all, but deletes stay per document (Concept 1).',
+      steps: [
+        {
+          title: 'collMod',
+          note: 'An existing { created_at: 1 } index became a TTL index in 1 ms, no rebuild. Set expireAfterSeconds to the retention period; the TTL monitor then deletes in the background.',
+          code: "db.runCommand({ collMod: 'orders_ttl',\n  index: { keyPattern: { created_at: 1 }, expireAfterSeconds: 34214400 } });",
+          active: ['orders', 'ttl', 'expire'],
+          edges: ['orders-ttl', 'ttl-expire'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Comparison
+
+| Convert 5M rows to monthly partitions | Data rewritten | Write blocking | Time (lab) |
+|---|---|---|---|
+| PostgreSQL copy | all rows, 1.22 GB WAL | none during copy; catch-up needed | 6.1 s |
+| PostgreSQL attach in place | none | 3 ms + 33 ms | 0.88 s + 0.14 s + 0.03 s |
+| MySQL `PARTITION BY` | all rows, twice (PK, then partitions) | the whole copy | 6.3 s + 9.4 s |
+| MySQL online tool | all rows, in background | the final swap | not measured |
+| MongoDB `$out` per month | one month at a time | none | 0.44–0.78 s per month |
+| MongoDB TTL via `collMod` | none | none | 1 ms |
+
+<Pitfall>
+The lab table is 579 MB and cached. On a 500 GB table, the copy is hours of WAL or binlog that every replica replays, and the MySQL `PARTITION BY` blocks writes for those hours. In PostgreSQL, never let ATTACH do the validation: without the CHECK constraint the full scan runs under ACCESS EXCLUSIVE (here 140–276 ms for 5M rows, linearly more for more). Run `VALIDATE CONSTRAINT` first, when writes are still allowed.
+</Pitfall>
+
+## Real-world scenario: partitioning order history at 800 million rows
+
+An order table has grown to 800M rows over five years. Retention is now 3 years, and deleting 2 years of rows would take days of DELETE and VACUUM.
+
+| Step | How |
+|---|---|
+| 1. Unique index `(id, created_at)` | `CREATE UNIQUE INDEX CONCURRENTLY` (hours, writes continue) |
+| 2. `CHECK (created_at < '2026-02-01') NOT VALID`, then `VALIDATE` | One full scan, writes continue |
+| 3. Switch transaction with `lock_timeout = '2s'` | Seconds, retried until it gets the lock |
+| 4. New monthly partitions from 2026-02 | Created 3 months ahead (Concept 3) |
+| 5. Old data | Option A: wait until all legacy rows are past 3 years and drop the legacy partition. Option B: copy the most recent 3 years out of legacy month by month into proper partitions, then drop legacy. |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 3, Concept 3](/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-3-unique-keys) | Why the primary key must include `created_at`, and how to keep `id` unique |
+| [Session 3, Concept 2](/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-2-building-indexes-online) | Building partition indexes without blocking writes |
+| [Indexing Session 8, Concept 3](/blogs/databases/indexing/session-8-when-indexes-hurt/concept-3-concurrently-locking) | CONCURRENTLY and its trade-offs |
+| Concept 3 | ATTACH with a CHECK constraint skips the scan |
+
+## Key takeaways
+
+1. Copying into a partitioned table rewrites every row (1.22 GB of WAL for 5M rows) and leaves the "writes during the copy" problem to you.
+2. In PostgreSQL the existing table can become one partition: index it concurrently, validate a CHECK, and the switch is milliseconds.
+3. ATTACH without a matching CHECK scans the whole table under ACCESS EXCLUSIVE; with it, ATTACH is a catalog change.
+4. MySQL first requires the partition column in every unique key, then rebuilds the table with ALGORITHM=COPY and writes blocked; large tables need an online schema-change tool.
+5. MongoDB has nothing to convert: either move months into collections or turn the existing index into a TTL index with `collMod`.
+
+## Check questions
+
+1. Why is "writes during the copy" the real problem of the copy migration, not the 6.1 s?
+2. Why does the attach-in-place approach need a new unique index before the switch?
+3. Why validate the CHECK constraint before the switch instead of letting ATTACH check the rows?
+4. The first switch failed with "multiple primary keys for table "orders_legacy" are not allowed". What was wrong, and what does the fix give up?
+5. Why did MySQL refuse `PARTITION BY` on the original table, and why is the conversion two rebuilds?
+6. After the switch, how does the legacy partition eventually go away without moving rows?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-4-partition-lifecycle/concept-4-converting-a-table/answers">Worked answers to Q1–Q6</DeepDive>
