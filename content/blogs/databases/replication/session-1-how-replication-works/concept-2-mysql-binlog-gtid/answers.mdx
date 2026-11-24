@@ -1,0 +1,71 @@
+---
+title: "Answers: MySQL ships its binary log"
+description: "Worked answers to the Session 1 Concept 2 check questions."
+companion: "answers"
+tags: ["replication", "binlog", "gtid", "mysql", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-implementation.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-gtids-concepts.html"
+---
+
+<Tldr>
+The binlog is a logical description of committed transactions. Its size depends on the row format, not on how InnoDB laid out the pages.
+</Tldr>
+
+## Q1. Two logs at commit
+
+**Question:** why does a MySQL replica not need InnoDB's redo log, and why does the source write two logs at commit?
+
+The redo log describes changes to InnoDB pages of this server and is only used to recover this server after a crash. The replica has its own InnoDB with its own pages, so it needs a description of the transaction (which rows changed to what), not of the source's pages. The binary log is that description, and it is also what point-in-time recovery and change data capture read. MySQL therefore writes both at commit and coordinates them with an internal two-phase commit, so that after a crash a transaction is either in both logs or in neither. Here the 100,000-row UPDATE wrote 10.1 MB of redo and 8.2 MB of binlog.
+
+> **Common mistake:** assuming `innodb_flush_log_at_trx_commit = 1` alone makes replication safe. The binlog's own flushing is `sync_binlog`.
+
+## Q2. Five events
+
+**Question:** list the five events of the single-row INSERT and say what each one is for.
+
+| Event | Bytes | Purpose |
+|---|---|---|
+| `Gtid` | 79 | Sets the transaction's GTID (`e1ab078e-…:32`) |
+| `Query` BEGIN | 83 | Starts the transaction on the replica |
+| `Table_map` | 69 | Maps a table id (85) to `shop.orders` and its column types |
+| `Write_rows` | 76 | The inserted row, using that table id |
+| `Xid` | 31 | COMMIT, with the source's internal transaction id |
+
+> **Common mistake:** reading `Write_rows` as SQL. In row format the replica does not parse SQL; it writes the row image directly.
+
+## Q3. 41 KB vs 240 KB
+
+**Question:** why was the 1,000-row INSERT only 41,472 bytes of binlog when the same INSERT is about 240 KB of WAL in PostgreSQL?
+
+The binlog holds each new row once, compactly encoded (about 41 bytes per row here) plus one set of transaction events. PostgreSQL's WAL holds every page change the INSERT caused: the heap tuple with its header, an entry for each of the two indexes, and page-level overhead, about 240 bytes per row. The replica in MySQL rebuilds its index entries itself while applying the rows, so their cost is paid in CPU on the replica instead of in bytes on the network.
+
+> **Common mistake:** concluding MySQL replication is "cheaper". It moves less data but makes the replica do more work per row, which matters for lag (Session 3).
+
+## Q4. MINIMAL row images
+
+**Question:** when would you choose `binlog_row_image = MINIMAL`, and what do you lose?
+
+When large UPDATEs dominate the binlog and every table has a primary key: the 100,000-row UPDATE fell from 8.2 MB to 1.6 MB because each event carried only the key before and the changed column after. You lose the full before-image: change data capture tools that need the old values of every column, and tools that rebuild undo statements from the binlog, see less. Tables without a primary key are also harder for the replica to locate rows in.
+
+> **Common mistake:** switching to MINIMAL while a CDC pipeline still reads the binlog expecting full rows.
+
+## Q5. Errant GTIDs
+
+**Question:** what is an errant GTID, how did one appear here, and why does it matter before a failover?
+
+A GTID created on a replica that the source never had. The INSERT on `rpa-my2` was recorded as `e1ab4183-…:6`, the replica's own server_uuid, so `@@gtid_executed` on the replica became `e1ab078e-…:1-33, e1ab4183-…:1-7` (the replica's own `1-5` were already there on the fresh container, from its first-start setup). If that replica is promoted, the other replicas see transactions they lack and fetch them, spreading the stray change; if the old source's binlogs no longer contain the matching history, replicas can fail to connect (both from the documentation). Compare `gtid_executed` sets before promoting a replica.
+
+> **Common mistake:** "fixing" a broken replica by skipping the failing transaction without checking why it failed. The data is then different on the two servers.
+
+## Q6. Two reasons not to use statement format
+
+**Question:** statement format made the UPDATE 343 bytes. Give two reasons not to use it.
+
+1. Non-deterministic statements: `UPDATE … ORDER BY … LIMIT`, functions like `RAND()`, `UUID()`, `SYSDATE()` can change different rows or values on the replica; the source logged Note 1592 for LIMIT and for a system function.
+2. The replica repeats the work: a statement that scanned 100,000 rows on the source scans them again on the replica, possibly with a different plan, adding replica lag.
+
+Also: tools that read the binlog as a change stream need row events.
+
+> **Common mistake:** setting `binlog_format = MIXED` and assuming MySQL detects every unsafe statement. It detects the cases it knows about, not every application-level assumption.

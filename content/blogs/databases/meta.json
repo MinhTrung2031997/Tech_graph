@@ -4,6 +4,7 @@
   "pages": [
     "indexing",
     "transactions",
-    "partitioning-sharding"
+    "partitioning-sharding",
+    "replication"
   ]
 }

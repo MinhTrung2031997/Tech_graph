@@ -1,0 +1,65 @@
+---
+title: "Answers: MongoDB ships its oplog"
+description: "Worked answers to the Session 1 Concept 3 check questions."
+companion: "answers"
+tags: ["replication", "oplog", "mongodb", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/replica-set-oplog/"
+  - "https://www.mongodb.com/docs/manual/core/replica-set-sync/"
+---
+
+<Tldr>
+The oplog is a list of idempotent per-document changes that every member keeps. Its entry count, not the number of statements, is what replication pays for.
+</Tldr>
+
+## Q1. Logging the result of $inc
+
+**Question:** why does MongoDB log `$inc` as the resulting value rather than as `$inc`?
+
+So that every entry is idempotent. A secondary applies the oplog in batches; after a crash or restart it may re-apply entries it had already applied, and during an initial sync it applies entries to data that may already contain them. Logging `amount: 81.07` gives the same document whether applied once or twice; logging `$inc: 1` would add 1 per application. The same idea turns a multi-document update into one entry per document, each naming its `_id`.
+
+> **Common mistake:** expecting the oplog to contain the statement your application ran. It contains the resulting per-document change.
+
+## Q2. 334 vs 185 bytes
+
+**Question:** a single `updateOne` from mongosh was 334 bytes, one entry of the `updateMany` 185 bytes. Where do the 149 bytes go?
+
+mongosh sends single-document writes as **retryable writes**. Their oplog entries carry `lsid` (the logical session id, with a UUID and a hashed user id), `txnNumber`, `stmtId` and `prevOpTime`, which let the server recognise a retried write and return the earlier result instead of applying it twice. `updateMany` is not retryable, so its entries have none of those fields.
+
+> **Common mistake:** sizing the oplog from a test that used multi-document updates, then running production traffic of single-document retryable writes, which are larger per entry.
+
+## Q3. One million documents
+
+**Question:** how many oplog entries does `updateMany` on 1 million documents produce, and what does that do to the oplog window?
+
+One million entries. At the 185 bytes per entry measured here that is about 185 MB, more with larger documents or changed fields. The oplog is capped by size, so those entries push out older ones: the window, the time between the oldest and the newest entry, shrinks by however long it would normally take to write 185 MB of entries. On a busy primary with a small oplog that can be hours.
+
+> **Common mistake:** reading the window right after creating a replica set (`timeDiffHours: 0.01` here) as a property of the oplog. It depends on the write rate.
+
+## Q4. A transaction is one entry
+
+**Question:** why is a whole transaction one oplog entry, and what does that guarantee secondaries?
+
+The transaction's writes are kept on the primary until commit, then written to the oplog as one `applyOps` entry (653 bytes for three updates here; very large transactions are split into a chain of entries, from the documentation). A secondary applies that entry as a unit, so a reader on a secondary sees either none or all of the transaction's changes, never three-quarters of an order.
+
+> **Common mistake:** assuming a secondary may show partial transactions because entries are applied in parallel. Parallelism is between independent entries; one applyOps is applied whole.
+
+## Q5. Pull vs push
+
+**Question:** secondaries pull from a sync source. Name one advantage of pull over the source pushing.
+
+Any of:
+- A secondary decides where to sync from: it can pull from another secondary (chained replication) to spare the primary or to stay within a region.
+- The primary keeps no per-replica state of what it has sent; a secondary simply resumes its cursor from its last applied `ts`.
+- A slow secondary slows only its own cursor, not the primary's writes (unless the write concern waits for it, Session 2).
+
+> **Common mistake:** assuming the primary knows how far behind each secondary is because it sends to them. It learns positions from the secondaries' progress reports (`rs.status()`).
+
+## Q6. Down longer than the window
+
+**Question:** a secondary was down for two days; the oplog window is 20 hours. What happens when it starts?
+
+It asks its sync source for entries after its last applied `ts`. That entry is no longer in any member's oplog, because the capped collection has already removed it. The secondary cannot know what it missed, so it goes into maintenance (state RECOVERING, "too stale to catch up", from the documentation) and must be resynced: an initial sync copies all data again, which for a large data set takes hours and loads the sync source. Prevent it by sizing the oplog for your longest planned outage.
+
+> **Common mistake:** restarting the stale secondary repeatedly, hoping it catches up. Only a resync, or a restore from a recent backup plus oplog, brings it back.

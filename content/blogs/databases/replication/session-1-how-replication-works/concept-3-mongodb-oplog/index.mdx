@@ -1,0 +1,199 @@
+---
+title: "Concept 3: MongoDB ships its oplog"
+description: "A MongoDB replica set copies the primary's oplog, a capped collection of idempotent operations, and secondaries apply it. insertOne wrote one 397-byte entry. updateMany with $inc on 100,000 documents wrote 100,000 entries of 185 bytes (18.5 MB), each holding the new value, not the $inc. insertMany of 1,000 documents became two applyOps entries of 500 inserts; a 3-update transaction one 653-byte applyOps entry. Secondaries refuse writes (NotWritablePrimary 10107) and replayed a drop() within 6 ms."
+type: "concept"
+tags: ["replication", "oplog", "mongodb", "replica-set"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/replica-set-oplog/"
+  - "https://www.mongodb.com/docs/manual/core/replica-set-sync/"
+  - "https://www.mongodb.com/docs/manual/core/retryable-writes/"
+  - "https://www.mongodb.com/docs/manual/reference/command/replSetGetStatus/"
+---
+
+<Tldr>
+MongoDB replication is **logical and pulled**. Every write on the primary also inserts an entry into `local.oplog.rs`, a capped collection, in the same storage transaction. Each secondary fetches new entries from its sync source, stores them in its own oplog and applies them in batches. Entries are **idempotent**: an `$inc` is logged as the resulting value, so applying an entry twice gives the same document. Measured on 100,000 `orders` documents: `insertOne` wrote **1 entry of 397 bytes**; `updateMany` with `$inc` on all documents wrote **100,000 entries of 185 bytes (18.5 MB)**; `insertMany` of 1,000 documents became **2 `applyOps` entries** of 500 inserts each (108,649 bytes each); a transaction updating 3 documents became **1 `applyOps` entry of 653 bytes**. The oplog here was **29.6 GB** (capped), and a secondary refused a write with **NotWritablePrimary (10107)**.
+</Tldr>
+
+## The moving parts
+
+| Term | Meaning |
+|---|---|
+| Oplog | `local.oplog.rs`, a capped collection on every member; one document per operation, ordered by `ts` |
+| `op` | `i` insert, `u` update, `d` delete, `c` command (`applyOps`, `drop`, `create` …), `n` no-op |
+| `o` / `o2` | The change (`$v: 2` diff, or a full document) / the target (`_id`) |
+| Idempotent | Applying the entry once or twice gives the same result: `$inc: 1` is logged as `amount: 81.07` |
+| Sync source | The member a secondary pulls from (here both pulled from the primary, `syncSourceHost: rpa-mongo1:27017`) |
+| `applyOps` | One entry that wraps several operations: used for transactions and batched inserts |
+| Oplog window | Time span between the oldest and newest entry; a secondary away longer than the window must resync |
+| **✓ / ✗** | Done / refused |
+
+## The path of one write
+
+<Flow
+  title="MongoDB: one write from client to secondary"
+  height={350}
+  nodes={[
+    { id: 'client', label: 'Client', sub: 'driver / mongosh', x: 20, y: 20, w: 170 },
+    { id: 'primary', label: 'Primary', sub: 'document + oplog entry', x: 20, y: 150, w: 170 },
+    { id: 'oplog', label: 'local.oplog.rs', sub: 'capped, 29.6 GB', x: 20, y: 280, w: 170 },
+    { id: 'fetch', label: 'Oplog fetcher', sub: 'secondary pulls', x: 310, y: 280, w: 180 },
+    { id: 'soplog', label: 'Secondary oplog', sub: 'same entries', x: 600, y: 280, w: 180 },
+    { id: 'apply', label: 'Oplog applier', sub: 'batches, parallel', x: 600, y: 150, w: 180 },
+    { id: 'coll', label: 'Secondary data', sub: 'shop.orders copy', x: 600, y: 20, w: 180 },
+  ]}
+  edges={[
+    { id: 'client-primary', from: 'client', to: 'primary' },
+    { id: 'primary-oplog', from: 'primary', to: 'oplog' },
+    { id: 'oplog-fetch', from: 'oplog', to: 'fetch', label: 'pull' },
+    { id: 'fetch-soplog', from: 'fetch', to: 'soplog', label: 'store' },
+    { id: 'soplog-apply', from: 'soplog', to: 'apply' },
+    { id: 'apply-coll', from: 'apply', to: 'coll' },
+  ]}
+  cases={[
+    {
+      title: 'insertOne',
+      path: 'primary writes document + 1 oplog entry (op i, 397 B) ✓ → secondary fetches ✓ → stores ✓ → applies ✓',
+      summary: 'One write, one oplog entry, written in the same storage transaction as the document.',
+      steps: [
+        {
+          title: 't1: the primary writes',
+          note: 'The insert and its oplog entry are one WiredTiger transaction. The entry: op: i, ns: shop.orders, the full document in o, plus lsid, txnNumber and stmtId because mongosh sends retryable writes. 397 bytes (bsonsize), the same in 3 runs.',
+          code: "db.orders.insertOne({ _id: 1000001, seller_id: 42, marketplace: 'shopee',\n  status: 'delivered', amount: Decimal128('99.90'), created_at: new Date() });",
+          active: ['client', 'primary', 'oplog'],
+          edges: ['client-primary', 'primary-oplog'],
+          subs: { oplog: '1 entry, op i, 397 B' },
+        },
+        {
+          title: 't2: the secondary pulls',
+          note: 'Secondaries are not sent anything: each runs a fetcher that keeps a cursor open on its sync source\'s oplog and receives new entries as they appear. rs.status() showed syncSourceHost rpa-mongo1:27017 for both secondaries.',
+          active: ['oplog', 'fetch', 'soplog'],
+          edges: ['oplog-fetch', 'fetch-soplog'],
+          subs: { soplog: 'same ts, same entry' },
+        },
+        {
+          title: 't3: the secondary applies',
+          note: 'The applier takes batches from the secondary\'s oplog and applies them with several threads, keeping per-document order. A secondary\'s oplog is identical to the primary\'s, which is what lets any member become a sync source or the next primary.',
+          active: ['soplog', 'apply', 'coll'],
+          edges: ['soplog-apply', 'apply-coll'],
+          subs: { coll: '✓ document inserted' },
+        },
+      ],
+    },
+    {
+      title: 'updateMany with $inc on 100,000 documents',
+      path: 'primary → 100,000 entries op u, 185 B each = 18.5 MB ✓ → each entry holds the new value, not $inc',
+      summary: 'A multi-document update is one oplog entry per document, each idempotent.',
+      steps: [
+        {
+          title: 'One entry per document',
+          note: 'updateMany({ _id: { $lte: 100000 } }, { $inc: { amount: Decimal128(\'1\') } }) added exactly 100,000 entries, 18,500,000 bytes, 185 bytes each. A single updateOne from mongosh was 334 bytes: the 149 extra bytes are lsid, txnNumber and stmtId of the retryable write.',
+          code: "db.orders.updateMany({ _id: { $lte: 100000 } }, { $inc: { amount: Decimal128('1') } });",
+          active: ['primary', 'oplog'],
+          edges: ['primary-oplog'],
+          subs: { oplog: '100,000 entries, 18.5 MB' },
+        },
+        {
+          title: 'The new value, not the operator',
+          note: 'Entry for _id 1: op: u, o: { $v: 2, diff: { u: { amount: Decimal128(\'81.07\') } } }, o2: { _id: 1 }. If a secondary applies it twice (after a restart in the middle of a batch), amount is 81.07 both times. An entry of $inc: 1 would add 2.',
+          active: ['oplog', 'fetch', 'soplog', 'apply', 'coll'],
+          edges: ['oplog-fetch', 'fetch-soplog', 'soplog-apply', 'apply-coll'],
+          subs: { apply: 'set amount = 81.07' },
+        },
+      ],
+    },
+    {
+      title: 'Batched inserts and transactions',
+      path: 'insertMany 1,000 → 2 applyOps entries (500 + 500) ✓; transaction of 3 updates → 1 applyOps entry, 653 B ✓',
+      summary: 'Several operations can share one oplog entry, which the secondary applies as a unit.',
+      steps: [
+        {
+          title: 'insertMany of 1,000 documents',
+          note: 'Two entries with op: c, ns: admin.$cmd, o: { applyOps: [500 inserts] }, 108,649 bytes each, multiOpType: 1 (217 bytes per document). Same in 3 runs.',
+          code: 'db.orders.insertMany(docs);   // 1,000 documents',
+          active: ['client', 'primary', 'oplog'],
+          edges: ['client-primary', 'primary-oplog'],
+          subs: { oplog: '2 × applyOps(500)' },
+        },
+        {
+          title: 'A transaction',
+          note: 'Three updateOne calls between startTransaction() and commitTransaction() became one entry: op: c, applyOps with three u operations, 653 bytes. Nothing of the transaction is in the oplog before the commit, so secondaries never see half of it.',
+          code: "s.startTransaction();\nfor (const id of [11, 12, 13]) so.updateOne({ _id: id }, { $set: { status: 'returned' } });\ns.commitTransaction();",
+          active: ['oplog', 'fetch', 'soplog', 'apply'],
+          edges: ['oplog-fetch', 'fetch-soplog', 'soplog-apply'],
+          subs: { apply: '3 updates as one unit' },
+        },
+      ],
+    },
+    {
+      title: 'Writes to a secondary, drops from the primary',
+      path: 'insertOne on a secondary ✗ NotWritablePrimary 10107; drop() on the primary ✓ → gone on the secondary after 6 ms',
+      summary: 'Secondaries only change through the oplog, including your mistakes.',
+      steps: [
+        {
+          title: 'A secondary refuses writes',
+          note: 'Connected directly to rpa-mongo2: insertOne failed with NotWritablePrimary 10107 "not primary". Unlike a MySQL replica, there is no setting that makes it writable.',
+          code: "// mongosh on rpa-mongo2\ndb.getSiblingDB('shop').orders.insertOne({ _id: 1 });   // NotWritablePrimary",
+          active: ['client', 'coll'],
+          subs: { coll: '✗ not primary' },
+        },
+        {
+          title: 'A drop replicates too',
+          note: 'A 1,000-document scratch collection was dropped on the primary; a loop reading the collection list on rpa-mongo2 saw it gone 6 ms later. A replica copies mistakes as faithfully as data.',
+          code: 'db.scratch.drop();   // gone on the secondary after 6 ms',
+          active: ['primary', 'oplog', 'fetch', 'soplog', 'apply', 'coll'],
+          edges: ['primary-oplog', 'oplog-fetch', 'fetch-soplog', 'soplog-apply', 'apply-coll'],
+          subs: { oplog: 'op c, drop' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## The oplog is a collection you can read
+
+```js
+// The most recent entry for orders
+db.getSiblingDB('local').oplog.rs.find({ ns: 'shop.orders' }).sort({ $natural: -1 }).limit(1)
+
+// Size and window
+db.getSiblingDB('local').getReplicationInfo()   // logSizeMB: 29617, usedMB: 39, timeDiffHours: 0.01
+```
+
+The oplog is capped: when it reaches its size (29,617 MB here, chosen by mongod from the disk size; set `--oplogSizeMB` or `replSetResizeOplog` to change it), the oldest entries are removed. The **oplog window**, how far back it reaches in time, is what matters operationally: a secondary that is down longer than the window cannot catch up from the oplog and needs an initial sync (Session 3 measures lag).
+
+<Pitfall>
+"One updateMany" is not one replication event. Updating 100,000 documents wrote 100,000 oplog entries, 18.5 MB, which every secondary fetches and applies one document at a time. A nightly job that rewrites a large collection with `updateMany` can shrink the oplog window from days to hours, because it fills the capped oplog with entries, and it creates a burst of replication lag. Batch large rewrites, and check `getReplicationInfo().timeDiffHours` after the job.
+</Pitfall>
+
+## Real-world scenario: an analytics secondary falls off the oplog
+
+A hidden secondary used for nightly exports is stopped for a disk replacement. The primary's oplog is sized for normal traffic, about 20 hours of window, but the same night a migration script runs `updateMany` on 40 million order documents: 40 million entries, about 7 GB at the 185 bytes per entry measured here, which pushes the window down to a few hours. When the secondary comes back, its last applied entry is no longer in the primary's oplog and it must resync from scratch. Before maintenance, compare the planned downtime with the window (`getReplicationInfo()`), resize the oplog if needed (`replSetResizeOplog`, online), and schedule bulk rewrites away from it.
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 2 | MySQL's binlog is also logical, but pushed by the source and not idempotent in statement format |
+| Concept 4 | Bytes per write compared across the three engines |
+| [Transactions Session 8, Concept 3](/blogs/databases/transactions/session-8-when-transactions-hurt/concept-3-big-transactions) | Large transactions become large applyOps entries |
+
+## Key takeaways
+
+1. Every write on the primary adds an entry to `local.oplog.rs` in the same storage transaction; secondaries pull and apply entries.
+2. Entries are idempotent: `$inc` is logged as the resulting value.
+3. A multi-document update is one entry per document: 100,000 entries and 18.5 MB here.
+4. Transactions and batched inserts become `applyOps` entries that are applied as a unit.
+5. Secondaries refuse client writes; a drop on the primary reached a secondary in 6 ms.
+6. The oplog is capped; its time window decides how long a secondary can be away.
+
+## Check questions
+
+1. Why does MongoDB log `$inc` as the resulting value rather than as `$inc`?
+2. A single `updateOne` from mongosh was 334 bytes, one entry of the `updateMany` 185 bytes. Where do the 149 bytes go?
+3. How many oplog entries does `updateMany` on 1 million documents produce, and what does that do to the oplog window?
+4. Why is a whole transaction one oplog entry, and what does that guarantee secondaries?
+5. Secondaries pull from a sync source. Name one advantage of pull over the source pushing.
+6. A secondary was down for two days; the oplog window is 20 hours. What happens when it starts?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-1-how-replication-works/concept-3-mongodb-oplog/answers">Worked answers to Q1–Q6</DeepDive>

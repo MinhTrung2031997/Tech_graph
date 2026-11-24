@@ -1,0 +1,195 @@
+---
+title: "Concept 1: PostgreSQL ships its WAL"
+description: "A PostgreSQL standby receives the primary's write-ahead log byte for byte and replays it. One single-row INSERT on the 100,000-row orders table wrote 272 bytes of WAL in four records: the heap row, one entry in each of the two indexes, and the commit. The first change to a page after a checkpoint carries a full 8 KB page image: 8,760 to 16,680 bytes for the same INSERT. With the standby stopped, its replication slot kept 96 MB of WAL on the primary; the standby replayed it within 0.5 s of starting."
+type: "concept"
+tags: ["replication", "wal", "postgresql", "streaming-replication", "replication-slots"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/warm-standby.html#STREAMING-REPLICATION"
+  - "https://www.postgresql.org/docs/17/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW"
+  - "https://www.postgresql.org/docs/17/pgwaldump.html"
+  - "https://www.postgresql.org/docs/17/warm-standby.html#STREAMING-REPLICATION-SLOTS"
+---
+
+<Tldr>
+PostgreSQL streaming replication is **physical**: the standby gets the same WAL bytes the primary wrote for crash recovery, and replays them into an identical copy of every data file. Nothing is translated, so everything the primary changes on disk is shipped: the row, **every index entry**, page pruning, and after each checkpoint a **full-page image** of every page touched for the first time. Measured on the 100,000-row `orders` table: a warm single-row INSERT wrote **272 bytes** (heap INSERT 103 B, two B-tree INSERT_LEAF records of 64 B, COMMIT 34 B); the same INSERT right after a CHECKPOINT wrote **8,760–16,680 bytes**. A **replication slot** makes the primary keep WAL until the standby has it: with the standby stopped, three bulk updates left **96 MB** of WAL retained, and the standby replayed it within **0.5 s** of starting.
+</Tldr>
+
+## The moving parts
+
+| Term | Meaning |
+|---|---|
+| WAL | Write-ahead log: every change to a data page is first written as a WAL record in `pg_wal/` |
+| LSN | Log sequence number, a byte position in the WAL (`0/B1CB1C8`). The difference between two LSNs is a number of bytes |
+| walsender | Process on the primary that reads WAL and streams it to one standby |
+| walreceiver | Process on the standby that receives WAL and writes it to the standby's `pg_wal/` |
+| startup process | Process on the standby that replays WAL records into the data files (`startup recovering …`) |
+| Replication slot | A named bookmark on the primary (`restart_lsn`): WAL after it is kept until that standby confirms it |
+| Full-page image (FPW) | A copy of the whole 8 KB page, added to the first WAL record that touches a page after a checkpoint |
+| **✓ / ✗** | Step done / waiting or not possible |
+
+`pg_stat_replication` on the primary reports four positions for each standby, one per stage. With the lab idle, all four were equal:
+
+```text
+application_name | walreceiver      state      | streaming
+sent_lsn         | 0/B1D2380        write_lsn  | 0/B1D2380
+flush_lsn        | 0/B1D2380        replay_lsn | 0/B1D2380
+sync_state       | async
+```
+
+Inside the containers, the processes are named after their job: `walsender postgres 192.168.163.3(43886) streaming 0/B1D2380` on the primary, `walreceiver streaming 0/B1D2380` and `startup recovering 00000001000000000000000B` on the standby.
+
+## The path of one INSERT
+
+<Flow
+  title="PostgreSQL: one INSERT from client to standby"
+  height={350}
+  nodes={[
+    { id: 'client', label: 'Client', sub: 'INSERT INTO orders', x: 20, y: 20, w: 170 },
+    { id: 'backend', label: 'Backend', sub: 'writes WAL records', x: 20, y: 150, w: 170 },
+    { id: 'wal', label: 'pg_wal (primary)', sub: 'records at an LSN', x: 20, y: 280, w: 170 },
+    { id: 'slot', label: 'Slot standby1', sub: 'restart_lsn', x: 310, y: 150, w: 180 },
+    { id: 'sender', label: 'walsender', sub: 'sent_lsn', x: 310, y: 280, w: 180 },
+    { id: 'receiver', label: 'walreceiver', sub: 'write / flush_lsn', x: 600, y: 280, w: 180 },
+    { id: 'startup', label: 'Startup process', sub: 'replay_lsn', x: 600, y: 150, w: 180 },
+    { id: 'rows', label: 'Standby tables', sub: 'read-only queries', x: 600, y: 20, w: 180 },
+  ]}
+  edges={[
+    { id: 'client-backend', from: 'client', to: 'backend' },
+    { id: 'backend-wal', from: 'backend', to: 'wal' },
+    { id: 'wal-sender', from: 'wal', to: 'sender', label: 'read' },
+    { id: 'sender-slot', from: 'sender', to: 'slot' },
+    { id: 'sender-receiver', from: 'sender', to: 'receiver', label: 'stream' },
+    { id: 'receiver-startup', from: 'receiver', to: 'startup' },
+    { id: 'startup-rows', from: 'startup', to: 'rows' },
+  ]}
+  cases={[
+    {
+      title: 'Warm page: a single-row INSERT',
+      path: 'backend → 4 WAL records, 272 B ✓ → walsender ✓ → walreceiver ✓ → startup replays ✓ → row visible on the standby',
+      summary: 'The standby receives the same 272 bytes the primary wrote for its own crash recovery.',
+      steps: [
+        {
+          title: 't1: the backend writes WAL',
+          note: 'pg_waldump of the INSERT: Heap INSERT 103 B (the row, block 3849 offset 77), Btree INSERT_LEAF 64 B (primary key), Btree INSERT_LEAF 64 B (created_at index), Transaction COMMIT 34 B. The insert LSN moved 272 bytes (3 runs: 272, 272, 296).',
+          code: "INSERT INTO orders VALUES (3000001, 42, 'shopee', 'delivered', 99.90, now());",
+          active: ['client', 'backend', 'wal'],
+          edges: ['client-backend', 'backend-wal'],
+          subs: { wal: '4 records, 272 B' },
+        },
+        {
+          title: 't2: the walsender streams it',
+          note: 'The walsender reads WAL that is already flushed on the primary and sends it on its replication connection. pg_stat_replication.sent_lsn moves to the end of the COMMIT record. The slot remembers how far this standby has confirmed.',
+          active: ['wal', 'sender', 'slot'],
+          edges: ['wal-sender', 'sender-slot'],
+          subs: { sender: 'sent_lsn = commit end' },
+        },
+        {
+          title: 't3: the walreceiver writes and flushes',
+          note: 'The walreceiver writes the bytes to the standby\'s own pg_wal and reports write_lsn and flush_lsn back to the primary. The standby\'s WAL file names match the primary\'s.',
+          active: ['sender', 'receiver'],
+          edges: ['sender-receiver'],
+          subs: { receiver: 'write ✓ flush ✓' },
+        },
+        {
+          title: 't4: the startup process replays',
+          note: 'Replay applies the same four records: the row goes to block 3849 offset 77 of the standby\'s copy, the two index leaves get their entries, the commit makes it visible. replay_lsn reaches the commit end; a query on the standby now sees the row.',
+          code: 'SELECT pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn(), pg_last_xact_replay_timestamp();',
+          active: ['receiver', 'startup', 'rows'],
+          edges: ['receiver-startup', 'startup-rows'],
+          subs: { startup: 'replay_lsn = commit end', rows: '✓ row visible' },
+        },
+      ],
+    },
+    {
+      title: 'Cold page: the first change after a checkpoint',
+      path: 'backend → records + full-page images ✓ (8.7–16.7 KB) → walsender → walreceiver → startup restores the whole page',
+      summary: 'After every checkpoint, the first change to each page ships the whole page.',
+      steps: [
+        {
+          title: 'The same INSERT after CHECKPOINT',
+          note: 'A page written partially during a crash cannot be repaired from a 103-byte record, so the first change to a page after each checkpoint logs the whole page (full_page_writes = on). The same INSERT wrote 16,680, 8,760 and 8,992 bytes in three runs, against 272 when warm.',
+          code: 'CHECKPOINT;\nINSERT INTO orders VALUES (1000001, 42, \'shopee\', \'delivered\', 99.90, now());   -- 8,760 to 16,680 B',
+          active: ['backend', 'wal'],
+          edges: ['backend-wal'],
+          subs: { wal: 'records + 8 KB pages' },
+        },
+        {
+          title: 'A cold UPDATE ships five pages',
+          note: 'UPDATE of one row whose page was full: PRUNE_ON_ACCESS 509 B, LOCK 8,215 B, UPDATE 6,025 B (new version on another page), INSERT_LEAF 6,673 B and 6,997 B (both indexes need an entry for the new version), COMMIT 34 B. Every record except COMMIT carried an FPW: 28,576 bytes for one row. Updated again right away: 168–176 bytes.',
+          code: 'UPDATE orders SET amount = amount + 1 WHERE id = 777;',
+          active: ['wal', 'sender', 'receiver', 'startup'],
+          edges: ['wal-sender', 'sender-receiver', 'receiver-startup'],
+          subs: { startup: 'restores 5 full pages' },
+        },
+      ],
+    },
+    {
+      title: 'Standby down: the slot keeps WAL',
+      path: 'standby ✗ stopped → slot active = f, restart_lsn frozen → primary keeps 96 MB ✓ → standby starts → replayed in 0.5 s ✓',
+      summary: 'The slot trades disk space on the primary for a standby that can always catch up.',
+      steps: [
+        {
+          title: 'Stop the standby, keep writing',
+          note: 'With rpa-pg2 stopped, three UPDATEs of all 100,000 rows ran on the primary. pg_replication_slots: active = f, wal_status = reserved, and current LSN minus restart_lsn = 96 MB. pg_wal held 9 segment files, 144 MB.',
+          code: "SELECT active, wal_status,\n       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn))\nFROM pg_replication_slots;   -- f | reserved | 96 MB",
+          active: ['backend', 'wal', 'slot'],
+          edges: ['backend-wal'],
+          subs: { slot: '✗ inactive, 96 MB kept', receiver: '✗ stopped' },
+        },
+        {
+          title: 'Start it again',
+          note: 'docker start rpa-pg2: the walreceiver reconnected with the slot, asked for WAL from its last position and replay_lsn equalled the primary\'s LSN 0.5 s after the start command. The slot then retained 0 bytes.',
+          active: ['slot', 'sender', 'receiver', 'startup', 'rows'],
+          edges: ['sender-slot', 'sender-receiver', 'receiver-startup', 'startup-rows'],
+          subs: { slot: '✓ active, 0 bytes kept', receiver: '✓ streaming' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## What "physical" means for you
+
+| Property | Consequence |
+|---|---|
+| The standby is a byte copy of the cluster | Same major version, same CPU architecture; you cannot replicate one database or one table |
+| Indexes and page maintenance are in the WAL | A single-row INSERT ships 3 records for 2 indexes; VACUUM and pruning on the primary are shipped too |
+| Full-page images after checkpoints | WAL volume, and so replication traffic, jumps right after each checkpoint |
+| The standby cannot write | It is in recovery: `pg_is_in_recovery()` returned `t` |
+| Slots keep WAL for absent standbys | Safe catch-up, but an abandoned slot fills the primary's disk; `max_slot_wal_keep_size` caps it |
+
+<Pitfall>
+A slot does not expire. A standby that is decommissioned without `pg_drop_replication_slot('standby1')` keeps every byte of WAL the primary writes from that moment, until `pg_wal` fills the disk and the **primary** stops. Here three bulk updates cost 96 MB in a minute. Monitor `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)` for every slot, and set `max_slot_wal_keep_size` so that a forgotten slot is invalidated (`wal_status = lost`) instead of taking the primary down.
+</Pitfall>
+
+## Real-world scenario: replication traffic doubles every five minutes
+
+An order service writes about 2 MB of WAL per second, but the network graph between the primary and the standby shows spikes to 6 MB/s right after each checkpoint (`checkpoint_timeout = 5min` here). Those are full-page images: after a checkpoint, every hot page is logged once in full before its normal small records resume. Options, in order of effort: turn on `wal_compression` (on a 100,000-row update it cut WAL from 45.5 MB to 39.9 MB, Concept 4), spread checkpoints further apart (`checkpoint_timeout`, `max_wal_size`), or accept the spikes and size the link for them. Never turn off `full_page_writes` to save traffic: it protects the primary against torn pages after a crash.
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Transactions Session 1, Concept 3](/blogs/databases/transactions/session-1-transaction-guarantees/concept-3-durability) | The same WAL makes a commit durable on one server; replication sends it to a second one |
+| Concept 4 | Bytes per write compared with MySQL's binlog and MongoDB's oplog |
+| [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) | Exercise 1 decodes these records with pg_waldump and stops the standby |
+
+## Key takeaways
+
+1. A PostgreSQL standby replays the primary's own WAL: physical, byte-for-byte, the whole cluster.
+2. Every change on disk is in the WAL: one INSERT into a table with two indexes was four records, 272 bytes.
+3. The first change to a page after a checkpoint ships the whole 8 KB page: the same INSERT cost 8,760–16,680 bytes cold.
+4. `pg_stat_replication` shows four positions per standby: sent, written, flushed, replayed.
+5. A replication slot keeps WAL for a standby that is away (96 MB here); drop slots you no longer need or cap them with `max_slot_wal_keep_size`.
+
+## Check questions
+
+1. Why did a single-row INSERT produce two B-tree records, and what would a third index add?
+2. The same INSERT wrote 272 bytes once and 16,680 bytes after a CHECKPOINT. What is in the extra bytes and why does PostgreSQL need them?
+3. Name the four LSN columns of `pg_stat_replication` and the process responsible for each.
+4. Why can a PostgreSQL standby not hold only the `orders` table?
+5. The standby was stopped for a minute and replayed 96 MB within 0.5 s of starting. What made that possible, and what is the risk of the same mechanism?
+6. A cold UPDATE of one row wrote 28,576 bytes. Which records did it contain, and why did both indexes get a new entry?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-1-how-replication-works/concept-1-postgresql-wal-streaming/answers">Worked answers to Q1–Q6</DeepDive>

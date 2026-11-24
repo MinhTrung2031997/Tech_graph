@@ -1,0 +1,202 @@
+---
+title: "Concept 2: MySQL ships its binary log"
+description: "MySQL replicas do not see InnoDB's redo log. The source writes a second, logical log, the binary log, and the replica re-executes its events. A single-row INSERT was 338 bytes in five events (Gtid, BEGIN, Table_map, Write_rows, Xid). An UPDATE of 100,000 rows was 8.2 MB with full row images, 1.6 MB with binlog_row_image = MINIMAL and 343 bytes as a statement, while InnoDB wrote 10.1 MB of redo that never left the source. An INSERT run on the replica itself later stopped replication with error 1062; super_read_only refuses such writes with ERROR 1290."
+type: "concept"
+tags: ["replication", "binlog", "gtid", "mysql", "innodb"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-implementation.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-gtids-concepts.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html#sysvar_binlog_row_image"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-rbr-safe-unsafe.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html#sysvar_super_read_only"
+---
+
+<Tldr>
+MySQL replication is **logical**. InnoDB's redo log stays on the source; at commit the source also writes the transaction to the **binary log** as events, each transaction tagged with a **GTID** (`server_uuid:number`). A Binlog Dump thread sends the events, the replica's I/O thread stores them in a **relay log**, and applier threads re-execute them on the replica's own InnoDB. Measured on 100,000 `orders` rows: a single-row INSERT was **338 bytes** in five events. An UPDATE of all 100,000 rows was **8.2 MB** in row format with full before/after images, **1.6 MB** with `binlog_row_image = MINIMAL`, **1.5 MB** with binlog transaction compression, and **343 bytes** in statement format, while InnoDB wrote **10.1 MB of redo** for it that no replica ever sees. A replica is an ordinary writable server: a row inserted there by mistake made the source's later INSERT of the same key fail on the replica with **error 1062** and replication stopped. `super_read_only = ON` refuses such writes (**ERROR 1290**).
+</Tldr>
+
+## The moving parts
+
+| Term | Meaning |
+|---|---|
+| Binary log (binlog) | Logical log of committed transactions in `binlog.000005` …, written by the source at commit; separate from InnoDB's redo log |
+| Event | One entry in the binlog: `Gtid`, `Query` (BEGIN or a statement), `Table_map`, `Write_rows` / `Update_rows` / `Delete_rows`, `Xid` (COMMIT) |
+| GTID | Global transaction id `source_uuid:n`. A replica records which GTIDs it has executed and asks for the rest (`SOURCE_AUTO_POSITION = 1`) |
+| Binlog Dump thread | Thread on the source that sends binlog events to one replica |
+| `replica_io` | Replica thread that receives events and writes them to the relay log (`Retrieved_Gtid_Set`) |
+| `replica_sql` + workers | Coordinator and 4 worker threads (default `replica_parallel_workers = 4`) that apply the relay log (`Executed_Gtid_Set`) |
+| Row / statement format | Log the changed rows (default `ROW`) or the SQL text (`STATEMENT`) |
+| `binlog_row_image` | `FULL` logs every column before and after; `MINIMAL` logs the key before and the changed columns after |
+
+On the replica, `performance_schema.threads` showed `thread/sql/replica_io` "Waiting for source to send event", `thread/sql/replica_sql` "Replica has read all relay log; waiting for more updates" and four `thread/sql/replica_worker` "Waiting for an event from Coordinator". On the source, one connection in state "Source has sent all binlog to replica; waiting for more updates".
+
+## The path of one INSERT
+
+<Flow
+  title="MySQL: one INSERT from client to replica"
+  height={350}
+  nodes={[
+    { id: 'client', label: 'Client', sub: 'INSERT INTO orders', x: 20, y: 20, w: 170 },
+    { id: 'commit', label: 'Source commit', sub: 'InnoDB + binlog', x: 20, y: 150, w: 170 },
+    { id: 'redo', label: 'InnoDB redo log', sub: 'stays on the source', x: 310, y: 150, w: 180 },
+    { id: 'binlog', label: 'binlog.000005', sub: 'events', x: 20, y: 280, w: 170 },
+    { id: 'dump', label: 'Binlog Dump', sub: 'source thread', x: 310, y: 280, w: 180 },
+    { id: 'io', label: 'replica_io', sub: 'relay log', x: 600, y: 280, w: 180 },
+    { id: 'sql', label: 'Applier', sub: 'coordinator + 4 workers', x: 600, y: 150, w: 180 },
+    { id: 'rows', label: 'Replica InnoDB', sub: 'own redo, own pages', x: 600, y: 20, w: 180 },
+  ]}
+  edges={[
+    { id: 'client-commit', from: 'client', to: 'commit' },
+    { id: 'commit-redo', from: 'commit', to: 'redo' },
+    { id: 'commit-binlog', from: 'commit', to: 'binlog' },
+    { id: 'binlog-dump', from: 'binlog', to: 'dump', label: 'read' },
+    { id: 'dump-io', from: 'dump', to: 'io', label: 'send' },
+    { id: 'io-sql', from: 'io', to: 'sql' },
+    { id: 'sql-rows', from: 'sql', to: 'rows' },
+  ]}
+  cases={[
+    {
+      title: 'A single-row INSERT',
+      path: 'commit → redo (local) ✓ + binlog 5 events, 338 B ✓ → Binlog Dump ✓ → replica_io → relay log ✓ → worker executes Write_rows ✓',
+      summary: 'The replica receives the row, not the source\'s page changes, and writes it with its own InnoDB.',
+      steps: [
+        {
+          title: 't1: commit writes two logs',
+          note: 'InnoDB writes its redo log (physical, for the source\'s own crash recovery) and the server writes the binlog. With sync_binlog = 1 and innodb_flush_log_at_trx_commit = 1 (the defaults here) both are flushed at commit; an internal two-phase commit keeps them in agreement after a crash.',
+          code: "INSERT INTO orders VALUES (3000001, 42, 'shopee', 'delivered', 99.90, '2026-01-01 10:00:00');",
+          active: ['client', 'commit', 'redo', 'binlog'],
+          edges: ['client-commit', 'commit-redo', 'commit-binlog'],
+          subs: { redo: '✗ never shipped' },
+        },
+        {
+          title: 't2: five events, 338 bytes',
+          note: 'SHOW BINLOG EVENTS: Gtid (79 B, SET @@SESSION.GTID_NEXT= \'e1ab078e-…:32\'), Query BEGIN (83 B), Table_map shop.orders (69 B), Write_rows (76 B, the row), Xid COMMIT (31 B). The binlog position moved 338 bytes in each of 3 runs.',
+          code: "SHOW BINLOG EVENTS IN 'binlog.000005';",
+          active: ['binlog', 'dump'],
+          edges: ['binlog-dump'],
+          subs: { binlog: 'GTID …:32, 338 B' },
+        },
+        {
+          title: 't3: the replica stores it',
+          note: 'The Binlog Dump thread pushes the events; replica_io appends them to the relay log (8fa0b0495b61-relay-bin.000007) and adds the GTID to Retrieved_Gtid_Set. Read_Source_Log_Pos became 536, the end of the transaction in binlog.000005.',
+          active: ['dump', 'io'],
+          edges: ['dump-io'],
+          subs: { io: 'Retrieved …:1-32' },
+        },
+        {
+          title: 't4: a worker applies it',
+          note: 'The coordinator hands the transaction to a worker, which inserts the row through the replica\'s own InnoDB (its own redo, its own index entries) and adds the GTID to Executed_Gtid_Set. Exec_Source_Log_Pos = 536, Seconds_Behind_Source = 0.',
+          active: ['io', 'sql', 'rows'],
+          edges: ['io-sql', 'sql-rows'],
+          subs: { sql: 'Executed …:1-32', rows: '✓ row inserted' },
+        },
+      ],
+    },
+    {
+      title: 'Row images vs statements: UPDATE of 100,000 rows',
+      path: 'ROW FULL 8.2 MB → MINIMAL 1.6 MB → ROW + compression 1.5 MB → STATEMENT 343 B; redo 10.1 MB stays local',
+      summary: 'Row format ships every changed row; statement format ships the SQL and makes the replica do the work again.',
+      steps: [
+        {
+          title: 'Row format, full images',
+          note: 'UPDATE orders SET amount = amount + 1 WHERE id <= 100000: 8,226,644 bytes of binlog, about 82 bytes per row (each row before and after). InnoDB wrote 10,109,440 bytes of redo for the same statement (Innodb_os_log_written), none of which is shipped.',
+          code: 'UPDATE orders SET amount = amount + 1 WHERE id <= 100000;   -- binlog 8.2 MB, redo 10.1 MB',
+          active: ['commit', 'redo', 'binlog'],
+          edges: ['commit-redo', 'commit-binlog'],
+          subs: { binlog: 'ROW FULL: 8.2 MB' },
+        },
+        {
+          title: 'Smaller row events',
+          note: 'SET SESSION binlog_row_image = MINIMAL: 1,607,320 bytes (key before, changed column after). SET SESSION binlog_transaction_compression = ON with full images: 1,501,031 bytes (zstd). Both are still one Update_rows entry per row.',
+          active: ['binlog', 'dump', 'io'],
+          edges: ['binlog-dump', 'dump-io'],
+          subs: { binlog: 'MINIMAL 1.6 MB' },
+        },
+        {
+          title: 'Statement format',
+          note: 'SET SESSION binlog_format = STATEMENT: 343 bytes, the SQL text. The replica runs the whole UPDATE again. With LIMIT, the source logged Note 1592 "Unsafe statement written to the binary log using statement format … it uses a LIMIT clause"; with RAND() also "uses a system function that may return a different value on the replica".',
+          code: "SET SESSION binlog_format = STATEMENT;\nUPDATE orders SET amount = amount + 1 WHERE id <= 100000;   -- 343 B",
+          active: ['binlog', 'sql', 'rows'],
+          edges: ['io-sql', 'sql-rows'],
+          subs: { binlog: 'STATEMENT: 343 B', sql: 're-runs the UPDATE' },
+        },
+      ],
+    },
+    {
+      title: 'A write on the replica',
+      path: 'INSERT id 4000001 on replica ✓ (writable) → source INSERTs the same id → worker ✗ 1062 → replica_sql stops; with super_read_only ✗ ERROR 1290',
+      summary: 'Nothing stops a client from writing to a replica unless you set super_read_only.',
+      steps: [
+        {
+          title: 'The replica accepts the write',
+          note: 'read_only and super_read_only were 0 on the fresh replica. An INSERT of id 4000001 on rpa-my2 succeeded and got a GTID of the replica\'s own server_uuid (an "errant" transaction the source does not have).',
+          code: "-- on the replica\nINSERT INTO orders VALUES (4000001, 7, 'lazada', 'delivered', 5.00, '2026-01-02 00:00:00');",
+          active: ['client', 'rows'],
+          subs: { rows: 'extra row, extra GTID' },
+        },
+        {
+          title: 'Replication stops',
+          note: 'The source then inserted id 4000001 too. The replica\'s worker failed: "Could not execute Write_rows event on table shop.orders; Duplicate entry \'4000001\' for key \'orders.PRIMARY\', Error_code: 1062". Replica_SQL_Running: No, Seconds_Behind_Source: NULL, while replica_io kept receiving.',
+          code: 'SHOW REPLICA STATUS\\G   -- Last_SQL_Errno: 1062',
+          active: ['io', 'sql'],
+          edges: ['io-sql'],
+          subs: { sql: '✗ stopped: 1062' },
+        },
+        {
+          title: 'Lock the replica',
+          note: 'After deleting the stray row and START REPLICA SQL_THREAD, replication resumed. With SET GLOBAL super_read_only = ON, a second attempt failed: ERROR 1290 (HY000): The MySQL server is running with the --super-read-only option so it cannot execute this statement. The replication threads still apply changes.',
+          code: 'SET GLOBAL super_read_only = ON;',
+          active: ['sql', 'rows'],
+          edges: ['sql-rows'],
+          subs: { rows: '✓ only replication writes' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## What "logical" means for you
+
+| Property | Consequence |
+|---|---|
+| The replica runs its own InnoDB | Its pages, redo and indexes are its own; it may even have extra indexes |
+| Events carry rows, not pages | No full-page images; index entries are rebuilt on the replica, so a 1,000-row INSERT was 41,472 bytes |
+| Each transaction has a GTID | The replica knows exactly which transactions it has; repointing it to a new source needs no file positions |
+| The replica is writable by default | Writes there create errant GTIDs and can stop replication later; set `super_read_only` |
+| Statement format re-executes SQL | Tiny binlog, but non-deterministic statements can produce different rows on the replica |
+
+<Pitfall>
+Statement format is not a free compression switch. It was 343 bytes instead of 8.2 MB for the 100,000-row UPDATE, but the replica re-ran the UPDATE, and any statement whose result depends on row order, time or randomness can change different rows on the replica. MySQL only adds a Note (1592) when it notices; the default `binlog_format = ROW` avoids the problem, and `MINIMAL` row images or `binlog_transaction_compression` get most of the size back.
+</Pitfall>
+
+## Real-world scenario: replica broken by a support script
+
+A support engineer connects a reporting tool to the replica and "fixes" a seller's order status there. Hours later the source updates the same order and the replica’s applier stops with an error such as the 1062 above; `Seconds_Behind_Source` shows NULL and the dashboards on the replica freeze at the time of the error. Fixes: set `super_read_only = ON` in the replica's configuration (the replication threads are not affected), give reporting users only `SELECT`, and compare `@@gtid_executed` on source and replica: any GTID with the replica's own `server_uuid` is an errant transaction to investigate before the replica is ever promoted.
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Transactions Session 1, Concept 3](/blogs/databases/transactions/session-1-transaction-guarantees/concept-3-durability) | `sync_binlog` and `innodb_flush_log_at_trx_commit` decide what a crash loses on the source |
+| Concept 1 | The physical alternative: PostgreSQL ships its recovery log |
+| Concept 4 | Bytes per write compared across the three engines |
+
+## Key takeaways
+
+1. MySQL replicates the binary log, a logical log separate from InnoDB's redo log; the redo log never leaves the source.
+2. A single-row INSERT was 5 events, 338 bytes; each transaction carries a GTID.
+3. Row format with full images shipped 8.2 MB for a 100,000-row UPDATE; MINIMAL 1.6 MB; statement format 343 bytes, at the price of re-execution and unsafe statements.
+4. The replica applies events with a coordinator and worker threads through its own InnoDB.
+5. A replica accepts writes unless `super_read_only` is on; a stray write stopped replication with error 1062.
+
+## Check questions
+
+1. Why does a MySQL replica not need InnoDB's redo log, and why does the source write two logs at commit?
+2. List the five events of the single-row INSERT and say what each one is for.
+3. Why was the 1,000-row INSERT only 41,472 bytes of binlog when the same INSERT is about 240 KB of WAL in PostgreSQL?
+4. When would you choose `binlog_row_image = MINIMAL`, and what do you lose?
+5. What is an errant GTID, how did one appear here, and why does it matter before a failover?
+6. Statement format made the UPDATE 343 bytes. Give two reasons not to use it.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-1-how-replication-works/concept-2-mysql-binlog-gtid/answers">Worked answers to Q1–Q6</DeepDive>

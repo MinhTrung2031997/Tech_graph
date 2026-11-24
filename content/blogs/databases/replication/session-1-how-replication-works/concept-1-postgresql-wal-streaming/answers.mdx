@@ -1,0 +1,69 @@
+---
+title: "Answers: PostgreSQL ships its WAL"
+description: "Worked answers to the Session 1 Concept 1 check questions."
+companion: "answers"
+tags: ["replication", "wal", "postgresql", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/warm-standby.html#STREAMING-REPLICATION"
+  - "https://www.postgresql.org/docs/17/wal-reliability.html"
+---
+
+<Tldr>
+The standby gets exactly what the primary needs for its own crash recovery: every page change, in order. That is why it is cheap to apply and expensive to ship.
+</Tldr>
+
+## Q1. Two B-tree records for one row
+
+**Question:** why did a single-row INSERT produce two B-tree records, and what would a third index add?
+
+`orders` has two indexes: the primary key on `id` and `orders_created_at_idx`. Inserting a row adds one entry to each index's leaf page, and each change to a page is its own WAL record (`Btree INSERT_LEAF`, 64 bytes each here). A third index adds a third INSERT_LEAF record, about 64 bytes more per INSERT, and after a checkpoint possibly another 8 KB page image. The standby does not rebuild index entries from the row: it replays the index records.
+
+> **Common mistake:** thinking replication ships "the row". Physical replication ships page changes, so index count drives replication volume.
+
+## Q2. 272 bytes vs 16,680 bytes
+
+**Question:** the same INSERT wrote 272 bytes once and 16,680 bytes after a CHECKPOINT. What is in the extra bytes and why does PostgreSQL need them?
+
+Full-page images. After a checkpoint, the first record that changes a page carries a copy of the whole 8 KB page. If the server crashes in the middle of writing a page to disk, the page on disk can be half old and half new ("torn"); a small record cannot be applied to it, but a full image can replace it. The INSERT touched three pages (the heap page and two index leaves). Each image leaves out the page's free space (the "hole"), and a page already imaged since the checkpoint is not imaged again, so the size depends on which pages were cold and how full they were: 8,760 to 16,680 bytes in three runs.
+
+> **Common mistake:** setting `full_page_writes = off` to reduce replication traffic. It removes the primary's protection against torn pages.
+
+## Q3. Four LSN columns
+
+**Question:** name the four LSN columns of `pg_stat_replication` and the process responsible for each.
+
+| Column | Meaning | Process |
+|---|---|---|
+| `sent_lsn` | WAL sent on the connection | walsender (primary) |
+| `write_lsn` | WAL written to the standby's pg_wal (OS cache) | walreceiver (standby) |
+| `flush_lsn` | WAL fsynced on the standby | walreceiver (standby) |
+| `replay_lsn` | WAL applied to the standby's data files | startup process (standby) |
+
+The gaps between them locate a delay: network (sent vs write), standby disk (write vs flush), replay (flush vs replay). Session 3 uses them to measure lag.
+
+> **Common mistake:** watching only `sent_lsn`. A standby can receive everything and still be minutes behind in replay.
+
+## Q4. Replicating one table
+
+**Question:** why can a PostgreSQL standby not hold only the `orders` table?
+
+WAL records refer to physical pages by relation file and block number (`rel 1663/5/16384 blk 3849`), for the whole cluster, all databases mixed in one stream. The standby must have the same files at the same block layout to apply them, so it is a copy of the entire cluster. To replicate one table, use logical replication (Session 7), which decodes WAL into row changes.
+
+> **Common mistake:** creating a standby "for reporting on one database" and being surprised it needs the full disk size of the primary.
+
+## Q5. Catching up after a stop
+
+**Question:** the standby was stopped for a minute and replayed 96 MB within 0.5 s of starting. What made that possible, and what is the risk of the same mechanism?
+
+The replication slot `standby1`. While the standby was away, the slot's `restart_lsn` stayed where the standby had confirmed, and the primary kept every WAL segment after it (`wal_status = reserved`). On restart the walreceiver asked for WAL from that position and got it. Without a slot, the primary may recycle those segments, and a standby that was away too long fails with "requested WAL segment … has already been removed" and must be cloned again (from the documentation; not reproduced here). The risk: a slot whose standby never comes back keeps WAL forever, until the primary's disk is full. Cap it with `max_slot_wal_keep_size` and alert on retained bytes.
+
+> **Common mistake:** relying on `wal_keep_size` alone. It keeps a fixed amount, which is either too little for a long outage or wasted space.
+
+## Q6. A 28,576-byte UPDATE
+
+**Question:** a cold UPDATE of one row wrote 28,576 bytes. Which records did it contain, and why did both indexes get a new entry?
+
+`PRUNE_ON_ACCESS` (509 B, the page was pruned of dead versions while being read), `LOCK` (8,215 B, the old version is locked while a page is found for the new one), `UPDATE` (6,025 B, the new version went to another page, block 3849), two `INSERT_LEAF` (6,673 B and 6,997 B) and `COMMIT` (34 B). All but the commit carried a full-page image. Because the new version is on a different page, this is not a HOT update: each index must point to the new version, even the `created_at` index whose value did not change. Run again on the same now-warm pages, an UPDATE of one row wrote 168–176 bytes.
+
+> **Common mistake:** assuming an UPDATE of a non-indexed column never touches indexes. It does whenever the new version does not fit on the same page.

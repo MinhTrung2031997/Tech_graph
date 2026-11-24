@@ -1,0 +1,81 @@
+---
+title: "Answers: How replication works session quiz"
+description: "Worked answers to the Session 1 quiz, with the lab's measured values."
+companion: "answers"
+tags: ["replication", "wal", "binlog", "oplog", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/warm-standby.html#STREAMING-REPLICATION"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-implementation.html"
+  - "https://www.mongodb.com/docs/manual/core/replica-set-oplog/"
+---
+
+<Tldr>
+PostgreSQL ships its recovery log, MySQL a second logical log, MongoDB an idempotent operation log. Their sizes, their failure modes and what a replica may do all follow from that choice.
+</Tldr>
+
+## Q1. Three logs for one INSERT
+
+**Question:** a single-row INSERT wrote 272 bytes of WAL, 338 bytes of binlog and 397 bytes of oplog. What does each of the three contain that the others do not?
+
+- **WAL (272 B):** page-level changes, including one record per index (two `Btree INSERT_LEAF` of 64 B) and block numbers on disk. The others contain no index changes and no page addresses.
+- **Binlog (338 B):** a GTID for the transaction and a `Table_map` describing the table's columns, then the row in `Write_rows`. Each transaction is identified across servers by its GTID.
+- **Oplog (397 B):** the whole document, plus session fields (`lsid`, `txnNumber`, `stmtId`) that make the write retryable without applying it twice.
+
+> **Common mistake:** comparing only the sizes. They are close for one row; the contents explain why they diverge for bulk changes.
+
+## Q2. Checkpoints and page images
+
+**Question:** why did the same PostgreSQL INSERT write up to 16,680 bytes right after a checkpoint, and why does a logical log not have that effect?
+
+After a checkpoint, the first change to each page logs the full 8 KB page (`full_page_writes`), so that a page torn by a crash can be restored. The INSERT touched three cold pages: 8,760–16,680 bytes in three runs instead of 272–296. A logical log describes rows, not pages; the replica's storage engine protects its own pages with its own mechanisms (InnoDB's doublewrite buffer, WiredTiger's checkpoints and journal, from the documentation), so nothing page-related is shipped.
+
+> **Common mistake:** blaming "replication spikes" on the application when they line up with checkpoints.
+
+## Q3. Four positions
+
+**Question:** which PostgreSQL process produces each of `sent_lsn`, `write_lsn`, `flush_lsn` and `replay_lsn`?
+
+`sent_lsn`: the walsender on the primary. `write_lsn` and `flush_lsn`: the walreceiver on the standby (written to its pg_wal, then fsynced), reported back to the primary. `replay_lsn`: the startup process on the standby, which applies WAL to the data files; only after replay do queries on the standby see the change.
+
+> **Common mistake:** treating "received" as "visible". A standby can have flushed WAL it has not replayed yet.
+
+## Q4. The slot while the standby was stopped
+
+**Question:** what did the replication slot do while the standby was stopped, and how can a slot take the primary down?
+
+The slot's `restart_lsn` stayed at the standby's last confirmed position and the primary kept all WAL after it: `active = f`, `wal_status = reserved`, 96 MB retained after three bulk updates. When the standby started it requested WAL from that position and caught up within 0.5 s. If the standby never returns, the slot keeps WAL without limit until the primary's disk fills and the primary stops. Drop unused slots and set `max_slot_wal_keep_size`.
+
+> **Common mistake:** removing a standby's container or server and leaving its slot on the primary.
+
+## Q5. Redo and binlog
+
+**Question:** why does MySQL write both a redo log and a binlog at commit, and which one does a replica read?
+
+The redo log is InnoDB's physical log for its own crash recovery; the binlog is the server's logical log of committed transactions, used for replication, point-in-time recovery and change data capture. An internal two-phase commit keeps them consistent after a crash. Replicas read only the binlog (10.1 MB of redo stayed on the source for the 100,000-row UPDATE; 8.2 MB of binlog was shipped).
+
+> **Common mistake:** tuning only `innodb_flush_log_at_trx_commit` for durability and leaving `sync_binlog` at a value that can lose binlog events on a crash.
+
+## Q6. Statement format
+
+**Question:** give one advantage and two risks of `binlog_format = STATEMENT` for a 100,000-row UPDATE.
+
+Advantage: the binlog entry is the SQL text, 343 bytes instead of 8.2 MB. Risks: the replica re-runs the UPDATE (same scan, its own plan, more replica load and lag); non-deterministic statements (`LIMIT` without a total order, `RAND()`, `UUID()`, time functions) can change different rows or values on the replica, and MySQL only flags the cases it recognises (Note 1592 for `LIMIT`).
+
+> **Common mistake:** turning statement format on globally to shrink binlogs. Row format with `MINIMAL` images (1.6 MB) or binlog compression (1.5 MB) is safe.
+
+## Q7. $inc and updateMany
+
+**Question:** why is an `$inc` stored in the oplog as the resulting value, and what does `updateMany` on 100,000 documents put in the oplog?
+
+Oplog entries must be idempotent: a secondary may apply an entry more than once (restarts, initial sync), and a stored result (`amount: 81.07`) gives the same document each time, while `$inc` would add again. `updateMany` on 100,000 documents produced 100,000 separate `op: 'u'` entries, 185 bytes each, 18.5 MB in total.
+
+> **Common mistake:** expecting one oplog entry per statement, and sizing the oplog window accordingly.
+
+## Q8. A broken MySQL replica
+
+**Question:** a MySQL replica stopped with error 1062. How could that happen in a correctly configured source/replica pair, and what setting prevents it?
+
+Someone or something wrote to the replica directly. MySQL replicas accept client writes by default (`read_only` and `super_read_only` were 0). The INSERT of id 4000001 on the replica got its own GTID; when the source later inserted the same id, the replica's applier failed with `Duplicate entry '4000001' for key 'orders.PRIMARY'` and `Replica_SQL_Running` became No. `SET GLOBAL super_read_only = ON` (and in the configuration file) blocks all client writes, including from users with SUPER, while replication threads still apply changes: the second attempt failed with ERROR 1290.
+
+> **Common mistake:** setting only `read_only = ON`. Accounts with the SUPER or CONNECTION_ADMIN privilege can still write (from the documentation); `super_read_only` closes that.

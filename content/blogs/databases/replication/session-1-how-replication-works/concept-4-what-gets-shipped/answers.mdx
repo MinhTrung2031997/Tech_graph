@@ -1,0 +1,67 @@
+---
+title: "Answers: Physical vs logical, measured"
+description: "Worked answers to the Session 1 Concept 4 check questions."
+companion: "answers"
+tags: ["replication", "wal", "binlog", "oplog", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/runtime-config-wal.html#GUC-WAL-COMPRESSION"
+  - "https://www.postgresql.org/docs/17/storage-hot.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html#sysvar_binlog_row_image"
+---
+
+<Tldr>
+Replication volume follows how each engine logs a change, not how big the change is. Measure the log, not the data.
+</Tldr>
+
+## Q1. WAL larger than the table
+
+**Question:** why is the PostgreSQL WAL for the 100,000-row UPDATE larger than the table itself?
+
+Every updated row produces a WAL record with the new row version. Because the pages were full, most new versions went to other pages, so each also needed a new entry in both indexes: three records per row. After a checkpoint, the first record touching each heap and index page also carries the whole 8 KB page. The table was 12 MB including indexes; the UPDATE wrote 34.0–34.7 MB warm and 45.5–46.8 MB after a checkpoint.
+
+> **Common mistake:** expecting WAL volume to be proportional to the bytes that changed (a number in 100,000 rows).
+
+## Q2. Only 12% from compression
+
+**Question:** `wal_compression = lz4` saved 12%. Why not more?
+
+`wal_compression` compresses full-page images only, not ordinary records. In this UPDATE most of the 45.5 MB were row-version and index records, which stayed the same size; only the page-image share shrank, to 39.9 MB in total. On a workload where page images dominate (many small updates spread over many pages right after checkpoints), the saving is larger.
+
+> **Common mistake:** turning on `wal_compression` and expecting it to fix the volume of bulk updates.
+
+## Q3. 10.1 MB of redo, 8.2 MB shipped
+
+**Question:** why did MySQL write 10.1 MB of redo but ship only 8.2 MB?
+
+The redo log is InnoDB's physical log of page changes for its own crash recovery, including undo records and index pages; it never leaves the server. The binlog is a separate logical log of the changed rows (before and after images with `FULL`). Replication ships only the binlog: 8.2 MB, or 1.6 MB with `MINIMAL`. The replica writes its own redo when it applies the rows.
+
+> **Common mistake:** adding redo and binlog together as "replication traffic". Only the binlog crosses the network.
+
+## Q4. Two secondaries
+
+**Question:** MongoDB wrote 18.5 MB of oplog. How much leaves the primary with two secondaries, and how could you reduce the primary's share?
+
+Each secondary fetches the entries from its sync source. Both synced from the primary here, so about 37 MB left the primary (plus protocol overhead). With chained replication, one secondary can sync from the other, and the primary sends 18.5 MB once. The cost: the second secondary is now one hop further behind.
+
+> **Common mistake:** assuming the primary sends each entry once to "the replica set".
+
+## Q5. Logical vs physical
+
+**Question:** name one thing a logical replica can do that a physical standby cannot, and one cost it pays for it.
+
+Can do (any one): replicate a subset (one database, one table in logical replication), have different indexes, run a different major version during an upgrade, accept writes to other tables (MySQL). Cost (any one): it repeats the index and page work for every change, so it needs more CPU and falls behind more easily on bulk changes; it can drift from the source if someone writes to it; statement-based or non-deterministic changes can diverge.
+
+> **Common mistake:** treating "logical" as "lightweight". The bytes are fewer; the replica's work is not.
+
+## Q6. The nightly price update
+
+**Question:** for the nightly 8-million-row price update, give two changes that reduce replication volume in PostgreSQL.
+
+Any two:
+- Update only rows whose value changes: `WHERE price IS DISTINCT FROM new_price`. Rows not updated produce no WAL.
+- Leave free space in pages (`ALTER TABLE … SET (fillfactor = 90)` and a rewrite) so new versions stay on the same page as HOT updates, which skip index entries when no indexed column changes.
+- Enable `wal_compression` to shrink the full-page images.
+- Spread checkpoints (`checkpoint_timeout`, `max_wal_size`) so fewer pages are imaged twice during the job.
+
+> **Common mistake:** splitting the job into many small transactions and expecting less WAL. Batching spreads the load and keeps lag low, but the total WAL is the same or slightly higher.
