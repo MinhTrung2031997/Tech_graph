@@ -1,0 +1,201 @@
+---
+title: "Concept 5: MongoDB has no partitions: time-series collections and one collection per month"
+description: "MongoDB cannot partition a collection on one server. The 5M orders were stored three ways and measured. A plain collection took 146 MB plus 115 MB of indexes. A time-series collection took 32 MB, summed a month in 10.7 ms instead of 73.7 ms, and refused every unique index. One collection per month gave instant drops, but no uniqueness across months and a 24-way $unionWith for an id lookup."
+type: "concept"
+tags: ["partitioning", "mongodb", "time-series", "constraints"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/timeseries-collections/"
+  - "https://www.mongodb.com/docs/manual/core/timeseries/timeseries-limitations/"
+  - "https://www.mongodb.com/docs/manual/reference/operator/aggregation/unionWith/"
+  - "https://www.mongodb.com/docs/manual/core/index-ttl/"
+---
+
+<Tldr>
+MongoDB splits data across servers (sharding, later in this course) but has no way to partition a collection on one server. There are three ways to lay out time-ordered orders:
+- **A plain collection** with an index on `created_at`: 146.4 MB of data plus 115.1 MB of indexes. `_id` is unique, and a lookup by id takes 0.28 ms.
+- **A time-series collection** (`timeField: created_at`, `metaField: marketplace`): 5,000,000 documents were stored in 5,002 compressed buckets, **32.0 MB with 0.2 MB of indexes**. A month's GMV by marketplace took **10.7 ms instead of 73.7 ms**. It **refused unique indexes** (`Unique indexes are not supported on time-series collections`) and stored the same `order_id` twice. A lookup by order id read all 5,002 buckets (2.1 ms).
+- **One collection per month** (`orders_2024_01` …): about the same size as the plain collection. A month is a collection you can drop instantly. But `_id` is unique only inside each month, and a lookup by id needs `$unionWith` over 24 collections (1.38 ms).
+</Tldr>
+
+## The three layouts
+
+| Term | Meaning |
+|---|---|
+| Time-series collection | A collection stored as **buckets**: up to 1,000 measurements with the same `metaField` value and nearby times, compressed column by column |
+| `timeField` / `metaField` | The timestamp (`created_at`) and the grouping field (`marketplace`) that decide the bucket |
+| Bucket | One internal document in `system.buckets.orders_ts` holding many orders, with min/max per field |
+| Collection per period | A naming convention (`orders_2025_03`): the application picks the collection |
+| `$unionWith` | Aggregation stage that appends another collection's results: how you query across months |
+| **✓ / ✗** | Works / does not work for that query or constraint |
+
+```js
+// time-series copy (11.2 s with $out)
+db.orders.aggregate([
+  { $project: { _id: 0, order_id: '$_id', seller_id: 1, marketplace: 1, status: 1, amount: 1, created_at: 1 } },
+  { $out: { db: 'pt3', coll: 'orders_ts',
+            timeseries: { timeField: 'created_at', metaField: 'marketplace', granularity: 'minutes' } } }
+]);
+// one collection per month (24 × $out + createIndex({ created_at: 1 }): 10.9 s)
+db.orders.aggregate([{ $match: { created_at: { $gte: ISODate('2025-03-01'), $lt: ISODate('2025-04-01') } } },
+                     { $out: 'orders_2025_03' }]);
+```
+
+<Flow
+  title="MongoDB: three layouts for the same 5M orders"
+  height={300}
+  nodes={[
+    { id: 'plain', label: 'orders', sub: 'plain, 146 + 115 MB', x: 20, y: 20, w: 220 },
+    { id: 'app', label: 'Application', sub: 'reports + lookups', x: 290, y: 20, w: 220 },
+    { id: 'others', label: '23 other months', sub: 'orders_2024_01 …', x: 560, y: 20, w: 220 },
+    { id: 'ts', label: 'orders_ts', sub: '5,002 buckets, 32 MB', x: 290, y: 200, w: 220 },
+    { id: 'month', label: 'orders_2025_03', sub: '212k docs, 6.1 + 4.4 MB', x: 560, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'app-plain', from: 'app', to: 'plain' },
+    { id: 'app-others', from: 'app', to: 'others' },
+    { id: 'app-ts', from: 'app', to: 'ts' },
+    { id: 'app-month', from: 'app', to: 'month' },
+  ]}
+  cases={[
+    {
+      title: 'Time-range reports',
+      path: 'one day: ✓ all three under 1 ms · March GMV by marketplace: plain 73.7 ms, ✓ ts 10.7 ms, month 36.3 ms',
+      summary: 'Time-series wins when a query reads many documents of a time range.',
+      subs: { plain: '✓ 73.7 ms (index + fetch)', ts: '✓ 10.7 ms (buckets)', month: '✓ 36.3 ms (scan)' },
+      steps: [
+        {
+          title: 'One day (6,840 orders)',
+          note: 'All three answered in under 1 ms, averaged over 50 runs. Plain: COUNT_SCAN of 6,840 created_at keys (0.88 ms). Time-series: CLUSTERED_IXSCAN reading 14 buckets (0.70 ms). Month collection: COUNT_SCAN (0.92 ms).',
+          code: "db.orders_ts.aggregate([\n  { $match: { created_at: { $gte: ISODate('2025-03-01'), $lt: ISODate('2025-03-02') } } },\n  { $count: 'n' }])   // 6840",
+          active: ['app', 'plain', 'ts', 'month'],
+          edges: ['app-plain', 'app-ts', 'app-month'],
+        },
+        {
+          title: 'One month, GMV by marketplace',
+          note: 'Best of 3 runs of 3: the plain collection walks 212k index keys and fetches every document (73.7 ms); the month collection scans its 212k documents (36.3 ms); the time-series collection reads about 210 compressed buckets of ~1,000 orders each (10.7 ms).',
+          code: "{ $group: { _id: '$marketplace', gmv: { $sum: '$amount' } } }",
+          active: ['app', 'plain', 'ts', 'month'],
+          edges: ['app-plain', 'app-ts', 'app-month'],
+        },
+      ],
+    },
+    {
+      title: 'Lookup by order id',
+      path: 'plain ✓ 0.28 ms EXPRESS_IXSCAN · ts ✗ COLLSCAN of 5,002 buckets 2.1 ms · per month: $unionWith × 24, 1.38 ms',
+      summary: 'Only the plain collection has one index over every order.',
+      subs: { plain: '✓ 1 key, 0.28 ms', ts: '✗ 5,002 buckets, 2.1 ms', month: '24 lookups, 1.38 ms', others: '23 of the 24 lookups' },
+      steps: [
+        {
+          title: 'Plain: one key',
+          note: 'find({ _id: 2500000 }) used EXPRESS_IXSCAN: 1 key, 1 document, 0.28 ms on average.',
+          code: 'db.orders.find({ _id: 2500000 })',
+          active: ['app', 'plain'],
+          edges: ['app-plain'],
+        },
+        {
+          title: 'Time-series: every bucket',
+          note: 'order_id is not the timeField or metaField, and there is no index on it: COLLSCAN over all 5,002 buckets, 2.1 ms. A secondary index on order_id is allowed, a unique one is not.',
+          code: 'db.orders_ts.find({ order_id: 2500000 })   // COLLSCAN, docsExamined 5002',
+          active: ['app', 'ts'],
+          edges: ['app-ts'],
+        },
+        {
+          title: 'Per month: ask every collection',
+          note: 'Without knowing the month, the application has to search all 24 collections: one $match plus 23 $unionWith stages, 1.38 ms. Each stage is an _id lookup, so it stays cheap, but it grows with every month kept.',
+          code: "db.orders_2024_01.aggregate([{ $match: { _id: 2500000 } },\n  { $unionWith: { coll: 'orders_2024_02', pipeline: [{ $match: { _id: 2500000 } }] } },\n  /* … 22 more … */ ])",
+          active: ['app', 'month', 'others'],
+          edges: ['app-month', 'app-others'],
+        },
+      ],
+    },
+    {
+      title: 'Uniqueness',
+      path: 'plain ✓ E11000 on duplicate _id · ts ✗ unique index refused, duplicate stored · per month ✗ same _id in two months',
+      summary: 'Splitting the data splits the unique index, as in Concept 3.',
+      subs: { plain: '✓ E11000', ts: '✗ InvalidOptions 72', month: '✗ duplicate across months', others: '✗ own _id index each' },
+      steps: [
+        {
+          title: 'Plain collection',
+          note: 'Inserting _id 2500000 again failed: E11000 duplicate key error collection: pt3.orders index: _id_ dup key: { _id: 2500000 }.',
+          code: "db.orders.insertOne({ _id: 2500000, created_at: ISODate('2025-06-15T10:00:00Z') })",
+          active: ['app', 'plain'],
+          edges: ['app-plain'],
+        },
+        {
+          title: 'Time-series collection',
+          note: 'Both a unique index on order_id and on (order_id, created_at) were refused. Inserting order 2500000 again with a June date succeeded: countDocuments({ order_id: 2500000 }) returned 2.',
+          code: "db.orders_ts.createIndex({ order_id: 1 }, { unique: true })\n// MongoServerError[InvalidOptions]: Unique indexes are not supported on time-series collections",
+          active: ['app', 'ts'],
+          edges: ['app-ts'],
+        },
+        {
+          title: 'One collection per month',
+          note: 'orders_2025_06.insertOne({ _id: 2500000, … }) succeeded although orders_2024_12 already holds _id 2500000. Each collection\'s _id index only knows its own month.',
+          code: 'orders_2024_12: 1 document with _id 2500000\norders_2025_06: 1 document with _id 2500000',
+          active: ['app', 'month', 'others'],
+          edges: ['app-month', 'app-others'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Comparison
+
+| | Plain collection | Time-series collection | Collection per month |
+|---|---|---|---|
+| Storage (data + indexes) | 146.4 + 115.1 MB | 32.0 + 0.2 MB | 145.7 + 104.8 MB (24 collections) |
+| One-day count | 0.88 ms | 0.70 ms | 0.92 ms |
+| Month GMV by marketplace | 73.7 ms | 10.7 ms | 36.3 ms |
+| Lookup by order id | 0.28 ms | 2.1 ms (all buckets) | 1.38 ms (24 collections) |
+| Unique order id | ✓ `_id` | ✗ no unique indexes | ✗ only per month |
+| Dropping a month | `deleteMany` (row by row) or TTL | TTL removes whole buckets (`expireAfterSeconds`, per the manual) | `drop()` one collection |
+| Query across months | Normal | Normal | `$unionWith` per month |
+
+Session 4 measures dropping a month in each layout: `deleteMany`, a TTL index, and `drop()`.
+
+## Same problems, in MySQL and PostgreSQL
+
+Collection per month is the same idea as a partitioned table, except that the application does the routing. It has the same costs as Concepts 1 and 3: a lookup without the month asks every month, and uniqueness stops at the month boundary. A time-series collection behaves like a columnar, compressed store. PostgreSQL and MySQL have nothing equivalent built in.
+
+<Pitfall>
+A time-series collection is not a drop-in replacement for `orders`. It is built for append-mostly data read by time range. It refuses unique indexes, so it can't stop a re-sent order from being stored twice, and a lookup by order id reads every bucket unless you add a (non-unique) index. Keep the operational orders in a plain collection with its unique `_id`. Copy them into a time-series collection for analytics and dashboards, where 4.6× less data (8× counting indexes) and 7× faster month scans pay off.
+</Pitfall>
+
+## Real-world scenario: the dashboard collection
+
+A brand dashboard shows GMV per marketplace per hour for the last 13 months. It currently aggregates over the operational `orders` collection, and the 13-month view takes seconds while competing with checkout for cache.
+
+| Option | Effect (from this lab's numbers) |
+|---|---|
+| Nightly `$merge` of new orders into a time-series collection (`metaField` holding marketplace and brand) | Month scans ~7× faster, data ~4.6× smaller, checkout collection untouched |
+| Duplicates from re-runs | Possible (no unique index). Make the job idempotent: only copy `created_at` after the last copied time |
+| Retention | Set `expireAfterSeconds` on the time-series collection for 13 months |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 1 | Collection per month has the same per-partition lookup cost as partition indexes |
+| Concept 3 | Same reason uniqueness breaks: one index per piece |
+| [Indexing Session 6](/blogs/databases/indexing/session-6-engine-differences/concept-5-mongodb-explain) | Reading `explain('executionStats')`: keys vs documents examined |
+
+## Key takeaways
+
+1. MongoDB has no table partitioning on one server; time-series collections and one collection per period are the usual substitutes.
+2. A time-series collection stored the 5M orders in 32 MB (vs 146 + 115 MB) and summed a month 7× faster, but refused every unique index.
+3. One collection per month gives instant drops, but no cross-month uniqueness and a `$unionWith` per month for lookups by id.
+4. A plain collection keeps a global unique `_id` and the fastest id lookups; deleting old data from it is the expensive part (Session 4).
+
+## Check questions
+
+1. How many buckets did the 5M orders become, and why about that many?
+2. Why was the month GMV query 7× faster on the time-series collection than on the plain one, although the plain one has an index on `created_at`?
+3. Why did a lookup by `order_id` on the time-series collection examine 5,002 buckets?
+4. What error did `createIndex({ order_id: 1 }, { unique: true })` return on the time-series collection?
+5. Order 2500000 was inserted into `orders_2025_06`. Why was there no duplicate-key error?
+6. How do you find an order by id when you don't know its month in the collection-per-month layout, and how does that cost grow?
+7. Which layout would you choose for checkout, and which for a 13-month GMV dashboard?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-5-mongodb-alternatives/answers">Worked answers to Q1–Q7</DeepDive>

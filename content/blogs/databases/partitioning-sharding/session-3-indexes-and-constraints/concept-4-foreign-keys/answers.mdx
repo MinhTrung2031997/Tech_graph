@@ -1,0 +1,72 @@
+---
+title: "Answers: Foreign keys to and from partitioned tables"
+description: "Worked answers to the Session 3 Concept 4 check questions."
+companion: "answers"
+tags: ["partitioning", "constraints", "foreign-keys", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE-LIMITATIONS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-limitations.html"
+---
+
+<Tldr>
+A foreign key into a partitioned table drags the partition key into the child, makes every child insert dearer, and ties the child's retention to the parent's.
+</Tldr>
+
+## Q1. Referencing `orders_p (id)`
+
+**Question:** why did `REFERENCES orders_p (id)` fail, and what did the child table need to add?
+
+A foreign key must reference a primary key or unique constraint, and `orders_p` has no unique constraint on `id` alone. It cannot have one, because unique keys must include the partition key (Concept 3). The only candidate is `(id, created_at)`, so `order_items` needed an `order_created_at` column and a two-column FK.
+
+> **Common mistake:** adding `UNIQUE (id)` to make the FK work. PostgreSQL refuses it on a partitioned table for the same reason.
+
+## Q2. 27 constraint rows
+
+**Question:** why does `pg_constraint` show 27 rows for one `ADD CONSTRAINT … FOREIGN KEY` on `orders_p`?
+
+Partitions are real tables, and each one gets its own copy of the constraint, linked to the parent's via `conparentid`. At that point `orders_p` had 26 partitions (24 months plus January and February 2026), so 1 + 26 = 27. The same happened on `order_items` for the FK into `orders_p`: one row per referenced partition plus the parent. After DETACH, a partition keeps its copy as a standalone constraint.
+
+> **Common mistake:** dropping the constraint on one partition. Inherited constraints are dropped through the parent.
+
+## Q3. 0.17 s, 1.93 s, 6.68 s
+
+**Question:** inserting 410k items took 0.17 s, 1.93 s and 6.68 s in three setups. Name the setups and explain the gaps.
+
+- **0.17 s:** no FK. Just the inserts.
+- **1.93 s:** FK to the plain `orders (id)`. Each row fires an RI trigger that looks up the parent key (and locks it `FOR KEY SHARE`): about 4 µs extra per row.
+- **6.68 s:** FK to `orders_p (id, created_at)`. The same check, but against a partitioned table, so each lookup first goes through the partition tree to find the right partition: about 16 µs per row, 3.5× the plain-parent cost.
+
+> **Common mistake:** measuring FK cost on a small test table and assuming partitioning won't change it.
+
+## Q4. Detach refused vs 57 ms
+
+**Question:** why did `DETACH PARTITION orders_p_2024_01` fail while `orders_p_2025_12` detached in 57 ms?
+
+Detaching a partition removes its rows from `orders_p`, so PostgreSQL checks whether any `order_items` row still references them. January 2024 has items (the error even names one: `(1, 2024-01-01 00:00:00+00)`), so the detach was refused. December 2025 has none: the check found nothing and the detach completed in 57 ms.
+
+> **Common mistake:** expecting a DETACH to be metadata-only when foreign keys point at the table. The check reads the child table.
+
+## Q5. What CASCADE would drop
+
+**Question:** `DROP TABLE orders_p_2024_01` suggested CASCADE. What would CASCADE drop?
+
+The dependent object named in the DETAIL line: the foreign key constraint `order_items_order_id_order_created_at_fkey` on `order_items`. The item rows stay. You would lose the FK for **all** months, and January's items would be left pointing at nothing. It's almost never what you want.
+
+> **Common mistake:** reading CASCADE as "delete the child rows too". That is `ON DELETE CASCADE` on the FK, a different feature, and dropping a partition does not fire it.
+
+## Q6. Partitioning a MySQL table with FKs
+
+**Question:** you must partition a MySQL table that has foreign keys. What do you have to do first?
+
+Drop every foreign key that involves the table, both the ones it defines and the ones other tables define referencing it. `ALTER TABLE … PARTITION BY` fails with ERROR 1506 while any exist. Then replace them with application checks or periodic orphan queries.
+
+> **Common mistake:** dropping only the table's own FKs and then hitting 1506 because of a child table's FK into it.
+
+## Q7. Children kept longer than parents
+
+**Question:** children are kept 10 years, parents 2 years. Should the child have an FK to the partitioned parent?
+
+No. With the FK, no parent month can be dropped while its children exist, so the parent's 2-year retention becomes 10 years. Either drop the FK and keep the parent data the children need elsewhere (an archive table, or copied columns in the child), or keep both for 10 years. If they share a retention period, partition the child by the same key and bounds and drop child months first.
+
+> **Common mistake:** discovering the conflict when the retention job starts failing, months after the FK was added.

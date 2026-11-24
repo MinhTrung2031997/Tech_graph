@@ -1,0 +1,366 @@
+---
+title: "Lab and session quiz: Indexes and constraints on partitions"
+description: "Count the 24 index probes of a lookup without the partition key, build an index online with ON ONLY + CONCURRENTLY + ATTACH, hit the unique-key and foreign-key errors in PostgreSQL and MySQL, keep a global unique id with a lookup table, and store the same orders as a MongoDB time-series collection and as one collection per month."
+type: "how-to"
+tags: ["partitioning", "indexing", "constraints", "postgresql", "mysql", "mongodb", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-limitations.html"
+  - "https://www.mongodb.com/docs/manual/core/timeseries-collections/"
+---
+
+<Tldr>
+Uses the containers and the `parts` database from the [Session 1 lab](/blogs/databases/partitioning-sharding/session-1-why-split-data/lab) (PostgreSQL `idx-pg`, MySQL `idx-mysql`, MongoDB `idx-mongo`), each holding the 5M-row `orders` table. The lab creates:
+- **PostgreSQL and MySQL:** `orders_p` (24 monthly partitions), `orders_pid` (partitioned by id), and `sellers`, `order_ids` and `order_items`.
+- **MongoDB:** `orders_ts` (time-series) and `orders_2024_01` … `orders_2025_12`.
+
+That's about 1.9 GB more in PostgreSQL (the lab database grew from 0.6 GB to 2.5 GB). Before each step, write down how many partitions or indexes you expect to be touched.
+</Tldr>
+
+## Setup
+
+```bash
+alias pg='docker exec -it idx-pg psql -U postgres -d parts'
+alias my='docker exec -it idx-mysql mysql -uroot -plab parts'
+alias mg='docker exec -it idx-mongo mongosh --quiet parts'
+```
+
+If you kept `orders_p` from the [Session 2 lab](/blogs/databases/partitioning-sharding/session-2-partitioning-postgresql/lab), the first statement below replaces it.
+
+```sql
+-- pg: 24 monthly partitions, same columns as orders, no indexes yet
+DROP TABLE IF EXISTS orders_p CASCADE;
+CREATE TABLE orders_p (LIKE orders INCLUDING DEFAULTS) PARTITION BY RANGE (created_at);
+DO $$
+DECLARE m date := '2024-01-01';
+BEGIN
+  WHILE m < '2026-01-01' LOOP
+    EXECUTE format('CREATE TABLE orders_p_%s PARTITION OF orders_p FOR VALUES FROM (%L) TO (%L)',
+                   to_char(m, 'YYYY_MM'), m, m + interval '1 month');
+    m := m + interval '1 month';
+  END LOOP;
+END $$;
+INSERT INTO orders_p SELECT * FROM orders;                          -- 2.6 s in the lab
+CREATE INDEX orders_p_id_idx ON orders_p (id);
+CREATE INDEX orders_p_created_at_idx ON orders_p (created_at);
+VACUUM ANALYZE orders_p;
+```
+
+```sql
+-- my: the primary key must include created_at (Exercise 3 shows why)
+DROP TABLE IF EXISTS orders_p;
+CREATE TABLE orders_p (
+  id BIGINT NOT NULL, seller_id INT NOT NULL, marketplace VARCHAR(8) NOT NULL, status VARCHAR(10) NOT NULL,
+  amount DECIMAL(12,2) NOT NULL, created_at DATETIME NOT NULL,
+  PRIMARY KEY (id, created_at), KEY orders_p_created_at_idx (created_at)
+) ENGINE = InnoDB PARTITION BY RANGE COLUMNS (created_at) (
+  PARTITION p2024_01 VALUES LESS THAN ('2024-02-01'), PARTITION p2024_02 VALUES LESS THAN ('2024-03-01'),
+  PARTITION p2024_03 VALUES LESS THAN ('2024-04-01'), PARTITION p2024_04 VALUES LESS THAN ('2024-05-01'),
+  PARTITION p2024_05 VALUES LESS THAN ('2024-06-01'), PARTITION p2024_06 VALUES LESS THAN ('2024-07-01'),
+  PARTITION p2024_07 VALUES LESS THAN ('2024-08-01'), PARTITION p2024_08 VALUES LESS THAN ('2024-09-01'),
+  PARTITION p2024_09 VALUES LESS THAN ('2024-10-01'), PARTITION p2024_10 VALUES LESS THAN ('2024-11-01'),
+  PARTITION p2024_11 VALUES LESS THAN ('2024-12-01'), PARTITION p2024_12 VALUES LESS THAN ('2025-01-01'),
+  PARTITION p2025_01 VALUES LESS THAN ('2025-02-01'), PARTITION p2025_02 VALUES LESS THAN ('2025-03-01'),
+  PARTITION p2025_03 VALUES LESS THAN ('2025-04-01'), PARTITION p2025_04 VALUES LESS THAN ('2025-05-01'),
+  PARTITION p2025_05 VALUES LESS THAN ('2025-06-01'), PARTITION p2025_06 VALUES LESS THAN ('2025-07-01'),
+  PARTITION p2025_07 VALUES LESS THAN ('2025-08-01'), PARTITION p2025_08 VALUES LESS THAN ('2025-09-01'),
+  PARTITION p2025_09 VALUES LESS THAN ('2025-10-01'), PARTITION p2025_10 VALUES LESS THAN ('2025-11-01'),
+  PARTITION p2025_11 VALUES LESS THAN ('2025-12-01'), PARTITION p2025_12 VALUES LESS THAN ('2026-01-01')
+);
+INSERT INTO orders_p SELECT * FROM orders;                          -- 17 s in the lab
+ANALYZE TABLE orders_p;
+```
+
+## Exercise 1: one probe per partition (Concept 1)
+
+```sql
+-- pg
+CREATE INDEX orders_p_seller_idx ON orders_p (seller_id);
+CREATE INDEX orders_seller_idx ON orders (seller_id);
+SELECT relname, relkind, pg_size_pretty(pg_relation_size(oid)) FROM pg_class
+WHERE relname LIKE 'orders_p%seller%' ORDER BY relname LIMIT 4;
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) SELECT * FROM orders   WHERE id = 2500000;
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) SELECT * FROM orders_p WHERE id = 2500000;
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) SELECT * FROM orders_p WHERE id = 2500000
+  AND created_at >= '2024-12-01' AND created_at < '2025-01-01';
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+SELECT level FROM bt_metap('orders_seller_idx');
+SELECT level FROM bt_metap('orders_p_2024_01_seller_id_idx');
+```
+
+```bash
+# pg: latency of random id lookups, 3 s each, run each line 3–5 times
+docker exec idx-pg sh -c "printf '\\\\set i random(1, 5000000)\nSELECT * FROM orders WHERE id = :i;\n' > /tmp/plain.sql
+  printf '\\\\set i random(1, 5000000)\nSELECT * FROM orders_p WHERE id = :i;\n' > /tmp/part.sql"
+docker exec idx-pg pgbench -U postgres -n -M prepared -T 3 -f /tmp/plain.sql parts | grep 'latency average'
+docker exec idx-pg pgbench -U postgres -n -M prepared -T 3 -f /tmp/part.sql  parts | grep 'latency average'
+```
+
+```sql
+-- my
+EXPLAIN SELECT * FROM orders_p WHERE id = 2500000\G
+FLUSH STATUS; SELECT id FROM orders   WHERE id = 2500000; SHOW SESSION STATUS LIKE 'Handler_read_key';
+FLUSH STATUS; SELECT id FROM orders_p WHERE id = 2500000; SHOW SESSION STATUS LIKE 'Handler_read_key';
+ALTER TABLE orders   ADD INDEX orders_seller_idx (seller_id),   ALGORITHM=INPLACE, LOCK=NONE;
+ALTER TABLE orders_p ADD INDEX orders_p_seller_idx (seller_id), ALGORITHM=INPLACE, LOCK=NONE;
+ANALYZE TABLE orders, orders_p;
+SELECT IF(table_name = 'orders', 'orders', 'orders_p') AS t, index_name, ROUND(SUM(stat_value) * 16 / 1024, 1) AS mb
+FROM mysql.innodb_index_stats
+WHERE database_name = 'parts' AND (table_name = 'orders' OR table_name LIKE 'orders_p#p#%') AND stat_name = 'size'
+GROUP BY t, index_name;
+```
+
+| Fill in | PostgreSQL `orders` | PostgreSQL `orders_p` | MySQL `orders` | MySQL `orders_p` |
+|---|---|---|---|---|
+| Index scans / `Handler_read_key` for `id = 2500000` | | | | |
+| Buffers (pg) | | | – | – |
+| Latency per lookup | | | | |
+| `seller_id` index size | | | | |
+
+Expected (lab): 1 vs 24 probes; 4 vs 73 buffers; 0.013 vs 0.137 ms (pg) and 10 vs 44 µs (my); 35 vs 35 MB (pg) and 97 vs 132 MB (my).
+
+## Exercise 2: building an index online (Concept 2)
+
+Terminal 1 builds, terminal 2 writes 0.5 s later, terminal 3 watches.
+
+```sql
+-- pg, terminal 1
+CREATE INDEX CONCURRENTLY orders_p_amount_idx ON orders_p (amount);    -- error
+CREATE INDEX orders_p_amount_idx ON orders_p (amount);                 -- blocking build
+-- terminal 3, during the build
+SELECT c.relname, l.mode FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+JOIN pg_stat_activity a ON a.pid = l.pid
+WHERE a.query LIKE 'CREATE INDEX orders_p_amount%' AND l.mode = 'ShareLock';
+-- terminal 2, during the build
+\timing on
+INSERT INTO orders_p VALUES (9000001, 1, 'shopee', 'delivered', 10, '2025-06-15');
+SELECT count(*) FROM orders_p WHERE created_at >= '2025-06-01' AND created_at < '2025-06-02';
+```
+
+Then the online way:
+
+```sql
+-- pg, terminal 1
+DROP INDEX orders_p_amount_idx;
+CREATE INDEX orders_p_amount_idx ON ONLY orders_p (amount);
+SELECT indisvalid FROM pg_index WHERE indexrelid = 'orders_p_amount_idx'::regclass;
+CREATE INDEX CONCURRENTLY orders_p_2025_06_amount_idx ON orders_p_2025_06 (amount);  -- terminal 2 inserts meanwhile
+ALTER INDEX orders_p_amount_idx ATTACH PARTITION orders_p_2025_06_amount_idx;
+EXPLAIN (COSTS OFF) SELECT * FROM orders_p WHERE amount = 77.77
+  AND created_at >= '2025-06-01' AND created_at < '2025-07-01';
+EXPLAIN (COSTS OFF) SELECT * FROM orders_p WHERE amount = 77.77
+  AND created_at >= '2025-05-01' AND created_at < '2025-06-01';
+```
+
+```bash
+# remaining partitions, one at a time
+for t in $(docker exec idx-pg psql -U postgres -d parts -Atc "
+  SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+  WHERE i.inhparent = 'orders_p'::regclass AND NOT EXISTS (
+    SELECT 1 FROM pg_index x JOIN pg_inherits ii ON ii.inhrelid = x.indexrelid
+    WHERE x.indrelid = c.oid AND ii.inhparent = 'orders_p_amount_idx'::regclass)"); do
+  docker exec idx-pg psql -U postgres -d parts -q \
+    -c "CREATE INDEX CONCURRENTLY ${t}_amount_idx ON $t (amount)" \
+    -c "ALTER INDEX orders_p_amount_idx ATTACH PARTITION ${t}_amount_idx"
+done
+docker exec idx-pg psql -U postgres -d parts -Atc \
+  "SELECT indisvalid FROM pg_index WHERE indexrelid = 'orders_p_amount_idx'::regclass"
+```
+
+```sql
+-- my, terminal 1 then terminal 2 during the build
+ALTER TABLE orders_p DROP INDEX orders_p_seller_idx;
+ALTER TABLE orders_p ADD INDEX orders_p_seller_idx (seller_id), ALGORITHM=INPLACE, LOCK=NONE;
+INSERT INTO orders_p VALUES (9000001, 1, 'shopee', 'delivered', 10, '2025-06-15');
+```
+
+| Run | Insert time during the build | Locks seen |
+|---|---|---|
+| pg plain `CREATE INDEX` on parent | | |
+| pg CIC on one partition | | |
+| my `LOCK=NONE` | | – |
+
+Expected (lab): 849 ms and ShareLock on the parent plus every partition; 2.0 ms; 7.2 ms.
+
+## Exercise 3: unique keys (Concept 3)
+
+```sql
+-- pg
+DELETE FROM orders_p WHERE id > 5000000;
+ALTER TABLE orders_p ADD PRIMARY KEY (id);                   -- error
+ALTER TABLE orders_p ADD PRIMARY KEY (id, created_at);
+INSERT INTO orders_p VALUES (2500000, 9, 'lazada', 'delivered', 5, '2025-06-15 10:00');
+SELECT id, created_at, tableoid::regclass FROM orders_p WHERE id = 2500000;
+INSERT INTO orders_p VALUES (2500000, 9, 'lazada', 'delivered', 5, '2025-06-15 10:00');   -- error
+DELETE FROM orders_p WHERE id = 2500000 AND created_at = '2025-06-15 10:00';
+
+-- the lookup table
+CREATE TABLE order_ids (id bigint PRIMARY KEY);
+INSERT INTO order_ids SELECT id FROM orders_p;
+CREATE FUNCTION orders_p_claim_id() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO order_ids VALUES (NEW.id);
+  RETURN NEW;
+END $$;
+\timing on
+INSERT INTO orders_p SELECT g, 1, 'shopee', 'delivered', 10, '2025-12-01'::timestamptz + (g - 6000000) * interval '20 seconds'
+FROM generate_series(6000001, 6100000) g;                     -- without trigger
+DELETE FROM orders_p WHERE id > 6000000;
+CREATE TRIGGER orders_p_claim_id BEFORE INSERT ON orders_p FOR EACH ROW EXECUTE FUNCTION orders_p_claim_id();
+INSERT INTO orders_p SELECT g, 1, 'shopee', 'delivered', 10, '2025-12-01'::timestamptz + (g - 6000000) * interval '20 seconds'
+FROM generate_series(6000001, 6100000) g;                     -- with trigger
+INSERT INTO orders_p VALUES (2500000, 9, 'lazada', 'delivered', 5, '2025-06-15 10:00');   -- error from the trigger
+
+-- partition by the unique column
+CREATE TABLE orders_pid (LIKE orders INCLUDING DEFAULTS, PRIMARY KEY (id)) PARTITION BY RANGE (id);
+DO $$ BEGIN FOR k IN 0..23 LOOP
+  EXECUTE format('CREATE TABLE orders_pid_%s PARTITION OF orders_pid FOR VALUES FROM (%s) TO (%s)',
+                 k, k * 208334 + 1, (k + 1) * 208334 + 1);
+END LOOP; END $$;
+INSERT INTO orders_pid SELECT * FROM orders;
+CREATE INDEX ON orders_pid (created_at);
+VACUUM ANALYZE orders_pid;
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT count(*) FROM orders_pid WHERE created_at >= '2025-03-01' AND created_at < '2025-03-02';
+SELECT min(id), max(id) FROM orders WHERE created_at >= '2025-03-01' AND created_at < '2025-03-02';
+-- add that id range to the query above and count the partitions again
+```
+
+```sql
+-- my
+CREATE TABLE orders_bad (id BIGINT NOT NULL PRIMARY KEY, seller_id INT NOT NULL, created_at DATETIME NOT NULL)
+  PARTITION BY RANGE COLUMNS (created_at) (PARTITION p0 VALUES LESS THAN ('2024-02-01'));     -- ERROR 1503
+INSERT INTO orders_p VALUES (2500000, 9, 'lazada', 'delivered', 5, '2025-06-15 10:00:00');
+SELECT id, created_at FROM orders_p WHERE id = 2500000;
+DELETE FROM orders_p WHERE id = 2500000 AND created_at = '2025-06-15 10:00:00';
+```
+
+Expected (lab): both engines refuse `PRIMARY KEY (id)`; the June copy of order 2500000 is accepted; 100k inserts 290 ms without the trigger, 668 ms with; one-day count on `orders_pid` scans 24 partitions, 1 with the id range.
+
+## Exercise 4: foreign keys (Concept 4)
+
+```sql
+-- pg
+CREATE TABLE sellers (id integer PRIMARY KEY, name text NOT NULL);
+INSERT INTO sellers SELECT s, 'seller-' || s FROM generate_series(1, 5000) s;
+\timing on
+ALTER TABLE orders_p ADD CONSTRAINT orders_p_seller_fk FOREIGN KEY (seller_id) REFERENCES sellers (id);
+SELECT count(*) FROM pg_constraint WHERE conname = 'orders_p_seller_fk';
+CREATE TABLE order_items_bad (order_id bigint REFERENCES orders_p (id), sku text);           -- error
+CREATE TABLE order_items (
+  order_id bigint NOT NULL, order_created_at timestamptz NOT NULL, sku text NOT NULL, qty integer NOT NULL,
+  FOREIGN KEY (order_id, order_created_at) REFERENCES orders_p (id, created_at));
+CREATE TABLE order_items_nofk (LIKE order_items);
+CREATE TABLE order_items_plainfk (order_id bigint NOT NULL REFERENCES orders (id),
+  order_created_at timestamptz NOT NULL, sku text NOT NULL, qty integer NOT NULL);
+INSERT INTO order_items_nofk    SELECT id, created_at, 'SKU-' || (id % 5000), 1 FROM orders WHERE created_at < '2024-03-01';
+INSERT INTO order_items_plainfk SELECT id, created_at, 'SKU-' || (id % 5000), 1 FROM orders WHERE created_at < '2024-03-01';
+INSERT INTO order_items         SELECT id, created_at, 'SKU-' || (id % 5000), 1 FROM orders WHERE created_at < '2024-03-01';
+ALTER TABLE orders_p DETACH PARTITION orders_p_2024_01;                                      -- error
+DROP TABLE orders_p_2024_01;                                                                 -- error
+ALTER TABLE orders_p DETACH PARTITION orders_p_2025_12;
+ALTER TABLE orders_p ATTACH PARTITION orders_p_2025_12 FOR VALUES FROM ('2025-12-01') TO ('2026-01-01');
+BEGIN; DELETE FROM orders_p WHERE id = 300000; ROLLBACK;                                     -- note the time
+CREATE INDEX ON order_items (order_id, order_created_at);
+BEGIN; DELETE FROM orders_p WHERE id = 300000; ROLLBACK;
+```
+
+```sql
+-- my: every line fails with ERROR 1506
+CREATE TABLE sellers (id INT NOT NULL PRIMARY KEY, name VARCHAR(20) NOT NULL);
+ALTER TABLE orders_p ADD CONSTRAINT orders_p_seller_fk FOREIGN KEY (seller_id) REFERENCES sellers (id);
+CREATE TABLE order_items (order_id BIGINT NOT NULL, order_created_at DATETIME NOT NULL, sku VARCHAR(12) NOT NULL,
+  FOREIGN KEY (order_id, order_created_at) REFERENCES orders_p (id, created_at));
+CREATE TABLE fk_child (seller_id INT NOT NULL, FOREIGN KEY (seller_id) REFERENCES sellers (id))
+  PARTITION BY HASH (seller_id) PARTITIONS 4;
+```
+
+| Insert 410k items | Time |
+|---|---|
+| No FK | |
+| FK to plain `orders (id)` | |
+| FK to `orders_p (id, created_at)` | |
+
+Expected (lab): 0.17 s, 1.93 s, 6.68 s; detach and drop of January 2024 refused; December 2025 detached in 57 ms; the parent delete's FK check 33.6 ms without the child index, 0.76 ms with it.
+
+## Exercise 5: MongoDB layouts (Concept 5)
+
+```js
+// mg: time-series copy and one collection per month
+db.orders.aggregate([
+  { $project: { _id: 0, order_id: '$_id', seller_id: 1, marketplace: 1, status: 1, amount: 1, created_at: 1 } },
+  { $out: { db: 'parts', coll: 'orders_ts',
+            timeseries: { timeField: 'created_at', metaField: 'marketplace', granularity: 'minutes' } } }]);
+for (let y = 2024; y <= 2025; y++) for (let m = 1; m <= 12; m++) {
+  const name = `orders_${y}_${String(m).padStart(2, '0')}`;
+  db.orders.aggregate([{ $match: { created_at: { $gte: new Date(Date.UTC(y, m - 1, 1)), $lt: new Date(Date.UTC(y, m, 1)) } } },
+                       { $out: name }]);
+  db.getCollection(name).createIndex({ created_at: 1 });
+}
+db.system.buckets.orders_ts.countDocuments();
+[db.orders.stats(), db.orders_ts.stats(), db.orders_2025_03.stats()]
+  .map(s => [s.ns, (s.storageSize / 1048576).toFixed(1), (s.totalIndexSize / 1048576).toFixed(1)]);
+
+// timings: wrap each in a loop of 50 and divide
+const march = { created_at: { $gte: ISODate('2025-03-01'), $lt: ISODate('2025-04-01') } };
+const gmv = { $group: { _id: '$marketplace', gmv: { $sum: '$amount' } } };
+db.orders.aggregate([{ $match: march }, gmv]);
+db.orders_ts.aggregate([{ $match: march }, gmv]);
+db.orders_2025_03.aggregate([gmv]);
+db.orders_ts.find({ order_id: 2500000 }).explain('executionStats').executionStats.totalDocsExamined;
+
+// uniqueness
+db.orders_ts.createIndex({ order_id: 1 }, { unique: true });          // error
+db.orders_2025_06.insertOne({ _id: 2500000, created_at: ISODate('2025-06-15T10:00:00Z') });   // accepted
+db.orders.insertOne({ _id: 2500000, created_at: ISODate('2025-06-15T10:00:00Z') });           // E11000
+db.orders_2025_06.deleteOne({ _id: 2500000 });
+```
+
+| Fill in | `orders` | `orders_ts` | `orders_2025_03` (×24) |
+|---|---|---|---|
+| Storage + indexes, MB | | | |
+| March GMV, ms | | | |
+| Lookup by order id, ms | | | |
+| Unique order id? | | | |
+
+Expected (lab): 146 + 115, 32 + 0.2, 146 + 105 MB (24 months); 73.7, 10.7, 36.3 ms; 0.28, 2.1 ms (5,002 buckets), 1.38 ms with 24 `$unionWith`; yes, no, only per month.
+
+## What this lab leaves behind, and cleanup
+
+| Engine | Objects |
+|---|---|
+| PostgreSQL | `orders_p` (24 partitions + PK, indexes, FK, trigger), `orders_pid`, `sellers`, `order_ids`, `order_items`, `order_items_nofk`, `order_items_plainfk`, extension `pageinspect`; the extra `seller_id` index on `orders` |
+| MySQL | `orders_p`, `sellers`; the extra `seller_id` index on `orders` |
+| MongoDB | `orders_ts`, `orders_2024_01` … `orders_2025_12` |
+
+```sql
+-- pg
+DROP TABLE IF EXISTS order_items, order_items_nofk, order_items_plainfk, order_items_bad, order_ids, orders_pid, orders_p, sellers CASCADE;
+DROP FUNCTION IF EXISTS orders_p_claim_id();
+DROP INDEX IF EXISTS orders_seller_idx;
+-- my
+DROP TABLE IF EXISTS orders_p, sellers, order_items, fk_child, orders_bad;
+ALTER TABLE orders DROP INDEX orders_seller_idx;
+```
+
+```js
+// mg
+db.orders_ts.drop();
+db.getCollectionNames().filter(c => /^orders_20/.test(c)).forEach(c => db.getCollection(c).drop());
+```
+
+Session 4 rebuilds `orders_p` itself, so nothing here is needed later.
+
+## Session quiz
+
+1. A table partitioned by month has a partitioned index on `id`. How many index descents does `WHERE id = 42` cost with 24 partitions, and with 730 daily ones?
+2. Why is the per-partition overhead invisible in a query that returns one seller's 1,000 orders, but dominant in a one-row lookup?
+3. Why did the InnoDB `seller_id` index grow by 37% after partitioning, with the same rows?
+4. What does a plain `CREATE INDEX ON orders_p (amount)` lock, and for how long? Give the online alternative in three steps.
+5. Why must every unique key on a partitioned table include the partition key? What did that allow in the lab?
+6. Compare the three ways to keep a globally unique order id, each with its measured cost.
+7. Why could `orders_p_2024_01` not be detached once `order_items` referenced it, and how do you design retention for parent and child?
+8. Which MongoDB layout gives instant monthly drops, which gives the smallest storage, and which keeps `_id` globally unique?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/lab/answers">Answers to the session quiz</DeepDive>

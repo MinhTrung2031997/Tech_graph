@@ -1,0 +1,70 @@
+---
+title: "Answers: MongoDB has no partitions: time-series collections and one collection per month"
+description: "Worked answers to the Session 3 Concept 5 check questions."
+companion: "answers"
+tags: ["partitioning", "mongodb", "time-series", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/timeseries-collections/"
+  - "https://www.mongodb.com/docs/manual/core/timeseries/timeseries-limitations/"
+---
+
+<Tldr>
+Time-series collections trade uniqueness and id lookups for compression and fast time scans; collection-per-month trades them for instant drops.
+</Tldr>
+
+## Q1. How many buckets
+
+**Question:** how many buckets did the 5M orders become, and why about that many?
+
+5,002 (`db.system.buckets.orders_ts.countDocuments()`). A bucket holds measurements with the same `metaField` value whose times fall within the bucket's span, up to 1,000 measurements. With 3 marketplaces and orders every few seconds, buckets fill up to the 1,000-measurement limit long before their time span runs out: 5,000,000 / 1,000 ≈ 5,000, plus a few partly filled at the boundaries.
+
+> **Common mistake:** using a high-cardinality `metaField` such as `seller_id` (5,000 values). Each seller would get its own small buckets, which hurts compression and creates many more buckets.
+
+## Q2. Why the month scan was 7× faster
+
+**Question:** why was the month GMV query 7× faster on the time-series collection than on the plain one, although the plain one has an index on `created_at`?
+
+The index finds the 212k March documents quickly, but the plain collection must then fetch and decode 212k separate documents (73.7 ms). The time-series collection reads about 210 buckets, each holding ~1,000 orders compressed column by column, and decompresses those buckets (10.7 ms). Scanning the plain month collection without any index (36.3 ms) beat the plain index path, because a sequential read is cheaper than 212k index-driven fetches.
+
+> **Common mistake:** expecting an index to speed up a query that returns a large share of a collection. Past a few percent of the documents, the fetches dominate.
+
+## Q3. 5,002 buckets for one order
+
+**Question:** why did a lookup by `order_id` on the time-series collection examine 5,002 buckets?
+
+The only indexed path into a time-series collection here is time (the clustered bucket order) and `marketplace + created_at`. `order_id` is an ordinary measurement field with no index, so the query is a COLLSCAN over all buckets (2.1 ms vs 0.28 ms on the plain collection). A secondary index on `order_id` would help; a unique one is not allowed.
+
+> **Common mistake:** moving an operational collection to time-series and discovering that lookups by business key became full scans.
+
+## Q4. The unique-index error
+
+**Question:** what error did `createIndex({ order_id: 1 }, { unique: true })` return on the time-series collection?
+
+`MongoServerError[InvalidOptions]` (code 72): `Unique indexes are not supported on time-series collections`. Adding `created_at` to the key did not help: `{ order_id: 1, created_at: 1 }` with `unique: true` failed the same way.
+
+> **Common mistake:** expecting the Concept 3 workaround (include the time field in the key) to work in MongoDB. It doesn't: time-series collections allow no unique index at all.
+
+## Q5. No duplicate-key error
+
+**Question:** order 2500000 was inserted into `orders_2025_06`. Why was there no duplicate-key error?
+
+`orders_2025_06` is a separate collection with its own `_id_` index, and that index has never seen `_id: 2500000`, which lives in `orders_2024_12`. Uniqueness is per collection, so the duplicate was accepted. The database has no idea the 24 collections belong together.
+
+> **Common mistake:** re-importing a month into the "current" collection by mistake and getting silent duplicates.
+
+## Q6. Finding an order without its month
+
+**Question:** how do you find an order by id when you don't know its month in the collection-per-month layout, and how does that cost grow?
+
+Query every month: one `$match` on the first collection plus a `$unionWith` (each with its own `$match` on `_id`) for each other collection: 24 index lookups, 1.38 ms here. The cost grows linearly with the number of months kept, like Concept 1's per-partition probes. Alternatives: encode the month in the order id, or keep a small `order_id → month` lookup collection.
+
+> **Common mistake:** writing the 24 `$unionWith` stages by hand. Generate the list from `db.getCollectionNames()`, or a new month will be missed.
+
+## Q7. Checkout vs dashboard
+
+**Question:** which layout would you choose for checkout, and which for a 13-month GMV dashboard?
+
+Checkout uses a plain collection, because it needs a unique `_id`, fast lookups by id, and updates to individual orders. The dashboard uses a time-series collection fed from it: 4.6× less data, 7× faster month scans, and retention by `expireAfterSeconds`. Its lack of unique indexes is acceptable if the feeding job is idempotent. Collection-per-month fits when the main need is dropping old data instantly and queries almost always know the month.
+
+> **Common mistake:** choosing one layout for both workloads.

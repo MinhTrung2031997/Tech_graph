@@ -1,0 +1,73 @@
+---
+title: "Answers: Every partition has its own index"
+description: "Worked answers to the Session 3 Concept 1 check questions."
+companion: "answers"
+tags: ["partitioning", "indexing", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-limitations.html"
+---
+
+<Tldr>
+There is no global index. The cost of a query is the number of partitions it cannot prune, times one index probe each.
+</Tldr>
+
+## Q1. How many indexes
+
+**Question:** `CREATE INDEX ON orders_p (seller_id)` created how many indexes, and which one holds no entries?
+
+25: one partitioned index on `orders_p` (`relkind = 'I'`) and one ordinary B-tree per partition, 24 at that point. The parent's index has no storage: it exists so that PostgreSQL can attach the partition indexes to it, give new partitions a matching index automatically, and report the set as one index. Its total size (35 MB) is the sum of the 24 partition indexes and equals the plain table's index.
+
+> **Common mistake:** expecting `pg_relation_size('orders_p_seller_idx')` to show the index size. It is 0; sum the partition indexes instead.
+
+## Q2. 73 buffers vs 4
+
+**Question:** why did `WHERE id = 2500000` read 73 buffers on `orders_p` and 4 on `orders`?
+
+On `orders`, one descent of the 3-level primary key (3 pages) plus one heap page: 4. On `orders_p` the query has no `created_at` condition, so nothing can be pruned: the plan is an `Append` of 24 index scans. 23 of them descend 3 pages and find nothing (69 buffers), and the one in `orders_p_2024_12` descends 3 pages and reads 1 heap page (4 buffers): 73.
+
+> **Common mistake:** assuming the planner "knows" where id 2500000 lives because ids grow with time. It knows only the partition bounds on `created_at`.
+
+## Q3. Smaller index, same probe
+
+**Question:** a 212k-row partition index is about 24× smaller than the 5M-row index. Why does each probe save at most one page?
+
+Probe cost is the tree's height, not its size, and height grows with the logarithm of the row count, base several hundred (entries per page). Both the 5M-row and the 212k-row `id` indexes have 3 levels (`bt_metap` level 2). For `seller_id`, 212k entries fit in 2 levels, so a partition probe saves one page. Dividing the rows by 24 removes at most one level, and the query then makes 24 probes.
+
+> **Common mistake:** "partitioning makes indexes smaller, so lookups get faster". Each index is smaller, but there are more of them to probe.
+
+## Q4. Many rows vs one row
+
+**Question:** why is the seller query (≈1,000 rows) only 13% slower on the partitioned table, while the id lookup is 10× slower?
+
+The extra cost is a fixed ~2–3 index pages per partition (48 index buffers instead of 4). For the id lookup that overhead is the whole query (73 vs 4 buffers). The seller query reads about 950 heap pages either way, because one seller's orders are spread over two years of data, so 44 extra index pages are small by comparison (1.28 vs 1.44 ms).
+
+> **Common mistake:** benchmarking partitioning with a report query and concluding point lookups are fine too.
+
+## Q5. `ref` vs `const`
+
+**Question:** in MySQL, why is the access type `ref` on `orders_p` but `const` on `orders` for the same `WHERE id = …`?
+
+`const` means "at most one row, by a unique key". On `orders` the primary key is `id`. On `orders_p` it is `(id, created_at)`, because MySQL requires the partitioning column in every unique key (Concept 3). An equality on `id` alone is a prefix of that key and can match several rows, so the optimizer uses `ref`, in all 24 partitions.
+
+> **Common mistake:** reading `rows: 1` in EXPLAIN as "one partition". Check the `partitions` column.
+
+## Q6. Bigger secondary index, same data
+
+**Question:** why did the `seller_id` index grow from 96.6 MB to 132.4 MB in MySQL when the data did not change?
+
+An InnoDB secondary index entry is `(seller_id, primary key)`. The primary key went from `id` (8 bytes) to `(id, created_at)` (8 + 5 bytes), so every one of the 5M entries got wider. The relative growth is largest for the narrowest index (`seller_id`, a 4-byte int: +37%).
+
+> **Common mistake:** budgeting partition storage as "same data, same size". In InnoDB the primary-key change makes every secondary index bigger.
+
+## Q7. The webhook
+
+**Question:** a webhook looks orders up by id in a table partitioned by month. Give two ways to make it touch one partition.
+
+1. Make the partition key available to the caller: put the order month (or `created_at`) in the reference sent to the gateway and add `AND created_at >= … AND created_at < …` to the lookup.
+2. Keep a small `order_id → created_at` table (PK on id), look up the date first, then query with it: two cheap probes instead of 24.
+
+A third option is to partition by an id range (ids grow with time), which makes id lookups prune; date queries then need a matching id range to prune.
+
+> **Common mistake:** adding a "global" index on id: neither PostgreSQL nor MySQL can create one on a partitioned table.

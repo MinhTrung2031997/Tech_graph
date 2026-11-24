@@ -1,0 +1,260 @@
+---
+title: "Concept 4: Foreign keys to and from partitioned tables"
+description: "PostgreSQL supports foreign keys in both directions, at a price. A foreign key from orders_p to sellers was validated in about 0.25 s. A foreign key to orders_p must reference (id, created_at), so child rows carry the partition key, and inserting 410k child rows took 6.7 s against 1.9 s with a plain parent and 0.17 s with no FK. Referenced partitions can no longer be detached or dropped. MySQL refuses every foreign key that involves a partitioned table (ERROR 1506)."
+type: "concept"
+tags: ["partitioning", "constraints", "foreign-keys", "postgresql", "mysql"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE-LIMITATIONS"
+  - "https://www.postgresql.org/docs/17/sql-altertable.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-limitations.html"
+---
+
+<Tldr>
+**From** a partitioned table to a plain one works like on any table. `orders_p.seller_id REFERENCES sellers` validated 5M rows in about 0.25 s, and PostgreSQL created **27 constraint rows** (the parent plus one per partition). **To** a partitioned table is harder, because an FK must reference a unique key and the only unique key is `(id, created_at)` ([Concept 3](/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-3-unique-keys)). `REFERENCES orders_p (id)` failed with "there is no unique constraint matching given keys", so `order_items` had to carry `order_created_at`. Inserting 410,397 items then took **6.68 s**, against 1.93 s with an FK to the plain `orders` and 0.17 s without an FK. Retention then gets blocked. `DETACH PARTITION orders_p_2024_01` failed ("removing partition … violates foreign key constraint") and so did `DROP TABLE`, while an unreferenced month detached in 57 ms. **MySQL** refuses foreign keys on partitioned tables in every direction, with `ERROR 1506: Foreign keys are not yet supported in conjunction with partitioning`.
+</Tldr>
+
+## The setup
+
+Two new tables in the lab database:
+
+| Table | Rows | Relationship |
+|---|---|---|
+| `sellers (id PRIMARY KEY, name)` | 5,000 | `orders_p.seller_id` references it |
+| `order_items (order_id, order_created_at, sku, qty)` | 410,397 (one per order in Jan–Feb 2024) | References `orders_p` |
+
+| Term | Meaning |
+|---|---|
+| Referencing table (child) | The table with the FK column: `order_items` |
+| Referenced table (parent) | The table with the unique key: `orders_p` |
+| RI trigger | The internal trigger that checks an FK on every insert, update or delete |
+| Detach / drop a partition | How Session 4 removes an old month in milliseconds |
+| **✓ Allowed / ✗ Refused** | Outcome of the statement |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: foreign keys around orders_p"
+  height={300}
+  nodes={[
+    { id: 'items', label: 'order_items', sub: '410k rows, child', x: 20, y: 20, w: 220 },
+    { id: 'parent', label: 'orders_p', sub: 'PK (id, created_at)', x: 290, y: 20, w: 220 },
+    { id: 'sellers', label: 'sellers', sub: '5,000 rows, PK (id)', x: 560, y: 20, w: 220 },
+    { id: 'jan', label: 'orders_p_2024_01', sub: 'referenced by items', x: 20, y: 200, w: 220 },
+    { id: 'dec', label: 'orders_p_2025_12', sub: 'no items', x: 560, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'items-parent', from: 'items', to: 'parent' },
+    { id: 'parent-sellers', from: 'parent', to: 'sellers' },
+    { id: 'items-jan', from: 'items', to: 'jan' },
+    { id: 'parent-jan', from: 'parent', to: 'jan' },
+    { id: 'parent-dec', from: 'parent', to: 'dec' },
+  ]}
+  cases={[
+    {
+      title: 'FK from the partitioned table',
+      path: 'orders_p.seller_id → sellers(id) → ✓ validated 5M rows in ~0.25 s → 1 + 26 constraint rows',
+      summary: 'Works like a plain table; each partition gets its own copy of the constraint.',
+      subs: { sellers: '✓ referenced' },
+      steps: [
+        {
+          title: 'Add and validate',
+          note: 'Adding the FK checks every existing row against sellers: 264 ms and 219 ms in two runs on orders_p, 650 ms (one run) on the plain orders table.',
+          code: 'ALTER TABLE orders_p ADD CONSTRAINT orders_p_seller_fk\n  FOREIGN KEY (seller_id) REFERENCES sellers (id);',
+          active: ['parent', 'sellers'],
+          edges: ['parent-sellers'],
+        },
+        {
+          title: 'One constraint per partition',
+          note: 'pg_constraint has 27 rows named orders_p_seller_fk: the parent (conparentid = 0) and one inherited copy per partition, and a detached partition keeps its FK as a standalone constraint (checked: after DETACH, orders_p_2025_12 had orders_p_seller_fk with conparentid = 0).',
+          code: "SELECT count(*) FROM pg_constraint WHERE conname = 'orders_p_seller_fk';   -- 27",
+          active: ['parent', 'jan', 'dec', 'sellers'],
+          edges: ['parent-jan', 'parent-dec', 'parent-sellers'],
+        },
+      ],
+    },
+    {
+      title: 'FK to the partitioned table',
+      path: 'REFERENCES orders_p (id) ✗ no unique constraint → REFERENCES orders_p (id, created_at) ✓ → 410k inserts 6.68 s',
+      summary: 'The child must carry the partition key, and every check is 3.5× dearer than against a plain parent.',
+      subs: { items: 'carries order_created_at' },
+      steps: [
+        {
+          title: 'id alone is not a unique key',
+          note: 'An FK must reference a primary key or unique constraint. On orders_p that is (id, created_at).',
+          code: 'CREATE TABLE order_items_bad (order_id bigint REFERENCES orders_p (id), sku text);\nERROR:  there is no unique constraint matching given keys for referenced table "orders_p"',
+          active: ['items', 'parent'],
+          edges: ['items-parent'],
+          subs: { items: '✗ refused' },
+        },
+        {
+          title: 'Reference the composite key',
+          note: 'order_items gets an order_created_at column and a two-column FK. PostgreSQL created 27 FK constraint rows on order_items (one per referenced partition plus the parent) and 104 RI triggers on the partitions.',
+          code: 'CREATE TABLE order_items (\n  order_id bigint NOT NULL, order_created_at timestamptz NOT NULL,\n  sku text NOT NULL, qty integer NOT NULL,\n  FOREIGN KEY (order_id, order_created_at) REFERENCES orders_p (id, created_at));',
+          active: ['items', 'parent', 'jan'],
+          edges: ['items-parent', 'items-jan'],
+        },
+        {
+          title: 'Every insert is checked through the partition tree',
+          note: 'Inserting the same 410,397 rows (Jan–Feb 2024 orders, one item each): 0.17 s with no FK, 1.93 s with an FK to the plain orders(id), 6.60 / 6.82 / 6.68 s with the FK to orders_p(id, created_at). Each check is a lookup that must first find the right partition.',
+          code: 'INSERT INTO order_items\nSELECT id, created_at, \'SKU-\' || (id % 5000), 1 FROM orders WHERE created_at < \'2024-03-01\';',
+          active: ['items', 'parent', 'jan'],
+          edges: ['items-parent', 'items-jan', 'parent-jan'],
+        },
+      ],
+    },
+    {
+      title: 'Retention meets the FK',
+      path: 'DETACH 2024_01 ✗ still referenced · DROP 2024_01 ✗ dependent constraint · DETACH 2025_12 ✓ 57 ms',
+      summary: 'A referenced month cannot leave until its children do.',
+      subs: { jan: '✗ cannot detach or drop', dec: '✓ detached in 57 ms' },
+      steps: [
+        {
+          title: 'Detach is checked',
+          note: 'Detaching a referenced partition would orphan its order_items, so PostgreSQL checks the children and refuses.',
+          code: 'ALTER TABLE orders_p DETACH PARTITION orders_p_2024_01;\nERROR:  removing partition "orders_p_2024_01" violates foreign key constraint\n        "order_items_order_id_order_created_at_fkey1"\nDETAIL:  Key (order_id, order_created_at)=(1, 2024-01-01 00:00:00+00) is still referenced from table "order_items".',
+          active: ['parent', 'jan', 'items'],
+          edges: ['parent-jan', 'items-jan'],
+        },
+        {
+          title: 'Drop is refused too',
+          note: 'DROP TABLE on the partition fails on the dependency, with a hint to CASCADE, which would drop the FK constraint from order_items, not the item rows.',
+          code: 'DROP TABLE orders_p_2024_01;\nERROR:  cannot drop table orders_p_2024_01 because other objects depend on it\nDETAIL:  constraint order_items_order_id_order_created_at_fkey on table order_items depends on table orders_p_2024_01\nHINT:  Use DROP ... CASCADE to drop the dependent objects too.',
+          active: ['jan', 'items'],
+          edges: ['items-jan'],
+        },
+        {
+          title: 'An unreferenced month leaves quickly',
+          note: 'orders_p_2025_12 has no items: DETACH PARTITION took 57 ms, including the check that no child rows reference it.',
+          code: 'ALTER TABLE orders_p DETACH PARTITION orders_p_2025_12;   -- 56.6 ms',
+          active: ['parent', 'dec'],
+          edges: ['parent-dec'],
+        },
+      ],
+    },
+  ]}
+/>
+
+### Deleting a parent row needs an index on the child
+
+Every delete or key update on `orders_p` checks `order_items` for references. Without an index on `order_items (order_id, order_created_at)` that check is a sequential scan of the child table:
+
+| `DELETE FROM orders_p WHERE id = 300000` (referenced, so it fails) | Time to the FK error |
+|---|---|
+| No index on `order_items (order_id, order_created_at)` | 33.6 ms |
+| With that index | 0.76 ms |
+
+PostgreSQL does not create this index for you ([Indexing Session 9](/blogs/databases/indexing/session-9-indexes-for-joins/concept-3-foreign-keys)).
+
+## MySQL
+
+<Flow
+  title="MySQL: foreign keys and partitioned InnoDB tables"
+  height={300}
+  nodes={[
+    { id: 'items', label: 'order_items', sub: 'plain table', x: 20, y: 20, w: 220 },
+    { id: 'parent', label: 'orders_p', sub: 'partitioned', x: 290, y: 20, w: 220 },
+    { id: 'sellers', label: 'sellers', sub: 'plain table', x: 560, y: 20, w: 220 },
+    { id: 'child', label: 'fk_child', sub: 'partitioned by HASH', x: 560, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'items-parent', from: 'items', to: 'parent' },
+    { id: 'parent-sellers', from: 'parent', to: 'sellers' },
+    { id: 'child-sellers', from: 'child', to: 'sellers' },
+  ]}
+  cases={[
+    {
+      title: 'Every direction refused',
+      path: 'partitioned → plain ✗ 1506 · plain → partitioned ✗ 1506 · CREATE partitioned with FK ✗ 1506 · ALTER … PARTITION BY on a table with an FK ✗ 1506',
+      summary: 'No foreign keys at all once a table is partitioned.',
+      subs: { items: '✗ 1506', parent: '✗ 1506', child: '✗ 1506' },
+      steps: [
+        {
+          title: 'From the partitioned table',
+          note: 'Adding orders_p.seller_id → sellers fails.',
+          code: 'ALTER TABLE orders_p ADD CONSTRAINT orders_p_seller_fk\n  FOREIGN KEY (seller_id) REFERENCES sellers (id);\nERROR 1506 (HY000): Foreign keys are not yet supported in conjunction with partitioning',
+          active: ['parent', 'sellers'],
+          edges: ['parent-sellers'],
+        },
+        {
+          title: 'To the partitioned table',
+          note: 'A plain order_items referencing orders_p (id, created_at) fails with the same error.',
+          code: 'CREATE TABLE order_items (order_id BIGINT NOT NULL, order_created_at DATETIME NOT NULL, sku VARCHAR(12) NOT NULL,\n  FOREIGN KEY (order_id, order_created_at) REFERENCES orders_p (id, created_at));\nERROR 1506 (HY000): Foreign keys are not yet supported in conjunction with partitioning',
+          active: ['items', 'parent'],
+          edges: ['items-parent'],
+        },
+        {
+          title: 'Partitioning a table that has an FK',
+          note: 'Both CREATE TABLE … PARTITION BY HASH with an FK and ALTER TABLE … PARTITION BY on an existing table with an FK fail. To partition an InnoDB table you must drop its foreign keys first, in both directions.',
+          code: 'ALTER TABLE plain_child PARTITION BY HASH (seller_id) PARTITIONS 4;\nERROR 1506 (HY000): Foreign keys are not yet supported in conjunction with partitioning',
+          active: ['child', 'sellers'],
+          edges: ['child-sellers'],
+        },
+      ],
+    },
+  ]}
+/>
+
+Without foreign keys, integrity moves to the application, or to triggers (not measured here) and periodic orphan checks:
+
+```sql
+-- items whose order no longer exists (e.g. after a partition was dropped)
+SELECT i.order_id FROM order_items i
+LEFT JOIN orders_p o ON o.id = i.order_id AND o.created_at = i.order_created_at
+WHERE o.id IS NULL LIMIT 10;
+```
+
+## MongoDB
+
+MongoDB has no foreign keys at all, partitioned or not. References between collections are checked by the application, which is the situation MySQL partitioned tables are in.
+
+## Comparison
+
+| | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| FK from a partitioned table | ✓ (one constraint per partition) | ✗ ERROR 1506 | No FKs |
+| FK to a partitioned table | ✓ must include the partition key | ✗ ERROR 1506 | No FKs |
+| Insert cost of the check (410k child rows) | 6.68 s vs 1.93 s to a plain parent | n/a | n/a |
+| Detach / drop a referenced partition | ✗ refused while children exist | n/a | n/a |
+
+<Pitfall>
+An FK **to** a partitioned table ties retention together: you can't drop March's orders until March's items are gone. Partition the child table by the same key (`order_created_at`, same monthly bounds) and drop both months together, child first. If the child keeps rows longer than the parent (e.g. invoices kept 10 years, orders 2 years), don't use an FK into the partitioned table. Check integrity in the application or in a periodic orphan query instead.
+</Pitfall>
+
+## Real-world scenario: the retention job that stopped working
+
+A team partitions `orders` monthly and schedules "drop the partition older than 24 months" (Session 4). Months later someone adds `refunds.order_id → orders` for a finance feature, with `order_created_at` carried along. The next retention run fails with "removing partition … violates foreign key constraint", nobody notices, and old partitions pile up for three months until disk alerts fire.
+
+| Fix | Effect |
+|---|---|
+| Partition `refunds` by `order_created_at` with the same bounds; retention drops the `refunds` month first, then `orders` | FK kept, retention works |
+| Keep refunds longer: drop the FK, archive the order rows that refunds need | Retention works, integrity by job |
+| Alert on the retention job's exit status | The failure is seen the same day |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Indexing Session 9](/blogs/databases/indexing/session-9-indexes-for-joins/concept-3-foreign-keys) | Index the FK columns on the child; PostgreSQL does not do it for you |
+| Concept 3 | The FK can only reference `(id, created_at)` because that is the only unique key |
+| [Transactions Session 5](/blogs/databases/transactions/session-5-locks-and-indexes/concept-1-row-and-table-locks) | FK checks take row locks on the parent (`FOR KEY SHARE`) |
+
+## Key takeaways
+
+1. PostgreSQL supports FKs from and to partitioned tables; MySQL refuses both (ERROR 1506), and MongoDB has no FKs.
+2. An FK to a partitioned table must reference a key that includes the partition key, so child rows carry it (`order_created_at`).
+3. The check is more expensive: 6.68 s for 410k child inserts, vs 1.93 s against a plain parent.
+4. A referenced partition cannot be detached or dropped; plan child retention with the parent (same partition bounds, drop child first).
+5. Index the child's FK columns: deleting a parent row took 33.6 ms without the index and 0.76 ms with it.
+
+## Check questions
+
+1. Why did `REFERENCES orders_p (id)` fail, and what did the child table need to add?
+2. Why does `pg_constraint` show 27 rows for one `ADD CONSTRAINT … FOREIGN KEY` on `orders_p`?
+3. Inserting 410k items took 0.17 s, 1.93 s and 6.68 s in three setups. Name the setups and explain the gaps.
+4. Why did `DETACH PARTITION orders_p_2024_01` fail while `orders_p_2025_12` detached in 57 ms?
+5. `DROP TABLE orders_p_2024_01` suggested CASCADE. What would CASCADE drop?
+6. You must partition a MySQL table that has foreign keys. What do you have to do first?
+7. Children are kept 10 years, parents 2 years. Should the child have an FK to the partitioned parent?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-4-foreign-keys/answers">Worked answers to Q1–Q7</DeepDive>

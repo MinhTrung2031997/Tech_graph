@@ -1,0 +1,267 @@
+---
+title: "Concept 1: Every partition has its own index"
+description: "An index on a partitioned table is one small index per partition, never one global index. On the 5M-row orders table split into 24 months, a lookup by id without the partition key probed all 24 indexes: 73 buffers instead of 4 and about 10× slower in PostgreSQL (0.137 vs 0.013 ms), 24 handler reads instead of 1 and 4× slower in MySQL. Queries that include the partition key, or that read many rows anyway, cost about the same as on the plain table."
+type: "concept"
+tags: ["partitioning", "indexing", "postgresql", "mysql"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE"
+  - "https://www.postgresql.org/docs/17/sql-createindex.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-overview.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-limitations.html"
+---
+
+<Tldr>
+`CREATE INDEX ON orders_p (seller_id)` created **one partitioned index with no entries** plus **24 ordinary indexes**, one per monthly partition; partitions added later got theirs automatically. Neither PostgreSQL nor MySQL has a global index across partitions. So a query that does not filter on the partition key (`created_at`) has to **probe every partition's index**: `WHERE id = 2500000` read **73 buffers in 24 index scans** instead of 4 buffers in one, and took **0.137 ms instead of 0.013 ms** (pgbench, best of 5). MySQL showed the same: `EXPLAIN` listed all 24 partitions, `Handler_read_key` went from 1 to 24, and a lookup went from **10.1 to 43.6 µs**. Adding the month to the query brought it back to 1 partition and 4 buffers. Queries that read many rows (one seller's ~1,000 orders, one day's 6,840) cost about the same either way.
+</Tldr>
+
+## The setup
+
+`orders` is the plain 5M-row table from the [Session 1 lab](/blogs/databases/partitioning-sharding/session-1-why-split-data/lab). `orders_p` is the same data in 24 monthly range partitions on `created_at` (`orders_p_2024_01` … `orders_p_2025_12`), built as in [Session 2](/blogs/databases/partitioning-sharding/session-2-partitioning-postgresql/concept-1-declarative-partitioning). Both tables got the same indexes on `id`, `seller_id` and `created_at`.
+
+| Term | Meaning |
+|---|---|
+| Partitioned index | The index you create on the parent. In PostgreSQL it is catalog-only (`relkind = 'I'`): it holds no entries, only links to the partition indexes |
+| Partition index (local index) | An ordinary B-tree on one partition, holding that partition's rows only |
+| Global index | One index over all partitions' rows. **Neither engine has one** |
+| Probe | One descent from the root of one B-tree to a leaf |
+| **✓ Probed / ✗ Pruned** | Did the query descend this partition's index? |
+
+## PostgreSQL
+
+```sql
+CREATE INDEX orders_p_seller_idx ON orders_p (seller_id);
+SELECT count(*) FILTER (WHERE relkind = 'I') AS parent, count(*) FILTER (WHERE relkind = 'i') AS leaf,
+       pg_size_pretty(sum(pg_relation_size(oid)))
+FROM pg_class WHERE relname LIKE 'orders_p%seller%';
+--  parent | leaf | size
+--       1 |   24 | 35 MB         (orders_seller_idx on the plain table: 35 MB)
+```
+
+<Flow
+  title="PostgreSQL: SELECT * FROM orders_p WHERE id = 2500000"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Query', sub: 'id = 2500000', x: 20, y: 20, w: 220 },
+    { id: 'parent', label: 'orders_p_id_idx', sub: 'partitioned, no entries', x: 290, y: 20, w: 220 },
+    { id: 'other', label: '21 more partitions', sub: '2024_02 … 2025_11', x: 560, y: 20, w: 220 },
+    { id: 'p1', label: 'orders_p_2024_01', sub: 'id index, 212k rows', x: 20, y: 200, w: 220 },
+    { id: 'p12', label: 'orders_p_2024_12', sub: 'id index, 212k rows', x: 290, y: 200, w: 220 },
+    { id: 'p24', label: 'orders_p_2025_12', sub: 'id index, 212k rows', x: 560, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-parent', from: 'q', to: 'parent' },
+    { id: 'parent-other', from: 'parent', to: 'other' },
+    { id: 'parent-p1', from: 'parent', to: 'p1' },
+    { id: 'parent-p12', from: 'parent', to: 'p12' },
+    { id: 'parent-p24', from: 'parent', to: 'p24' },
+  ]}
+  cases={[
+    {
+      title: 'No partition key in the query',
+      path: 'id = 2500000 → no created_at to prune on → ✓ 24 index scans (3 buffers each, 4 in 2024_12) → 1 row, 73 buffers',
+      summary: '23 of the 24 probes find nothing.',
+      subs: { p1: '✓ probed, 0 rows', p12: '✓ probed, 1 row', p24: '✓ probed, 0 rows', other: '✓ 21 probes, 0 rows' },
+      steps: [
+        {
+          title: 'No partition can be excluded',
+          note: 'The partition key is created_at; the query only names id. The planner cannot know which month holds order 2500000, so it plans an Append with one Index Scan per partition.',
+          code: 'EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)\nSELECT * FROM orders_p WHERE id = 2500000;',
+          active: ['q', 'parent'],
+          edges: ['q-parent'],
+        },
+        {
+          title: '24 descents, 1 hit',
+          note: 'Each partition index has root, inner and leaf pages: 3 buffers per probe. Only orders_p_2024_12 returns the row (4 buffers, one more for the heap). Total: Buffers: shared hit=73, versus 4 for the plain table.',
+          code: 'Append (actual rows=1)  Buffers: shared hit=73\n  -> Index Scan using orders_p_2024_01_id_idx … (rows=0)  hit=3\n  … 22 more …\n  -> Index Scan using orders_p_2024_12_id_idx … (rows=1)  hit=4',
+          active: ['parent', 'p1', 'p12', 'p24', 'other'],
+          edges: ['parent-p1', 'parent-p12', 'parent-p24', 'parent-other'],
+        },
+        {
+          title: 'The cost in time',
+          note: 'pgbench, one client, random id, prepared statements, best of 5 runs of 3 s: 0.013 ms per lookup on orders, 0.137 ms on orders_p. Ten times slower, because it does 24 times the work.',
+          code: 'orders    latency average = 0.013 ms\norders_p  latency average = 0.137 ms',
+          active: ['q', 'p12'],
+          edges: ['q-parent', 'parent-p12'],
+        },
+      ],
+    },
+    {
+      title: 'Partition key in the query',
+      path: 'id = 2500000 AND created_at in December 2024 → ✗ 23 pruned → ✓ 1 index scan → 4 buffers',
+      summary: 'Same cost as the plain table.',
+      subs: { p1: '✗ pruned', p12: '✓ probed, 1 row', p24: '✗ pruned', other: '✗ 21 pruned' },
+      steps: [
+        {
+          title: 'Prune first, then probe one index',
+          note: 'With a created_at range the planner keeps only orders_p_2024_12: a single Index Scan, Buffers: shared hit=4, no Append node.',
+          code: "SELECT * FROM orders_p\nWHERE id = 2500000\n  AND created_at >= '2024-12-01' AND created_at < '2025-01-01';",
+          active: ['q', 'parent', 'p12', 'p1', 'p24', 'other'],
+          edges: ['q-parent', 'parent-p12'],
+        },
+      ],
+    },
+  ]}
+/>
+
+### What each partition index looks like
+
+Each partition index is smaller, but not by as much as you might think. B-trees grow by **levels**, and each level multiplies capacity by a few hundred:
+
+| Index | Rows | `bt_metap` level (root height) | Probe cost |
+|---|---|---|---|
+| `orders_pkey` (plain, id) | 5,000,000 | 2 (3 levels) | 3 pages + heap |
+| `orders_p_2024_01_id_idx` | 212,039 | 2 (3 levels) | 3 pages |
+| `orders_seller_idx` (plain) | 5,000,000 | 2 (3 levels) | 3 pages |
+| `orders_p_2024_01_seller_id_idx` | 212,039 | 1 (2 levels) | 2 pages |
+
+A partition index saves at most one level per probe. Probing 24 of them costs far more than that saving.
+
+### Queries that read many rows
+
+| Query (PostgreSQL) | `orders` | `orders_p` | Why |
+|---|---|---|---|
+| `WHERE id = :i` (1 row) | 0.013 ms, 4 buffers | 0.137 ms, 73 buffers | 24 probes for 1 row |
+| `WHERE seller_id = :s` (~1,000 rows, count + sum) | 1.28 ms | 1.44 ms | 4 vs 48 index buffers, but ~950 heap pages either way |
+| `created_at` within one day (6,840 rows) | 0.274 ms | 0.305 ms | Pruned to 1 partition |
+| `CREATE INDEX … (seller_id)` | 0.75 s | 0.60 s | Same total work, best of 3 |
+
+The probe overhead is fixed per partition, so it dominates a 1-row lookup and disappears in a query that reads hundreds of rows. A seller's orders are spread over all 24 months anyway, so the plain table reads about the same heap pages (949 vs 991).
+
+## MySQL
+
+InnoDB stores each partition as its own tablespace with its own clustered index and secondary indexes. MySQL has no partitioned-index object at all: `ALTER TABLE orders_p ADD INDEX` builds 24 indexes.
+
+<Flow
+  title="MySQL: SELECT * FROM orders_p WHERE id = 2500000"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Query', sub: 'id = 2500000', x: 20, y: 20, w: 220 },
+    { id: 'opt', label: 'Partition pruning', sub: 'needs created_at', x: 290, y: 20, w: 220 },
+    { id: 'other', label: '21 more partitions', sub: 'p2024_02 … p2025_11', x: 560, y: 20, w: 220 },
+    { id: 'p1', label: 'p2024_01', sub: 'PRIMARY (id, created_at)', x: 20, y: 200, w: 220 },
+    { id: 'p12', label: 'p2024_12', sub: 'PRIMARY (id, created_at)', x: 290, y: 200, w: 220 },
+    { id: 'p24', label: 'p2025_12', sub: 'PRIMARY (id, created_at)', x: 560, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-opt', from: 'q', to: 'opt' },
+    { id: 'opt-other', from: 'opt', to: 'other' },
+    { id: 'opt-p1', from: 'opt', to: 'p1' },
+    { id: 'opt-p12', from: 'opt', to: 'p12' },
+    { id: 'opt-p24', from: 'opt', to: 'p24' },
+  ]}
+  cases={[
+    {
+      title: 'No partition key in the query',
+      path: 'id only → partitions: all 24 → type ref on PRIMARY → ✓ Handler_read_key 24 → 43.6 µs',
+      summary: 'One probe per partition, as in PostgreSQL.',
+      subs: { p1: '✓ probed, 0 rows', p12: '✓ probed, 1 row', p24: '✓ probed, 0 rows', other: '✓ 21 probes, 0 rows' },
+      steps: [
+        {
+          title: 'EXPLAIN shows every partition',
+          note: 'The partitions column lists p2024_01 … p2025_12, and the access type is ref instead of const: id is only a prefix of the primary key (id, created_at), which is unique only per partition.',
+          code: 'EXPLAIN SELECT * FROM orders_p WHERE id = 2500000\\G\n   partitions: p2024_01,p2024_02, … ,p2025_12\n         type: ref\n          key: PRIMARY',
+          active: ['q', 'opt'],
+          edges: ['q-opt'],
+        },
+        {
+          title: 'Count the probes',
+          note: 'FLUSH STATUS, run the query, then SHOW SESSION STATUS LIKE \'Handler_read_key\': 1 on the plain orders table, 24 on orders_p.',
+          code: "FLUSH STATUS;\nSELECT id FROM orders_p WHERE id = 2500000;\nSHOW SESSION STATUS LIKE 'Handler_read_key';   -- 24",
+          active: ['opt', 'p1', 'p12', 'p24', 'other'],
+          edges: ['opt-p1', 'opt-p12', 'opt-p24', 'opt-other'],
+        },
+        {
+          title: 'The cost in time',
+          note: '20,000 random-id lookups through a prepared statement inside a stored procedure, best of 3: 10.1 µs each on orders, 43.6 µs on orders_p.',
+          code: "CALL bench_lookup('orders', 20000);     -- 10.1 µs per lookup\nCALL bench_lookup('orders_p', 20000);   -- 43.6 µs per lookup",
+          active: ['q', 'p12'],
+          edges: ['q-opt', 'opt-p12'],
+        },
+      ],
+    },
+    {
+      title: 'Partition key in the query',
+      path: 'id + created_at in December 2024 → ✗ 23 pruned → partitions: p2024_12 → type range, 1 row',
+      summary: 'Pruning happens before any index is touched.',
+      subs: { p1: '✗ pruned', p12: '✓ probed, 1 row', p24: '✗ pruned', other: '✗ 21 pruned' },
+      steps: [
+        {
+          title: 'One partition left',
+          note: 'EXPLAIN shows partitions: p2024_12 and a range scan on PRIMARY with rows: 1.',
+          code: "EXPLAIN SELECT * FROM orders_p WHERE id = 2500000\n  AND created_at >= '2024-12-01' AND created_at < '2025-01-01'\\G",
+          active: ['q', 'opt', 'p12', 'p1', 'p24', 'other'],
+          edges: ['q-opt', 'opt-p12'],
+        },
+      ],
+    },
+  ]}
+/>
+
+### InnoDB secondary indexes get wider
+
+In InnoDB every secondary index entry stores the primary key, to find the row. A partitioned InnoDB table must have `created_at` in its primary key ([Concept 3](/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-3-unique-keys)), so **every secondary index entry gets wider**. From `mysql.innodb_index_stats` after `ANALYZE TABLE`:
+
+| Index | `orders` (PK id) | `orders_p` (PK id, created_at), sum of 24 | Change |
+|---|---|---|---|
+| PRIMARY | 301.9 MB | 315.1 MB | +4% |
+| `created_at` | 89.7 MB | 107.4 MB | +20% |
+| `seller_id` | 96.6 MB | 132.4 MB | +37% |
+| `ADD INDEX (seller_id)`, online | 2.9 s | 6.3 s | best of 2 |
+
+The [Indexing course](/blogs/databases/indexing/session-6-engine-differences/concept-2-innodb-secondary) covers why InnoDB secondary indexes carry the primary key.
+
+## MongoDB
+
+MongoDB has no table partitioning, so it has no partition indexes either. Inside one collection every index is global. [Concept 5](/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-5-mongodb-alternatives) covers what MongoDB offers instead: time-series collections and one collection per period.
+
+## Comparison
+
+| | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| Index on a partitioned table | 1 catalog-only parent + 1 per partition | 1 per partition, no parent object | n/a (no partitions) |
+| Global index across partitions | No | No | Every index in a collection is global |
+| Lookup without the partition key | 24 probes, 73 buffers, ~10× slower | 24 probes, ~4× slower | n/a |
+| New partitions | Get every index automatically | Get every index automatically | n/a |
+
+<Pitfall>
+Partitioning by `created_at` and then looking orders up by `id` (from an API, a payment callback or a join) turns every lookup into one probe per partition. With 24 partitions that cost 10× in PostgreSQL. With daily partitions over two years it would be about 730 probes. Before choosing the partition key, list the hot queries and check that each one can include it. If the hottest query cannot, either carry the partition key alongside the id (for example, encode the month in the order number, or send `created_at` with the request) or choose a different key.
+</Pitfall>
+
+## Real-world scenario: the payment webhook
+
+An order service partitions `orders` by month. The payment gateway calls back with the order id only, and the webhook runs `UPDATE orders SET status = 'paid' WHERE id = $1`. After 36 months of partitions, webhook latency has grown with every month added, while the dashboard (which filters by date) got faster.
+
+| Fix | Effect |
+|---|---|
+| Put the order month in the id or reference you send to the gateway, and add `AND created_at >= … AND created_at < …` | 1 partition probed |
+| Keep a small `order_id → created_at` lookup table (PK on id) | 1 probe there + 1 partition |
+| Partition by `id` range instead (ids grow with time) | `id` lookups prune; date queries need an id range to prune ([Concept 3](/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-3-unique-keys)) |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Indexing Session 2](/blogs/databases/indexing/session-2-btree-internals/concept-3-point-lookup) | One point lookup = one root-to-leaf descent; partitions multiply the descents |
+| [Session 2](/blogs/databases/partitioning-sharding/session-2-partitioning-postgresql/concept-2-pruning-plan-vs-execution) | Pruning decides how many partition indexes a query touches |
+| Concept 3 | Why a unique index can't be global either |
+
+## Key takeaways
+
+1. An index on a partitioned table is a set of per-partition (local) indexes. Neither PostgreSQL nor MySQL has a global index.
+2. A query without the partition key probes every partition's index: 24 probes, 73 buffers and 10× the time for a one-row lookup in PostgreSQL; 24 handler reads and 4× in MySQL.
+3. With the partition key in the query, the cost matches the plain table.
+4. Queries that read many rows barely notice the per-partition overhead.
+5. In InnoDB the partition key joins the primary key, which widens every secondary index (+20% to +37% here).
+
+## Check questions
+
+1. `CREATE INDEX ON orders_p (seller_id)` created how many indexes, and which one holds no entries?
+2. Why did `WHERE id = 2500000` read 73 buffers on `orders_p` and 4 on `orders`?
+3. A 212k-row partition index is about 24× smaller than the 5M-row index. Why does each probe save at most one page?
+4. Why is the seller query (≈1,000 rows) only 13% slower on the partitioned table, while the id lookup is 10× slower?
+5. In MySQL, why is the access type `ref` on `orders_p` but `const` on `orders` for the same `WHERE id = …`?
+6. Why did the `seller_id` index grow from 96.6 MB to 132.4 MB in MySQL when the data did not change?
+7. A webhook looks orders up by id in a table partitioned by month. Give two ways to make it touch one partition.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-1-local-indexes/answers">Worked answers to Q1–Q7</DeepDive>
