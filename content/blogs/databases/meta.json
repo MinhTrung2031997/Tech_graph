@@ -1,5 +1,9 @@
 {
   "title": "Databases",
   "icon": "Database",
-  "pages": ["indexing", "transactions"]
+  "pages": [
+    "indexing",
+    "transactions",
+    "partitioning-sharding"
+  ]
 }

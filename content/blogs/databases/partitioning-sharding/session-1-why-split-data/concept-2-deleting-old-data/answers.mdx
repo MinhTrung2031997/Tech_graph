@@ -1,0 +1,67 @@
+---
+title: "Answers: Deleting old data"
+description: "Worked answers to the Session 1 Concept 2 check questions."
+companion: "answers"
+tags: ["partitioning", "retention", "delete", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-undo-logs.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-formats.html"
+---
+
+<Tldr>
+A delete costs per row, now and later. A drop costs per table, once.
+</Tldr>
+
+## Q1. Everything PostgreSQL did for the DELETE
+
+**Question:** list everything PostgreSQL did for the 212,039-row DELETE, from the statement to the end of VACUUM.
+
+1. Planned the statement and scanned `orders_created_at_idx` for `created_at < '2024-02-01'`.
+2. For each of 212,039 heap rows: set `xmax` to the deleting transaction and wrote a WAL record (27 MB in total, including full-page images of pages touched for the first time after a checkpoint).
+3. Committed: the rows became dead tuples (`n_dead_tup` 212,039). Indexes were not touched yet.
+4. VACUUM scanned the 1,982 heap pages holding dead tuples (4.24% of the table), collected their item pointers, removed the matching entries from **both** indexes (581 index pages became empty and were deleted in each), then marked the heap slots free: another 10 MB of WAL, 0.66 s.
+5. The free space went into the free space map; the file stayed 365 MB.
+
+> **Common mistake:** counting only the DELETE statement. The cleanup is a second pass over the same rows and indexes, and in production it competes with everything else for I/O.
+
+## Q2. 4,288 bytes for DROP TABLE
+
+**Question:** why did DROP TABLE write only 4,288 bytes of WAL for the same rows?
+
+DROP TABLE does not touch rows. It deletes the table's entries from the system catalogs (`pg_class`, `pg_attribute`, `pg_index`, `pg_constraint`, …), which are a few dozen catalog row changes, and logs that the files must be removed at commit. Whether the table holds 1 row or 1 billion, the WAL is about the same.
+
+> **Common mistake:** assuming WAL is proportional to the data affected. It is proportional to the **changes logged**; dropping a file is one change.
+
+## Q3. Still 365 MB
+
+**Question:** why did the PostgreSQL table stay 365 MB after DELETE and VACUUM, and what happened when January was re-inserted?
+
+VACUUM frees the space inside pages for reuse; it only truncates the file if empty pages are at the **end** of the file. January was at the start (ids 1–212,039 were loaded first), so nothing could be truncated. When January was inserted again, the new rows went into the free space at the start of the file: the heap stayed 365 MB. The indexes did grow (table + indexes 579 MB → 596 MB), because index pages freed in one part of the tree are not always reused by keys arriving elsewhere.
+
+> **Common mistake:** expecting disk space back after a big delete. Only `VACUUM FULL` / `pg_repack` (a full rewrite) or dropping the table gives it back.
+
+## Q4. ROLLBACK almost as slow as DELETE
+
+**Question:** MySQL's ROLLBACK of the delete took 0.47 s. Why is rolling back a big delete almost as slow as doing it?
+
+InnoDB changes records in place and keeps the old versions in undo. A rollback has to walk the undo log backwards and undo every one of the 212,039 delete-marks in the clustered index and the secondary index: the same amount of work, in reverse. (PostgreSQL's rollback is instant, because the deleted rows were never removed, only stamped with an `xmax` that now belongs to an aborted transaction; the cost moves to later VACUUM work instead.)
+
+> **Common mistake:** killing a long-running delete "to make it stop". The rollback then takes about as long again, and the server does it anyway after a restart.
+
+## Q5. WAL for a 40M-row month
+
+**Question:** your month is 40M rows. Estimate the WAL volume of a PostgreSQL DELETE of one month from the lab numbers.
+
+The lab: 27 MB for 212,039 rows ≈ **130 bytes per row**. 40M × 130 bytes ≈ **5.2 GB** for the DELETE, plus VACUUM at ≈ 50 bytes per row (10 MB / 212k) ≈ **2 GB**. Order of magnitude: 7 GB of WAL to archive, ship to replicas and back up, to remove one month. It varies with row width, number of indexes and checkpoint timing (full-page images), so measure on your own table.
+
+> **Common mistake:** extrapolating time instead of volume. Time depends on the hardware and load; the WAL volume per row is fairly stable and it is what fills disks and lags replicas.
+
+## Q6. Replicas
+
+**Question:** why does a row-by-row delete hurt replicas, and why doesn't a DROP?
+
+A replica applies what the primary logs. For a delete that is one change per row (PostgreSQL WAL records, 2,132 MySQL `Delete_rows` events covering 212,039 rows, one MongoDB oplog entry per document), and MySQL and MongoDB secondaries replay them through the storage engine again. A big delete arrives as a burst the replica needs about as long to apply as the primary did, so it lags. A DROP is one catalog change on the replica too.
+
+> **Common mistake:** throttling the delete on the primary and forgetting that the replicas (including the delayed and analytics ones) must still apply every row.

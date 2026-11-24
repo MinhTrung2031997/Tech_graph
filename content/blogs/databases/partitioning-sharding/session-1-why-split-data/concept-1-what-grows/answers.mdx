@@ -1,0 +1,67 @@
+---
+title: "Answers: What grows with one big table"
+description: "Worked answers to the Session 1 Concept 1 check questions."
+companion: "answers"
+tags: ["partitioning", "sharding", "btree", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pageinspect.html#PAGEINSPECT-B-TREE-FUNCS"
+  - "https://www.postgresql.org/docs/current/planner-stats.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-persistent-stats.html"
+---
+
+<Tldr>
+Lookups pay per tree level; whole-table work pays per row. Splitting data helps with the second.
+</Tldr>
+
+## Q1. 7 buffers vs 6
+
+**Question:** why did a lookup by id cost 7 buffers at 5M rows and 6 at 50k? How many rows would you need for 8?
+
+The `o50k_pkey` root is level 1 (root → leaf); `orders_pkey` is level 2 (root → internal → leaf). One more level means one more page on the way down, so one more buffer. The other buffers in the count (the leaf, the heap page and fixed overhead) are the same at every size.
+
+In the lab, a full leaf held **367** keys and a full internal page **286** child pointers (`bt_page_stats` on `orders_pkey`). A level-2 tree can address up to about 286 × 286 × 367 ≈ **30 million** rows before the root has to split again, so the next level (and the 8th buffer) arrives somewhere around 30M rows, earlier if pages are not full.
+
+> **Common mistake:** expecting lookup cost to grow with row count. It grows with log(rows): each level multiplies capacity by about 286.
+
+## Q2. ANALYZE barely grows
+
+**Question:** why did `ANALYZE` grow only 3.2× when the table grew 100×?
+
+`ANALYZE` reads a random **sample** of 300 × `default_statistics_target` = 30,000 rows, whatever the table size. At 50k rows that is most of the table; at 5M it is 0.6%. The remaining growth comes from reading sample pages spread over a bigger table and from the second index.
+
+> **Common mistake:** scheduling "big table maintenance" with ANALYZE in mind. ANALYZE is cheap at any size; VACUUM, index builds and copies are what grow.
+
+## Q3. MySQL's 20× for 10×
+
+**Question:** MySQL's full scan took 0.03 s at 500k and 0.59 s at 5M. Why more than 10×?
+
+At 500k rows the table (40 MB) fits in the 128 MB buffer pool, so repeated scans read memory. At 5M rows the clustered index has 300 MB of leaf pages: a scan pushes its own earlier pages out of the pool, so every run reads most pages again from the OS cache or the disk. The cost per page jumps when the data stops fitting.
+
+> **Common mistake:** extrapolating linearly from a test table that fits in memory to a production table that does not.
+
+## Q4. MongoDB in memory, still 107×
+
+**Question:** MongoDB had everything in a 5.5 GB cache. Why did `createIndex` still grow 107×?
+
+Building an index reads every document, extracts `seller_id` and sorts 5M keys. Memory removes disk reads, not the work per document: decompressing pages, walking BSON, comparing keys. 100× the documents means about 100× the CPU (sorting adds a little more: n log n).
+
+> **Common mistake:** "it's all in RAM, so size doesn't matter". RAM makes per-row work cheaper, it doesn't remove it.
+
+## Q5. Your own whole-table jobs
+
+**Question:** list three jobs on your own largest table that read every row. Which of them run on a schedule?
+
+Typical answers: index builds for new features (on demand), anti-wraparound `VACUUM` / `VACUUM FREEZE` (automatic, schedule set by `autovacuum_freeze_max_age`), backups and restores (nightly), `pg_dump` / `mysqldump` for test copies, `OPTIMIZE TABLE` / `pg_repack`, `validate()`, retention deletes ("older than 2 years"), schema changes that rewrite the table. The scheduled ones are the ones that will silently grow until they no longer fit their window.
+
+> **Common mistake:** listing only queries. The jobs that break first are usually maintenance and operations.
+
+## Q6. "2B rows, let's shard"
+
+**Question:** a colleague says "the orders table is 2B rows, lookups must be slow, let's shard". What would you measure first?
+
+1. The actual slow statements (`pg_stat_statements`, performance_schema digests, the MongoDB profiler) and their plans: are they index lookups, or scans?
+2. For index lookups: buffers / pages per call. A 2B-row B-tree is 4–5 levels; that is 4–5 pages, usually cached.
+3. Whether the problem is whole-table work (vacuum, index builds, retention deletes, backups) or write throughput of one server. Those are the problems splitting solves; Concept 3 shows which split solves which.
+
+> **Common mistake:** choosing sharding to fix query speed. A missing index on a 2B-row table is still a missing index on every shard.

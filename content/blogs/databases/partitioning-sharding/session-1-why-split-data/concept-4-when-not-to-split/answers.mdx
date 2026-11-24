@@ -1,0 +1,66 @@
+---
+title: "Answers: When not to split"
+description: "Worked answers to the Session 1 Concept 4 check questions."
+companion: "answers"
+tags: ["partitioning", "indexing", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-index-only-scans.html"
+  - "https://www.postgresql.org/docs/current/ddl-partitioning.html#DDL-PARTITIONING-PRUNING"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-index-types.html"
+---
+
+<Tldr>
+Pruning helps only queries that filter on the partition key, and a good index often helps them just as much.
+</Tldr>
+
+## Q1. 820 vs 1,982 buffers
+
+**Question:** why did the PostgreSQL covering index read 820 buffers while the partition scan read 1,982?
+
+The partition scan reads every heap page of `orders_m_2025_03`: all columns of 212,039 rows (26 MB). The covering index `(created_at) INCLUDE (amount)` holds only the two columns the query needs, in order, so the same rows fit in about 820 index pages; with the visibility map all-visible (after VACUUM), no heap page is read (`Heap Fetches: 0`).
+
+> **Common mistake:** thinking a partition is "the smallest thing to scan". A narrow index over the same range is smaller still.
+
+## Q2. 76 buffers vs 7
+
+**Question:** why did the lookup by id read 76 buffers on `orders_m` but 7 on `orders`?
+
+`WHERE id = 4242424` says nothing about `created_at`, so no partition can be pruned. The plan is an Append over 24 Index Scans, one on each partition's primary key `(id, created_at)`. Each probe descends a small tree (about 3 buffers) and 23 find nothing: 24 × ~3 + the heap page ≈ 76. The plain table does one descent of one tree: 7.
+
+> **Common mistake:** assuming a partitioned table has one index. Each partition has its own; a "global" index across partitions does not exist in PostgreSQL or MySQL.
+
+## Q3. MySQL's 4× and the covering index
+
+**Question:** why was MySQL's month sum 4× slower on the plain table with a `created_at` index, and how did the covering index fix it?
+
+InnoDB secondary index entries hold the key and the primary key, not the row. To read `amount`, each of the 212,039 entries needs a lookup in the clustered index (PRIMARY): 212,039 extra B-tree descents (107–154 ms). The partition scan reads the clustered index of one partition sequentially instead (25–31 ms). The covering index `(created_at, amount)` has `amount` in the secondary index itself, so no PRIMARY lookups: 25 ms, the same as the partition.
+
+> **Common mistake:** "MySQL partitioning made the query 4× faster, so partitioning is the fix". The fix was not reading the clustered index once per row; a covering index does that without changing the table.
+
+## Q4. 24 smaller pieces, not faster
+
+**Question:** why is the partitioned seller report not faster, even though each partition is 24× smaller?
+
+`seller_id` is not the partition key, so all 24 partitions must be scanned: the total data read is the same 5M rows (slightly more pages, since the partitioned table is bigger). On top of that come 24 scan nodes, more planning and less effective parallelism per partition. Smaller pieces only help when most of them can be skipped.
+
+> **Common mistake:** expecting "divide and conquer" without the "divide" being decided by the query.
+
+## Q5. Planning time and new connections
+
+**Question:** a query runs once per HTTP request on a new connection. Why does the 2–4 ms planning time matter more for it?
+
+The first query on a table in a session has to load the metadata of the parent, all 24 partitions and their indexes into that backend's caches and consider them all. Repeating the query in the same session planned in 0.08–0.19 ms, because the metadata was then cached. With a new connection per request (no pool), every request pays the cold cost, which can be larger than the execution itself (0.22 ms). Connection pooling, prepared statements and pruning by partition key all reduce it.
+
+> **Common mistake:** measuring planning time with `\timing` in one long psql session and concluding it is negligible.
+
+## Q6. Lookups by id with date partitioning
+
+**Question:** your application looks orders up by id far more often than by date. Give two ways to keep date partitioning without probing every partition.
+
+1. **Send the date with the id**: the application usually knows when the order was placed (it is in the URL, the cache or the parent record). `WHERE id = $1 AND created_at = $2` prunes to one partition.
+2. **Make the id carry the date**: a time-ordered id (UUIDv7, a snowflake id, or `yyyymm` as a prefix) lets the application or a function compute the partition from the id.
+3. **A small lookup table** `order_id → created_at` (unpartitioned, indexed), read first.
+4. **Partition by id ranges instead**: since id grows with time, `PARTITION BY RANGE (id)` keeps retention by "oldest partition" and lets lookups by id prune.
+
+> **Common mistake:** creating a non-unique index on `id` alone in every partition and calling it solved. That still probes every partition, just through a different index.

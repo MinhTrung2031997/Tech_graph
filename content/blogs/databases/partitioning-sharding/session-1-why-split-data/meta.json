@@ -1,0 +1,12 @@
+{
+  "title": "Session 1: Why split data",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-what-grows/index",
+    "concept-2-deleting-old-data/index",
+    "concept-3-partitioning-sharding-replication/index",
+    "concept-4-when-not-to-split/index",
+    "lab/index"
+  ]
+}

@@ -1,0 +1,318 @@
+---
+title: "Concept 2: Deleting old data"
+description: "Deleting January 2024 (212,039 of 5M orders) row by row vs dropping a table that holds only that month. PostgreSQL: DELETE 75 ms + 27 MB of WAL + a 0.66 s VACUUM, and the table stayed 365 MB; DROP TABLE 7 ms and 4,288 bytes of WAL. MySQL: DELETE 0.6 s and 8.3 MB of binary log; DROP 0.04 s. MongoDB: deleteMany 1.04 s; drop 4 ms. This is the job partitioning was invented for."
+type: "concept"
+tags: ["partitioning", "retention", "delete", "postgresql", "mysql", "mongodb", "vacuum"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/ddl-partitioning.html#DDL-PARTITIONING-OVERVIEW"
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/delete.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-purge-configuration.html"
+  - "https://www.mongodb.com/docs/manual/reference/method/db.collection.deleteMany/"
+---
+
+<Tldr>
+Every orders table eventually gets a retention rule: "keep two years". With one big table, the only tool is `DELETE … WHERE created_at < …`, which works **row by row**: deleting one month (**212,039** rows) cost PostgreSQL **75 ms and 27 MB of WAL**, then a **0.66 s VACUUM and 10 MB more WAL**, and the table file stayed **365 MB**. MySQL took **0.6 s** and wrote **8.3 MB of binary log** that every replica must replay. MongoDB's `deleteMany` took **1.04 s**. The same month stored as its own table was gone in **7 ms with 4,288 bytes of WAL** (PostgreSQL), **0.04 s** (MySQL) and **4 ms** (MongoDB): dropping a table is a metadata change plus a file delete, whatever it contains. On a real table, multiply the row-by-row numbers by the size of your month. Partitioning (Session 2) turns the first kind of delete into the second.
+</Tldr>
+
+## The setup
+
+January 2024 is orders 1 to 212,039 of `orders`. Each engine:
+
+1. copied January into a backup table,
+2. ran `DELETE` (or `deleteMany`) for `created_at < '2024-02-01'` on the 5M-row table and measured it,
+3. created a separate month-sized table with the same rows and indexes and measured `DROP TABLE` (or `drop()`) on it,
+4. put January back.
+
+| Term | Meaning |
+|---|---|
+| Row-by-row delete | Every matching row is found, marked deleted, logged, and later cleaned up, one at a time |
+| Drop | The table's files are removed and its catalog entry deleted: cost does not depend on the row count |
+| WAL / redo / binary log | Logs every change for crash recovery (WAL, redo) and replication (WAL, binary log). Bigger log = more disk writes and more for replicas to replay |
+| Dead tuple | PostgreSQL: a deleted row version still in its page until VACUUM removes it |
+| Purge | InnoDB: background removal of delete-marked records once no transaction needs them |
+| **✓ Cheap / ✗ Proportional to rows** | Whether a step's cost depends on how many rows are deleted |
+
+## PostgreSQL
+
+| | DELETE one month | DROP a month-sized table |
+|---|---|---|
+| Rows | 212,039 | 212,039 |
+| Statement time | 74.8 ms | 7.1 ms |
+| WAL written | 27 MB | 4,288 bytes |
+| Follow-up work | VACUUM: 0.66 s, 10 MB WAL, 1,982 heap pages + 581 pages in each index | none |
+| Table file afterwards | 365 MB (unchanged) | file removed |
+
+<Flow
+  title="PostgreSQL: delete one month vs drop it"
+  height={300}
+  nodes={[
+    { id: 'del', label: 'DELETE', sub: "created_at < '2024-02-01'", x: 20, y: 20, w: 200 },
+    { id: 'idx', label: 'created_at index', sub: 'finds 212,039 rows', x: 300, y: 20, w: 200 },
+    { id: 'heap', label: 'Heap pages', sub: '365 MB', x: 580, y: 20, w: 200 },
+    { id: 'drop', label: 'DROP TABLE', sub: 'jan_copy, 212,039 rows', x: 20, y: 200, w: 200 },
+    { id: 'wal', label: 'WAL', sub: 'to disk and replicas', x: 300, y: 200, w: 200 },
+    { id: 'vac', label: 'VACUUM', sub: 'removes dead tuples', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'del-idx', from: 'del', to: 'idx' },
+    { id: 'idx-heap', from: 'idx', to: 'heap' },
+    { id: 'heap-wal', from: 'heap', to: 'wal' },
+    { id: 'heap-vac', from: 'heap', to: 'vac' },
+    { id: 'vac-wal', from: 'vac', to: 'wal' },
+    { id: 'drop-wal', from: 'drop', to: 'wal' },
+  ]}
+  cases={[
+    {
+      title: 'DELETE one month',
+      path: 'created_at index → heap ✗ 212,039 rows marked dead → WAL ✗ 27 MB → VACUUM ✗ 0.66 s, 10 MB → file still 365 MB',
+      summary: 'Every step is proportional to the rows deleted.',
+      subs: { drop: 'not used' },
+      steps: [
+        {
+          title: 'Find the rows',
+          note: 'The planner uses orders_created_at_idx to find the 212,039 January rows.',
+          code: "DELETE FROM orders WHERE created_at < '2024-02-01';   -- DELETE 212039, 74.8 ms",
+          active: ['del', 'idx'],
+          edges: ['del-idx'],
+        },
+        {
+          title: 'Mark each row dead and log it',
+          note: 'Each row version gets xmax set; each change is a WAL record. pg_wal_lsn_diff before/after: 27 MB. pg_stat_user_tables: n_dead_tup 212,039. pg_relation_size: still 365 MB.',
+          code: "SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), :'lsn0'));   -- 27 MB",
+          active: ['idx', 'heap', 'wal'],
+          edges: ['idx-heap', 'heap-wal'],
+          subs: { heap: '✗ 212,039 dead tuples' },
+        },
+        {
+          title: 'VACUUM cleans up later',
+          note: 'VACUUM (VERBOSE): 1,982 heap pages scanned (4.24%), 212,039 tuples removed, 581 index pages deleted in each index, 10 MB of WAL, 0.66 s. The file is still 365 MB: freed space is reused by later inserts, not returned to the OS.',
+          code: 'VACUUM (VERBOSE) orders;',
+          active: ['heap', 'vac', 'wal'],
+          edges: ['heap-vac', 'vac-wal'],
+          subs: { heap: '✓ space reusable, file 365 MB' },
+        },
+      ],
+    },
+    {
+      title: 'DROP a month-sized table',
+      path: 'DROP TABLE → WAL ✓ 4,288 bytes → files removed → 7.1 ms, no VACUUM',
+      summary: 'The cost does not depend on how many rows the table holds.',
+      subs: { idx: 'not used', heap: 'not used', vac: '✓ nothing to clean' },
+      steps: [
+        {
+          title: 'Drop the table',
+          note: 'jan_copy held the same 212,039 rows with a primary key and a created_at index. DROP TABLE wrote 4,288 bytes of WAL (catalog changes) and took 7.1 ms. The data files are unlinked at commit; there are no dead tuples and nothing for VACUUM.',
+          code: "DROP TABLE jan_copy;   -- 7.1 ms\nSELECT pg_wal_lsn_diff(pg_current_wal_lsn(), :'lsn3');   -- 4288",
+          active: ['drop', 'wal'],
+          edges: ['drop-wal'],
+        },
+      ],
+    },
+  ]}
+/>
+
+After January was re-inserted and the table vacuumed, the heap was still 365 MB (the new rows reused the freed space) but the table with indexes had grown from **579 MB to 596 MB**: the index pages freed by VACUUM are not all reused by new keys in a different place of the tree.
+
+## MySQL InnoDB
+
+| | DELETE one month | DROP a month-sized table |
+|---|---|---|
+| Statement time (3 runs) | 0.60 / 0.67 / 0.59 s | 0.04 s |
+| Binary log for the transaction | 8.3 MB (2,132 `Delete_rows` events) | one DDL statement event |
+| Undo | every deleted row is kept in undo: `ROLLBACK` of the same delete took 0.47 s | none |
+| Follow-up work | purge removes the delete-marked records in the background | none |
+
+The redo log counter (`Innodb_redo_log_current_lsn`) is server-wide; other workloads were writing at the same time, so the redo volume of the delete is not reported here.
+
+<Flow
+  title="InnoDB: delete one month vs drop it"
+  height={300}
+  nodes={[
+    { id: 'del', label: 'DELETE', sub: "created_at < '2024-02-01'", x: 20, y: 20, w: 200 },
+    { id: 'sec', label: 'created_at index', sub: 'finds 212,039 rows', x: 300, y: 20, w: 200 },
+    { id: 'pk', label: 'PRIMARY', sub: 'clustered rows', x: 580, y: 20, w: 200 },
+    { id: 'drop', label: 'DROP TABLE', sub: 'jan_copy, 212,039 rows', x: 20, y: 200, w: 200 },
+    { id: 'binlog', label: 'Binary log', sub: 'replayed by replicas', x: 300, y: 200, w: 200 },
+    { id: 'undo', label: 'Undo log', sub: 'old rows until purge', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'del-sec', from: 'del', to: 'sec' },
+    { id: 'sec-pk', from: 'sec', to: 'pk' },
+    { id: 'pk-undo', from: 'pk', to: 'undo' },
+    { id: 'pk-binlog', from: 'pk', to: 'binlog' },
+    { id: 'drop-binlog', from: 'drop', to: 'binlog' },
+  ]}
+  cases={[
+    {
+      title: 'DELETE one month',
+      path: 'created_at index → PRIMARY ✗ 212,039 records delete-marked → undo ✗ every row → binary log ✗ 8.3 MB → purge later',
+      summary: '0.6 s here; replicas then apply 2,132 row events.',
+      subs: { drop: 'not used' },
+      steps: [
+        {
+          title: 'Find and delete-mark each row',
+          note: 'Each matching record in PRIMARY and in orders_created_at_idx is delete-marked inside the transaction: 212,039 rows affected, 0.59–0.67 s over three runs.',
+          code: "DELETE FROM orders WHERE created_at < '2024-02-01';   -- 212039 rows affected (0.60 sec)",
+          active: ['del', 'sec', 'pk'],
+          edges: ['del-sec', 'sec-pk'],
+        },
+        {
+          title: 'Keep every old row in undo',
+          note: 'Undo keeps each deleted row so the transaction can roll back and older snapshots can still read it. ROLLBACK of the same DELETE took 0.47 s, nearly as long as the delete itself. Purge removes the records after commit.',
+          code: "BEGIN; DELETE FROM orders WHERE created_at < '2024-02-01'; ROLLBACK;   -- 0.63 s + 0.47 s",
+          active: ['pk', 'undo'],
+          edges: ['pk-undo'],
+          subs: { undo: '✗ 212,039 old rows' },
+        },
+        {
+          title: 'Log every row for replicas',
+          note: 'Row-based binary log: SHOW BINARY LOG STATUS position moved from 8,721,289 to 17,441,845 (8.3 MB) for this one transaction: BEGIN, Table_map, 2,132 Delete_rows events, COMMIT. Each replica re-applies all of it.',
+          code: "SHOW BINLOG EVENTS IN 'binlog.000013' FROM 8721289;",
+          active: ['pk', 'binlog'],
+          edges: ['pk-binlog'],
+          subs: { binlog: '✗ 8.3 MB of row events' },
+        },
+      ],
+    },
+    {
+      title: 'DROP a month-sized table',
+      path: 'DROP TABLE → binary log ✓ one statement → tablespace file removed → 0.04 s',
+      summary: 'No undo, no row events, no purge.',
+      subs: { sec: 'not used', pk: 'not used', undo: '✓ nothing kept' },
+      steps: [
+        {
+          title: 'Drop the table',
+          note: 'jan_copy (same rows and indexes) is its own .ibd file; DROP TABLE removes it and logs one DDL statement: 0.04 s.',
+          code: 'DROP TABLE jan_copy;   -- 0.04 sec',
+          active: ['drop', 'binlog'],
+          edges: ['drop-binlog'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+| | `deleteMany` one month | `drop()` a month-sized collection |
+|---|---|---|
+| Time (2 runs) | 1,106 / 1,037 ms | 4 ms |
+| Work | removes 212,039 documents and their `_id` and `created_at` index entries one by one | removes the collection's files and catalog entry |
+| On-disk size afterwards | `storageSize` 146 MB (unchanged) | files removed |
+
+In a replica set, each deleted document is also one oplog entry, replayed by every secondary (this lab's `idx-mongo` is standalone, so that part was not measured).
+
+<Flow
+  title="MongoDB: deleteMany one month vs drop it"
+  height={300}
+  nodes={[
+    { id: 'del', label: 'deleteMany', sub: 'created_at < Feb 2024', x: 20, y: 20, w: 200 },
+    { id: 'idx', label: 'created_at index', sub: 'finds 212,039 docs', x: 300, y: 20, w: 200 },
+    { id: 'coll', label: 'orders', sub: '5M documents', x: 580, y: 20, w: 200 },
+    { id: 'drop', label: 'drop()', sub: 'jan_copy collection', x: 20, y: 200, w: 200 },
+    { id: 'month', label: 'jan_copy', sub: '212,039 documents', x: 300, y: 200, w: 200 },
+    { id: 'files', label: 'Data files', sub: 'one per collection/index', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'del-idx', from: 'del', to: 'idx' },
+    { id: 'idx-coll', from: 'idx', to: 'coll' },
+    { id: 'coll-files', from: 'coll', to: 'files' },
+    { id: 'drop-month', from: 'drop', to: 'month' },
+    { id: 'month-files', from: 'month', to: 'files' },
+  ]}
+  cases={[
+    {
+      title: 'deleteMany one month',
+      path: 'created_at index → orders ✗ 212,039 documents and index entries removed → files ✗ still 146 MB → 1.04 s',
+      summary: 'One removal per document, plus one per index entry.',
+      subs: { drop: 'not used', month: 'not used' },
+      steps: [
+        {
+          title: 'Find the documents',
+          note: 'deleteMany uses the created_at index to find the 212,039 January documents.',
+          code: "db.orders.deleteMany({ created_at: { $lt: ISODate('2024-02-01') } })   // deletedCount 212039, 1,037 ms",
+          active: ['del', 'idx'],
+          edges: ['del-idx'],
+        },
+        {
+          title: 'Remove each document and its keys',
+          note: 'Every document is removed from the collection and from both indexes. stats().storageSize stayed 146 MB: WiredTiger keeps the freed blocks in the file for reuse.',
+          active: ['idx', 'coll', 'files'],
+          edges: ['idx-coll', 'coll-files'],
+          subs: { files: '✗ 146 MB, unchanged' },
+        },
+      ],
+    },
+    {
+      title: 'drop() a month-sized collection',
+      path: 'drop() → jan_copy ✓ whole collection → its files ✓ removed → 4 ms',
+      summary: 'A metadata change, whatever the collection holds.',
+      subs: { idx: 'not used', coll: 'not touched' },
+      steps: [
+        {
+          title: 'Drop the collection',
+          note: 'jan_copy held the same 212,039 documents with an index on created_at. drop() took 4 ms.',
+          code: 'db.jan_copy.drop()   // 4 ms',
+          active: ['drop', 'month', 'files'],
+          edges: ['drop-month', 'month-files'],
+          subs: { files: '✓ jan_copy files removed' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Comparison
+
+| One month (212,039 rows) | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| Row-by-row delete | 75 ms + VACUUM 0.66 s | 0.6 s + purge | 1.04 s |
+| Log volume of the delete | 27 MB WAL (+10 MB for VACUUM) | 8.3 MB binary log | one oplog entry per document (replica sets) |
+| Drop a table holding the month | 7.1 ms, 4,288 bytes WAL | 0.04 s | 4 ms |
+| File size after the delete | unchanged (365 MB) | unchanged | unchanged (146 MB) |
+
+<Pitfall>
+The lab numbers look small because one month here is 212k rows. Retention deletes grow with **your** month: at 50M rows a month, the same `DELETE` writes gigabytes of WAL or binary log, holds a transaction open for many minutes (blocking VACUUM and purge for everyone, see [Transactions Session 4](/blogs/databases/transactions/session-4-mvcc-internals/concept-4-long-transactions)), makes replicas lag while they replay it, and leaves the files as big as before. Teams then batch it into small deletes that run all night. Dropping a table of that month stays a few milliseconds.
+</Pitfall>
+
+## Real-world scenario: the nightly purge that never finishes
+
+A platform keeps 18 months of order events. The purge job runs `DELETE FROM order_events WHERE created_at < NOW() - INTERVAL 18 MONTH LIMIT 10000` (MySQL) in a loop every night.
+
+| Symptom | Cause |
+|---|---|
+| Purge runs 5 hours and overlaps the morning peak | One month is 60M rows; each batch scans the index, deletes, logs, commits |
+| Replica lag alerts every night | The replicas replay every deleted row |
+| Disk usage never goes down | Deleted space is reused, never returned |
+| Autovacuum constantly busy on this table | Every deleted row is a dead tuple to clean |
+
+With one table per month, the job becomes "drop the table from 19 months ago": milliseconds, a few kilobytes of log, and the disk space comes back. That is the core promise of partitioning, built in [Session 2](/blogs/databases/partitioning-sharding/session-2-partitioning-postgresql/lab).
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Transactions Session 8](/blogs/databases/transactions/session-8-when-transactions-hurt/concept-3-big-transactions) | Big transactions: undo, WAL and replica lag |
+| [Indexing Session 8](/blogs/databases/indexing/session-8-when-indexes-hurt/concept-2-bloat-unused) | Bloat: why freed space stays in the file |
+| Concept 3 | Partitioning gives one table per month inside one database |
+
+## Key takeaways
+
+1. A row-by-row delete costs per row: index lookups, a log record per row, undo or dead tuples, and later cleanup.
+2. Dropping a table costs per table: a catalog change and a file removal (7 ms, 0.04 s, 4 ms here).
+3. Deleting rows does not shrink files in any of the three engines; dropping a table does.
+4. Retention deletes also hurt replicas (8.3 MB of binary log for one small month) and other transactions.
+5. If data leaves by age, store it so that an age range is a table: that is time-based partitioning.
+
+## Check questions
+
+1. List everything PostgreSQL did for the 212,039-row DELETE, from the statement to the end of VACUUM.
+2. Why did DROP TABLE write only 4,288 bytes of WAL for the same rows?
+3. Why did the PostgreSQL table stay 365 MB after DELETE and VACUUM, and what happened when January was re-inserted?
+4. MySQL's ROLLBACK of the delete took 0.47 s. Why is rolling back a big delete almost as slow as doing it?
+5. Your month is 40M rows. Estimate the WAL volume of a PostgreSQL DELETE of one month from the lab numbers.
+6. Why does a row-by-row delete hurt replicas, and why doesn't a DROP?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-1-why-split-data/concept-2-deleting-old-data/answers">Worked answers to Q1–Q6</DeepDive>

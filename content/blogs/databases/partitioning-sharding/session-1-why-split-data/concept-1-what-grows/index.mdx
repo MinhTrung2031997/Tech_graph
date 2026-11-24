@@ -1,0 +1,317 @@
+---
+title: "Concept 1: What grows with one big table"
+description: "The same orders table at 50k, 500k and 5M rows in PostgreSQL, MySQL and MongoDB. A lookup by id stays at a few pages and a few hundredths of a millisecond, because B-tree depth grows by one level per ~100× rows. Everything that reads the whole table grows with it: CREATE INDEX 10 ms → 683 ms in PostgreSQL, 0.11 s → 3.14 s in MySQL, 40 ms → 4.3 s in MongoDB."
+type: "concept"
+tags: ["partitioning", "sharding", "postgresql", "mysql", "mongodb", "btree", "maintenance"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pageinspect.html#PAGEINSPECT-B-TREE-FUNCS"
+  - "https://www.postgresql.org/docs/current/sql-vacuum.html"
+  - "https://www.postgresql.org/docs/current/sql-analyze.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-persistent-stats.html"
+  - "https://www.mongodb.com/docs/manual/reference/command/collStats/"
+---
+
+<Tldr>
+Two kinds of work behave very differently as a table grows. **Lookups through an index** barely notice: a B-tree adds one level for roughly every 100× more rows, so finding order 42 cost **7 buffers and 0.041 ms** at 5M rows against **6 buffers and 0.035 ms** at 50k (PostgreSQL). **Work that touches every row** grows with the table: at 100× the rows, `CREATE INDEX` took **69×** longer in PostgreSQL (9.9 → 683 ms), **29×** in MySQL (0.11 → 3.14 s) and **107×** in MongoDB (40 ms → 4.3 s); a full-table `VACUUM` took 34× longer. Once the table outgrows memory (PostgreSQL `shared_buffers` and the InnoDB buffer pool are 128 MB, the table 579 MB / 392 MB), full scans get slower than linear: MySQL's full `SUM` took 20× longer for 10× the rows. Partitioning attacks the second kind of work, not the first.
+</Tldr>
+
+## The setup
+
+The course table `orders` has 5,000,000 rows over two years (see the [lab](/blogs/databases/partitioning-sharding/session-1-why-split-data/lab)). For this concept two smaller copies were made from its first rows: `o500k` (500,000) and `o50k` (50,000), with the same primary key and `created_at` index. Every timing is the best of 3 runs on a laptop while other workloads ran; 5M rows is not "big data", so read the **ratios** between the columns, not the absolute numbers.
+
+| Term | Meaning |
+|---|---|
+| B-tree level | Height of an index tree. PostgreSQL's `bt_metap().level` is the root's level: level 2 means root → internal → leaf, three pages to reach a leaf |
+| Lookup | Finding one row through an index: cost depends on tree height, not on row count |
+| Whole-table work | Anything that reads every row: full scans, `CREATE INDEX`, `VACUUM` with page skipping disabled, `validate`, backups, copies |
+| Buffer cache | `shared_buffers` (PostgreSQL, 128 MB here), the InnoDB buffer pool (128 MB), the WiredTiger cache (5,495 MB in this container) |
+| **✓ In cache / ✗ Not in cache** | Whether the pages a step needs are already in the engine's memory |
+
+## PostgreSQL
+
+| `orders` at | 50k | 500k | 5M | 5M ÷ 50k |
+|---|---|---|---|---|
+| Table + 2 indexes | 6 MB | 59 MB | 579 MB | 97× |
+| Primary key root level (`bt_metap`) | 1 | 2 | 2 | +1 level |
+| Lookup by id: buffers / execution | 6 / 0.035 ms | 7 / 0.037 ms | 7 / 0.041 ms | 1.2× |
+| `SELECT sum(amount)` (full scan, 2 parallel workers) | 2.3 ms | 10.6 ms | 69.8 ms | 30× |
+| `VACUUM (DISABLE_PAGE_SKIPPING)` | 2.7 ms | 13.4 ms | 90.6 ms | 34× |
+| `CREATE INDEX … (seller_id)` | 9.9 ms | 57.5 ms | 683 ms | 69× |
+| `ANALYZE` | 22.5 ms | 30.0 ms | 72.8 ms | 3.2× |
+
+`ANALYZE` is the exception that proves the rule: it reads a **sample** of 30,000 rows (300 × `default_statistics_target`), so it hardly grows. Everything that reads every row grows with the row count.
+
+<Flow
+  title="PostgreSQL: lookup vs whole-table work on 5M rows"
+  height={300}
+  nodes={[
+    { id: 'query', label: 'Query', sub: 'WHERE id = 42', x: 20, y: 20, w: 200 },
+    { id: 'idx', label: 'orders_pkey', sub: '107 MB, root level 2', x: 300, y: 20, w: 200 },
+    { id: 'heap', label: 'Heap', sub: '365 MB, 46,729 pages', x: 580, y: 20, w: 200 },
+    { id: 'maint', label: 'Maintenance', sub: 'VACUUM, CREATE INDEX', x: 20, y: 200, w: 200 },
+    { id: 'cache', label: 'shared_buffers', sub: '128 MB', x: 300, y: 200, w: 200 },
+    { id: 'disk', label: 'OS cache / disk', sub: 'the other 451 MB', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'query-idx', from: 'query', to: 'idx' },
+    { id: 'idx-heap', from: 'idx', to: 'heap' },
+    { id: 'maint-cache', from: 'maint', to: 'cache' },
+    { id: 'heap-cache', from: 'heap', to: 'cache' },
+    { id: 'cache-disk', from: 'cache', to: 'disk' },
+  ]}
+  cases={[
+    {
+      title: 'Lookup by id',
+      path: 'orders_pkey ✓ 3 levels → heap ✓ 1 page → 7 buffers, 0.041 ms',
+      summary: '100× more rows added one tree level and one buffer.',
+      subs: { cache: '✓ hot path cached', disk: 'not touched' },
+      steps: [
+        {
+          title: 'Descend the index',
+          note: 'The root is level 2: root → internal page → leaf. At 50k rows the root was level 1 (one page fewer). The upper levels of a hot index stay in shared_buffers.',
+          code: "SELECT level FROM bt_metap('orders_pkey');   -- 2 (o500k: 2, o50k: 1)",
+          active: ['query', 'idx'],
+          edges: ['query-idx'],
+        },
+        {
+          title: 'Fetch one heap page',
+          note: 'The leaf entry points to one heap page. EXPLAIN (ANALYZE, BUFFERS): shared hit=7, execution 0.041 ms. At 50k rows: 6 buffers, 0.035 ms.',
+          code: 'EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE id = 42;',
+          active: ['idx', 'heap', 'cache'],
+          edges: ['idx-heap'],
+        },
+      ],
+    },
+    {
+      title: 'Whole-table work',
+      path: 'maintenance → all 46,729 heap pages → shared_buffers ✗ (128 MB < 579 MB) → OS cache / disk',
+      summary: 'Cost grows with the table: 30× to 69× for 100× the rows.',
+      subs: { cache: '✗ too small for the table', disk: '✓ holds the rest (warm)' },
+      steps: [
+        {
+          title: 'Read every page',
+          note: 'VACUUM (DISABLE_PAGE_SKIPPING) reads all heap pages: 2.7 ms at 50k, 90.6 ms at 5M. CREATE INDEX on seller_id reads every row and sorts 5M keys: 9.9 ms → 683 ms.',
+          code: "VACUUM (DISABLE_PAGE_SKIPPING) orders;\nCREATE INDEX orders_seller_tmp ON orders (seller_id);",
+          active: ['maint', 'cache', 'heap'],
+          edges: ['maint-cache', 'heap-cache'],
+        },
+        {
+          title: 'The table does not fit',
+          note: '579 MB of table and indexes against 128 MB of shared_buffers: whole-table work keeps evicting pages and refilling them from the OS cache (or the disk, when the OS cache is cold). The first full scan of the 5M table took 115 ms, the next ones 70 ms.',
+          active: ['cache', 'disk'],
+          edges: ['cache-disk'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL InnoDB
+
+| `orders` at | 50k | 500k | 5M | 5M ÷ 50k |
+|---|---|---|---|---|
+| Table + index (`data_length + index_length`) | 5 MB | 40 MB | 392 MB | 78× |
+| PRIMARY leaf pages (`innodb_index_stats`) | n/a | n/a | 19,234 (300 MB) | |
+| Lookup by id | `const`, 0.00 s | `const`, 0.00 s | `const`, 0.00 s | ≈ 1× |
+| `SELECT SUM(amount)` (full scan) | 0.01 s | 0.03 s | 0.59 s | 59× |
+| `ALTER TABLE … ADD INDEX (seller_id)` | 0.11 s | 0.69 s | 3.14 s | 29× |
+| `ANALYZE TABLE` | ≤ 0.01 s | ≤ 0.02 s | ≤ 0.06 s | sampled |
+
+Between 500k and 5M rows the full scan took **20× longer for 10× the rows**: the 300 MB clustered index no longer fits the 128 MB buffer pool, so each scan reads most pages back in. `ANALYZE TABLE` samples 20 pages per index (`innodb_stats_persistent_sample_pages`), so its cost barely moves.
+
+<Flow
+  title="InnoDB: lookup vs whole-table work on 5M rows"
+  height={300}
+  nodes={[
+    { id: 'query', label: 'Query', sub: 'WHERE id = 42', x: 20, y: 20, w: 200 },
+    { id: 'pk', label: 'PRIMARY', sub: 'clustered, 300 MB of leaves', x: 300, y: 20, w: 220 },
+    { id: 'sec', label: 'New index', sub: 'seller_id, built by ALTER', x: 580, y: 20, w: 200 },
+    { id: 'maint', label: 'Maintenance', sub: 'ADD INDEX, full scan', x: 20, y: 200, w: 200 },
+    { id: 'bp', label: 'Buffer pool', sub: '128 MB', x: 300, y: 200, w: 220 },
+    { id: 'disk', label: 'Disk', sub: 'pages evicted and re-read', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'query-pk', from: 'query', to: 'pk' },
+    { id: 'pk-sec', from: 'pk', to: 'sec' },
+    { id: 'maint-bp', from: 'maint', to: 'bp' },
+    { id: 'pk-bp', from: 'pk', to: 'bp' },
+    { id: 'bp-disk', from: 'bp', to: 'disk' },
+  ]}
+  cases={[
+    {
+      title: 'Lookup by id',
+      path: 'PRIMARY ✓ root → leaf holds the row → const access, 0.00 s at every size',
+      summary: 'The row lives in the clustered index leaf: no separate heap page.',
+      subs: { bp: '✓ upper levels cached', disk: 'not touched' },
+      steps: [
+        {
+          title: 'One descent of the clustered index',
+          note: 'EXPLAIN shows type const and EXPLAIN ANALYZE "Rows fetched before execution": the optimizer reads the row during planning. Handler_read_key went up by 1.',
+          code: 'EXPLAIN SELECT * FROM orders WHERE id = 42;   -- type: const, rows: 1',
+          active: ['query', 'pk', 'bp'],
+          edges: ['query-pk'],
+        },
+      ],
+    },
+    {
+      title: 'Whole-table work',
+      path: 'maintenance → every PRIMARY leaf → buffer pool ✗ (128 MB < 300 MB) → disk → new index written',
+      summary: '100× the rows: ADD INDEX 29×, full scan 59×.',
+      subs: { bp: '✗ too small for the table', disk: '✓ every scan re-reads pages' },
+      steps: [
+        {
+          title: 'Scan the clustered index',
+          note: 'SUM(amount) reads all 19,234 PRIMARY leaf pages: 0.03 s at 500k (fits the buffer pool), 0.59 s at 5M (does not).',
+          code: 'SELECT SUM(amount) FROM orders;',
+          active: ['maint', 'bp', 'pk'],
+          edges: ['maint-bp', 'pk-bp'],
+        },
+        {
+          title: 'Evict and re-read',
+          note: 'A full scan of 300 MB through a 128 MB pool evicts its own earlier pages, so the next scan starts cold again.',
+          active: ['bp', 'disk'],
+          edges: ['bp-disk'],
+        },
+        {
+          title: 'Build a new index',
+          note: 'ADD INDEX reads every row, sorts 5M (seller_id, id) entries and writes the new tree: 0.11 s at 50k, 3.14 s at 5M.',
+          code: 'ALTER TABLE orders ADD INDEX seller_tmp (seller_id);',
+          active: ['pk', 'sec'],
+          edges: ['pk-sec'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+| `orders` at | 50k | 500k | 5M | 5M ÷ 50k |
+|---|---|---|---|---|
+| Data (uncompressed) / indexes | 6 MB / 1 MB | 57 MB / 6 MB | 567 MB / 115 MB | |
+| Lookup by `_id`: keys / time | 1 / 0 ms | 1 / 0 ms | 1 / 0 ms | 1× |
+| `$group` sum of `amount` (collection scan) | 8 ms | 76 ms | 1,077 ms | 135× |
+| `createIndex({ seller_id: 1 })` | 40 ms | 369 ms | 4,273 ms | 107× |
+| `validate()` | 48 ms | 486 ms | 5,600 ms | 117× |
+
+WiredTiger's cache is 5,495 MB in this container, so the whole collection fits in memory and nothing is read from disk; the growth is pure CPU work per document (decompressing pages, converting BSON). `stats().wiredTiger.btree["maximum tree depth"]` reported 3 for all three sizes.
+
+<Flow
+  title="MongoDB: lookup vs whole-collection work on 5M documents"
+  height={300}
+  nodes={[
+    { id: 'query', label: 'Query', sub: 'find({ _id: 42 })', x: 20, y: 20, w: 200 },
+    { id: 'idx', label: '_id index', sub: 'B-tree, depth 3', x: 300, y: 20, w: 200 },
+    { id: 'coll', label: 'Collection', sub: '567 MB of documents', x: 580, y: 20, w: 200 },
+    { id: 'maint', label: 'Maintenance', sub: 'createIndex, validate', x: 20, y: 200, w: 200 },
+    { id: 'cache', label: 'WiredTiger cache', sub: '5,495 MB', x: 300, y: 200, w: 200 },
+    { id: 'cpu', label: 'CPU per document', sub: 'decompress, read BSON', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'query-idx', from: 'query', to: 'idx' },
+    { id: 'idx-coll', from: 'idx', to: 'coll' },
+    { id: 'maint-cache', from: 'maint', to: 'cache' },
+    { id: 'coll-cache', from: 'coll', to: 'cache' },
+    { id: 'cache-cpu', from: 'cache', to: 'cpu' },
+  ]}
+  cases={[
+    {
+      title: 'Lookup by _id',
+      path: '_id index ✓ 1 key → collection ✓ 1 document → 0 ms at every size',
+      summary: 'totalKeysExamined 1, totalDocsExamined 1, whatever the size.',
+      subs: { cache: '✓ in cache', cpu: 'one document' },
+      steps: [
+        {
+          title: 'Descend the _id index',
+          note: 'explain("executionStats"): EXPRESS_IXSCAN plan on _id_, totalKeysExamined 1, executionTimeMillis 0 at 50k, 500k and 5M.',
+          code: "db.orders.find({ _id: 42 }).explain('executionStats')",
+          active: ['query', 'idx'],
+          edges: ['query-idx'],
+        },
+        {
+          title: 'Fetch one document',
+          note: 'The index entry holds the record id of one document in the collection.',
+          active: ['idx', 'coll', 'cache'],
+          edges: ['idx-coll'],
+        },
+      ],
+    },
+    {
+      title: 'Whole-collection work',
+      path: 'maintenance → every document → cache ✓ (all fits) → CPU per document → 107× to 135× for 100× the rows',
+      summary: 'Even with everything in memory, the work is per document.',
+      subs: { cache: '✓ the whole collection fits', cpu: '✗ 5M documents to process' },
+      steps: [
+        {
+          title: 'Visit every document',
+          note: 'createIndex({ seller_id: 1 }) reads all 5M documents and sorts their keys: 40 ms at 50k, 4,273 ms at 5M. validate() checks every document and index entry: 48 ms → 5,600 ms.',
+          code: "db.orders.createIndex({ seller_id: 1 })\ndb.orders.validate()",
+          active: ['maint', 'cache', 'coll'],
+          edges: ['maint-cache', 'coll-cache'],
+        },
+        {
+          title: 'Memory does not make it free',
+          note: 'No disk reads here; the cost is CPU per document. A collection 100× bigger needs about 100× the CPU for the same job.',
+          active: ['cache', 'cpu'],
+          edges: ['cache-cpu'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Comparison
+
+| 100× more rows (50k → 5M) | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| Lookup by primary key | 1.2× (+1 level) | ≈ 1× | 1× |
+| Full scan | 30× | 59× | 135× |
+| Build an index | 69× | 29× | 107× |
+| Whole-table check | `VACUUM` 34× | (not measured) | `validate` 117× |
+| Statistics | `ANALYZE` 3.2× (sampled) | sampled | (not applicable) |
+
+<Pitfall>
+"The table is too big" is not a diagnosis. If the slow queries are lookups through a good index, 100× more rows costs one more tree level, and splitting the table will not help. Check **which work** is slow: if it is whole-table work (index builds, vacuum, scans, backups, deleting old rows), splitting can help, because each piece can be handled alone. Concept 4 measures the opposite case.
+</Pitfall>
+
+## Real-world scenario: the index that now takes an hour
+
+A marketplace orders table grew from 20M to 2B rows over four years. Queries by order id and by seller with recent dates are still fast. What broke:
+
+| Job | Then | Now | Why |
+|---|---|---|---|
+| Add an index for a new report | minutes | hours | Reads and sorts every row |
+| Anti-wraparound `VACUUM` | minutes | most of a day | Reads every page that is not frozen |
+| Restore a backup to a test server | 20 min | 2 days | Copies every byte |
+| Delete orders older than 3 years | quick | hours, plus bloat | Concept 2 |
+
+None of these got slower because of tree depth. They got slower because they touch every row, and there are 100× more rows.
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Indexing Session 2](/blogs/databases/indexing/session-2-btree-internals/concept-3-point-lookup) | Why a lookup costs one page per tree level |
+| [Indexing Session 6](/blogs/databases/indexing/session-6-engine-differences/concept-1-postgres-mvcc) | VACUUM and the visibility map: why a normal VACUUM can skip clean pages |
+| Concept 2 | Deleting old data is the whole-table-style job that hurts most |
+| Concept 4 | Measures that a good index already makes the per-month query fast |
+
+## Key takeaways
+
+1. B-tree depth grows logarithmically: 100× more rows added one level (PostgreSQL) and no measurable lookup time.
+2. Whole-table work grows linearly or worse: index builds 29×–107×, scans 30×–135×, vacuum/validate 34×–117× for 100× the rows.
+3. When the table outgrows the buffer cache, scans pay to re-read pages each time (MySQL: 20× for 10× the rows past the 128 MB pool).
+4. Sampled jobs (`ANALYZE`) barely grow.
+5. Splitting data is a remedy for whole-table work, not for slow lookups.
+
+## Check questions
+
+1. Why did a lookup by id cost 7 buffers at 5M rows and 6 at 50k? How many rows would you need for 8?
+2. Why did `ANALYZE` grow only 3.2× when the table grew 100×?
+3. MySQL's full scan took 0.03 s at 500k and 0.59 s at 5M. Why more than 10×?
+4. MongoDB had everything in a 5.5 GB cache. Why did `createIndex` still grow 107×?
+5. List three jobs on your own largest table that read every row. Which of them run on a schedule?
+6. A colleague says "the orders table is 2B rows, lookups must be slow, let's shard". What would you measure first?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-1-why-split-data/concept-1-what-grows/answers">Worked answers to Q1–Q6</DeepDive>

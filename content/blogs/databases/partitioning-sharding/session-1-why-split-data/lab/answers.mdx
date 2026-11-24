@@ -1,0 +1,84 @@
+---
+title: "Answers: Why split data session quiz"
+description: "Worked answers to the Session 1 quiz."
+companion: "answers"
+tags: ["partitioning", "sharding", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/ddl-partitioning.html"
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-pruning.html"
+---
+
+<Tldr>
+Lookups scale with tree depth; whole-table work and row-by-row deletes scale with rows. Split data to make those units smaller, and only after the indexes are right.
+</Tldr>
+
+## Q1. When the 8th buffer arrives
+
+**Question:** a lookup by id cost 7 buffers at 5M rows. Roughly how many rows can the primary key hold before it needs an 8th, and why does that number grow so fast?
+
+About **30 million**. A full leaf of `orders_pkey` held 367 keys and a full internal page 286 pointers, so a tree with a root at level 2 addresses up to 286 × 286 × 367 ≈ 30M rows. Each extra level multiplies capacity by about 286: level 3 reaches ~8.6 billion. That is why lookup cost is almost flat in table size.
+
+> **Common mistake:** assuming lookup cost grows with rows. It grows with log₂₈₆(rows).
+
+## Q2. What grew 100×, what did not
+
+**Question:** name two jobs whose time grew roughly 100× when the table grew 100×, and one that did not. Why the difference?
+
+Grew: `CREATE INDEX` (PostgreSQL 69×, MongoDB 107×), MongoDB `validate()` (117×), full scans (30×–135×). Did not: `ANALYZE` (3.2×) and lookups by primary key (about 1×). Jobs that visit every row grow with the row count; `ANALYZE` reads a fixed-size sample and a lookup reads one path down a tree.
+
+> **Common mistake:** judging "is the table too big?" from query latency alone. Maintenance jobs show growth long before lookups do.
+
+## Q3. 27 MB vs 4,288 bytes
+
+**Question:** deleting one month cost PostgreSQL 27 MB of WAL plus a VACUUM; dropping the same rows as a table cost 4,288 bytes. Explain the difference in one sentence each.
+
+- **DELETE:** every one of the 212,039 rows gets its own change (a WAL record each, plus full-page images), and VACUUM later visits the same rows and index entries again to remove them.
+- **DROP:** the catalog entries for one table and its indexes are removed and the files deleted at commit, so the logged work does not depend on how many rows the table holds.
+
+> **Common mistake:** "DROP is fast because it is not logged". It is logged (that is how replicas drop the table too); there is just very little to log.
+
+## Q4. Still 365 MB
+
+**Question:** after the DELETE and VACUUM, the PostgreSQL heap was still 365 MB. When does deleted space become available, and when is it returned to the operating system?
+
+It becomes **reusable** once VACUUM has removed the dead tuples and recorded the free space in the free space map: re-inserting January filled it, and the heap stayed 365 MB. It is **returned** to the OS only if the empty pages are at the very end of the file (VACUUM truncates them), or after a full rewrite (`VACUUM FULL`, `pg_repack`, `CLUSTER`), or when the table is dropped. InnoDB and WiredTiger behave the same way: freed space stays in the file.
+
+> **Common mistake:** running a big DELETE to free disk space and being surprised that `df` shows no change.
+
+## Q5. Which split for which problem
+
+**Question:** which of partitioning, sharding and replication helps with (a) slow retention deletes, (b) a primary at 95% CPU from writes, (c) reports slowing down checkout?
+
+- (a) **Partitioning** by time: retention becomes dropping a partition.
+- (b) **Sharding**: the only one that spreads writes over several servers. (First check indexes and commit batching.)
+- (c) **Replication**: run the reports on a replica so they do not compete with checkout on the primary.
+
+> **Common mistake:** answering "sharding" for all three. It is the most expensive option and does not by itself fix (a) or (c).
+
+## Q6. Lookups by id on the partitioned table
+
+**Question:** why did the lookup by id get more expensive on the partitioned table, and how can the application avoid it?
+
+The table is partitioned on `created_at`, and `WHERE id = …` does not constrain `created_at`, so nothing can be pruned: PostgreSQL ran 24 index scans (76 buffers instead of 7) and MySQL did 24 index reads instead of 1. Avoid it by sending the date with the id (`AND created_at` in the right month pruned to one partition, 7 buffers), by using ids that encode time (UUIDv7, snowflake), or by partitioning on `id` ranges, which also follow time in this table.
+
+> **Common mistake:** adding an index on `id` alone to each partition. There is still one index per partition to probe.
+
+## Q7. MySQL's 4×
+
+**Question:** MySQL's month sum was 4× faster on the partitioned table than on the plain one with a `created_at` index. Why, and what plain-table change made them equal?
+
+InnoDB secondary indexes point to the primary key, so reading `amount` for each of the 212,039 index entries cost a separate lookup in the clustered index (107–154 ms). The partitioned table instead scanned one 212,039-row partition sequentially (25–31 ms). A covering index `(created_at, amount)` on the plain table removed the per-row lookups: 25 ms, equal to the partition.
+
+> **Common mistake:** crediting partitioning for a gain that came from avoiding random lookups, which an index can do too.
+
+## Q8. Three measurements before partitioning
+
+**Question:** your team proposes partitioning `orders` by month "for performance". Write the three measurements you would ask for before agreeing.
+
+1. **The query mix by filter column**: what share of statements (by calls and by total time, from `pg_stat_statements` or performance_schema digests) filter on `created_at`, and what share look rows up by id, seller or customer, which would then probe every partition.
+2. **The slow queries' plans with the best possible index**: if a composite or covering index already brings them to the partitioned speed (as in Concept 4), partitioning buys nothing for them.
+3. **The cost of the whole-table jobs**: how long retention deletes, index builds, VACUUM and backups take today, and how their windows are trending. That is where partitioning pays off, and it gives a concrete target ("retention from 4 hours to seconds").
+
+> **Common mistake:** approving partitioning on "the table is big". Size is not the problem; specific jobs and queries are.
