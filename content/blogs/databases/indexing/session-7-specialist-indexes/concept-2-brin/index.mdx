@@ -1,0 +1,229 @@
+---
+title: "Concept 2: BRIN for time-series and logs"
+description: "A Block Range INdex stores only the minimum and maximum of each range of 128 heap pages: 24 kB instead of 21 MB for 1M orders. Why it works brilliantly on physically ordered columns like created_at and is useless on scattered ones, and what MySQL and MongoDB use instead (partitioning, time-series collections)."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "brin", "time-series"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/brin.html"
+  - "https://www.postgresql.org/docs/current/brin-intro.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-range.html"
+  - "https://www.mongodb.com/docs/manual/core/timeseries-collections/"
+---
+
+<Tldr>
+A **BRIN** index does not point at rows. It splits the table into ranges of 128 pages and stores the **min and max** value of each range: for `orders.created_at`, range 0 holds 1–5 January, range 1 holds 5–10 January, and so on. A query for one day reads the BRIN (3 pages, **24 kB** in total vs 21 MB for a B-tree), keeps only the ranges whose min–max overlaps the day, and scans those pages: **349 lossy pages and 31,273 rows rechecked** to return 2,740. It only works if values follow the physical order (correlation 0.98 for `created_at`); on `customer_id` (correlation −0.005) every range spans 5–100,000, and a forced BRIN scan read **6,528 pages** to find 7 rows. MySQL has no BRIN (use range partitioning); MongoDB has time-series collections.
+</Tldr>
+
+## A summary per block range
+
+| Range | Heap pages | `created_at` min … max (from `brin_page_items`) |
+|---|---|---|
+| 0 | 0–127 | 2025-01-01 00:00 … 2025-01-05 15:00 |
+| 1 | 128–255 | 2025-01-05 15:00 … 2025-01-10 06:00 |
+| … | … | … |
+
+| | B-tree on `created_at` | BRIN on `created_at` |
+|---|---|---|
+| Entries | One per row (1M) | One per 128 pages (≈ 80) |
+| Size | 21 MB | **24 kB** |
+| Result | Exact rows | Candidate pages ("lossy"): every row on them is rechecked |
+| Needs | Nothing special | Values correlated with physical order |
+
+| Term | Meaning |
+|---|---|
+| Block range | `pages_per_range` heap pages (128 by default) summarised by one BRIN entry |
+| Lossy | BRIN returns pages, not rows: `Heap Blocks: lossy=…`, `Rows Removed by Index Recheck` |
+| Correlation | `pg_stats.correlation`: 1 = physical order matches value order |
+| **✓ Range overlaps / ✗ Range excluded** | Read the range's pages or skip them |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: a BRIN scan"
+  height={330}
+  nodes={[
+    { id: 'q', label: 'Condition', sub: '', x: 20, y: 20, w: 240 },
+    { id: 'brin', label: 'BRIN', sub: 'min/max per 128 pages', x: 320, y: 20, w: 220 },
+    { id: 'skip', label: '✗ Range excluded', sub: 'pages skipped', x: 600, y: 20, w: 180 },
+    { id: 'keep', label: '✓ Range overlaps', sub: 'all its pages read', x: 320, y: 150, w: 220 },
+    { id: 'heap', label: 'Heap pages', sub: 'recheck every row', x: 600, y: 150, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-brin', from: 'q', to: 'brin' },
+    { id: 'brin-skip', from: 'brin', to: 'skip' },
+    { id: 'brin-keep', from: 'brin', to: 'keep' },
+    { id: 'keep-heap', from: 'keep', to: 'heap' },
+  ]}
+  cases={[
+    {
+      title: 'created_at: one day',
+      path: '≈ 80 summaries checked → ✓ 3 ranges overlap 1 March → 349 pages, 31,273 rows rechecked → 2,740 rows',
+      summary: 'Measured: 357 buffers; BRIN 24 kB.',
+      subs: { q: "created_at in 1 March", heap: '349 lossy pages' },
+      steps: [
+        {
+          title: 'Read the summaries',
+          note: 'The BRIN index is 3 pages. Each entry gives a range\'s min and max created_at.',
+          code: "CREATE INDEX orders_created_brin ON orders USING brin (created_at);\nEXPLAIN (ANALYZE, BUFFERS) SELECT count(*), sum(amount) FROM orders\nWHERE created_at >= '2025-03-01' AND created_at < '2025-03-02';",
+          active: ['q', 'brin'],
+          edges: ['q-brin'],
+        },
+        {
+          title: '✗ Most ranges excluded',
+          note: 'Almost every range\'s min–max lies entirely before or after 1 March, so its pages are skipped without reading them.',
+          active: ['brin', 'skip'],
+          edges: ['brin-skip'],
+        },
+        {
+          title: '✓ A few ranges overlap',
+          note: 'The ranges around 1 March are kept: Bitmap Heap Scan, Heap Blocks: lossy=349. Every row on them is checked: Rows Removed by Index Recheck 31,273; 2,740 match. 357 buffers in total, with an index 900× smaller than the B-tree.',
+          active: ['brin', 'keep', 'heap'],
+          edges: ['brin-keep', 'keep-heap'],
+        },
+      ],
+    },
+    {
+      title: 'customer_id: scattered',
+      path: 'every range spans 5 … 100,000 → ✓ nearly all overlap → 6,528 pages, 639,793 rows rechecked → 7 rows',
+      summary: 'Measured (other indexes hidden): 29 ms; the planner would never choose this.',
+      subs: { q: 'customer_id = 7', heap: '6,528 lossy pages' },
+      steps: [
+        {
+          title: 'Useless summaries',
+          note: 'Customers are spread evenly through the table, so every 128-page range contains nearly every customer: summaries like 7 … 99,985 and 5 … 100,000.',
+          code: "CREATE INDEX orders_customer_brin ON orders USING brin (customer_id);\nSELECT blknum, value FROM brin_page_items(get_raw_page('orders_customer_brin', 2), 'orders_customer_brin');",
+          active: ['q', 'brin'],
+          edges: ['q-brin'],
+        },
+        {
+          title: '✓ Almost every range overlaps',
+          note: 'Forced (other customer indexes dropped in a transaction): lossy=6,528 pages, Rows Removed by Index Recheck 639,793, to return 7 rows. Correlation −0.005 is the warning sign: BRIN only works when the value follows the physical order.',
+          active: ['brin', 'keep', 'heap'],
+          edges: ['brin-keep', 'keep-heap'],
+        },
+      ],
+    },
+  ]}
+/>
+
+### Keeping BRIN effective
+
+| Risk | Effect | Mitigation |
+|---|---|---|
+| Updates or deletes move rows (non-HOT versions land anywhere) | Ranges widen; correlation drops (1.0 → 0.98 after the Session 5 updates) | BRIN suits append-mostly data: logs, events, metrics |
+| New pages at the end are not yet summarised | They are always scanned until summarised | `autosummarize = on`, or VACUUM / `brin_summarize_new_values()` |
+| Range too coarse | More lossy pages per query | Smaller `pages_per_range` (e.g. 32): bigger index, fewer pages read |
+
+## MySQL: no BRIN; partition instead
+
+MySQL has no block-range index. The closest tool for "skip the old data" is **range partitioning**: each partition is its own table, and the optimizer prunes partitions that cannot match.
+
+<Flow
+  title="MySQL: partition pruning as the BRIN equivalent"
+  height={280}
+  nodes={[
+    { id: 'q', label: "created_at in 1 March", sub: '', x: 20, y: 20, w: 240 },
+    { id: 'part', label: 'Partitions by month', sub: 'p2025_01 … p2025_12', x: 320, y: 20, w: 220 },
+    { id: 'skip', label: '✗ Pruned', sub: '11 partitions skipped', x: 600, y: 20, w: 180 },
+    { id: 'keep', label: '✓ p2025_03', sub: 'scan or index within', x: 320, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-part', from: 'q', to: 'part' },
+    { id: 'part-skip', from: 'part', to: 'skip' },
+    { id: 'part-keep', from: 'part', to: 'keep' },
+  ]}
+  cases={[
+    {
+      title: 'Partition pruning',
+      path: 'PARTITION BY RANGE on the date → ✓ only March is read',
+      summary: 'Coarse like BRIN, but declared in the schema; EXPLAIN shows partitions: p2025_03.',
+      steps: [
+        {
+          title: 'Prune by the partition key',
+          note: 'With PARTITION BY RANGE (TO_DAYS(created_at)), a condition on created_at lets MySQL skip every partition outside the range; EXPLAIN\'s partitions column lists the ones read. Dropping an old partition also deletes old data instantly.',
+          code: "CREATE TABLE events (… created_at DATETIME NOT NULL, PRIMARY KEY (id, created_at))\nPARTITION BY RANGE (TO_DAYS(created_at)) (\n  PARTITION p2025_03 VALUES LESS THAN (TO_DAYS('2025-04-01')), …);",
+          active: ['q', 'part', 'skip', 'keep'],
+          edges: ['q-part', 'part-skip', 'part-keep'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: time-series collections
+
+MongoDB has no BRIN either. For time-ordered data, a **time-series collection** stores measurements in buckets grouped by time and metadata, keeping per-bucket min and max of the time field: the same "summary per block" idea, built into the storage format.
+
+<Flow
+  title="MongoDB: time-series buckets"
+  height={280}
+  nodes={[
+    { id: 'q', label: 'ts in 1 March', sub: '', x: 20, y: 20, w: 240 },
+    { id: 'bk', label: 'Buckets', sub: 'control.min / control.max', x: 320, y: 20, w: 220 },
+    { id: 'skip', label: '✗ Bucket excluded', sub: 'outside the time range', x: 600, y: 20, w: 180 },
+    { id: 'keep', label: '✓ Bucket overlaps', sub: 'unpacked and filtered', x: 320, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-bk', from: 'q', to: 'bk' },
+    { id: 'bk-skip', from: 'bk', to: 'skip' },
+    { id: 'bk-keep', from: 'bk', to: 'keep' },
+  ]}
+  cases={[
+    {
+      title: 'Bucket min/max',
+      path: 'each bucket stores min/max time → ✓ only overlapping buckets are unpacked',
+      summary: 'A BRIN-like summary per bucket.',
+      steps: [
+        {
+          title: 'Skip buckets by their bounds',
+          note: 'db.createCollection("metrics", { timeseries: { timeField: "ts", metaField: "device" } }) groups documents into buckets; queries on ts use each bucket\'s control.min.ts / control.max.ts to skip whole buckets, then unpack and filter the rest.',
+          code: 'db.createCollection("metrics", { timeseries: { timeField: "ts", metaField: "device", granularity: "minutes" } })',
+          active: ['q', 'bk', 'skip', 'keep'],
+          edges: ['q-bk', 'bk-skip', 'bk-keep'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+Creating a BRIN on a column because "it is tiny" without checking `pg_stats.correlation` gives an index that the planner either ignores or, worse, uses on a skewed estimate. Check that the column is close to ±1.0 and that the table is append-mostly.
+</Pitfall>
+
+## Real-world scenario: a 2 TB event log
+
+An append-only `events` table grows 5 GB a day; queries always filter on a time window. A B-tree on `created_at` is 300 GB and slows every insert.
+
+| Option | Size | Query for one hour |
+|---|---|---|
+| B-tree on `created_at` | ≈ 300 GB | Exact rows |
+| BRIN on `created_at` (`pages_per_range` 32) | A few MB | A few block ranges, rechecked |
+| Monthly partitions + BRIN | A few MB | Prune to one partition, then BRIN |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 8: write amplification | BRIN adds almost nothing to inserts |
+| Session 8: index-design checklist | "Is a B-tree really needed for this time column?" |
+
+## Key takeaways
+
+1. BRIN stores min/max per block range (128 pages by default), not per row: 24 kB vs 21 MB for 1M orders.
+2. It returns candidate pages; every row on them is rechecked (lossy).
+3. It works only when values follow physical order: correlation 0.98 worked; −0.005 read 6,528 pages for 7 rows.
+4. Ideal for append-mostly time-series and logs; updates and deletes erode it.
+5. MySQL's closest equivalent is range partitioning; MongoDB's is time-series collections with per-bucket bounds.
+
+## Check questions
+
+1. What does one BRIN entry store, and why is the index so small?
+2. Why did the one-day query read 349 pages and recheck 31,273 rows to return 2,740?
+3. Why is a BRIN on `customer_id` useless, and which statistic tells you so in advance?
+4. What happens to a BRIN index when many old rows are updated in a non-HOT way?
+5. When would you lower `pages_per_range`, and what does it cost?
+6. How does MySQL partition pruning resemble BRIN, and how does it differ?
+7. Why is BRIN a good fit for an append-only log table but a poor fit for an orders table with frequent status updates?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-7-specialist-indexes/concept-2-brin/answers">Worked answers to Q1–Q7</DeepDive>

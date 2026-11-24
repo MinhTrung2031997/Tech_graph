@@ -1,0 +1,89 @@
+---
+title: "Answers: Specialist indexes session quiz"
+description: "Worked answers to the Session 7 quiz."
+companion: "answers"
+tags: ["indexing", "gin", "brin", "gist", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-types.html"
+---
+
+<Tldr>
+Choose the index type by the operator the query uses: contains → GIN, overlaps → GiST, physically ordered ranges on huge tables → BRIN, substrings → trigram, words → full-text.
+</Tldr>
+
+## Q1. Which index type
+
+**Question:** for each query, name the best PostgreSQL index type: (a) `tags @> '{sale}'`; (b) `created_at` range on an append-only log; (c) `name ILIKE '%phone%'`; (d) "no two reservations of a room overlap"; (e) `description` matches "waterproof boots".
+
+| Query | Index |
+|---|---|
+| (a) | GIN on the array |
+| (b) | BRIN (or B-tree if the table is small or updated) |
+| (c) | GIN with `gin_trgm_ops` (trigram) |
+| (d) | GiST exclusion constraint (`btree_gist` for the room equality) |
+| (e) | GIN on a `tsvector` (full-text) |
+
+> **Common mistake:** a B-tree for every case.
+
+## Q2. 22 vs 500 heap pages
+
+**Question:** why did the GIN array query read 22 heap pages, while the jsonb query read 500?
+
+Both used GIN to find exactly the matching rows; the heap part depends on where those rows are. The 334 `clearance` rows had been updated (non-HOT), so their new versions sat together at the end of the table: 22 pages. The 500 `brand7` rows are spread evenly (every 200th id): 500 rows on 500 different pages.
+
+> **Common mistake:** attributing the difference to GIN on jsonb being slower.
+
+## Q3. Keep the B-tree?
+
+**Question:** the created_at BRIN is 24 kB and the B-tree 21 MB. Why would you still keep the B-tree on `orders`?
+
+`orders` is updated (statuses change), so physical order erodes and BRIN ranges widen. The B-tree returns exact rows (no lossy recheck), supports `ORDER BY created_at … LIMIT` without sorting, serves point lookups, and can be part of composite or covering indexes. BRIN shines on huge, append-only tables queried by wide time windows.
+
+> **Common mistake:** replacing every timestamp B-tree with BRIN to save space.
+
+## Q4. Text search vs full-text GIN
+
+**Question:** why did the text search in Exercise 3 fetch 40,000 documents, and how would PostgreSQL's full-text GIN differ?
+
+MongoDB's text index scanned each term (OR), fetched every document containing either word (40,000), then verified the phrases (5,000). A PostgreSQL GIN on `tsvector` with `to_tsquery('waterproof & travel')` intersects the two lexemes' posting lists inside the index and fetches only rows containing both.
+
+> **Common mistake:** assuming all inverted indexes intersect terms.
+
+## Q5. Hashed index on dates
+
+**Question:** a team uses a hashed index on `created_at` to "speed up date filters". What happens to their range queries?
+
+They cannot use it: hashing scatters neighbouring timestamps, so `created_at >= X` has no index range and falls back to a COLLSCAN (as `user_id > 4990` did). Only exact-equality matches on a timestamp, which are rare, would use it. Use a normal ascending index.
+
+> **Common mistake:** believing hashed indexes are faster in general.
+
+## Q6. The document TTL left behind
+
+**Question:** why did the TTL monitor leave one document behind?
+
+Its `created_at` was the string `"not a date"`. TTL only expires documents whose indexed field is a date (or an array of dates); other values are ignored forever.
+
+> **Common mistake:** storing epoch numbers and expecting TTL to treat them as dates.
+
+## Q7. Three characters
+
+**Question:** why does the trigram index need at least three characters, and what happens with `LIKE '%12%'`?
+
+The index is keyed by trigrams; a pattern must contain at least one complete trigram to look anything up. `'%12%'` has none, so the index cannot narrow the search and PostgreSQL does a full scan (or reads the whole index). Require a minimum query length in the UI.
+
+> **Common mistake:** expecting short queries to be fast because "there is an index".
+
+## Q8. Missing in MySQL
+
+**Question:** which of this session's features have no direct equivalent in MySQL, and what would you use instead for each?
+
+| Feature | MySQL alternative |
+|---|---|
+| GIN on arbitrary jsonb | Multi-valued index per JSON array path; functional indexes per scalar path |
+| BRIN | Range partitioning with partition pruning |
+| Trigram (`LIKE '%…%'`) | FULLTEXT with the ngram parser (word-like n-gram search), or an external search engine |
+| Exclusion constraints | Application locking (`SELECT … FOR UPDATE`) or triggers |
+| TTL | Event scheduler / cron deletes, or dropping partitions |
+
+> **Common mistake:** assuming FULLTEXT can replace `LIKE '%…%'` exactly.

@@ -1,0 +1,307 @@
+---
+title: "Concept 1: GIN for jsonb, arrays and full-text"
+description: "PostgreSQL's inverted index: one entry per element, key or word, each with a list of rows. How GIN answers array containment, jsonb queries and full-text search, what it costs on writes, and the MySQL (multi-valued, FULLTEXT) and MongoDB (multikey, wildcard, text) equivalents."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "gin", "jsonb", "full-text"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/gin.html"
+  - "https://www.postgresql.org/docs/current/datatype-json.html#JSON-INDEXING"
+  - "https://www.postgresql.org/docs/current/textsearch-indexes.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/create-index.html#create-index-multi-valued"
+  - "https://dev.mysql.com/doc/refman/8.4/en/fulltext-search.html"
+  - "https://www.mongodb.com/docs/manual/core/indexes/index-types/index-wildcard/"
+---
+
+<Tldr>
+A B-tree maps **one value per row** to that row. Many columns hold **several** searchable things per row: an array of tags, the keys of a JSON document, the words of a description. A **GIN** (Generalized Inverted Index) stores one entry per element with a compressed **posting list** of the rows containing it, and answers "rows containing X and Y" by intersecting lists. On 100,000 products, `tags @> '{clearance,gift}'` read **7 index pages and 22 heap pages** instead of 4,835 for a Seq Scan; a jsonb containment query read 13 index pages; a 3-word full-text search read 42. The price is writes: 50,000 inserts took **296 ms with four GIN indexes vs 169 ms without**. MySQL has multi-valued indexes and FULLTEXT; MongoDB has multikey, wildcard and text indexes.
+</Tldr>
+
+## B-tree vs inverted index
+
+| | B-tree | GIN |
+|---|---|---|
+| Entries per row | One (the column's value) | One per element / key / word |
+| Entry | value → row | element → posting list of rows |
+| Good at | Equality, ranges, ordering | "Contains", "has key", "matches words"; intersecting several elements |
+| Not good at | Elements inside a value | Ranges and ordering |
+
+| Lab table `products` (100,000 rows, 31 MB) | GIN index | Size |
+|---|---|---|
+| `tags text[]` (3–5 tags each) | `USING gin (tags)` | 576 kB |
+| `attrs jsonb` | `USING gin (attrs)` (`jsonb_ops`) | 1.28 MB |
+| `attrs jsonb` | `USING gin (attrs jsonb_path_ops)` | 800 kB |
+| `fts tsvector` (from `description`) | `USING gin (fts)` | 6.4 MB |
+
+| Term | Meaning |
+|---|---|
+| Posting list | Compressed, sorted list of row addresses for one element |
+| `@>` | Contains: `tags @> '{a,b}'`, `attrs @> '{"brand": "brand7"}'` |
+| `jsonb_ops` vs `jsonb_path_ops` | Default operator class indexes every key and value (supports `?`, `?|`, `?&`, `@>`); `jsonb_path_ops` indexes value paths only (smaller, supports `@>` and jsonpath only) |
+| Pending list (`fastupdate`) | New entries are buffered and merged into the main index in batches, to cheapen inserts |
+| **✓ Intersect lists / ✗ No index match** | GIN narrows to rows containing every element; otherwise a scan |
+
+## PostgreSQL: three uses of GIN
+
+<Flow
+  title="PostgreSQL: GIN on arrays, jsonb and full-text"
+  height={330}
+  nodes={[
+    { id: 'q', label: 'Condition', sub: '', x: 20, y: 20, w: 240 },
+    { id: 'gin', label: 'GIN index', sub: 'element → posting list', x: 320, y: 20, w: 220 },
+    { id: 'and', label: '✓ Intersect lists', sub: 'rows with every element', x: 600, y: 20, w: 180 },
+    { id: 'no', label: '✗ No index match', sub: '', x: 320, y: 150, w: 220 },
+    { id: 'seq', label: 'Seq Scan', sub: '', x: 320, y: 260, w: 220 },
+    { id: 'heap', label: 'Heap pages', sub: 'recheck rows', x: 600, y: 150, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-gin', from: 'q', to: 'gin' },
+    { id: 'gin-and', from: 'gin', to: 'and' },
+    { id: 'gin-no', from: 'gin', to: 'no' },
+    { id: 'no-seq', from: 'no', to: 'seq' },
+    { id: 'and-heap', from: 'and', to: 'heap' },
+  ]}
+  cases={[
+    {
+      title: 'Array containment',
+      path: "tags @> '{clearance,gift}' → lists for clearance ∩ gift ✓ → 334 rows on 22 heap pages",
+      summary: 'Measured: 7 index + 22 heap pages (29 buffers) vs Seq Scan 4,835 buffers, 22 ms.',
+      subs: { q: "tags @> '{clearance,gift}'", heap: '22 pages' },
+      steps: [
+        {
+          title: 'Look up each element',
+          note: 'The GIN index has one entry per distinct tag. clearance (500 rows) and gift each have a posting list.',
+          code: "CREATE INDEX products_tags_gin ON products USING gin (tags);\nEXPLAIN (ANALYZE, BUFFERS) SELECT id FROM products WHERE tags @> ARRAY['clearance','gift'];",
+          active: ['q', 'gin'],
+          edges: ['q-gin'],
+        },
+        {
+          title: '✓ Intersect the lists',
+          note: 'Bitmap Index Scan: the two lists are intersected inside the index (7 pages read), leaving the rows that contain both: 334.',
+          active: ['gin', 'and'],
+          edges: ['gin-and'],
+        },
+        {
+          title: 'Fetch and recheck',
+          note: 'Bitmap Heap Scan over 22 pages. Without the index: Seq Scan, 4,835 buffers. Compare MongoDB\'s multikey index, which seeks on one tag and checks the other per document (Session 6, Concept 3).',
+          active: ['and', 'heap'],
+          edges: ['and-heap'],
+        },
+      ],
+    },
+    {
+      title: 'jsonb containment',
+      path: "attrs @> '{\"brand\":\"brand7\",\"color\":\"black\"}' → jsonb_path_ops ✓ → 500 rows",
+      summary: 'Measured: 13 index pages + 500 heap pages vs Seq Scan 3,904.',
+      subs: { q: 'attrs @> {brand7, black}', heap: '500 pages' },
+      steps: [
+        {
+          title: 'Paths as elements',
+          note: 'jsonb_path_ops stores a hash per value path (brand = "brand7", color = "black"). The planner picked it over the default jsonb_ops index: it is smaller (800 kB vs 1.28 MB).',
+          code: "CREATE INDEX products_attrs_pathops ON products USING gin (attrs jsonb_path_ops);\nSELECT id FROM products WHERE attrs @> '{\"brand\": \"brand7\", \"color\": \"black\"}';",
+          active: ['q', 'gin', 'and'],
+          edges: ['q-gin', 'gin-and'],
+        },
+        {
+          title: 'Fetch 500 rows',
+          note: '13 index pages, 500 heap pages. Key-existence queries (attrs ? \'warranty\') need jsonb_ops; here every row has the key anyway, so the planner scanned.',
+          active: ['and', 'heap'],
+          edges: ['and-heap'],
+        },
+      ],
+    },
+    {
+      title: 'Full-text search',
+      path: "fts @@ 'waterproof & boots & travel' → three word lists ∩ ✓ → 5,000 rows",
+      summary: 'Measured: 42 index pages for 5,000 matches.',
+      subs: { q: "fts @@ 'waterproof & boot & travel'", heap: '3,846 pages' },
+      steps: [
+        {
+          title: 'Words as elements',
+          note: 'A tsvector holds the normalised words (lexemes: boots → boot) of each description; GIN indexes each lexeme. A generated column keeps it current.',
+          code: "ALTER TABLE products ADD COLUMN fts tsvector\n  GENERATED ALWAYS AS (to_tsvector('english', description)) STORED;\nCREATE INDEX products_fts ON products USING gin (fts);\nSELECT id FROM products WHERE fts @@ to_tsquery('english', 'waterproof & boots & travel');",
+          active: ['q', 'gin', 'and'],
+          edges: ['q-gin', 'gin-and'],
+        },
+        {
+          title: 'Rows with all three words',
+          note: 'Bitmap Index Scan read 42 pages; 5,000 rows match, spread over 3,846 heap pages. Ranking (ts_rank) needs the tsvector, so it is computed on the fetched rows.',
+          active: ['and', 'heap'],
+          edges: ['and-heap'],
+        },
+      ],
+    },
+    {
+      title: 'Without a GIN index',
+      path: "tags @> '{clearance,gift}' ✗ no index match → Seq Scan of every row",
+      summary: 'Measured: 4,835 buffers, 22 ms for 334 rows.',
+      subs: { q: "tags @> '{clearance,gift}'", seq: '4,835 buffers' },
+      steps: [
+        {
+          title: '✗ Nothing to look up',
+          note: 'Without GIN, the only way to know which arrays contain both tags is to read every row and test it.',
+          code: "DROP INDEX products_tags_gin;\nEXPLAIN (ANALYZE, BUFFERS) SELECT id FROM products WHERE tags @> ARRAY['clearance','gift'];",
+          active: ['q', 'gin', 'no', 'seq'],
+          edges: ['q-gin', 'gin-no', 'no-seq'],
+        },
+      ],
+    },
+    {
+      title: 'Write cost',
+      path: '50,000 inserts: 169 ms without GIN indexes, 296 ms with four',
+      summary: 'Each row adds an entry per element to every GIN index.',
+      subs: { q: 'INSERT 50,000 rows' },
+      steps: [
+        {
+          title: 'Many entries per row',
+          note: 'Each new product adds an entry per tag, per jsonb key or path, and per word. GIN buffers them in a pending list (fastupdate) and merges in batches, which keeps inserts cheaper but makes queries scan the pending list until it is merged (by VACUUM or when it exceeds gin_pending_list_limit).',
+          code: 'INSERT INTO products … SELECT … FROM generate_series(100001, 150000);',
+          active: ['q', 'gin'],
+          edges: ['q-gin'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: multi-valued indexes and FULLTEXT
+
+| Need | MySQL feature | Lab |
+|---|---|---|
+| Elements of a JSON array | Multi-valued index: `INDEX ((CAST(tags->'$' AS CHAR(12) ARRAY)))` | `'clearance' MEMBER OF (tags->'$')`: `ref`, rows 500; `JSON_CONTAINS`: `range` |
+| Words in text | `FULLTEXT` index (InnoDB) | `MATCH … AGAINST ('+waterproof +boots +travel' IN BOOLEAN MODE)`: type `fulltext`, 5,000 rows |
+
+<Flow
+  title="MySQL: multi-valued and FULLTEXT indexes"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Condition', sub: '', x: 20, y: 20, w: 240 },
+    { id: 'idx', label: 'Index', sub: '', x: 320, y: 20, w: 220 },
+    { id: 'yes', label: '✓ Same expression', sub: 'index used', x: 600, y: 20, w: 180 },
+    { id: 'no', label: '✗ Different expression', sub: 'type: ALL', x: 320, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-idx', from: 'q', to: 'idx' },
+    { id: 'idx-yes', from: 'idx', to: 'yes' },
+    { id: 'idx-no', from: 'idx', to: 'no' },
+  ]}
+  cases={[
+    {
+      title: 'Multi-valued index',
+      path: "MEMBER OF (tags) ✗ ALL; MEMBER OF (tags->'$') ✓ ref, rows 500",
+      summary: 'The query must use the indexed expression exactly.',
+      subs: { q: "'clearance' MEMBER OF …", idx: "tags->'$' as an array" },
+      steps: [
+        {
+          title: '✗ Different expression',
+          note: "WHERE 'clearance' MEMBER OF (tags): EXPLAIN type ALL. The index is on tags->'$', not tags.",
+          code: "CREATE INDEX tags_mv ON products ((CAST(tags->'$' AS CHAR(12) ARRAY)));\nEXPLAIN SELECT id FROM products WHERE 'clearance' MEMBER OF (tags);",
+          active: ['q', 'idx', 'no'],
+          edges: ['q-idx', 'idx-no'],
+        },
+        {
+          title: '✓ Same expression',
+          note: "WHERE 'clearance' MEMBER OF (tags->'$'): type ref, key tags_mv, rows 500. JSON_CONTAINS(tags->'$', '[\"clearance\",\"sale\"]') uses it as a range.",
+          code: "EXPLAIN SELECT id FROM products WHERE 'clearance' MEMBER OF (tags->'$');",
+          active: ['q', 'idx', 'yes'],
+          edges: ['q-idx', 'idx-yes'],
+        },
+      ],
+    },
+    {
+      title: 'FULLTEXT',
+      path: "MATCH(description) AGAINST (… IN BOOLEAN MODE) ✓ type: fulltext → 5,000 rows",
+      summary: 'InnoDB full-text index: an inverted index on words.',
+      subs: { q: '+waterproof +boots +travel', idx: 'FULLTEXT (description)' },
+      steps: [
+        {
+          title: '✓ Inverted index on words',
+          note: 'EXPLAIN type fulltext. Boolean mode requires all three words (+). Only MATCH … AGAINST uses it; LIKE \'%boots%\' does not.',
+          code: "CREATE FULLTEXT INDEX products_ft ON products (description);\nSELECT id FROM products WHERE MATCH(description) AGAINST ('+waterproof +boots +travel' IN BOOLEAN MODE);",
+          active: ['q', 'idx', 'yes'],
+          edges: ['q-idx', 'idx-yes'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: multikey, wildcard and text
+
+| Need | MongoDB index | Lab (100,000 items) |
+|---|---|---|
+| Array elements | Multikey (any index on an array field) | Session 6, Concept 3 |
+| Arbitrary keys of a sub-document | Wildcard `{ "attrs.$**": 1 }` | `attrs.brand = 'brand7'`: 500 keys, 500 docs; 2.4 MB |
+| Words in text | Text index `{ description: "text" }` (one per collection) | 6.1 MB; Concept 3 |
+
+<Flow
+  title="MongoDB: a wildcard index on attrs"
+  height={260}
+  nodes={[
+    { id: 'q', label: "{ 'attrs.brand': 'brand7' }", sub: '', x: 20, y: 20, w: 240 },
+    { id: 'wild', label: 'attrs.$** index', sub: 'one entry per path + value', x: 320, y: 20, w: 220 },
+    { id: 'yes', label: '✓ Path matched', sub: '500 keys, 500 docs', x: 600, y: 20, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-wild', from: 'q', to: 'wild' },
+    { id: 'wild-yes', from: 'wild', to: 'yes' },
+  ]}
+  cases={[
+    {
+      title: 'Wildcard lookup',
+      path: 'entries (attrs.brand, "brand7") ✓ → FETCH ← IXSCAN, 500 keys',
+      summary: 'Any attrs field can be queried without a dedicated index.',
+      steps: [
+        {
+          title: 'Index every path',
+          note: 'A wildcard index stores (path, value) pairs for every field under attrs, like jsonb_ops in PostgreSQL. Each query uses one path: with two conditions it seeks on one and filters the other.',
+          code: 'db.items.createIndex({ "attrs.$**": 1 })\ndb.items.find({ "attrs.brand": "brand7" })',
+          active: ['q', 'wild', 'yes'],
+          edges: ['q-wild', 'wild-yes'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+A GIN index on a jsonb column does not help ordinary comparisons on a field inside it: `attrs->>'brand' = 'brand7'` is an expression, not containment, so it needs a B-tree expression index (Session 5) or must be rewritten as `attrs @> '{"brand": "brand7"}'`. Write queries in the operator family the index supports.
+</Pitfall>
+
+## Real-world scenario: flexible product attributes
+
+A marketplace stores product attributes as jsonb because each category has different fields. Filters combine 2–4 attributes.
+
+| Option | Behaviour |
+|---|---|
+| B-tree expression index per attribute | Fast for the indexed attributes only; one index per field |
+| GIN `jsonb_path_ops` on `attrs` + `@>` queries | One index serves any combination of equality filters; intersects them |
+| Separate attribute table `(product_id, key, value)` | Classic, B-tree friendly; more joins |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 4: trigram | GIN also powers `LIKE '%…%'` via trigrams |
+| Session 8: write amplification | GIN inserts many entries per row |
+
+## Key takeaways
+
+1. GIN is an inverted index: one entry per element, key or word, each with a posting list of rows.
+2. It answers containment (`@>`), key existence (`?`) and full-text matches (`@@`), intersecting lists for several elements.
+3. Lab: 29 buffers vs 4,835 for an array containment; 13 index pages for jsonb; 42 for a 3-word text search.
+4. `jsonb_path_ops` is smaller but supports only containment and jsonpath; `jsonb_ops` also supports key existence.
+5. GIN makes writes more expensive (296 vs 169 ms for 50,000 inserts); the pending list softens inserts.
+6. MySQL: multi-valued indexes (query must use the same expression) and FULLTEXT. MongoDB: multikey, wildcard and text indexes.
+
+## Check questions
+
+1. Why can't a B-tree on `tags text[]` efficiently answer "rows containing 'gift'"?
+2. How did GIN answer `tags @> '{clearance,gift}'` with 7 index pages?
+3. When would you choose `jsonb_path_ops` over the default `jsonb_ops`?
+4. Why might `attrs->>'brand' = 'brand7'` not use a GIN index on `attrs`?
+5. Why are inserts slower with GIN indexes, and what does `fastupdate` change?
+6. Why did MySQL ignore the multi-valued index for `'clearance' MEMBER OF (tags)`?
+7. How does a MongoDB wildcard index compare with a PostgreSQL GIN index on jsonb?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-7-specialist-indexes/concept-1-gin/answers">Worked answers to Q1–Q7</DeepDive>

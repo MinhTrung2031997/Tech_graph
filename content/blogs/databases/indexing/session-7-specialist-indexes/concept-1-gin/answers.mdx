@@ -1,0 +1,70 @@
+---
+title: "Answers: GIN for jsonb, arrays and full-text"
+description: "Worked answers to the Session 7 Concept 1 check questions."
+companion: "answers"
+tags: ["indexing", "gin", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/gin.html"
+  - "https://www.postgresql.org/docs/current/datatype-json.html#JSON-INDEXING"
+---
+
+<Tldr>
+GIN indexes the pieces of a value; queries must ask about pieces with GIN's operators.
+</Tldr>
+
+## Q1. B-tree on an array
+
+**Question:** why can't a B-tree on `tags text[]` efficiently answer "rows containing 'gift'"?
+
+A B-tree sorts whole values: `{blue,gift,red}` sorts by its first elements, so arrays containing `gift` are spread all over the index. There is no contiguous stretch to seek to. A B-tree on an array helps only equality or ordering of the whole array.
+
+> **Common mistake:** expecting `= ANY(tags)` to use a B-tree on `tags`.
+
+## Q2. 7 index pages
+
+**Question:** how did GIN answer `tags @> '{clearance,gift}'` with 7 index pages?
+
+It looked up the entries for `clearance` and `gift`, read their posting lists (compressed lists of row addresses), and intersected them inside the index. Only rows in both lists (334) were fetched, from 22 heap pages.
+
+> **Common mistake:** "GIN scans the index for arrays that contain both". It never looks at whole arrays; it combines per-element lists.
+
+## Q3. jsonb_path_ops
+
+**Question:** when would you choose `jsonb_path_ops` over the default `jsonb_ops`?
+
+When queries are containment (`@>`) or jsonpath matches only: it hashes whole value paths, so it is smaller (800 kB vs 1.28 MB in the lab) and often faster. Keep `jsonb_ops` if you need key-existence operators (`?`, `?|`, `?&`), which `jsonb_path_ops` does not support.
+
+> **Common mistake:** creating both "just in case"; each costs writes.
+
+## Q4. ->> and GIN
+
+**Question:** why might `attrs->>'brand' = 'brand7'` not use a GIN index on `attrs`?
+
+`->>` extracts a text value and `=` compares it: a B-tree-style expression comparison, not one of GIN's jsonb operators. Rewrite as `attrs @> '{"brand": "brand7"}'`, or add a B-tree expression index on `(attrs->>'brand')`.
+
+> **Common mistake:** assuming any query touching a jsonb column can use its GIN index.
+
+## Q5. Insert cost
+
+**Question:** why are inserts slower with GIN indexes, and what does `fastupdate` change?
+
+Each row adds an entry per element (tag, path, word) to each GIN index, and updating posting lists is costlier than one B-tree insert. In the lab: 296 ms vs 169 ms for 50,000 rows with four GIN indexes. `fastupdate` (on by default) appends new entries to a pending list and merges them in bulk later, making inserts cheaper, at the cost of queries also scanning the pending list until the merge (VACUUM, or when it exceeds `gin_pending_list_limit`).
+
+> **Common mistake:** turning off `fastupdate` to "speed things up" without measuring both reads and writes.
+
+## Q6. MySQL ignored the index
+
+**Question:** why did MySQL ignore the multi-valued index for `'clearance' MEMBER OF (tags)`?
+
+The index is defined on the expression `CAST(tags->'$' AS CHAR(12) ARRAY)`. MySQL uses it only when the query's expression matches: `MEMBER OF (tags->'$')` gave `ref`, rows 500; `MEMBER OF (tags)` gave a full scan.
+
+> **Common mistake:** concluding multi-valued indexes do not work.
+
+## Q7. Wildcard vs GIN
+
+**Question:** how does a MongoDB wildcard index compare with a PostgreSQL GIN index on jsonb?
+
+Both index every path and value inside a document field, so any field can be queried without a dedicated index. The wildcard index is a B-tree of `(path, value)` entries: each query seeks on **one** path and filters others on the fetched documents. GIN `@>` with several pairs **intersects** their posting lists in the index. For multi-field filters GIN reads less; for single-field lookups both are similar.
+
+> **Common mistake:** "a wildcard index replaces compound indexes"; it serves one field per query.

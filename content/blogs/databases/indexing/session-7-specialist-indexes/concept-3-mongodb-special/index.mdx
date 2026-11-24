@@ -1,0 +1,249 @@
+---
+title: "Concept 3: MongoDB TTL, wildcard, text and hashed indexes"
+description: "Four MongoDB index types with special jobs: TTL indexes delete expired documents, wildcard indexes cover unknown fields, text indexes search words, hashed indexes spread shard keys. What each does, measured, and the PostgreSQL and MySQL way to get the same result."
+type: "concept"
+tags: ["indexing", "mongodb", "postgresql", "mysql", "ttl", "wildcard", "text-index", "hashed"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/index-ttl/"
+  - "https://www.mongodb.com/docs/manual/core/indexes/index-types/index-wildcard/"
+  - "https://www.mongodb.com/docs/manual/core/indexes/index-types/index-text/"
+  - "https://www.mongodb.com/docs/manual/core/indexes/index-types/index-hashed/"
+  - "https://www.postgresql.org/docs/current/ddl-partitioning.html"
+---
+
+<Tldr>
+MongoDB has index types that do more than speed up lookups. A **TTL index** makes a background thread delete documents once a date field is older than `expireAfterSeconds` (in the lab, an hour-old document vanished within ≈ 70 s; one whose field was not a date stayed forever). A **wildcard index** `attrs.$**` indexes every field under `attrs` (500 keys for `attrs.brand = 'brand7'`). A **text index** finds words (a two-word phrase search examined 45,000 keys and 40,000 documents to return 5,000). A **hashed index** serves equality (20 keys) but not ranges (COLLSCAN). PostgreSQL and MySQL reach the same goals with partitions and scheduled deletes, GIN / FULLTEXT, and hash partitioning.
+</Tldr>
+
+## The four types at a glance
+
+| Type | Created with | Does | Lab |
+|---|---|---|---|
+| TTL | `{ created_at: 1 }, { expireAfterSeconds: N }` | Deletes documents whose date is older than N seconds | Expired doc removed within ≈ 70 s; non-date field kept |
+| Wildcard | `{ "attrs.$**": 1 }` | Indexes every path and value under a field | 2.4 MB; 500 keys for one brand |
+| Text | `{ description: "text" }` | Stemmed words, `$text` search, relevance score | 6.1 MB; 45,000 keys / 40,000 docs / 5,000 returned for a phrase |
+| Hashed | `{ user_id: "hashed" }` | B-tree on hash(value); spreads shard keys | Equality 20 keys; range → COLLSCAN |
+
+| Term | Meaning |
+|---|---|
+| TTL monitor | Background thread that runs about every 60 s and deletes expired documents through the index |
+| `$text` | Query operator for text indexes; one text index per collection |
+| **✓ Index serves it / ✗ Not served** | Per index type below |
+
+<Flow
+  title="MongoDB: four special index types"
+  height={340}
+  nodes={[
+    { id: 'q', label: 'Operation', sub: '', x: 20, y: 20, w: 240 },
+    { id: 'idx', label: 'Index', sub: '', x: 320, y: 20, w: 220 },
+    { id: 'yes', label: '✓ Served', sub: '', x: 600, y: 20, w: 180 },
+    { id: 'no', label: '✗ Not served', sub: '', x: 600, y: 150, w: 180 },
+    { id: 'bg', label: 'TTL monitor', sub: 'every ≈ 60 s', x: 320, y: 150, w: 220 },
+    { id: 'out', label: 'Result', sub: '', x: 320, y: 270, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-idx', from: 'q', to: 'idx' },
+    { id: 'idx-yes', from: 'idx', to: 'yes' },
+    { id: 'idx-no', from: 'idx', to: 'no' },
+    { id: 'bg-idx', from: 'bg', to: 'idx', label: 'scan' },
+    { id: 'bg-out', from: 'bg', to: 'out' },
+  ]}
+  cases={[
+    {
+      title: 'TTL',
+      path: 'TTL monitor scans { created_at } for dates older than 5 s → ✓ deletes them; non-date values ✗ never expire',
+      summary: 'Measured: 3 documents → 1 after ≈ 70 s (the one with created_at: "not a date").',
+      subs: { q: 'insert 3 documents', idx: '{ created_at: 1 }, TTL 5 s', out: '1 document left' },
+      steps: [
+        {
+          title: 'A TTL index on a date field',
+          note: 'expireAfterSeconds: 5 means "delete when created_at is more than 5 s in the past". Three documents: one now, one an hour old, one with a string instead of a date.',
+          code: 'db.ttl.createIndex({ created_at: 1 }, { expireAfterSeconds: 5 })\ndb.ttl.insertMany([{ created_at: new Date() }, { created_at: new Date(Date.now() - 3600e3) }, { created_at: "not a date" }])',
+          active: ['q', 'idx'],
+          edges: ['q-idx'],
+        },
+        {
+          title: 'The monitor deletes through the index',
+          note: 'About every 60 s, the TTL monitor walks the index from the oldest date up to now − 5 s and deletes those documents. After ≈ 70 s only one document was left.',
+          active: ['bg', 'idx', 'yes'],
+          edges: ['bg-idx', 'idx-yes'],
+        },
+        {
+          title: '✗ Non-date values never expire',
+          note: 'The document with created_at: "not a date" is still there: TTL only acts on date values (or arrays of dates). Deletion is not instant either: expect up to a minute or more of delay under load.',
+          active: ['idx', 'no', 'bg', 'out'],
+          edges: ['idx-no', 'bg-out'],
+        },
+      ],
+    },
+    {
+      title: 'Wildcard',
+      path: "{ 'attrs.brand': 'brand7' } → attrs.$** ✓ 500 keys, 500 documents",
+      summary: 'Useful when attribute names are not known in advance.',
+      subs: { q: "attrs.brand = 'brand7'", idx: 'attrs.$**', yes: '500 keys' },
+      steps: [
+        {
+          title: '✓ Any field under attrs',
+          note: 'The wildcard index stores (path, value) for every field in attrs. A query on one field seeks on that path: FETCH ← IXSCAN(attrs_wild), 500 keys, 500 documents. It cannot serve sorts on several fields or compound conditions as one range.',
+          code: 'db.items.createIndex({ "attrs.$**": 1 })\ndb.items.find({ "attrs.brand": "brand7" })',
+          active: ['q', 'idx', 'yes'],
+          edges: ['q-idx', 'idx-yes'],
+        },
+      ],
+    },
+    {
+      title: 'Text',
+      path: '$text "waterproof" "travel" → OR of word scans (45,000 keys) → FETCH 40,000 → TEXT_MATCH → 5,000',
+      summary: 'Words are found through the index; phrases are verified on the documents.',
+      subs: { q: '$text: "waterproof" "travel"', idx: 'description text', yes: '5,000 returned' },
+      steps: [
+        {
+          title: 'Scan each word',
+          note: 'The text index holds stemmed words. The plan is TEXT_MATCH ← FETCH ← OR ← IXSCAN: one index scan per term, merged (45,000 keys).',
+          code: 'db.items.createIndex({ description: "text" })\ndb.items.find({ $text: { $search: "\\"waterproof\\" \\"travel\\"" } })',
+          active: ['q', 'idx'],
+          edges: ['q-idx'],
+        },
+        {
+          title: 'Verify on the documents',
+          note: '40,000 documents fetched; TEXT_MATCH keeps those containing both phrases: 5,000. Unlike PostgreSQL\'s GIN, the terms are OR-ed in the index and checked afterwards, so multi-term searches can fetch far more than they return.',
+          active: ['idx', 'yes'],
+          edges: ['idx-yes'],
+        },
+      ],
+    },
+    {
+      title: 'Hashed',
+      path: 'user_id = 42 ✓ 20 keys; user_id > 4990 ✗ COLLSCAN',
+      summary: 'Hashing destroys order: equality only.',
+      subs: { q: 'user_id = 42 / > 4990', idx: '{ user_id: "hashed" }' },
+      steps: [
+        {
+          title: '✓ Equality',
+          note: 'hash(42) is looked up in the B-tree of hashes: 20 keys, 20 documents. Its main job is sharding: a hashed shard key spreads monotonically increasing values evenly across shards.',
+          code: 'db.items.createIndex({ user_id: "hashed" })\ndb.items.find({ user_id: 42 })',
+          active: ['q', 'idx', 'yes'],
+          edges: ['q-idx', 'idx-yes'],
+        },
+        {
+          title: '✗ Range',
+          note: 'user_id > 4990: neighbouring values have unrelated hashes, so the index cannot help: COLLSCAN of 100,000 documents for 180 results (Session 2, Concept 1).',
+          code: 'db.items.find({ user_id: { $gt: 4990 } })',
+          active: ['idx', 'no'],
+          edges: ['idx-no'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## The same goals in PostgreSQL and MySQL
+
+| Goal | MongoDB | PostgreSQL | MySQL |
+|---|---|---|---|
+| Expire old data | TTL index | Time partitions + `DROP` (or a scheduled `DELETE` with a B-tree on the date) | Time partitions + `DROP PARTITION`, or an event / cron `DELETE` |
+| Index unknown fields | Wildcard | GIN on jsonb (Concept 1) | Functional or multi-valued indexes per path |
+| Search words | Text index | GIN on tsvector | FULLTEXT |
+| Spread keys across nodes | Hashed shard key | Hash partitioning (`PARTITION BY HASH`); Citus for distribution | `PARTITION BY HASH` / KEY |
+
+<Flow
+  title="PostgreSQL: expiring data without TTL"
+  height={260}
+  nodes={[
+    { id: 'job', label: 'Daily job', sub: 'cron / pg_cron', x: 20, y: 20, w: 240 },
+    { id: 'drop', label: '✓ DROP old partition', sub: 'instant, no bloat', x: 320, y: 20, w: 220 },
+    { id: 'del', label: 'DELETE old rows', sub: 'dead tuples, VACUUM', x: 320, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'job-drop', from: 'job', to: 'drop' },
+    { id: 'job-del', from: 'job', to: 'del', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Partition drop vs DELETE',
+      path: 'time-partitioned table → ✓ DROP the expired partition; unpartitioned → DELETE + VACUUM',
+      summary: 'Dropping a partition removes its files at once (Session 1, Concept 3: deletes do not shrink a table).',
+      steps: [
+        {
+          title: 'Drop, do not delete',
+          note: 'With PARTITION BY RANGE (created_at), expiring a month is DROP TABLE events_2025_01: no dead tuples, no index bloat. A DELETE of the same rows leaves dead tuples and index entries for VACUUM.',
+          code: 'CREATE TABLE events (…, created_at timestamptz NOT NULL) PARTITION BY RANGE (created_at);\nDROP TABLE events_2025_01;',
+          active: ['job', 'drop', 'del'],
+          edges: ['job-drop', 'job-del'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Flow
+  title="MySQL: expiring data without TTL"
+  height={260}
+  nodes={[
+    { id: 'job', label: 'Event scheduler', sub: 'or cron', x: 20, y: 20, w: 240 },
+    { id: 'drop', label: '✓ DROP PARTITION', sub: 'instant', x: 320, y: 20, w: 220 },
+    { id: 'del', label: 'DELETE in batches', sub: 'purge, fragmentation', x: 320, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'job-drop', from: 'job', to: 'drop' },
+    { id: 'job-del', from: 'job', to: 'del', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Partition drop vs DELETE',
+      path: 'range-partitioned table → ✓ ALTER TABLE … DROP PARTITION',
+      summary: 'Same principle as PostgreSQL.',
+      steps: [
+        {
+          title: 'Drop the old partition',
+          note: 'ALTER TABLE events DROP PARTITION p2025_01 removes a month in milliseconds. Large DELETEs instead generate undo, purge work and fragmented pages; if unavoidable, delete in small batches by primary key.',
+          code: 'ALTER TABLE events DROP PARTITION p2025_01;',
+          active: ['job', 'drop', 'del'],
+          edges: ['job-drop', 'job-del'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+A TTL index deletes documents one by one, as ordinary deletes, and the monitor runs only about once a minute. Expiring millions of documents a day creates heavy delete load, replication traffic and cache churn. For high-volume expiry, prefer time-bucketed collections you drop whole, or time-series collections with `expireAfterSeconds`, which drop whole buckets.
+</Pitfall>
+
+## Real-world scenario: session storage
+
+User sessions are stored with `lastSeen`, and should disappear after 30 days of inactivity.
+
+| Engine | Approach |
+|---|---|
+| MongoDB | TTL index on `lastSeen` with `expireAfterSeconds: 2592000`; update `lastSeen` on activity to postpone expiry |
+| PostgreSQL | B-tree on `last_seen`; a nightly `DELETE … WHERE last_seen < now() - interval '30 days'` in batches; or a cache like Redis with native TTL |
+| MySQL | Same as PostgreSQL, scheduled by the event scheduler |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 4: trigram | Substring search beyond words |
+| Session 8: write amplification | TTL deletes and wildcard entries are write work too |
+
+## Key takeaways
+
+1. TTL indexes let MongoDB delete expired documents in the background (about every 60 s), only for date values.
+2. Wildcard indexes index every path under a field; each query uses one path.
+3. Text indexes find stemmed words; multi-term queries scan each term and verify on the documents.
+4. Hashed indexes serve equality and even shard distribution, never ranges.
+5. PostgreSQL and MySQL reach the same goals with partition drops, GIN / FULLTEXT and hash partitioning.
+
+## Check questions
+
+1. How does a TTL index decide what to delete, and why did one document never expire in the lab?
+2. Why is deletion through a TTL index not instant, and what problem appears with very high expiry volumes?
+3. When is a wildcard index the right choice, and what can it not do?
+4. Why did the text search examine 40,000 documents to return 5,000?
+5. Why can a hashed index serve `user_id = 42` but not `user_id > 4990`?
+6. How would you implement "delete events older than 90 days" in PostgreSQL without TTL, and why is dropping partitions better than DELETE?
+7. Which PostgreSQL feature corresponds to each of MongoDB's wildcard and text indexes?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-7-specialist-indexes/concept-3-mongodb-special/answers">Worked answers to Q1–Q7</DeepDive>
