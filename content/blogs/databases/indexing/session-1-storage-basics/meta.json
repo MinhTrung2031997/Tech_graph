@@ -5,10 +5,8 @@
   "pages": [
     "concept-1-pages/index",
     "concept-2-heap-vs-clustered/index",
-    "concept-3-seq-scan/index"
-  ],
-  "planned": [
-    "Concept 4: Sequential vs random I/O",
-    "Lab and session quiz"
+    "concept-3-seq-scan/index",
+    "concept-4-sequential-vs-random-io/index",
+    "lab/index"
   ]
 }

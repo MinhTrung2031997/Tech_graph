@@ -1,0 +1,102 @@
+---
+title: "Answers: Storage basics session quiz"
+description: "Worked answers to the Session 1 quiz, checked against the lab databases."
+companion: "answers"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html"
+  - "https://www.postgresql.org/docs/current/storage-hot.html"
+---
+
+<Tldr>
+Every answer here was checked on the lab databases. The recurring ideas: a row's address follows from rows per page; a scan's cost follows from pages and their order; and space is only given back when pages at the end of a file become empty or the table is rewritten.
+</Tldr>
+
+## Q1. The ctid of id 250
+
+**Question:** the lab table has 10,102 pages and 99 rows per page. Without running anything, what is the ctid of the row with `id = 250`?
+
+Rows were inserted in id order, 99 per page, pages numbered from 0 and slots from 1.
+
+| Step | Calculation |
+|---|---|
+| Page | (250 − 1) / 99 = 2.5 → page **2** (it holds ids 199–297) |
+| Slot | 250 − 198 = **52** |
+| ctid | **(2,52)**, confirmed by `SELECT ctid FROM orders WHERE id = 250` |
+
+> **Common mistake:** numbering slots from 0, giving (2,51). Line pointers start at 1.
+
+## Q2. The 32 hits
+
+**Question:** Exercise 2's run 2 showed `hit=32 read=10070`. Where did the 32 hits come from, and what would run 2 show with `shared_buffers = 1GB`?
+
+The table is larger than ¼ of `shared_buffers` (79 MB > 32 MB), so run 1 used a 32-slot ring and overwrote it again and again. When run 1 ended, the ring still held the **last 32 pages**; run 2 found exactly those. With 1 GB, ¼ is 256 MB, the ring rule does not apply, all 10,102 pages stay cached and run 2 shows `hit=10102`.
+
+> **Common mistake:** "32 random pages stayed cached". They are the last 32 the scan read, because the ring is reused in order.
+
+## Q3. Why page 10,101 and not a new page
+
+**Question:** in Exercise 3, why did the first update move the row to page 10,101 rather than to a brand-new page 10,102?
+
+Page 0 had 36 bytes free, too little for the new version, so the update could not be HOT. Postgres then looked for **any page with room**, using the free space map. Page 10,101 held a single row (id 1,000,000) and was almost empty, so the new version went there as (10101,2). A new page is added only when no existing page has room.
+
+> **Common mistake:** "a non-HOT update always creates a new page". It goes to any page with room; extending the file is the last resort.
+
+## Q4. The same lookup in PostgreSQL
+
+**Question:** in Exercise 4, `WHERE id = 42` needed 3 page requests. How many would the same lookup need in PostgreSQL with a B-tree on `id` of the same height, and why the difference?
+
+**4: 3 index pages + 1 heap page.** In InnoDB the leaf of the primary-key tree *is* the row, so the descent ends with the data. In PostgreSQL the index leaf holds `42 → ctid`, and the row is on a separate heap page (Concept 2).
+
+> **Common mistake:** "the same, 3". That would only hold for an index-only scan, where every needed column is in the index (Session 5).
+
+## Q5. Which row matched after 20 rows
+
+**Question:** Exercise 5's `LIMIT 1` query found its match after 20 rows. Which row was it, and why that one?
+
+**id 20.** The seed marks `g % 20 = 0` as `shipped`, so ids 20, 40, 60 … are shipped. The Seq Scan reads page 0 in slot order: ids 1–19 fail the filter (`Rows Removed by Filter: 19`), id 20 matches, and the `LIMIT` stops the scan after 1 page.
+
+> **Common mistake:** "the first row on the page with the lowest status". A Seq Scan returns rows in physical order; without `ORDER BY` there is no other order.
+
+## Q6. Deleting the newest rows instead
+
+**Question:** after Exercise 6's `DELETE` and `VACUUM`, how many pages would the copy have used if the deleted rows had been the **newest** 900,000 (`id > 100000`) instead? Why?
+
+**About 1,011 pages.** The remaining ids 1–100,000 sit on the first ≈ 1,011 pages, and everything after them is empty. VACUUM can **truncate empty pages at the end** of the file:
+
+```text
+INFO:  table "orders_copy": truncated 10112 to 1011 pages
+```
+
+| Rows deleted | Where the empty pages are | Pages after VACUUM |
+|---|---|---|
+| Oldest 900,000 (Exercise 6) | Front of the file | 10,101: nothing to truncate |
+| Newest 900,000 | End of the file | 1,011 |
+
+Truncation needs a short exclusive lock and gives up if another session is waiting for the table, so it can be partial (one lab run stopped at 1,165 pages); the next VACUUM continues it.
+
+> **Common mistake:** "the same as Exercise 6, VACUUM never shrinks files". It does, but only from the end.
+
+## Q7. The same plans on a cloud disk
+
+**Question:** using Exercise 7's numbers, estimate how long the Index Scan's heap reads would take on a cloud disk at 1 ms per random read, and the Seq Scan's reads at 125 MB/s.
+
+| Plan | Calculation | Estimate |
+|---|---|---|
+| Index Scan | 6,387 random reads × 1 ms | ≈ **6.4 s** |
+| Seq Scan | 10,102 pages × 8 KB = 79 MB; 79 / 125 MB/s | ≈ **0.63 s** |
+
+On the laptop the Index Scan lost by 25%; on a cloud disk it loses by 10×. The planner's `random_page_cost = 4.0` is closer to the cloud ratio than to the laptop's.
+
+> **Common mistake:** applying 1 ms to the Seq Scan's pages too. Sequential pages arrive many per request; throughput, not per-request latency, limits them.
+
+## Q8. Why the COLLSCAN was slower
+
+**Question:** in Exercise 9, the IXSCAN read more pages into cache than the COLLSCAN but was 3× faster. What did the COLLSCAN spend its time on?
+
+**CPU.** It examined 1,000,000 documents, decompressing every page and matching each document against the filter; the IXSCAN examined 10,000. Its page reads were sequential and cheap on local NVMe, so the per-document work dominated: 197 ms vs 68 ms.
+
+On a slow disk the picture flips: 3,279 random page reads would cost seconds, the COLLSCAN's sequential reads far less.
+
+> **Common mistake:** "the IXSCAN read fewer pages". It read more; it examined far fewer documents.
