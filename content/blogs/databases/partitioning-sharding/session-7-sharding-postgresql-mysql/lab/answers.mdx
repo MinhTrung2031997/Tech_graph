@@ -1,0 +1,83 @@
+---
+title: "Answers: Sharding PostgreSQL and MySQL session quiz"
+description: "Worked answers to the Session 7 quiz, with the lab's measured values."
+companion: "answers"
+tags: ["sharding", "citus", "mysql", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://docs.citusdata.com/en/stable/develop/reference_processing.html"
+  - "https://docs.citusdata.com/en/stable/sharding/data_modeling.html"
+  - "https://docs.citusdata.com/en/stable/develop/api_udf.html#isolate-tenant-to-new-shard"
+---
+
+<Tldr>
+Citus and application-level sharding solve the same problems; the difference is who writes the routing, the merges and the resharding: the database, or you.
+</Tldr>
+
+## Q1. The primary key
+
+**Question:** why must the primary key of `orders_d` include `seller_id`, and what does `PRIMARY KEY (seller_id, id)` no longer guarantee?
+
+Uniqueness is enforced by an index inside each shard, and only rows with the same `seller_id` are guaranteed to be in the same shard. A key that contains `seller_id` can be checked locally; `PRIMARY KEY (id)` cannot, so Citus refused it ("Distributed relations cannot have UNIQUE, EXCLUDE, or PRIMARY KEY constraints that do not include the partition column"). `PRIMARY KEY (seller_id, id)` guarantees only that the pair is unique: two sellers could hold orders with the same `id`. Keeping `id` globally unique is left to how ids are generated (Session 8).
+
+> **Common mistake:** relying on the primary key to catch a duplicate order id coming from a retried import.
+
+## Q2. Tasks
+
+**Question:** a lookup by `id` on `orders_d` took 1.96 ms against 0.54 ms when `seller_id` was added. Explain the difference in terms of tasks.
+
+Without `seller_id` the coordinator cannot tell which shard holds the order, so it creates one task per shard: 32 index lookups on two workers, 31 of which return nothing, plus 32 results to collect. With `seller_id = 145` it hashes the value, finds the one shard (102010 on `pt-citus-w1`) and sends one task: a router query. The work inside each task is the same small index lookup; the difference is the number of tasks and their overhead.
+
+> **Common mistake:** expecting more workers to speed up the id lookup. It adds tasks, not useful work.
+
+## Q3. Colocated but repartitioned
+
+**Question:** why did joining `orders_d` and `items_s` on the order id alone need a repartition join, although both tables are colocated?
+
+Colocation guarantees that rows with the same **distribution column value** are in the same shard group. The planner decides whether a join is shard-local from the join condition: `i.order_id = o.id` does not mention `seller_id`, so it cannot prove that an order's items are in the same shard group, even though in this data they always are. It refused the query ("the query contains a join that requires repartitioning"). Adding `i.seller_id = o.seller_id` made it a colocated join: 192 ms vs about 10 s for the repartition join on `items_o`.
+
+> **Common mistake:** switching on `citus.enable_repartition_joins` instead of adding the distribution column to the join.
+
+## Q4. Reference tables
+
+**Question:** when is a reference table the right choice for a small table, and what does each write to it cost?
+
+When the table is small, joined from many shards or many distributed tables on columns other than their distribution column, and written rarely: marketplaces, countries, FX rates, categories. Every node holds a copy, so every join to it is local (41 ms in the lab, like the colocated 38 ms). Each write changes every copy in one distributed transaction with two-phase commit: 5.9 ms for a single-row UPDATE against 1.7 ms on a distributed table and 1.2 ms on a local one, and the cost grows with the number of nodes.
+
+> **Common mistake:** making a frequently updated table such as stock levels a reference table because it is small.
+
+## Q5. Which queries ship every row
+
+**Question:** which of these queries send every row to the coordinator: GMV per marketplace, top 10 sellers, median order amount, page 10,001 with OFFSET? What would you change for each one that does?
+
+- GMV per marketplace: no. Partial counts and sums, 96 rows.
+- Top 10 sellers: no. Grouped by the distribution column, per-shard top 10, 320 rows.
+- Median order amount: yes. `percentile_cont` shipped 1,000,000 values (7.8 MB). Pre-aggregate (for example a histogram per day), or use an approximate percentile.
+- Page 10,001 with OFFSET: yes. Each shard sent up to 100,010 rows, here all 1,000,000 (15 MB, 906 ms). Use keyset pagination: 320 rows, 4.6 ms, same page.
+
+> **Common mistake:** judging a multi-shard query by its result size. The 10-row OFFSET page moved the whole table.
+
+## Q6. Per-shard top 10
+
+**Question:** in the application-sharded MySQL setup, why was the per-shard top 10 correct for sellers and wrong for days?
+
+A seller's orders are all on one shard (the shard key is `seller_id`), so each shard's per-seller totals are final and the global top 10 is among the 20 candidates. A day's orders are spread over both shards, so each shard's per-day totals are partial; a top 10 built from partial top 10s misses days and undercounts the ones it finds. The lab's naive merge got 3 of the 10 days and none of the totals right; returning every day from each shard (730 rows) and adding them gave the exact answer.
+
+> **Common mistake:** writing one generic "merge top N" helper and using it for every grouping.
+
+## Q7. Avoiding the modulo move
+
+**Question:** going from 2 to 4 shards with `seller_id % N` moves half the data. What two designs avoid that, and what does each cost?
+
+- **A directory table** mapping each seller to a shard: you move only the sellers you choose, one at a time, with a short write freeze per seller (34 ms for 247 rows in the lab). Cost: a lookup on every request (0.29 ms, so in practice a cache), and the directory becomes a critical component.
+- **Many fixed logical shards** mapped to fewer servers (`seller_id % 64` → a server map), the approach Citus takes with 32 hash ranges and Vitess with keyspace ID ranges: growth moves whole logical shards to new servers without rehashing any row. Cost: more databases or schemas to manage, and the logical shard count limits how far you can spread.
+
+> **Common mistake:** starting with `% 2` for two servers because "we can change it later".
+
+## Q8. Splitting out one seller
+
+**Question:** what did `isolate_tenant_to_new_shard` with `block_writes` do to seller 1673's writes, and what would make the split non-blocking?
+
+It blocked writes to the whole shard that held seller 1673 (shard 102075, about a quarter of `orders_d4`) while copying it into three new shards: 2.2 s in total, and an INSERT for seller 1673 issued during the split waited 1.7 s. Other shards were unaffected. The default transfer mode copies with logical replication while writes continue and blocks only for a short switch-over, but it needs `wal_level = logical` on the workers; the lab workers run `replica`, so the default call failed. Setting `wal_level = logical` requires a restart, so it belongs in the cluster's initial configuration.
+
+> **Common mistake:** discovering the `wal_level` requirement during the first production rebalance.

@@ -1,0 +1,217 @@
+---
+title: "Concept 2: Colocation and reference tables"
+description: "Joins in Citus stay on the workers only when matching rows are guaranteed to be in the same place. Orders joined to items on seller_id and order id (colocated) took 192 ms; the same join on order id only, against items distributed by order id, was refused until citus.enable_repartition_joins was switched on, then took about 10 s. A 5,000-row sellers table as a reference table (a copy on every node) joined in 41 ms; left as a local table on the coordinator it was shipped to every task (70 ms). Each write to the reference table cost 5.9 ms against 1.7 ms."
+type: "concept"
+tags: ["sharding", "citus", "joins", "colocation", "reference-tables"]
+status: "draft"
+sources:
+  - "https://docs.citusdata.com/en/stable/sharding/data_modeling.html"
+  - "https://docs.citusdata.com/en/stable/develop/reference_ddl.html#reference-tables"
+  - "https://docs.citusdata.com/en/stable/develop/reference_sql.html#joins"
+  - "https://docs.citusdata.com/en/stable/develop/api_guc.html#citus-enable-repartition-joins-boolean"
+---
+
+<Tldr>
+A join can run inside each shard only if **every pair of matching rows lives in the same shard group**. Two tables distributed on the same column type with the same shard count are **colocated**: hash range N of both tables sits on the same worker. Joining `orders_d` and `items_s` (both by `seller_id`) **on `seller_id` and the order id** ran as 32 local joins: **192 ms** for December 2025. The same join **on the order id alone**, or against `items_o` distributed by `order_id`, needs rows moved between workers: Citus refused it ("the query contains a join that requires repartitioning") and, with `citus.enable_repartition_joins = on`, took about **10 s**: 50 times slower. Small shared tables go in a **reference table**, copied to every node: the sellers join took **41 ms**, close to the colocated `sellers_dist` (38 ms), while a plain local table on the coordinator had to be shipped to all 32 tasks (70 ms). The price of a reference table is on writes: **5.9 ms** per single-row UPDATE against **1.7 ms** on a distributed table.
+</Tldr>
+
+## The tables
+
+All in database `pt7`, next to `orders_d` (1M orders, 32 shards by `seller_id`, Concept 1):
+
+| Table | Rows | How it is stored |
+|---|---|---|
+| `items_s` | 2,000,000 (2 per order) | distributed by `seller_id`, `colocate_with => 'orders_d'` |
+| `items_o` | 2,000,000 (same rows) | distributed by `order_id`, `colocate_with => 'none'` |
+| `sellers_ref` | 5,000 | reference table: one full copy on the coordinator and on each worker |
+| `sellers_dist` | 5,000 | distributed by `seller_id`, colocated with `orders_d` |
+| `sellers_local` | 5,000 | plain table on the coordinator only |
+
+`citus_tables` showed `orders_d`, `items_s` and `sellers_dist` with the same `colocation_id` (2), `items_o` with its own (5), and `sellers_ref` as `reference` with one shard placed on all three nodes.
+
+| Term | Meaning |
+|---|---|
+| Colocation group | Tables with the same distribution column type and shard count whose shard N always sits on the same worker |
+| Colocated join | A join on the distribution columns of colocated tables: Citus runs it as one join per shard pair, on the worker |
+| Repartition join | A join on another column: workers re-hash both sides by the join key and send rows to each other (MapMergeJob) |
+| Reference table | A small table copied in full to every node, so any shard can join to it locally |
+| Local table join | A join with a plain coordinator table: Citus first ships the needed local rows to the workers (a "distributed subplan") |
+| **✓ / ✗** | Runs on the worker without moving rows / needs rows moved or is refused |
+
+## Joining orders to items
+
+<Flow
+  title="Citus: orders_d join items, December 2025"
+  height={400}
+  nodes={[
+    { id: 'coord', label: 'Coordinator', sub: 'plans, merges', x: 300, y: 20, w: 200 },
+    { id: 'w1', label: 'w1: shard group 102008', sub: 'orders_d + items_s', x: 20, y: 180, w: 240 },
+    { id: 'w2', label: 'w2: shard group 102009', sub: 'orders_d + items_s', x: 540, y: 180, w: 240 },
+    { id: 'rep', label: 'Repartition', sub: 're-hash by order_id', x: 280, y: 320, w: 240 },
+  ]}
+  edges={[
+    { id: 'coord-w1', from: 'coord', to: 'w1' },
+    { id: 'coord-w2', from: 'coord', to: 'w2' },
+    { id: 'w1-rep', from: 'w1', to: 'rep' },
+    { id: 'w2-rep', from: 'w2', to: 'rep' },
+  ]}
+  cases={[
+    {
+      title: 'ON seller_id AND order id (colocated)',
+      path: 'coordinator ✓ → 32 tasks → each worker joins its own shard pair ✓ → repartition ✗ not needed',
+      summary: 'Every item is in the same shard group as its order, because both are placed by seller_id. 192 ms.',
+      steps: [
+        {
+          title: 'One join per shard pair',
+          note: 'EXPLAIN: Task Count: 32; each task is a Hash Join of items_s_102109 with orders_d_102008 on (seller_id, order_id), using the created_at index on the orders shard. No row leaves its worker except the 32 partial aggregates.',
+          code: "SELECT count(*), sum(i.qty)\nFROM orders_d o JOIN items_s i ON i.seller_id = o.seller_id AND i.order_id = o.id\nWHERE o.created_at >= '2025-12-01';   -- 84814 item rows",
+          active: ['coord', 'w1', 'w2'],
+          edges: ['coord-w1', 'coord-w2'],
+          subs: { w1: '✓ local join', w2: '✓ local join' },
+        },
+      ],
+    },
+    {
+      title: 'ON order id only',
+      path: 'coordinator → ✗ refused by default → with enable_repartition_joins: map 32 tasks → move rows → merge 12 tasks (about 10 s)',
+      summary: 'The planner cannot prove matching rows are colocated, even for items_s, which is.',
+      steps: [
+        {
+          title: 'Refused',
+          note: 'Both items_o (distributed by order_id) and items_s joined without seller_id fail the same way. Citus does not use the knowledge that order ids never repeat across sellers: the join key is not the distribution column.',
+          code: "SELECT count(*), sum(i.qty) FROM orders_d o JOIN items_o i ON i.order_id = o.id\nWHERE o.created_at >= '2025-12-01';\n-- ERROR:  the query contains a join that requires repartitioning\n-- HINT:  Set citus.enable_repartition_joins to on to enable repartitioning",
+          active: ['coord'],
+          subs: { coord: '✗ refused' },
+        },
+        {
+          title: 'Repartition join',
+          note: 'EXPLAIN: two MapMergeJobs, Map Task Count: 32, Merge Task Count: 12. Each worker re-hashes its rows by order_id into intermediate files and fetches the buckets it is responsible for from the other worker. Same 84,814 rows; 8.7 s, 10.0 s and 11.9 s in three runs.',
+          code: 'SET citus.enable_repartition_joins = on;',
+          active: ['coord', 'w1', 'w2', 'rep'],
+          edges: ['coord-w1', 'coord-w2', 'w1-rep', 'w2-rep'],
+          subs: { w1: '✗ rows leave', w2: '✗ rows leave', rep: '12 merge tasks' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Joining orders to sellers
+
+GMV per seller country for December 2025 (5 countries, 42,407 orders):
+
+<Flow
+  title="Citus: orders_d join a 5,000-row sellers table"
+  height={290}
+  nodes={[
+    { id: 'coord', label: 'Coordinator', sub: 'pt-citus', x: 300, y: 20, w: 200 },
+    { id: 'local', label: 'sellers_local', sub: 'coordinator only', x: 580, y: 20, w: 200 },
+    { id: 'w1', label: 'Worker pt-citus-w1', sub: '16 orders_d shards', x: 60, y: 200, w: 260 },
+    { id: 'w2', label: 'Worker pt-citus-w2', sub: '16 orders_d shards', x: 480, y: 200, w: 260 },
+  ]}
+  edges={[
+    { id: 'coord-local', from: 'coord', to: 'local' },
+    { id: 'coord-w1', from: 'coord', to: 'w1' },
+    { id: 'coord-w2', from: 'coord', to: 'w2' },
+  ]}
+  cases={[
+    {
+      title: 'Reference table sellers_ref',
+      path: 'coordinator ✓ → 32 tasks → each joins its orders shard to the local sellers_ref copy ✓',
+      summary: 'Any shard can join to a table that exists on its own worker. 41 ms.',
+      steps: [
+        {
+          title: 'Join on the worker',
+          note: 'create_reference_table placed one shard of sellers_ref on pt-citus, pt-citus-w1 and pt-citus-w2. Each of the 32 tasks joins its orders_d shard to the copy on the same worker. Colocated sellers_dist does the same in 38 ms.',
+          code: "SELECT s.country, count(*), sum(o.amount)\nFROM orders_d o JOIN sellers_ref s USING (seller_id)\nWHERE o.created_at >= '2025-12-01' GROUP BY 1;",
+          active: ['coord', 'w1', 'w2'],
+          edges: ['coord-w1', 'coord-w2'],
+          subs: { w1: '✓ + sellers_ref copy', w2: '✓ + sellers_ref copy' },
+        },
+        {
+          title: 'The cost: every write goes everywhere',
+          note: 'UPDATE of one seller row: 5.9 ms on sellers_ref (written to 3 placements in one distributed transaction) against 1.7 ms on sellers_dist (one shard) and 1.2 ms on sellers_local.',
+          code: 'UPDATE sellers_ref SET name = name WHERE seller_id = 1673;',
+          active: ['coord', 'w1', 'w2'],
+          edges: ['coord-w1', 'coord-w2'],
+          subs: { coord: '✓ copy 1 of 3', w1: '✓ copy 2 of 3', w2: '✓ copy 3 of 3' },
+        },
+      ],
+    },
+    {
+      title: 'Plain local table sellers_local',
+      path: 'coordinator: read sellers_local ✓ → ship 5,000 rows to every task ✗ → 32 joins',
+      summary: 'Allowed, but the local table travels with every query. 70 ms.',
+      steps: [
+        {
+          title: 'Distributed subplan',
+          note: 'EXPLAIN: Distributed Subplan 3_1: Seq Scan on sellers_local; each task then joins its shard to read_intermediate_result(...). The coordinator ships the whole table for every query (citus.local_table_join_policy = auto).',
+          code: "SELECT s.country, count(*), sum(o.amount)\nFROM orders_d o JOIN sellers_local s USING (seller_id)\nWHERE o.created_at >= '2025-12-01' GROUP BY 1;",
+          active: ['coord', 'local', 'w1', 'w2'],
+          edges: ['coord-local', 'coord-w1', 'coord-w2'],
+          subs: { local: '✓ read in full', w1: '✗ receives 5,000 rows', w2: '✗ receives 5,000 rows' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Measured
+
+pgbench, one connection, three repetitions, middle value. Ratios only (see Concept 1 for why).
+
+| Join | How the second table is stored | Latency | Rows moved between nodes |
+|---|---|---|---|
+| orders + items, on seller and order id | colocated (`items_s`) | 192 ms | none, 32 partial results |
+| orders + items, on order id only | `items_o` by `order_id` (repartition on) | 10.0 s | both tables re-hashed |
+| orders + sellers by country | reference (`sellers_ref`) | 41 ms | none |
+| orders + sellers by country | colocated (`sellers_dist`) | 38 ms | none |
+| orders + sellers by country | local on coordinator (`sellers_local`) | 70 ms | 5,000 rows to every task |
+| same, no Citus (`orders` + `sellers_local`) | plain tables, coordinator | 17 ms | none |
+
+| Single-row UPDATE | Latency |
+|---|---|
+| `sellers_ref` (3 copies) | 5.9 ms |
+| `sellers_dist` (1 shard) | 1.7 ms |
+| `sellers_local` | 1.2 ms |
+
+<Pitfall>
+Distributing `order_items` by its own key (`order_id`) looks natural and is wrong for this schema: every join with `orders` becomes a repartition join, refused by default and 50 times slower when allowed. Put the parent's distribution column into the child table (`order_items.seller_id`), distribute both by it, `colocate_with` the parent, and **include it in the join condition**. Note that `items_s` joined on the order id alone was still refused: Citus checks the join condition, not your data.
+</Pitfall>
+
+## Real-world scenario: the e-commerce schema in Citus
+
+| Table | Choice | Reason |
+|---|---|---|
+| `orders`, `order_items`, `payments`, `returns` | distributed by `seller_id`, colocated | Seller dashboards are router queries; joins between them stay on one shard |
+| `sellers` | distributed by `seller_id` (colocated) or reference | Joined to everything by `seller_id`; either works, colocated is cheaper to write |
+| `marketplaces`, `countries`, `fx_rates`, `categories` | reference | Small, joined from every shard, rarely written |
+| `products` shared across sellers (brand catalogue) | reference if small; otherwise its own distribution with care | A catalogue joined on `sku` from every seller is a repartition join if distributed by `sku` |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Indexing Session 9, Concept 1](/blogs/databases/indexing/session-9-indexes-for-joins/concept-1-join-algorithms) | The join algorithms that each task runs on its worker |
+| Concept 1 | Why a query that fixes `seller_id` touches one shard |
+| Concept 3 | Aggregates over many shards |
+| Concept 4 | Without Citus, the application has to do these joins and merges itself |
+
+## Key takeaways
+
+1. Tables distributed on the same column type with the same shard count can be colocated: shard N of each sits on the same worker.
+2. A join stays on the workers only if its condition includes the distribution columns of colocated tables.
+3. Anything else needs a repartition join: refused by default, about 50 times slower here when allowed.
+4. Small tables joined from every shard belong in reference tables: fast joins, slower writes (one copy per node).
+5. Joining a plain coordinator table works but ships it to the workers on every query.
+
+## Check questions
+
+1. What makes `items_s` colocated with `orders_d`, and what does that guarantee?
+2. `items_s` is colocated with `orders_d`, yet the join on `i.order_id = o.id` alone was refused. Why?
+3. What does a repartition join do, and why was it 50 times slower here?
+4. Why was the reference-table join about as fast as the colocated `sellers_dist` join?
+5. Why did a single-row UPDATE cost 5.9 ms on `sellers_ref` and 1.7 ms on `sellers_dist`?
+6. You need to join orders to a 2-million-row brand catalogue on `sku`. What are your options?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-7-sharding-postgresql-mysql/concept-2-colocation-reference-tables/answers">Worked answers to Q1–Q6</DeepDive>

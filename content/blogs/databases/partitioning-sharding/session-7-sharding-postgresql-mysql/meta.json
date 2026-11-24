@@ -1,0 +1,13 @@
+{
+  "title": "Session 7: Sharding PostgreSQL and MySQL",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-distributed-tables/index",
+    "concept-2-colocation-reference-tables/index",
+    "concept-3-multi-shard-queries/index",
+    "concept-4-application-sharding/index",
+    "concept-5-resharding-and-middleware/index",
+    "lab/index"
+  ]
+}

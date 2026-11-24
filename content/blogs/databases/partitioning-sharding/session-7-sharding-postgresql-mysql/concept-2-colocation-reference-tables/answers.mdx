@@ -1,0 +1,64 @@
+---
+title: "Answers: Colocation and reference tables"
+description: "Worked answers to the Session 7 Concept 2 check questions."
+companion: "answers"
+tags: ["sharding", "citus", "joins", "answers"]
+status: "draft"
+sources:
+  - "https://docs.citusdata.com/en/stable/sharding/data_modeling.html"
+  - "https://docs.citusdata.com/en/stable/develop/reference_ddl.html#reference-tables"
+---
+
+<Tldr>
+Design the schema so that the rows you join are stored together; anything else moves data across the network on every query.
+</Tldr>
+
+## Q1. What colocation guarantees
+
+**Question:** what makes `items_s` colocated with `orders_d`, and what does that guarantee?
+
+Both are distributed by an `integer` column (`seller_id`) with 32 shards, and `items_s` was created with `colocate_with => 'orders_d'`, so `citus_tables` gives them the same `colocation_id`. Shard N of `items_s` covers the same hash range as shard N of `orders_d` and is always placed on the same worker; when Citus moves one, it moves the whole shard group. Therefore every item row with `seller_id = 1673` is on the same worker, in the matching shard, as every order row with `seller_id = 1673`.
+
+> **Common mistake:** creating the child table without `colocate_with` and with a different shard count. Same column, different groups: the join is not colocated.
+
+## Q2. Colocated but refused
+
+**Question:** `items_s` is colocated with `orders_d`, yet the join on `i.order_id = o.id` alone was refused. Why?
+
+Colocation guarantees that rows with equal **distribution column values** are together. The planner only knows the join is shard-local if the join condition equates the distribution columns. With `i.order_id = o.id` alone, nothing tells it that an item with order id 777777 has the same `seller_id` as order 777777: in this data it always does, but no constraint says so. Adding `i.seller_id = o.seller_id` to the condition gives the planner the proof and costs nothing.
+
+> **Common mistake:** concluding colocation "does not work" and switching on repartition joins globally. Fix the query, not the setting.
+
+## Q3. Repartition joins
+
+**Question:** what does a repartition join do, and why was it 50 times slower here?
+
+Neither table is placed by the join key, so Citus re-hashes the rows: map tasks (32 per table) read each shard and write the rows into buckets by `order_id`; merge tasks (12) fetch their bucket from every worker and join. EXPLAIN showed two MapMergeJobs. Every row of both sides that passes the filters crosses the network and is written to intermediate files, instead of 32 shard-local hash joins that only return small partial aggregates. 192 ms vs about 10 s.
+
+> **Common mistake:** treating `citus.enable_repartition_joins = on` as a performance option. It makes the query possible, not fast.
+
+## Q4. Reference vs colocated
+
+**Question:** why was the reference-table join about as fast as the colocated `sellers_dist` join?
+
+In both cases each task joins its `orders_d` shard to sellers data that is already on the same worker: the matching `sellers_dist` shard (about 156 sellers) or the full `sellers_ref` copy (5,000 sellers). Nothing moves between nodes. The reference copy is bigger, but 5,000 rows are trivial for a hash join: 41 ms vs 38 ms.
+
+> **Common mistake:** making every dimension table a reference table. That is right for small, rarely written tables; a large or frequently written table should be distributed and colocated instead.
+
+## Q5. Writes to a reference table
+
+**Question:** why did a single-row UPDATE cost 5.9 ms on `sellers_ref` and 1.7 ms on `sellers_dist`?
+
+A reference table has a copy (placement) on every node: three here. Every write must change all copies atomically, so Citus runs it as a distributed transaction across the coordinator and both workers, with two-phase commit (`pg_dist_transaction` gained rows on each update). `sellers_dist` stores the row once, in one shard, so the update is a router statement to one worker. On a cluster with 20 workers, a reference table write touches 21 nodes.
+
+> **Common mistake:** putting a frequently updated table such as stock levels or session data in a reference table because it is "small".
+
+## Q6. A large catalogue joined on sku
+
+**Question:** you need to join orders to a 2-million-row brand catalogue on `sku`. What are your options?
+
+- If it fits comfortably on every node and changes rarely (a nightly load), make it a **reference table**: every join is local; each nightly load writes to every node.
+- If each seller has its own catalogue, add `seller_id` to it, distribute it by `seller_id`, colocate it with orders, and join on `(seller_id, sku)`.
+- If it is a large shared catalogue that changes often, keep it distributed by `sku` and accept repartition joins for the reports that need it, or pre-join the few attributes you need (brand, category) into the order items when they are written.
+
+> **Common mistake:** distributing the catalogue by `sku` and the order items by `seller_id`, then wondering why every report needs repartitioning.

@@ -1,0 +1,63 @@
+---
+title: "Answers: Resharding and sharding middleware"
+description: "Worked answers to the Session 7 Concept 5 check questions."
+companion: "answers"
+tags: ["sharding", "resharding", "answers"]
+status: "draft"
+sources:
+  - "https://docs.citusdata.com/en/stable/develop/api_udf.html#isolate-tenant-to-new-shard"
+  - "https://vitess.io/docs/reference/features/vindexes/"
+  - "https://proxysql.com/documentation/how-to-setup-proxysql-sharding/"
+---
+
+<Tldr>
+Plan for the second shard count when you choose the first routing rule: fixed logical shards or a directory turn growth into moving pieces instead of rehashing everything.
+</Tldr>
+
+## Q1. Who moves from 2 to 4
+
+**Question:** why does going from 2 to 4 shards with `seller_id % N` move exactly the sellers with `seller_id % 4` equal to 2 or 3?
+
+`seller_id % 4` is 0, 1, 2 or 3, and `seller_id % 2` equals `(seller_id % 4) % 2`. Sellers with remainder 0 mod 4 were on shard 0 and stay on shard 0; remainder 1 stays on shard 1. Remainder 2 was on shard 0 (2 % 2 = 0) and now belongs to shard 2; remainder 3 was on shard 1 and now belongs to shard 3. That is half of the sellers: 2,500, holding 500,022 rows. Going to 3 shards is worse (3,333 sellers, 666,012 rows), because 3 is not a multiple of 2 and the remainders mix.
+
+> **Common mistake:** assuming that adding one shard to N moves 1/(N+1) of the data, as with consistent hashing. With plain modulo it moves most of it.
+
+## Q2. Skipping the freeze
+
+**Question:** what could go wrong in the directory move if step 1 (freeze) were skipped?
+
+Between the SELECT on the source and the directory flip, the application still routes seller 1673 to `pt7_s1`. A new order, an update or a delete written there in that window is not in the copy. After the flip, the application reads from `pt7_s0`, where that change is missing, and step 4 deletes the source rows, destroying it. With the freeze, writes for that seller wait (34 ms here) and nothing is lost. The alternative to freezing is copying and then replaying changes from a change stream (binlog), which is what Vitess's VReplication does.
+
+> **Common mistake:** freezing only new orders and forgetting updates (status changes, refunds) to existing ones.
+
+## Q3. Caching the directory
+
+**Question:** the directory adds 0.29 ms per request. How would you remove most of that cost, and what must the cache handle?
+
+Cache the mapping in the application (5,000 small rows fit in memory) or in a shared cache. The cache must handle changes: during and after a move, a stale entry sends writes to the old shard. Common approaches: version the directory and check the version on write; keep the `moving` flag authoritative in the database for writes while reads use the cache; or make the old shard reject writes for moved keys (a "tombstone" row) so a stale route fails loudly and the client refreshes its cache.
+
+> **Common mistake:** a cache with a long TTL and no invalidation; after a move, writes keep going to the old shard until the TTL expires.
+
+## Q4. The failed split
+
+**Question:** why did `isolate_tenant_to_new_shard` fail by default in the lab, and what did `block_writes` cost?
+
+The default `shard_transfer_mode` (`auto`) uses logical replication to copy the shard while writes continue, then catches up and switches. Logical replication needs logical decoding, which needs `wal_level = logical` on the worker; the lab workers run `replica`, so the call failed with "logical decoding requires "wal_level" >= "logical"". Changing `wal_level` needs a restart, which the lab rules do not allow. With `block_writes` the split copied the shard while blocking writes to it: 2.2 s in total, and an INSERT for seller 1673 issued during the split waited 1.7 s. Only that one shard (a quarter of `orders_d4`) was affected.
+
+> **Common mistake:** running shard moves on production with `block_writes` because it "worked in staging". Set `wal_level = logical` on workers ahead of time so non-blocking moves are possible.
+
+## Q5. Adding a worker to Citus
+
+**Question:** how do Citus's 32 shards on 2 workers avoid the modulo problem when a third worker is added?
+
+Rows are assigned to **shards** by fixed hash ranges, and shards are assigned to **workers** by metadata. Adding a worker does not change any row's shard; the rebalancer moves whole shards (about a third of them, with their colocated shards) to the new worker and updates `pg_dist_placement`. Each move copies one shard, and the rest of the cluster keeps working. The limit is the shard count: 32 shards cannot use more than 32 workers, which is why the shard count is chosen larger than the worker count.
+
+> **Common mistake:** choosing a shard count equal to today's worker count. Then growth needs shard splits instead of simple moves.
+
+## Q6. ProxySQL's part
+
+**Question:** what can ProxySQL do for a sharded MySQL setup, and what remains the application's job?
+
+From its documentation: ProxySQL routes each query to a hostgroup (a set of backend servers) using rules that match the user, the schema name or a pattern or comment in the query text. With one schema or comment per shard, it can send the query to the right server, hide server addresses, and handle connection pooling and failover within a hostgroup. It does not compute the shard from a key, does not scatter one query to all shards, does not merge results, and does not move data. The application still decides which shard a query belongs to (by naming the schema or adding the comment), writes every fan-out and merge, and runs resharding itself.
+
+> **Common mistake:** expecting a proxy in front of MySQL to make sharding transparent. Only a sharding-aware layer such as Vitess does that, and with documented limits.

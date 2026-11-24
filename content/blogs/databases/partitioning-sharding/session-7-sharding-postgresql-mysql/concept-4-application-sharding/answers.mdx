@@ -1,0 +1,62 @@
+---
+title: "Answers: Sharding MySQL in the application"
+description: "Worked answers to the Session 7 Concept 4 check questions."
+companion: "answers"
+tags: ["sharding", "mysql", "application", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/"
+  - "https://vitess.io/docs/reference/features/sharding/"
+---
+
+<Tldr>
+Application-level sharding is cheap for queries that carry the shard key and turns every other query into code you have to write, test and keep correct.
+</Tldr>
+
+## Q1. Routed vs fan-out
+
+**Question:** why was the routed seller query no slower than on the unsharded table, while the order-id lookup was?
+
+The routing function is a modulo in the application: no extra hop, no extra planning. The query then runs on one database that has half the rows and the same index on `(seller_id, created_at)`, so it does the same index range scan as on `pt7_all`: 0.12 ms vs 0.11 ms. The order-id lookup has no shard key, so the application sends it to both databases one after the other: two round trips instead of one (0.25 ms vs 0.11 ms), and one more for each additional shard.
+
+> **Common mistake:** measuring only the routed queries in a sharding proof of concept and concluding sharding is free.
+
+## Q2. Ten shards
+
+**Question:** parallel fan-out took 16 ms and sequential 25 ms. What would you expect with 10 shards, and what limits the parallel case?
+
+Sequential time is roughly the **sum** of the shard times: each of 10 shards has a tenth of the data, so the sum stays near the unsharded time (about 25 ms here) plus 10 round trips. Parallel time is roughly the **slowest** shard plus the merge: in principle about a tenth, if each shard is its own server. The limits: the slowest shard (a busy or skewed one sets the latency for every report), threads and connections in the application (10 per report, times concurrent reports), and in this lab the fact that both shards share one MySQL server and its CPUs, which is why 2 parallel shards gave 16 ms, not 12.5 ms.
+
+> **Common mistake:** a connection pool sized for routed traffic. A fan-out to N shards needs N connections at once for every concurrent report.
+
+## Q3. Top 10 days vs top 10 sellers
+
+**Question:** why was the naive top-10-days merge wrong, and why was the same approach right for top 10 sellers?
+
+A day's orders come from all sellers, so each day's GMV is split between the two shards. Each shard's top 10 is based on its half only; a day that is in one shard's list but not the other's is added with only half its GMV, and a day that is in neither list but high overall is missed. Result: 3 of the 10 correct days, 0 correct totals. A seller's orders are all in one shard, so a shard's per-seller totals are final and the global top 10 must be among the 20 candidates: the merge matched the unsharded result exactly.
+
+> **Common mistake:** testing the merge on a dataset where one shard dominates, which hides the error.
+
+## Q4. Page 101
+
+**Question:** how many rows must each shard return for page 101 (rows 1,001 to 1,010), and why?
+
+1,010 from each shard (OFFSET + LIMIT), in the page's sort order. Any of the 1,010 newest rows overall could all be on one shard, so the application must take each shard's first 1,010 rows, merge-sort 2,020 rows, skip 1,000 and keep 10. 0.41 ms unsharded vs 3.65 ms sharded here; with N shards and page P the cost is N × P × page size rows. Keyset pagination needs only 10 rows from each shard.
+
+> **Common mistake:** sending `LIMIT 10 OFFSET 1000` to every shard. Each shard skips its own 1,000 rows, and the result is simply wrong.
+
+## Q5. Average of averages
+
+**Question:** a report computes the average order value per shard and averages the two. When is it wrong?
+
+Whenever the shards have different numbers of orders. The correct average is (sum₀ + sum₁) / (count₀ + count₁); the average of averages weights each shard equally. With 500,192 and 499,808 rows the error here is tiny, which is exactly why it goes unnoticed in testing. If one shard holds the large sellers and twice as many orders, the error becomes large. Return sum and count from each shard instead.
+
+> **Common mistake:** trusting a merge because it matched on balanced test data.
+
+## Q6. Who else needs the router
+
+**Question:** list three parts of the system besides the API that must use the routing function.
+
+Any three of: background jobs (settlement, notifications, retention), admin and support tools, one-off data-fix scripts, schema migrations (run on every shard), BI and finance exports (every shard), CDC pipelines into a warehouse, backup and restore procedures (restore all shards to the same point), and test fixtures. Each one that bypasses the router can write to the wrong shard or read only part of the data.
+
+> **Common mistake:** a data-fix script connected straight to "the database" that is in fact one shard.

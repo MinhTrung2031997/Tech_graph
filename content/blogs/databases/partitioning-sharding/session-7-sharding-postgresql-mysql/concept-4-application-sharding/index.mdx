@@ -1,0 +1,198 @@
+---
+title: "Concept 4: Sharding MySQL in the application"
+description: "Without a sharding layer, the application owns the routing function and every merge. Orders split across two MySQL databases by seller_id % 2: a seller query routed to one shard cost the same as on the unsharded table (0.12 vs 0.11 ms); a lookup by order id had to ask both (0.25 ms); GMV per marketplace fanned out in parallel took 16 ms vs 25 ms unsharded. A naive merge of each shard's top 10 days got 3 of the 10 days and none of the totals right; correct merges need every group from every shard, and page 101 needs 1,010 rows from each shard."
+type: "concept"
+tags: ["sharding", "mysql", "application", "routing"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-limitations.html"
+  - "https://vitess.io/docs/reference/features/sharding/"
+  - "https://pymysql.readthedocs.io/en/latest/"
+---
+
+<Tldr>
+MySQL has no built-in way to spread one table over several servers. The simplest way is **application-level sharding**: N independent databases with the same schema, and a **routing function** in the application that picks the database from the shard key. In the lab, `pt7_s0` holds the 500,192 orders of even `seller_id`s and `pt7_s1` the 499,808 of odd ones; a Python router (PyMySQL) talks to both. Routed queries are as fast as before (**0.12 ms vs 0.11 ms** for a seller's month). Everything that does not carry the shard key becomes the application's job: a lookup by order id asks every shard (**0.25 ms**); a report fans out and the application **merges** (GMV per marketplace **16 ms** in parallel vs **25 ms** unsharded, **25 ms** if the shards are queried one after the other). Merging is where bugs hide: adding up each shard's **top 10 days** gave **3 of the 10 right days and 0 correct totals**; the right answer needed every day from every shard (730 rows). Page 101 of a list needed **1,010 rows from each shard**. This is the work Citus did in Concept 3.
+</Tldr>
+
+## The setup
+
+All on `idx-mysql` (MySQL 8.4), three databases created for this session: `pt7_all` holds the 1,000,000 orders unsharded (the baseline); `pt7_s0` and `pt7_s1` are the shards; each has an index on `(seller_id, created_at)`. In production the shards would be separate servers; here they share one, so parallel fan-out uses two server threads on the same machine.
+
+```python
+SHARDS = [connect("pt7_s0"), connect("pt7_s1")]   # shard n holds seller_id % 2 = n
+
+def shard_for(seller_id):
+    """The only place that knows the sharding rule."""
+    return SHARDS[seller_id % 2]
+
+def fan_out_parallel(sql, args):
+    """Send the same query to every shard at once; one thread and one connection per shard."""
+    return list(pool.map(lambda c: run(c, sql, args), PARALLEL_SHARDS))
+```
+
+| Term | Meaning |
+|---|---|
+| Shard key | The column the routing function uses: `seller_id` |
+| Routing function | Code that maps a shard key value to a database: `seller_id % 2` here; a directory table in Concept 5 |
+| Fan-out | Sending one query to every shard |
+| Merge | Combining the shards' results in the application: adding counts, re-sorting, re-limiting |
+| Scatter-gather | Fan-out plus merge |
+| **✓ / ✗** | Shard queried / not queried |
+
+<Flow
+  title="Application router over two MySQL shards"
+  height={360}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'Python + PyMySQL', x: 300, y: 20, w: 200 },
+    { id: 'router', label: 'shard_for(seller_id)', sub: 'seller_id % 2', x: 280, y: 140, w: 240 },
+    { id: 'merge', label: 'App merge', sub: 'add, sort, limit', x: 580, y: 140, w: 200 },
+    { id: 's0', label: 'pt7_s0', sub: 'even sellers, 500,192 rows', x: 40, y: 290, w: 260 },
+    { id: 's1', label: 'pt7_s1', sub: 'odd sellers, 499,808 rows', x: 500, y: 290, w: 260 },
+  ]}
+  edges={[
+    { id: 'app-router', from: 'app', to: 'router' },
+    { id: 'router-merge', from: 'router', to: 'merge' },
+    { id: 'router-s0', from: 'router', to: 's0' },
+    { id: 'router-s1', from: 'router', to: 's1' },
+  ]}
+  cases={[
+    {
+      title: 'Seller 1673, December',
+      path: 'router: 1673 % 2 = 1 → pt7_s1 ✓ → pt7_s0 ✗',
+      summary: 'The hot path: same cost as the unsharded table, 0.12 ms vs 0.11 ms.',
+      steps: [
+        {
+          title: 'Route and run',
+          note: 'The application computes the shard and sends an ordinary query to one database. The shard does not know it is a shard.',
+          code: "shard_for(1673).execute(\"SELECT count(*), sum(amount) FROM orders\n  WHERE seller_id = %s AND created_at >= %s AND created_at < %s\",\n  (1673, '2025-12-01', '2026-01-01'))",
+          active: ['app', 'router', 's1'],
+          edges: ['app-router', 'router-s1'],
+          subs: { s1: '✓ 1 query', s0: '✗' },
+        },
+      ],
+    },
+    {
+      title: 'Order 777777 (no seller)',
+      path: 'router: no shard key → pt7_s0 ✓ → pt7_s1 ✓ → one of them answers',
+      summary: 'Both shards must be asked. 0.25 ms vs 0.11 ms, and the cost grows with the number of shards.',
+      steps: [
+        {
+          title: 'Ask everyone',
+          note: 'pt7_s0 returns nothing, pt7_s1 returns the order of seller 145. With 64 shards this is 64 queries for one row.',
+          code: "for c in SHARDS: c.execute(\"SELECT * FROM orders WHERE id = %s\", (777777,))",
+          active: ['app', 'router', 's0', 's1'],
+          edges: ['app-router', 'router-s0', 'router-s1'],
+          subs: { s0: '✓ 0 rows', s1: '✓ 1 row' },
+        },
+      ],
+    },
+    {
+      title: 'GMV per marketplace, December',
+      path: 'fan-out ✓ both shards in parallel → app adds count and sum per marketplace → 3 rows',
+      summary: 'Parallel 16 ms, sequential 25 ms, unsharded 25 ms. The merged result equalled the unsharded one exactly.',
+      steps: [
+        {
+          title: 'Fan-out',
+          note: 'Each shard aggregates its half of December: about 21,000 orders, 3 rows back.',
+          code: "fan_out_parallel(\"SELECT marketplace, count(*), sum(amount) FROM orders\n  WHERE created_at >= %s AND created_at < %s GROUP BY marketplace\", DEC)",
+          active: ['app', 'router', 's0', 's1'],
+          edges: ['app-router', 'router-s0', 'router-s1'],
+          subs: { s0: '✓ 3 rows', s1: '✓ 3 rows' },
+        },
+        {
+          title: 'Merge',
+          note: 'Counts and sums add up; an average would have to be rebuilt from them. The application now contains a small query engine.',
+          active: ['router', 'merge'],
+          edges: ['router-merge'],
+          subs: { merge: '6 rows → 3' },
+        },
+      ],
+    },
+    {
+      title: 'Top 10 days of 2025',
+      path: 'naive: each shard LIMIT 10 → merge ✗ wrong → correct: every day from every shard (730 rows) → merge ✓',
+      summary: 'A day spans both shards, so a per-shard top 10 is not enough.',
+      steps: [
+        {
+          title: 'Naive merge',
+          note: "Each shard returned its own top 10 days (20 rows); the app added them and kept the best 10. Only 3 of those days are in the true top 10, and all 10 totals are wrong: a day that is in one shard's top 10 but not the other's gets only half its GMV.",
+          code: "... GROUP BY DATE(created_at) ORDER BY g DESC LIMIT 10   -- on each shard",
+          active: ['app', 'router', 's0', 's1', 'merge'],
+          edges: ['app-router', 'router-s0', 'router-s1', 'router-merge'],
+          subs: { merge: '✗ 3/10 days, 0 totals' },
+        },
+        {
+          title: 'Correct merge',
+          note: 'Each shard returns every day of 2025 (365 rows each), the app adds per day, sorts and takes 10: identical to the unsharded query. 70 ms in parallel vs 127 ms unsharded.',
+          code: "... GROUP BY DATE(created_at)   -- no LIMIT on the shards",
+          active: ['router', 's0', 's1', 'merge'],
+          edges: ['router-s0', 'router-s1', 'router-merge'],
+          subs: { s0: '✓ 365 rows', s1: '✓ 365 rows', merge: '✓ 730 rows → 10' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Measured
+
+PyMySQL from the host, median of 200 runs for lookups, 30 for reports, 10 to 50 for the rest, two runs of the script (ranges show both).
+
+| Query | Unsharded `pt7_all` | Sharded | How |
+|---|---|---|---|
+| Seller 1673, December | 0.11–0.19 ms | 0.12–0.17 ms | routed to 1 shard |
+| Order by id | 0.11–0.18 ms | 0.25–0.34 ms | both shards, one after the other |
+| GMV per marketplace, December | 25–31 ms | 25–28 ms sequential, 16–17 ms parallel | fan-out, add |
+| Top 10 days of 2025 | 127 ms | 70 ms | parallel fan-out of every day, add, sort |
+| Page 101 (10 rows after 1,000) | 0.41 ms | 3.65 ms | 1,010 rows from each shard, sort, skip |
+
+| Merge question | Correct with per-shard LIMIT? | Measured |
+|---|---|---|
+| Top 10 sellers | yes: a seller lives in one shard | identical to unsharded |
+| Top 10 days | no: a day spans shards | naive 3/10 days, 0/10 totals; full merge identical |
+| Page 101 | only with LIMIT offset + 10 per shard | identical; 2,020 rows shipped for 10 |
+
+<Pitfall>
+The routing function becomes part of every code path: background jobs, admin tools, data fixes, BI exports, migrations. One script that writes to the wrong database, or a report that forgets one shard, silently corrupts or undercounts data. Keep routing in one library, make every query go through it, and give each shard a check (for example a constraint or a periodic audit that `seller_id % 2` matches the shard). Merges need the same care as SQL: partial aggregates must combine (sum and count, not averages), and LIMIT can only be pushed to the shards when the group lives in one shard.
+</Pitfall>
+
+## Real-world scenario: an order service on sharded MySQL
+
+| Requirement | What the team must build |
+|---|---|
+| Write an order | Router from `seller_id`; the order id must be unique across shards (Session 8) |
+| Seller dashboards | Routed queries; nothing new |
+| "Find order" for support | Fan-out, or a global `order_id → seller_id` lookup table |
+| Daily finance report for all sellers | Fan-out + merge; or replicate all shards into a warehouse and report there |
+| A seller grows too big for its shard | Move it (Concept 5): copy, switch routing, delete |
+| Schema change | Run the migration on every shard, and handle the window where shards differ |
+
+That list is the case for a sharding layer: Citus (Concepts 1–3) or, for MySQL, Vitess (Concept 5).
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 3 | The same merges, done by the Citus coordinator |
+| [Indexing Session 10, Concept 4](/blogs/databases/indexing/session-10-pagination-aggregation/concept-4-min-max-top-n) | Top-N on one server |
+| [Transactions Session 8, Concept 4](/blogs/databases/transactions/session-8-when-transactions-hurt/concept-4-distributed-transactions) | A write that touches two shards is a distributed transaction |
+| Concept 5 | Changing the number of shards, and the middleware that hides them |
+
+## Key takeaways
+
+1. Application-level sharding is N ordinary databases plus a routing function in the code.
+2. Queries with the shard key are as cheap as before; everything else is a fan-out.
+3. The application must merge correctly: combine sums and counts, not averages; only push LIMIT down when a group lives in one shard.
+4. Deep pagination costs OFFSET + LIMIT rows from every shard.
+5. Every tool that touches the data must use the same router.
+
+## Check questions
+
+1. Why was the routed seller query no slower than on the unsharded table, while the order-id lookup was?
+2. Parallel fan-out took 16 ms and sequential 25 ms. What would you expect with 10 shards, and what limits the parallel case?
+3. Why was the naive top-10-days merge wrong, and why was the same approach right for top 10 sellers?
+4. How many rows must each shard return for page 101 (rows 1,001 to 1,010), and why?
+5. A report computes the average order value per shard and averages the two. When is it wrong?
+6. List three parts of the system besides the API that must use the routing function.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-7-sharding-postgresql-mysql/concept-4-application-sharding/answers">Worked answers to Q1–Q6</DeepDive>

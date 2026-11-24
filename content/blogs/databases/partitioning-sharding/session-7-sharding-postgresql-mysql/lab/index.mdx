@@ -1,0 +1,400 @@
+---
+title: "Lab and session quiz: Sharding PostgreSQL and MySQL"
+description: "Distribute the 1M-row orders table in Citus and compare router and multi-shard queries, colocated, repartition and reference-table joins, and what multi-shard queries send to the coordinator; then shard the same orders across two MySQL databases with a Python router, write correct cross-shard merges, move a seller with a directory table, and isolate a seller in its own Citus shard."
+type: "how-to"
+tags: ["sharding", "citus", "mysql", "lab"]
+status: "draft"
+sources:
+  - "https://docs.citusdata.com/en/stable/develop/api_udf.html"
+  - "https://docs.citusdata.com/en/stable/develop/reference_processing.html"
+  - "https://pymysql.readthedocs.io/en/latest/"
+---
+
+<Tldr>
+Uses the Citus cluster (`pt-citus` coordinator, workers `pt-citus-w1` and `pt-citus-w2`) and `idx-mysql`, with database `parts`. The cluster setup (containers, network, node registration) is printed in full in the Session 5 lab. Exercises 1–3 and 5b are Citus, 4 and 5a MySQL with a small Python program. The lab numbers came from database `pt7` on one laptop where the Citus image runs under amd64 emulation: **compare ratios, not times**, and never compare Citus times with times from `idx-pg`.
+</Tldr>
+
+## Setup
+
+```bash
+alias pcit='docker exec -it pt-citus psql -U postgres -d parts'
+alias pmy='docker exec -it idx-mysql mysql -uroot -plab'
+```
+
+If `parts` does not exist on the Citus cluster yet, create it on all three nodes (Citus does not propagate `CREATE DATABASE` to the workers), register the nodes **inside that database**, and load the 1M-row orders table:
+
+```bash
+for h in pt-citus pt-citus-w1 pt-citus-w2; do
+  docker exec $h psql -U postgres -c "CREATE DATABASE parts"
+  docker exec $h psql -U postgres -d parts -c "CREATE EXTENSION citus"
+done
+docker exec pt-citus psql -U postgres -d parts \
+  -c "SELECT citus_set_coordinator_host('pt-citus', 5432)" \
+  -c "SELECT citus_add_node('pt-citus-w1', 5432)" \
+  -c "SELECT citus_add_node('pt-citus-w2', 5432)"
+# The 1M-row seed is the Session 1 PostgreSQL seed with generate_series(1::bigint, 1000000)
+# and ((g - 1) * 631584 / 10000) seconds between rows; the Session 5 lab prints it in full.
+docker exec -i pt-citus psql -U postgres -d parts < citus-pt-seed-1m.sql
+```
+
+Then, on the coordinator (`pcit`):
+
+```sql
+CREATE INDEX orders_seller_idx ON orders (seller_id);   -- the single-node baseline gets a fair index
+```
+
+## Exercise 1: distribute orders
+
+```sql
+-- pcit
+CREATE TABLE orders_d (LIKE orders INCLUDING DEFAULTS);
+ALTER TABLE orders_d ADD PRIMARY KEY (id);
+SELECT create_distributed_table('orders_d', 'seller_id');            -- read the error
+ALTER TABLE orders_d DROP CONSTRAINT orders_d_pkey;
+ALTER TABLE orders_d ADD PRIMARY KEY (seller_id, id);
+SELECT create_distributed_table('orders_d', 'seller_id');
+INSERT INTO orders_d SELECT * FROM orders;
+CREATE INDEX orders_d_created_at_idx ON orders_d (created_at);
+CREATE INDEX orders_d_id_idx ON orders_d (id);
+VACUUM ANALYZE orders_d;
+
+SELECT table_name, distribution_column, colocation_id, shard_count, table_size FROM citus_tables;
+SELECT nodename, count(*), pg_size_pretty(sum(shard_size)) FROM citus_shards
+WHERE table_name = 'orders_d'::regclass GROUP BY 1;
+WITH r AS (SELECT result::bigint n FROM run_command_on_shards('orders_d', 'SELECT count(*) FROM %s'))
+SELECT min(n), max(n) FROM r;                                         -- lab: 26707, 34950
+SELECT hashint4(1673), get_shard_id_for_distribution_column('orders_d', 1673);
+
+EXPLAIN (ANALYZE, COSTS OFF) SELECT count(*), sum(amount) FROM orders_d WHERE seller_id = 1673;   -- Task Count: 1
+EXPLAIN (ANALYZE, COSTS OFF) SELECT * FROM orders_d WHERE id = 777777;                            -- Task Count: 32
+INSERT INTO orders_d (id, marketplace, status, amount, created_at) VALUES (1, 'shopee', 'delivered', 10, now());  -- error
+```
+
+Time the lookups with pgbench on one connection (a file per query in the container):
+
+```bash
+bench() { echo "$2" | docker exec -i pt-citus sh -c "cat > /tmp/$1.sql"
+          docker exec pt-citus pgbench -U postgres -d parts -n -c 1 -t ${3:-200} -f /tmp/$1.sql | grep 'latency average'; }
+bench seller_local "SELECT count(*), sum(amount) FROM orders WHERE seller_id = 1673;"
+bench seller_dist  "SELECT count(*), sum(amount) FROM orders_d WHERE seller_id = 1673;"
+bench id_local     "SELECT * FROM orders WHERE id = 777777;"
+bench id_dist      "SELECT * FROM orders_d WHERE id = 777777;"
+bench id_routed    "SELECT * FROM orders_d WHERE seller_id = 145 AND id = 777777;"
+```
+
+Lab values (middle of 3 runs): 0.20, 0.62, 0.11, 1.96 and 0.54 ms. Optional: build `orders_d4` the same way with `shard_count => 4, colocate_with => 'none'` and time the id lookup again (lab: 0.92 ms).
+
+## Exercise 2: colocation and reference tables
+
+```sql
+-- pcit
+CREATE TABLE sellers_local (seller_id int PRIMARY KEY, name text NOT NULL, country text NOT NULL);
+INSERT INTO sellers_local SELECT s, 'seller-' || s,
+  (ARRAY['VN','VN','VN','VN','TH','TH','TH','SG','MY','PH'])[(('x' || substr(md5('n' || s), 1, 8))::bit(32)::bigint % 10) + 1]
+FROM generate_series(1, 5000) s;
+CREATE TABLE sellers_ref (LIKE sellers_local INCLUDING ALL);
+INSERT INTO sellers_ref SELECT * FROM sellers_local;
+SELECT create_reference_table('sellers_ref');
+SELECT truncate_local_data_after_distributing_table('sellers_ref');
+CREATE TABLE sellers_dist (LIKE sellers_local INCLUDING ALL);
+SELECT create_distributed_table('sellers_dist', 'seller_id', colocate_with => 'orders_d');
+INSERT INTO sellers_dist SELECT * FROM sellers_local;
+
+CREATE TABLE items_s (order_id bigint NOT NULL, line int NOT NULL, seller_id int NOT NULL, sku text NOT NULL,
+                      qty int NOT NULL, PRIMARY KEY (seller_id, order_id, line));
+SELECT create_distributed_table('items_s', 'seller_id', colocate_with => 'orders_d');
+INSERT INTO items_s SELECT o.id, l, o.seller_id, 'SKU-' || lpad(((o.id * 2 + l) * 48271 % 5000)::text, 6, '0'), 1 + (o.id + l) % 3
+FROM orders o, generate_series(1, 2) l;
+CREATE TABLE items_o (LIKE items_s INCLUDING DEFAULTS);
+ALTER TABLE items_o ADD PRIMARY KEY (order_id, line);
+SELECT create_distributed_table('items_o', 'order_id', colocate_with => 'none');
+INSERT INTO items_o SELECT * FROM items_s;
+VACUUM ANALYZE items_s; VACUUM ANALYZE items_o;
+SELECT table_name, citus_table_type, distribution_column, colocation_id FROM citus_tables ORDER BY colocation_id;
+```
+
+```sql
+\timing on
+-- colocated: on the distribution column and the order id
+SELECT count(*), sum(i.qty) FROM orders_d o JOIN items_s i ON i.seller_id = o.seller_id AND i.order_id = o.id
+WHERE o.created_at >= '2025-12-01';
+-- the same tables on the order id only, then the table distributed by order_id
+SELECT count(*), sum(i.qty) FROM orders_d o JOIN items_s i ON i.order_id = o.id WHERE o.created_at >= '2025-12-01';
+SELECT count(*), sum(i.qty) FROM orders_d o JOIN items_o i ON i.order_id = o.id WHERE o.created_at >= '2025-12-01';
+SET citus.enable_repartition_joins = on;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(i.qty) FROM orders_d o JOIN items_o i ON i.order_id = o.id WHERE o.created_at >= '2025-12-01';
+SELECT count(*), sum(i.qty) FROM orders_d o JOIN items_o i ON i.order_id = o.id WHERE o.created_at >= '2025-12-01';
+RESET citus.enable_repartition_joins;
+
+-- sellers three ways
+EXPLAIN (COSTS OFF) SELECT s.country, count(*), sum(o.amount) FROM orders_d o JOIN sellers_local s USING (seller_id)
+WHERE o.created_at >= '2025-12-01' GROUP BY 1;   -- Distributed Subplan
+```
+
+Then time with `bench` the country query against `sellers_ref`, `sellers_dist`, `sellers_local` and plain `orders` + `sellers_local`, and a single-row `UPDATE … SET name = name WHERE seller_id = 1673` on each sellers table (lab: 41, 38, 70, 17 ms; updates 5.9, 1.7, 1.2 ms).
+
+## Exercise 3: what reaches the coordinator
+
+For each query, run `EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)` and note the Custom Scan's `actual rows` and `Tuple data received from nodes`:
+
+```sql
+SELECT marketplace, count(*), sum(amount), avg(amount) FROM orders_d GROUP BY 1;
+SELECT seller_id, sum(amount) g FROM orders_d GROUP BY 1 ORDER BY g DESC LIMIT 10;
+SELECT (created_at AT TIME ZONE 'UTC')::date d, sum(amount) g FROM orders_d GROUP BY 1 ORDER BY g DESC LIMIT 10;
+SELECT count(DISTINCT seller_id) FROM orders_d;
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY amount) FROM orders_d;
+SELECT id, created_at FROM orders_d ORDER BY created_at, id LIMIT 10 OFFSET 100000;
+SELECT id, created_at FROM orders_d WHERE (created_at, id) > ('2024-03-14 02:22:56+00', 100000)
+ORDER BY created_at, id LIMIT 10;
+```
+
+Lab: 96 rows / 4,796 bytes; 320 / 5,754; 23,392 / 394 kB; 32 / 256; 1,000,000 / 7.8 MB; 1,000,000 / 15 MB; 320 / 5,120. Check that the OFFSET and keyset queries return the same 10 rows. Finally, `CREATE INDEX orders_d_amount_idx ON orders_d (amount)` and count the shard indexes:
+
+```sql
+SELECT count(*) FROM run_command_on_shards('orders_d',
+  $$SELECT 1 FROM pg_indexes WHERE indexname LIKE 'orders_d_amount_idx%%' AND tablename = '%s'$$) WHERE result = '1';
+DROP INDEX orders_d_amount_idx;
+```
+
+## Exercise 4: application-level sharding on MySQL
+
+Three databases: `parts_all` (1M orders, the baseline) and the shards `parts_s0`, `parts_s1`:
+
+```bash
+for d in parts_all parts_s0 parts_s1 parts_dir; do pmy -e "CREATE DATABASE IF NOT EXISTS $d"; done
+```
+
+Load `parts_all` with the 1M-row MySQL seed (the Session 1 MySQL seed with 1,000 × 1,000 rows and `631584 DIV 10000`):
+
+```sql
+-- pmy parts_all
+DROP TABLE IF EXISTS orders;
+CREATE TABLE orders (
+  id          BIGINT        NOT NULL PRIMARY KEY,
+  seller_id   INT           NOT NULL,
+  marketplace VARCHAR(8)    NOT NULL,
+  status      VARCHAR(10)   NOT NULL,
+  amount      DECIMAL(12,2) NOT NULL,
+  created_at  DATETIME      NOT NULL,
+  KEY orders_created_at_idx (created_at)
+) ENGINE = InnoDB;
+SET SESSION cte_max_recursion_depth = 1000;
+INSERT INTO orders
+WITH RECURSIVE a(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM a WHERE n < 999),
+               b(m) AS (SELECT 0 UNION ALL SELECT m + 1 FROM b WHERE m < 999),
+               s(g) AS (SELECT a.n * 1000 + b.m + 1 FROM a CROSS JOIN b)
+SELECT g,
+       CONV(SUBSTR(MD5(CONCAT('s', g)), 1, 8), 16, 10) % 5000 + 1,
+       CASE WHEN CONV(SUBSTR(MD5(CONCAT('m', g)), 1, 8), 16, 10) % 10 < 5 THEN 'shopee'
+            WHEN CONV(SUBSTR(MD5(CONCAT('m', g)), 1, 8), 16, 10) % 10 < 8 THEN 'tiktok'
+            ELSE 'lazada' END,
+       CASE WHEN CONV(SUBSTR(MD5(CONCAT('t', g)), 1, 8), 16, 10) % 20 < 2 THEN 'cancelled'
+            WHEN CONV(SUBSTR(MD5(CONCAT('t', g)), 1, 8), 16, 10) % 20 = 2 THEN 'returned'
+            ELSE 'delivered' END,
+       (g * 7907) % 50000 / 100 + 1,
+       TIMESTAMP '2024-01-01 00:00:00' + INTERVAL ((g - 1) * 631584 DIV 10000) SECOND
+FROM s ORDER BY g;
+ALTER TABLE orders ADD KEY orders_seller_created_idx (seller_id, created_at);
+ANALYZE TABLE orders;
+```
+
+Split it by `seller_id % 2` (on one server this is a cross-database INSERT; between real servers you would export and import):
+
+```sql
+-- pmy
+CREATE TABLE parts_s0.orders LIKE parts_all.orders;
+INSERT INTO parts_s0.orders SELECT * FROM parts_all.orders WHERE seller_id % 2 = 0;   -- lab: 500,192 rows
+CREATE TABLE parts_s1.orders LIKE parts_all.orders;
+INSERT INTO parts_s1.orders SELECT * FROM parts_all.orders WHERE seller_id % 2 = 1;   -- lab: 499,808 rows
+```
+
+The router (`router.py`), run from the host with Python 3 and PyMySQL (`python3 -m venv venv && ./venv/bin/pip install pymysql`):
+
+```python
+"""Application-level sharding demo: orders split across two MySQL databases by seller_id % 2.
+Runs each query pattern many times and prints median wall-clock latency (ms) as seen by the application."""
+import statistics, sys, time
+from concurrent.futures import ThreadPoolExecutor
+import pymysql
+
+def conn(db):
+    return pymysql.connect(host="127.0.0.1", port=3307, user="root", password="lab", database=db, autocommit=True)
+
+ALL = conn("parts_all")                         # unsharded baseline, same 1M rows
+SHARDS = [conn("parts_s0"), conn("parts_s1")]   # shard n holds sellers with seller_id % 2 = n
+POOL = ThreadPoolExecutor(max_workers=2)        # one thread per shard for parallel fan-out
+PSHARDS = [conn("parts_s0"), conn("parts_s1")]  # separate connections: a pymysql connection is not thread-safe
+
+def shard_for(seller_id):
+    """The routing function: the only place that knows the sharding rule."""
+    return SHARDS[seller_id % 2]
+
+def q(c, sql, args=None):
+    with c.cursor() as cur:
+        cur.execute(sql, args)
+        return cur.fetchall()
+
+def fan_out_seq(sql, args=None):
+    return [q(c, sql, args) for c in SHARDS]
+
+def fan_out_par(sql, args=None):
+    return list(POOL.map(lambda c: q(c, sql, args), PSHARDS))
+
+def bench(name, fn, n=50):
+    fn()  # warm up
+    ts = []
+    for _ in range(n):
+        t = time.perf_counter(); fn(); ts.append((time.perf_counter() - t) * 1000)
+    print(f"{name:28s} median {statistics.median(ts):8.2f} ms")
+
+DEC = ("2025-12-01", "2026-01-01")
+SELLER_GMV = "SELECT count(*), sum(amount) FROM orders WHERE seller_id = %s AND created_at >= %s AND created_at < %s"
+MKT = ("SELECT marketplace, count(*), sum(amount) FROM orders WHERE created_at >= %s AND created_at < %s "
+       "GROUP BY marketplace")
+
+def merge_mkt(parts):
+    """Merge partial aggregates: counts and sums add up across shards."""
+    out = {}
+    for rows in parts:
+        for m, c, s in rows:
+            a = out.setdefault(m, [0, 0]); a[0] += c; a[1] += s
+    return out
+
+if __name__ == "__main__":
+    bench("seller month, unsharded", lambda: q(ALL, SELLER_GMV, (1673, *DEC)), 200)
+    bench("seller month, routed", lambda: q(shard_for(1673), SELLER_GMV, (1673, *DEC)), 200)
+    bench("order by id, unsharded", lambda: q(ALL, "SELECT * FROM orders WHERE id = %s", (777777,)), 200)
+    bench("order by id, both shards", lambda: fan_out_seq("SELECT * FROM orders WHERE id = %s", (777777,)), 200)
+    bench("marketplace Dec, unsharded", lambda: q(ALL, MKT, DEC), 30)
+    bench("marketplace Dec, sequential", lambda: merge_mkt(fan_out_seq(MKT, DEC)), 30)
+    bench("marketplace Dec, parallel", lambda: merge_mkt(fan_out_par(MKT, DEC)), 30)
+    a = {r[0]: (r[1], r[2]) for r in q(ALL, MKT, DEC)}
+    b = merge_mkt(fan_out_par(MKT, DEC))
+    print("merge equals unsharded:", all(a[m][0] == b[m][0] and a[m][1] == b[m][1] for m in a))
+```
+
+Lab medians: 0.11–0.19, 0.12–0.17, 0.11–0.18, 0.25–0.34, 25–31, 25–28 and 16–17 ms; the merge matched.
+
+Now the merges that go wrong (`topn.py`, next to `router.py`):
+
+```python
+"""Cross-shard top-N and pagination: what a per-shard LIMIT gets right and wrong."""
+from router import ALL, q, fan_out_par
+
+DAYS = ("SELECT DATE(created_at) d, sum(amount) g FROM orders WHERE created_at >= '2025-01-01' "
+        "GROUP BY d ORDER BY g DESC")
+truth = q(ALL, DAYS + " LIMIT 10")
+
+naive = {}                                     # each shard's own top 10, added up: wrong
+for rows in fan_out_par(DAYS + " LIMIT 10"):
+    for d, g in rows: naive[d] = naive.get(d, 0) + g
+naive_top = sorted(naive.items(), key=lambda x: -x[1])[:10]
+
+full = {}                                      # every day from every shard, added up: right
+for rows in fan_out_par(DAYS):
+    for d, g in rows: full[d] = full.get(d, 0) + g
+full_top = sorted(full.items(), key=lambda x: -x[1])[:10]
+
+print("naive: right days", len({d for d, _ in naive_top} & {d for d, _ in truth}), "of 10")
+print("naive: right totals", sum(1 for d, g in naive_top if (d, g) in set(map(tuple, truth))))
+print("full merge equals truth:", [tuple(r) for r in truth] == [(d, g) for d, g in full_top])
+
+PAGE = "SELECT id, created_at FROM orders ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s"
+t = q(ALL, PAGE, (10, 1000))                   # page 101 on the unsharded table
+parts = fan_out_par(PAGE, (1010, 0))           # OFFSET + LIMIT rows from every shard
+m = sorted([r for rows in parts for r in rows], key=lambda x: (x[1], x[0]), reverse=True)[1000:1010]
+print("page 101 equals truth:", list(t) == m, "rows shipped:", sum(len(r) for r in parts))
+```
+
+Lab: 3 of 10 days, 0 totals right; full merge right (730 rows); page 101 right with 2,020 rows shipped. Also try sending `LIMIT 10 OFFSET 1000` to both shards and compare.
+
+## Exercise 5: resharding
+
+**5a. Modulo vs directory (MySQL).**
+
+```sql
+-- pmy parts_all: who moves when the shard count changes
+SELECT SUM(seller_id % 4 <> seller_id % 2) AS to_4, SUM(seller_id % 3 <> seller_id % 2) AS to_3
+FROM (SELECT DISTINCT seller_id FROM orders) s;                                       -- lab: 2500, 3333
+SELECT SUM(seller_id % 4 <> seller_id % 2), SUM(seller_id % 3 <> seller_id % 2) FROM orders;   -- 500022, 666012
+
+-- pmy parts_dir: the directory
+CREATE TABLE seller_shard (seller_id INT PRIMARY KEY, shard TINYINT NOT NULL, moving BOOL NOT NULL DEFAULT FALSE);
+INSERT INTO seller_shard SELECT seller_id, seller_id % 2, FALSE FROM parts_all.orders GROUP BY seller_id;
+```
+
+`move.py` (next to `router.py`) freezes, copies, flips and deletes one seller, then moves it back:
+
+```python
+"""Move one seller between application shards using a directory table: freeze, copy, flip, delete."""
+import time
+from router import conn, bench
+DIR = conn("parts_dir"); S = [conn("parts_s0"), conn("parts_s1")]
+
+def shard_of(seller):
+    with DIR.cursor() as c:
+        c.execute("SELECT shard, moving FROM seller_shard WHERE seller_id = %s", (seller,)); return c.fetchone()
+
+def move(seller, dst):
+    src, _ = shard_of(seller); t0 = time.perf_counter()
+    with DIR.cursor() as c:      # 1. freeze writes for this seller (the app checks `moving` before writing)
+        c.execute("UPDATE seller_shard SET moving = TRUE WHERE seller_id = %s", (seller,))
+    with S[src].cursor() as c:   # 2. copy rows through the application
+        c.execute("SELECT * FROM orders WHERE seller_id = %s", (seller,)); rows = c.fetchall()
+    with S[dst].cursor() as c:
+        c.executemany("INSERT INTO orders VALUES (%s,%s,%s,%s,%s,%s)", rows)
+    with DIR.cursor() as c:      # 3. flip the directory entry and unfreeze
+        c.execute("UPDATE seller_shard SET shard = %s, moving = FALSE WHERE seller_id = %s", (dst, seller))
+    t_flip = time.perf_counter()
+    with S[src].cursor() as c:   # 4. delete the old copy
+        c.execute("DELETE FROM orders WHERE seller_id = %s", (seller,))
+    print(f"seller {seller}: {len(rows)} rows {src}->{dst}, writes frozen {1000 * (t_flip - t0):.1f} ms")
+
+move(1673, 0); move(1673, 1)
+bench("route via directory", lambda: shard_of(1673), 500)
+```
+
+Lab: 247 rows, frozen 358 ms on the first (cold) run and 34 ms on the second; directory lookup 0.29 ms.
+
+**5b. Split a seller into its own Citus shard.** On the 4-shard copy from Exercise 1 (`orders_d4`), in two terminals:
+
+```sql
+-- pcit, terminal 1
+SELECT get_shard_id_for_distribution_column('orders_d4', 1673);
+SELECT isolate_tenant_to_new_shard('orders_d4', 1673);                                   -- needs wal_level = logical
+\timing on
+SELECT isolate_tenant_to_new_shard('orders_d4', 1673, shard_transfer_mode => 'block_writes');
+-- pcit, terminal 2, right after starting the split:
+INSERT INTO orders_d4 VALUES (20000001, 1673, 'shopee', 'delivered', 10, now());           -- waits
+-- afterwards:
+SELECT shardid, s.shardminvalue, s.shardmaxvalue, nodename FROM citus_shards c JOIN pg_dist_shard s USING (shardid)
+WHERE c.table_name = 'orders_d4'::regclass ORDER BY s.shardminvalue::bigint;
+DELETE FROM orders_d4 WHERE id = 20000001;
+```
+
+Lab: the default call failed with "logical decoding requires "wal_level" >= "logical""; `block_writes` took 2.2 s, the INSERT waited 1.7 s, and the table went from 4 to 6 shards with seller 1673 alone in one of them (247 rows).
+
+## Reset
+
+```sql
+-- pcit
+DROP TABLE IF EXISTS orders_d, orders_d4, items_s, items_o, sellers_ref, sellers_dist, sellers_local CASCADE;
+DROP INDEX IF EXISTS orders_seller_idx;
+```
+
+```bash
+for d in parts_all parts_s0 parts_s1 parts_dir; do pmy -e "DROP DATABASE IF EXISTS $d"; done
+```
+
+## Session quiz
+
+1. Why must the primary key of `orders_d` include `seller_id`, and what does `PRIMARY KEY (seller_id, id)` no longer guarantee?
+2. A lookup by `id` on `orders_d` took 1.96 ms against 0.54 ms when `seller_id` was added. Explain the difference in terms of tasks.
+3. Why did joining `orders_d` and `items_s` on the order id alone need a repartition join, although both tables are colocated?
+4. When is a reference table the right choice for a small table, and what does each write to it cost?
+5. Which of these queries send every row to the coordinator: GMV per marketplace, top 10 sellers, median order amount, page 10,001 with OFFSET? What would you change for each one that does?
+6. In the application-sharded MySQL setup, why was the per-shard top 10 correct for sellers and wrong for days?
+7. Going from 2 to 4 shards with `seller_id % N` moves half the data. What two designs avoid that, and what does each cost?
+8. What did `isolate_tenant_to_new_shard` with `block_writes` do to seller 1673's writes, and what would make the split non-blocking?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-7-sharding-postgresql-mysql/lab/answers">Answers to the session quiz</DeepDive>

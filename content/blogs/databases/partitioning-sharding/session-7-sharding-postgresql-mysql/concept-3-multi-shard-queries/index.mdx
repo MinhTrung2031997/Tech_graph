@@ -1,0 +1,190 @@
+---
+title: "Concept 3: Multi-shard queries"
+description: "A query without the distribution column runs as one task per shard and the coordinator merges the results. When the workers can pre-aggregate (GROUP BY, sum, avg, count DISTINCT on the distribution column, ORDER BY … LIMIT), only 32 small partial results travel: 4.8 kB for GMV per marketplace. When they cannot, every row travels: OFFSET 100000 pulled all 1,000,000 rows (15 MB, 906 ms vs 24 ms on one server) and a median pulled 7.8 MB; keyset pagination needed 320 rows (4.6 ms). On one laptop the 32-shard table was about twice as slow as the plain one for full-table aggregates; DDL such as CREATE INDEX ran on all 32 shards."
+type: "concept"
+tags: ["sharding", "citus", "aggregation", "pagination", "postgresql"]
+status: "draft"
+sources:
+  - "https://docs.citusdata.com/en/stable/develop/reference_processing.html"
+  - "https://docs.citusdata.com/en/stable/develop/reference_sql.html#aggregate-functions"
+  - "https://docs.citusdata.com/en/stable/develop/reference_ddl.html"
+  - "https://docs.citusdata.com/en/stable/performance/performance_tuning.html"
+---
+
+<Tldr>
+A multi-shard query is split in two: a **worker part** run once per shard, and a **coordinator part** that merges. The coordinator can only merge cheaply if the worker part reduces the data first. `GROUP BY marketplace` with `count`, `sum` and `avg` returned **96 rows (4,796 bytes)** from 32 shards; top 10 sellers by GMV **320 rows**, because each shard sends its own top 10 (correct only because a seller lives in one shard); `count(DISTINCT seller_id)` **32 rows**. Some queries cannot be reduced: `ORDER BY created_at LIMIT 10 OFFSET 100000` made every shard send up to 100,010 rows, which here was **all 1,000,000 rows (15 MB, 906 ms vs 24 ms on the plain table)**; `percentile_cont` pulled **7.8 MB**. Keyset pagination (`WHERE (created_at, id) > …`) brought it back to **320 rows, 4.6 ms**. On this single laptop, full-table aggregates were about **2× slower** distributed (129 ms vs 68 ms for GMV per marketplace): the workers share the same CPUs, so there is only overhead to gain. `CREATE INDEX` on the distributed table built **32 shard indexes** in about the same time as one on the plain table.
+</Tldr>
+
+## How the coordinator splits a query
+
+| Term | Meaning |
+|---|---|
+| Worker part | The SQL each task runs on its shard, possibly with partial aggregation, LIMIT and ORDER BY |
+| Coordinator part | What runs on the coordinator over the tasks' results (`remote_scan`): final aggregation, sort, LIMIT |
+| Partial aggregate | A per-shard result that can be combined: a count, a sum, a sum and count for avg |
+| Pushdown | Moving work (filter, aggregation, limit) into the worker part |
+| `Tuple data received from nodes` | EXPLAIN ANALYZE line: bytes the coordinator received from all tasks |
+| **✓ / ✗** | Reduced on the worker / shipped raw to the coordinator |
+
+<Flow
+  title="Citus: who does the work in a multi-shard query"
+  height={290}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'one query', x: 20, y: 20, w: 200 },
+    { id: 'coord', label: 'Coordinator', sub: 'split into 32 tasks', x: 300, y: 20, w: 200 },
+    { id: 'merge', label: 'Coordinator merge', sub: 'remote_scan', x: 560, y: 20, w: 220 },
+    { id: 'w1', label: 'Worker pt-citus-w1', sub: '16 tasks', x: 100, y: 210, w: 240 },
+    { id: 'w2', label: 'Worker pt-citus-w2', sub: '16 tasks', x: 460, y: 210, w: 240 },
+  ]}
+  edges={[
+    { id: 'app-coord', from: 'app', to: 'coord' },
+    { id: 'coord-merge', from: 'coord', to: 'merge' },
+    { id: 'coord-w1', from: 'coord', to: 'w1' },
+    { id: 'coord-w2', from: 'coord', to: 'w2' },
+  ]}
+  cases={[
+    {
+      title: 'GMV per marketplace (pushdown)',
+      path: 'coordinator ✓ → each shard: HashAggregate ✓ 3 rows → merge 96 rows ✓ → 3 rows',
+      summary: 'Counts and sums add up; avg becomes sum and count. 4,796 bytes received.',
+      steps: [
+        {
+          title: 'Partial aggregation on every shard',
+          note: 'Each task runs HashAggregate on marketplace over its ~31k rows and returns 3 rows: count, sum and the pieces of avg.',
+          code: 'SELECT marketplace, count(*), sum(amount), avg(amount) FROM orders_d GROUP BY 1;',
+          active: ['app', 'coord', 'w1', 'w2'],
+          edges: ['app-coord', 'coord-w1', 'coord-w2'],
+          subs: { w1: '✓ 3 rows per shard', w2: '✓ 3 rows per shard' },
+        },
+        {
+          title: 'Final aggregation',
+          note: 'Custom Scan returned 96 rows (32 × 3); a HashAggregate on remote_scan.marketplace produces the 3 answers. Tuple data received from nodes: 4796 bytes.',
+          active: ['coord', 'merge'],
+          edges: ['coord-merge'],
+          subs: { merge: '96 rows → 3' },
+        },
+      ],
+    },
+    {
+      title: 'Top 10 sellers by GMV',
+      path: 'each shard: GROUP BY seller_id, ORDER BY, LIMIT 10 ✓ → merge 320 rows → top 10',
+      summary: 'Grouping by the distribution column is complete inside each shard, so per-shard top 10 is enough.',
+      steps: [
+        {
+          title: 'Limit pushed down',
+          note: 'A seller exists in exactly one shard, so its total is final on that shard. Each task returns its 10 best sellers (Limit, Sort, HashAggregate over 154 sellers); the coordinator sorts 320 rows. 5,754 bytes.',
+          code: 'SELECT seller_id, sum(amount) g FROM orders_d GROUP BY 1 ORDER BY g DESC LIMIT 10;',
+          active: ['coord', 'w1', 'w2', 'merge'],
+          edges: ['coord-w1', 'coord-w2', 'coord-merge'],
+          subs: { w1: '✓ top 10 per shard', w2: '✓ top 10 per shard', merge: '320 rows → 10' },
+        },
+      ],
+    },
+    {
+      title: 'Page 10,001 with OFFSET',
+      path: 'each shard: LIMIT 100010 ✗ → merge 1,000,000 rows → skip 100,000 → 10 rows',
+      summary: 'The coordinator cannot know which shard holds rows 100,001 to 100,010, so it needs every candidate. 906 ms.',
+      steps: [
+        {
+          title: 'Every shard sends everything',
+          note: 'The worker part is LIMIT 100010 with the same ORDER BY. No shard has that many rows (~31k), so each sends all of them: actual rows=1000000, Tuple data received from nodes: 15 MB. On the plain table the same query reads 100,010 index entries: 24 ms.',
+          code: 'SELECT id, created_at FROM orders_d ORDER BY created_at, id LIMIT 10 OFFSET 100000;',
+          active: ['coord', 'w1', 'w2', 'merge'],
+          edges: ['coord-w1', 'coord-w2', 'coord-merge'],
+          subs: { w1: '✗ all rows', w2: '✗ all rows', merge: '1,000,000 rows → 10' },
+        },
+        {
+          title: 'Keyset instead',
+          note: 'With the last row of the previous page as the starting point, each shard needs only its first 10 rows after it: 320 rows, 5,120 bytes, 4.6 ms. Same result as the OFFSET query.',
+          code: "SELECT id, created_at FROM orders_d\nWHERE (created_at, id) > ('2024-03-14 02:22:56+00', 100000)\nORDER BY created_at, id LIMIT 10;",
+          active: ['coord', 'w1', 'w2', 'merge'],
+          edges: ['coord-w1', 'coord-w2', 'coord-merge'],
+          subs: { w1: '✓ 10 rows per shard', w2: '✓ 10 rows per shard', merge: '320 rows → 10' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## What travels to the coordinator
+
+All on `orders_d` (1M rows, 32 shards), EXPLAIN ANALYZE, one run each:
+
+| Query | Rows received | Bytes received | Pushed down |
+|---|---|---|---|
+| `GROUP BY marketplace` with count, sum, avg | 96 | 4,796 | ✓ partial aggregates |
+| `GROUP BY seller_id ORDER BY sum DESC LIMIT 10` | 320 | 5,754 | ✓ complete groups + limit |
+| `ORDER BY amount DESC, id LIMIT 10` | 320 | 6,400 | ✓ limit |
+| `count(DISTINCT seller_id)` | 32 | 256 | ✓ distinct on the distribution column is per shard |
+| `count(DISTINCT status)` | 96 | 832 | ✓ per-shard distinct values, de-duplicated on the coordinator |
+| window `OVER (PARTITION BY marketplace …)`, one day | 1,367 | 45 kB | ✗ rows shipped, window on coordinator |
+| `percentile_cont(0.5)` over the table | 1,000,000 | 7.8 MB | ✗ every value shipped |
+| `ORDER BY created_at LIMIT 10 OFFSET 100000` | 1,000,000 | 15 MB | ✗ up to OFFSET + LIMIT rows per shard |
+| keyset page, `WHERE (created_at, id) > …` | 320 | 5,120 | ✓ limit |
+
+## Measured latency
+
+pgbench, one connection, three repetitions, middle value. Same laptop for every column.
+
+| Query | Plain `orders` | `orders_d`, 32 shards | `orders_d4`, 4 shards |
+|---|---|---|---|
+| December GMV (index on `created_at`) | 5.3 ms | 10.0 ms | 7.3 ms |
+| GMV per marketplace, full table | 68 ms | 129 ms | 93 ms |
+| Top 10 sellers, full table | 67 ms | 139 ms | |
+| Page with OFFSET 100000 | 24 ms | 906 ms | |
+| Keyset page | | 4.6 ms | |
+
+The full-table aggregates are slower distributed **on this machine**: both workers and the coordinator run on the same 10 cores under emulation, so splitting the scan into 32 tasks adds coordination without adding hardware. On real separate servers the scan work divides by the number of workers; the coordination overhead stays. The 4-shard copy shows that overhead shrinking with fewer tasks.
+
+## Writes and DDL across shards
+
+| Statement | Measured |
+|---|---|
+| `CREATE INDEX … ON orders_d (amount)` | 545 ms; created on all 32 shards (`run_command_on_shards` found it on 32); plain table 495 ms |
+| `CREATE INDEX CONCURRENTLY` on `orders_d` | works, 515 ms |
+| `UPDATE orders_d … WHERE created_at >= '2025-12-31'` | 1,367 rows on every shard, one transaction, 78 ms |
+
+A multi-shard UPDATE or DDL runs on every worker inside one distributed transaction; Session 8 looks at how Citus commits it (two-phase commit).
+
+<Pitfall>
+Deep `OFFSET` pagination is bad on one server ([Indexing Session 10, Concept 1](/blogs/databases/indexing/session-10-pagination-aggregation/concept-1-keyset-pagination)) and much worse when sharded: the coordinator must collect OFFSET + LIMIT rows **from every shard**, so the cost grows with the page number times the shard count. Here page 10,001 transferred the whole table. Use keyset pagination for any list that users page through across shards, and treat medians, percentiles and window functions over the whole table as "ship every row" operations: run them on a pre-aggregated table or with an approximation.
+</Pitfall>
+
+## Real-world scenario: the group-wide dashboard
+
+A brand partner wants a dashboard across all their sellers' shops: GMV by marketplace and day, top SKUs, median order value, and an order list with paging.
+
+| Widget | Behaviour on a table distributed by `seller_id` | What to do |
+|---|---|---|
+| GMV by marketplace and day | Partial aggregates, small transfer | Fine as is |
+| Top 10 sellers | Per-shard top 10, correct | Fine as is |
+| Top 10 SKUs across sellers | A SKU spans shards: every shard must send every SKU's partial sum | Fine for thousands of SKUs; for millions, pre-aggregate daily |
+| Median order value | Every amount shipped to the coordinator | Pre-aggregate, or an approximate percentile extension |
+| Order list, page 500 | OFFSET collects 500 pages from every shard | Keyset pagination |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Indexing Session 10, Concept 1](/blogs/databases/indexing/session-10-pagination-aggregation/concept-1-keyset-pagination) | Keyset pagination on one server |
+| [Indexing Session 10, Concept 5](/blogs/databases/indexing/session-10-pagination-aggregation/concept-5-pipelines-pushdown) | Pushing work down in a single-server pipeline |
+| Concept 4 | Without Citus, the application has to write this merge logic itself |
+
+## Key takeaways
+
+1. A multi-shard query runs a worker part on every shard and a coordinator part that merges.
+2. Counts, sums, averages, min/max, grouped results and ORDER BY … LIMIT are reduced on the workers; little data travels.
+3. Grouping by the distribution column is complete per shard, so per-shard top N is correct.
+4. OFFSET, percentiles and many window functions ship rows to the coordinator: the OFFSET query here moved the whole table.
+5. On one machine sharding only adds overhead; the gain comes from more machines.
+
+## Check questions
+
+1. How does Citus compute `avg(amount)` over 32 shards without shipping the amounts?
+2. Why is a per-shard LIMIT 10 enough for the top 10 sellers, and when would it not be?
+3. Why did `LIMIT 10 OFFSET 100000` pull all 1,000,000 rows, and how did the keyset query avoid it?
+4. Which of these ship every row to the coordinator: `count(DISTINCT seller_id)`, `percentile_cont(0.5)`, `max(amount)`?
+5. Why was the full-table GMV query slower on the 32-shard table than on the plain table here, and why would that change in production?
+6. `CREATE INDEX` on `orders_d` took about as long as on the plain table. What did it do?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-7-sharding-postgresql-mysql/concept-3-multi-shard-queries/answers">Worked answers to Q1–Q6</DeepDive>
