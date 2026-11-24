@@ -1,0 +1,84 @@
+---
+title: "Answers: Three ways to join"
+description: "Worked answers to the Session 9 Concept 1 check questions."
+companion: "answers"
+tags: ["indexing", "joins", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/planner-optimizer.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/hash-joins.html"
+  - "https://www.mongodb.com/docs/manual/reference/operator/aggregation/lookup/"
+---
+
+<Tldr>
+Nested loop needs an index on the inner side; hash join needs memory; merge join needs sorted inputs. Count the outer rows before deciding which one you want.
+</Tldr>
+
+## Q1. What each algorithm needs
+
+**Question:** what does each of the three join algorithms need from the inputs, and which one is the only one that benefits from an index on the inner join column?
+
+| Algorithm | Needs | Index on the inner join column |
+|---|---|---|
+| Nested loop | A cheap way to find the partners of one outer row | **Essential**: turns each inner search into one descent instead of a scan |
+| Hash join | Memory for the build side; an equality condition | Not used for the join (indexes may still serve filters) |
+| Merge join | Both inputs sorted on the join key | Helps only as a source of **sorted** input; it is read in order, not searched |
+
+Only the nested loop **searches** the inner side per outer row, so only it benefits from the index as a lookup structure. A merge join can use the same index, but as an ordered stream.
+
+> **Common mistake:** "an index speeds up every join". A hash join reads both sides once and never looks anything up.
+
+## Q2. Hash join for revenue per country
+
+**Question:** why did PostgreSQL choose a hash join for revenue per country, even though `orders_customer_idx` exists?
+
+Every customer and every order take part. A nested loop would do 100,000 descents into `orders_customer_idx` and fetch 1M heap rows in index order, which are random reads (cost 4 each in the model, Session 3). The hash join reads customers once (2,562 buffers), builds a 4.9 MB hash table, and reads orders once sequentially (10,205 buffers): 12,815 buffers in total. When most of both tables is needed, one sequential pass over each is the floor.
+
+> **Common mistake:** seeing a Seq Scan inside a join and adding an index for it. Check first whether the join keeps a small fraction of the rows.
+
+## Q3. Where the hash join's extra work went
+
+**Question:** the merge join read 10,850 buffers and the hash join 23,691 plus temp blocks. Where did the hash join's extra work come from?
+
+Two places:
+
+| Cost | Hash join | Merge join |
+|---|---|---|
+| order_items | Full sequential scan: all 2M rows (16,667 buffers), though only 400,000 match `id <= 200000` | Index scan from the start of `order_items_order_idx` to order 200,000: 4,322 buffers |
+| Sort for GROUP BY o.id | Hash output is unordered: Sort of 400,000 rows, external merge, 4.7 MB on disk (3,632 temp blocks) | Merge output is already in `o.id` order: no Sort |
+
+The index lets the merge join stop reading order_items once it passes order 200,000, and its ordered output makes the GROUP BY free.
+
+> **Common mistake:** comparing only the join node. The sort after the join was half the hash plan's cost.
+
+## Q4. MySQL's hash join
+
+**Question:** in MySQL, when is a hash join used, and why was the full-table aggregate faster with the index hinted away?
+
+MySQL uses a hash join only for an equi-join where **no index** can serve the inner side (it replaced the block nested loop in 8.0.18). If an index exists, the optimizer chooses the index nested loop; its cost model even printed the hash join at 9.96e+9. For the full aggregate that meant 100,000 index lookups and 1M clustered-index fetches (1.3–2.0 s). With `NO_INDEX` hints the join read orders once and probed a hash of 100,000 customers (≈ 0.24 s).
+
+> **Common mistake:** assuming MySQL weighs hash join against index lookups the way PostgreSQL does. It does not; for big reporting joins, test with `NO_INDEX` / `IGNORE INDEX` or run them on a replica built for reporting.
+
+## Q5. Using join buffer (hash join)
+
+**Question:** what does `Using join buffer (hash join)` in MySQL's EXPLAIN tell you about the indexes on the inner table?
+
+That no index on the inner table matches the join condition (or the matching ones were ignored by a hint), so the inner table is read in full (`type: ALL`) and matched through an in-memory hash table. On a small inner table that is fine; on a big one, joined to few outer rows, it means a missing index: 2,000,001 rows read to return 10 items in the lab.
+
+> **Common mistake:** reading "join buffer" as "it is cached, so it is fast". The whole table is still scanned on every execution.
+
+## Q6. 10,000,005 documents
+
+**Question:** why did MongoDB examine 10,000,005 documents to join 5 orders to their items, and what two things would avoid it?
+
+With no usable index on `order_items.order_id` and 2M documents (above the 10,000-document HashJoin limit), `$lookup` ran as `NestedLoopJoin`: a full collection scan per outer order, 5 × 2,000,000 + the 5 orders. To avoid it: **create an index on the foreignField** (`{ order_id: 1 }`: 15 keys, 15 documents, ≈ 1 ms), or, if the data is always read together, **embed** the items in the order document so no join is needed.
+
+> **Common mistake:** testing `$lookup` on a small development collection where HashJoin hides the missing index; in production the collection passes 10,000 documents and every outer document triggers a scan.
+
+## Q7. A 300-document lookup collection
+
+**Question:** a `$lookup` joins 1M events to a 300-document `event_types` collection on `type`. Does it need an index on `event_types.type`?
+
+Not for speed: 300 documents is below the HashJoin thresholds (10,000 documents, 100 MB), so SBE reads `event_types` once into a hash table and probes it per event, like the 5-document `countries` lookup (518 documents examined for 513 customers). An index would still be reasonable if `type` must be unique (a unique index enforces it) or if the collection may grow past 10,000 documents.
+
+> **Common mistake:** indexing every `foreignField` by reflex. Small dimension collections are joined by hashing.

@@ -1,0 +1,350 @@
+---
+title: "Concept 2: The index on the inner side"
+description: "A nested loop costs outer rows × (one descent + the fetches behind it). Measured in all three engines: where PostgreSQL switches from nested loop to hash join (between 300 and 1,000 customers), how a composite (join key, filter) index cuts the inner lookups from 13 to 6.5 buffers per customer, and how covering the inner side brings them to 3. MongoDB's $lookup with a pipeline filter needs the same compound index."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "joins", "nested-loop", "composite-index", "covering-index", "lookup"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/using-explain.html"
+  - "https://www.postgresql.org/docs/current/indexes-index-only-scans.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/nested-loop-joins.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/server-status-variables.html"
+  - "https://www.mongodb.com/docs/manual/reference/operator/aggregation/lookup/"
+---
+
+<Tldr>
+In a nested loop, the inner side runs **once per outer row**, so its cost is multiplied: **outer rows × (one index descent + the rows fetched behind it)**. In PostgreSQL that product decides the plan: up to 300 customers the nested loop wins (3,895 buffers), from 1,000 customers a hash join reading all of `orders` once is cheaper (≈ 10,300 buffers, whatever the count). Within the nested loop, the index design decides the multiplier. For "paid orders of SG gold customers" (513 customers), an index on `(customer_id)` alone costs **13 buffers per customer** and discards 7 of every 10 rows it fetches; **`(customer_id, status)`** puts both conditions into the descent (**6.5 per customer**, 3,691 buffers in total); adding the returned columns with `INCLUDE` makes it an index-only lookup (**3 per customer**, 1,927 buffers). MySQL shows the same steps in its handler counters (5,643 → 2,393 index reads), and MongoDB's `$lookup` with a `pipeline` filter needs the same compound index starting with the `foreignField` (5,130 → 1,880 keys, 0 documents when covered).
+</Tldr>
+
+## The multiplier
+
+| Term | Meaning |
+|---|---|
+| Outer rows | Rows coming out of the driving side, after its own filters |
+| Inner lookup | One execution of the inner side for one outer row: `loops=N` in PostgreSQL, `loops=N` in MySQL's EXPLAIN ANALYZE |
+| Per-loop cost | Buffers (or keys and documents) read by one inner lookup: the descent plus the fetches |
+| Join key + filter index | A composite index on the inner table: the join column first, then the inner filter columns (Session 4: equality columns together) |
+| **✓ Narrow lookup** | Each descent lands only on rows that match both the join and the inner filter |
+| **✗ Wide lookup** | Each descent fetches every row for the join key, then discards most of them |
+
+Nested loop cost ≈ **outer rows × per-loop cost**. You can cut it in two ways: fewer outer rows (a better filter or index on the outer side, Concept 4) or a cheaper per-loop lookup (this concept).
+
+## PostgreSQL: where nested loop stops paying
+
+Same join, growing number of customers (`WHERE c.id <= N`), with only `orders_customer_idx` on the inner side:
+
+| Customers (N) | Plan chosen | Buffers | Time |
+|---|---|---|---|
+| 1 | Nested Loop, bitmap scan of orders_customer_idx | 18 | 0.2 ms |
+| 10 | Nested Loop | 136 | 1.1 ms |
+| 100 | Nested Loop, Index Scan orders_customer_idx | 1,313 | 7 ms |
+| 300 | Nested Loop | 3,895 | 16 ms |
+| 1,000 | **Hash Join**, Seq Scan orders | 10,344 | 27 ms |
+| 3,000 | Hash Join | 10,410 | 24 ms |
+| 10,000 | Hash Join | 10,318 | 66 ms |
+| 100,000 | Hash Join, Seq Scan customers too | 11,060 | 128 ms |
+
+The nested loop costs ≈ 13 buffers per customer (one descent of ≈ 3 pages plus ≈ 10 heap pages for 10 orders); the hash join costs one pass over `orders` (10,205 pages) plus the customers. Forcing each plan at the boundary (`enable_hashjoin`, `enable_nestloop`):
+
+| Customers | Nested loop forced | Hash join forced |
+|---|---|---|
+| 300 | 3,895 buffers, cost 12,184 | 10,320 buffers, cost 16,771 |
+| 1,000 | 12,963 buffers, cost 31,172 | 10,344 buffers, cost 17,473 |
+| 10,000 | 130,354 buffers, cost 53,105, ≈ 54 ms | 10,318 buffers, cost 23,336, ≈ 63 ms |
+
+The planner switches where the buffer counts cross. The last row is the honest exception: with every page already in memory, 130,354 buffer hits were not slower than the hash join. The cost model prices random reads for disk (Session 3), so it protects you from the case where those pages are not cached.
+
+### Composite and covering inner indexes
+
+Query: paid orders of Singapore gold customers. 513 customers × ≈ 10 orders, of which ≈ 35% are paid: 1,775 rows.
+
+<Flow
+  title="PostgreSQL: the per-loop cost of the inner index"
+  height={300}
+  nodes={[
+    { id: 'outer', label: 'Outer: customers', sub: 'country_tier index', x: 20, y: 20, w: 220 },
+    { id: 'idx', label: 'Inner index', sub: '(customer_id)', x: 300, y: 20, w: 200 },
+    { id: 'heap', label: 'orders heap', sub: 'fetch + filter', x: 580, y: 20, w: 200 },
+    { id: 'drop', label: '✗ Discarded rows', sub: 'status ≠ paid', x: 580, y: 150, w: 200 },
+    { id: 'only', label: '✓ Index only', sub: 'no heap visit', x: 300, y: 150, w: 200 },
+  ]}
+  edges={[
+    { id: 'outer-idx', from: 'outer', to: 'idx' },
+    { id: 'idx-heap', from: 'idx', to: 'heap' },
+    { id: 'heap-drop', from: 'heap', to: 'drop' },
+    { id: 'idx-only', from: 'idx', to: 'only' },
+  ]}
+  cases={[
+    {
+      title: '✗ (customer_id) only',
+      path: '513 customers → orders_customer_idx: 10 rows each → heap fetch → ✗ 7 of 10 discarded → 7,064 buffers',
+      summary: 'Nested loop forced, to see its per-loop cost; the planner actually chose a hash join here (11,436 buffers).',
+      steps: [
+        {
+          title: 'Outer: 513 customers',
+          note: "Bitmap Index Scan on customers_country_tier (country = 'SG' AND tier = 'gold'), then 377 heap buffers: 513 rows. Without that index the outer side is a Seq Scan of customers (2,562 buffers across workers).",
+          code: "SELECT c.id, o.id, o.amount\nFROM customers c JOIN orders o ON o.customer_id = c.id\nWHERE c.country = 'SG' AND c.tier = 'gold' AND o.status = 'paid';",
+          active: ['outer'],
+          subs: { outer: '513 rows, 377 buffers' },
+        },
+        {
+          title: 'Each descent finds all 10 orders',
+          note: 'Index Scan using orders_customer_idx, Index Cond customer_id = c.id, loops=513. The index knows nothing about status, so every order of the customer is fetched from the heap.',
+          active: ['outer', 'idx', 'heap'],
+          edges: ['outer-idx', 'idx-heap'],
+          subs: { idx: '(customer_id): 10 per loop' },
+        },
+        {
+          title: 'Then most are thrown away',
+          note: 'Filter: status = paid, Rows Removed by Filter: 7 per loop. Inner side: 6,687 buffers, ≈ 13 per customer. Total 7,064 buffers. The planner preferred a hash join over all of orders (11,436 buffers) to this.',
+          active: ['heap', 'drop'],
+          edges: ['heap-drop'],
+          subs: { drop: '≈ 7 rows per loop' },
+        },
+      ],
+    },
+    {
+      title: '✓ (customer_id, status)',
+      path: '513 customers → descend to (customer_id, paid) ✓ → 3 rows each, no discards → 3,691 buffers',
+      summary: 'CREATE INDEX ON orders (customer_id, status): both conditions become index conditions.',
+      steps: [
+        {
+          title: 'Both conditions in the descent',
+          note: "Index Scan using orders_cust_status, Index Cond: (customer_id = c.id) AND (status = 'paid'). Each descent lands on the 3–4 paid orders of that customer; no Rows Removed by Filter. The planner now picks the nested loop by itself.",
+          code: 'CREATE INDEX orders_cust_status ON orders (customer_id, status);',
+          active: ['outer', 'idx', 'heap'],
+          edges: ['outer-idx', 'idx-heap'],
+          subs: { idx: '(customer_id, status)', heap: '3 rows per loop' },
+        },
+        {
+          title: 'Half the per-loop cost',
+          note: 'Inner side 3,314 buffers (≈ 6.5 per customer), total 3,691 buffers, ≈ 10 ms. Index size 17 MB, against 9 MB for (customer_id) (which is compressed by deduplication, Session 2).',
+          active: ['heap'],
+        },
+      ],
+    },
+    {
+      title: '✓ Covering: INCLUDE (id, amount)',
+      path: '513 customers → descend ✓ → Index Only Scan, Heap Fetches 2 → 1,927 buffers',
+      summary: 'CREATE INDEX ON orders (customer_id, status) INCLUDE (id, amount), then VACUUM so the visibility map is set (Session 5).',
+      steps: [
+        {
+          title: 'The returned columns are in the index',
+          note: 'The query returns o.id and o.amount. With both in INCLUDE, the inner lookup is an Index Only Scan: Heap Fetches 2 across all 513 loops.',
+          code: 'CREATE INDEX orders_cust_status_incl ON orders (customer_id, status)\n  INCLUDE (id, amount);\nVACUUM orders;',
+          active: ['outer', 'idx', 'only'],
+          edges: ['outer-idx', 'idx-only'],
+          subs: { idx: '+ INCLUDE (id, amount)', only: 'Heap Fetches: 2' },
+        },
+        {
+          title: '3 buffers per customer',
+          note: 'Inner side 1,550 buffers (≈ 3 per customer, one descent), total 1,927 buffers, ≈ 5 ms. The price is size: 47 MB for this index, maintained on every insert (Session 8).',
+          active: ['only'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: the same steps in handler counters
+
+MySQL always used the index nested loop here, at every size: 100 customers ≈ 6 ms, 1,000 ≈ 35 ms, 10,000 ≈ 0.25 s, 100,000 ≈ 2.9 s (Concept 1: it does not switch to a hash join while an index exists). So the inner index design is the only lever. `Handler_read_key` counts descents, `Handler_read_next` counts entries read after each descent, `Handler_read_rnd_next` counts rows read by table scans.
+
+<Flow
+  title="MySQL: shrinking the inner lookup"
+  height={300}
+  nodes={[
+    { id: 'outer', label: 'Outer: customers', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'sec', label: 'Inner secondary index', sub: '(customer_id)', x: 300, y: 20, w: 200 },
+    { id: 'pk', label: 'Clustered index', sub: 'fetch row by id', x: 580, y: 20, w: 200 },
+    { id: 'drop', label: '✗ Filter: status', sub: '', x: 580, y: 150, w: 200 },
+    { id: 'cov', label: '✓ Covering lookup', sub: 'Using index', x: 300, y: 150, w: 200 },
+  ]}
+  edges={[
+    { id: 'outer-sec', from: 'outer', to: 'sec' },
+    { id: 'sec-pk', from: 'sec', to: 'pk' },
+    { id: 'pk-drop', from: 'pk', to: 'drop' },
+    { id: 'sec-cov', from: 'sec', to: 'cov' },
+  ]}
+  cases={[
+    {
+      title: '✗ (customer_id), no outer index',
+      path: 'customers ✗ table scan 100,001 rows → 513 lookups × 10 entries → ✗ filter status → 1,880 rows',
+      summary: 'Starting point: no index on customers (country, tier), only orders_customer_idx.',
+      subs: { outer: 'table scan: 100,000 rows' },
+      steps: [
+        {
+          title: 'Outer: a full scan',
+          note: 'Table scan on c, Filter (tier = gold) and (country = SG): 513 of 100,000 rows. Handler_read_rnd_next 100,001.',
+          code: "FLUSH STATUS;\nSELECT c.id, o.id, o.amount\nFROM customers c JOIN orders o ON o.customer_id = c.id\nWHERE c.country = 'SG' AND c.tier = 'gold' AND o.status = 'paid';\nSHOW SESSION STATUS LIKE 'Handler_read%';",
+          active: ['outer'],
+        },
+        {
+          title: 'Inner: every order, then a filter',
+          note: 'Index lookup on o using orders_customer_idx, loops=513, 10 rows each; each entry leads to a clustered-index fetch, then Filter (status = paid) keeps 3.66 per loop. Handler_read_key 514, Handler_read_next 5,130. ≈ 21 ms.',
+          active: ['outer', 'sec', 'pk', 'drop'],
+          edges: ['outer-sec', 'sec-pk', 'pk-drop'],
+          subs: { drop: 'keeps 3.66 of 10' },
+        },
+      ],
+    },
+    {
+      title: '✓ (customer_id, status)',
+      path: 'customers_country_tier → 513 lookups on (customer_id, paid) ✓ → 2,393 entries, no filter → 1,880 rows',
+      summary: 'Indexes added: customers (country, tier), orders (customer_id, status).',
+      subs: { outer: 'covering ref: 513 rows' },
+      steps: [
+        {
+          title: 'Outer through an index',
+          note: 'Covering index lookup on c using customers_country_tier (country=SG, tier=gold): 513 rows, no table scan (Handler_read_rnd_next 0).',
+          code: 'ALTER TABLE customers ADD INDEX customers_country_tier (country, tier);\nALTER TABLE orders ADD INDEX orders_cust_status (customer_id, status);',
+          active: ['outer'],
+        },
+        {
+          title: 'Inner: only paid orders',
+          note: 'Index lookup on o using orders_cust_status (customer_id=c.id, status=paid). Handler_read_next drops from 5,643 (with the outer index but the old inner index) to 2,393: 1,880 matches + one end-of-range read per customer. No Filter line. ≈ 3.7 ms.',
+          active: ['outer', 'sec', 'pk'],
+          edges: ['outer-sec', 'sec-pk'],
+          subs: { sec: '(customer_id, status)', pk: '1,880 fetches' },
+        },
+      ],
+    },
+    {
+      title: '✓ Covering (customer_id, status, amount)',
+      path: '513 lookups → covering index ✓ no clustered fetch → 2,393 entries → 1,880 rows',
+      summary: 'In InnoDB every secondary entry already holds the primary key (id), so only amount must be added.',
+      subs: { outer: 'covering ref: 513 rows' },
+      steps: [
+        {
+          title: 'No clustered-index fetch',
+          note: 'Covering index lookup on o using orders_cust_status_amt; EXPLAIN Extra: Using index. Same 2,393 index entries, but none of the 1,880 clustered-index fetches: ≈ 1.1 ms.',
+          code: 'ALTER TABLE orders DROP INDEX orders_cust_status,\n  ADD INDEX orders_cust_status_amt (customer_id, status, amount);',
+          active: ['outer', 'sec', 'cov'],
+          edges: ['outer-sec', 'sec-cov'],
+          subs: { sec: '(customer_id, status, amount)', cov: 'Using index' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: $lookup with a filter on the foreign side
+
+A `$lookup` can combine `localField` / `foreignField` with a `pipeline` that filters the foreign documents. MongoDB runs it as "equality on `foreignField`, plus the pipeline's `$match`" per outer document, so the best index is the same as in SQL: **`foreignField` first, then the filter fields** (equality fields in any order, Session 4), then the returned fields to cover.
+
+Without a filter, the cost grows linearly with the outer documents and never switches strategy (the 1M-document `orders` collection is far above the HashJoin limit): 100 customers 1,100 keys ≈ 2 ms, 1,000 → 11,000 keys ≈ 14 ms, 10,000 → 110,000 keys ≈ 113 ms, 100,000 → 1,100,000 keys ≈ 1.1 s.
+
+<Flow
+  title="MongoDB: the index behind a $lookup pipeline"
+  height={300}
+  nodes={[
+    { id: 'outer', label: 'Outer: customers', sub: '$match country, tier', x: 20, y: 20, w: 220 },
+    { id: 'idx', label: 'orders index', sub: '{ customer_id: 1 }', x: 300, y: 20, w: 200 },
+    { id: 'docs', label: 'orders documents', sub: 'FETCH', x: 580, y: 20, w: 200 },
+    { id: 'drop', label: '✗ $match status', sub: 'after fetch', x: 580, y: 150, w: 200 },
+    { id: 'cov', label: '✓ Covered', sub: '0 documents', x: 300, y: 150, w: 200 },
+  ]}
+  edges={[
+    { id: 'outer-idx', from: 'outer', to: 'idx' },
+    { id: 'idx-docs', from: 'idx', to: 'docs' },
+    { id: 'docs-drop', from: 'docs', to: 'drop' },
+    { id: 'idx-cov', from: 'idx', to: 'cov' },
+  ]}
+  cases={[
+    {
+      title: '✗ { customer_id: 1 } only',
+      path: '513 customers → customer_id_1: every order → ✗ status checked on the document → 5,130 keys, 5,130 docs',
+      summary: 'The $lookup pipeline filters status: paid; the index only knows customer_id.',
+      steps: [
+        {
+          title: 'Outer documents',
+          note: 'Without an index on customers the $match is a COLLSCAN of 100,000 documents (≈ 100 ms). With { country: 1, tier: 1 }: IXSCAN, 513 keys, 513 documents.',
+          code: 'db.customers.aggregate([\n  { $match: { country: "SG", tier: "gold" } },\n  { $lookup: { from: "orders", localField: "_id", foreignField: "customer_id",\n      pipeline: [ { $match: { status: "paid" } }, { $project: { _id: 0, amount: 1 } } ],\n      as: "paid" } },\n  { $unwind: "$paid" }\n])',
+          active: ['outer'],
+          subs: { outer: '513 customers' },
+        },
+        {
+          title: 'Every order is fetched',
+          note: 'The $lookup stage reports indexesUsed ["customer_id_1"], totalKeysExamined 5,130, totalDocsExamined 5,130: all 10 orders per customer are fetched, and the status filter keeps 1,880.',
+          active: ['outer', 'idx', 'docs', 'drop'],
+          edges: ['outer-idx', 'idx-docs', 'docs-drop'],
+          subs: { drop: 'keeps 1,880 of 5,130' },
+        },
+      ],
+    },
+    {
+      title: '✓ { customer_id: 1, status: 1 }',
+      path: '513 customers → descend to (customer_id, paid) ✓ → 1,880 keys, 1,880 docs',
+      summary: 'The pipeline filter becomes part of the index bounds.',
+      steps: [
+        {
+          title: 'Bounds on both fields',
+          note: 'indexesUsed ["cust_status"]: 1,880 keys and 1,880 documents, exactly the matches. An index { status: 1, customer_id: 1 } gave the same 1,880 keys: with two equality fields, their order does not change the seek (Session 4).',
+          code: 'db.orders.createIndex({ customer_id: 1, status: 1 }, { name: "cust_status" })',
+          active: ['outer', 'idx', 'docs'],
+          edges: ['outer-idx', 'idx-docs'],
+          subs: { idx: '{ customer_id, status }', docs: '1,880 docs' },
+        },
+      ],
+    },
+    {
+      title: '✓ Covered: + amount, _id excluded',
+      path: '513 customers → { customer_id, status, amount } ✓ → 1,880 keys, 0 docs',
+      summary: 'The pipeline projects { _id: 0, amount: 1 }, and amount is in the index.',
+      steps: [
+        {
+          title: 'No documents fetched',
+          note: 'indexesUsed ["cust_status_amt"], totalKeysExamined 1,880, totalDocsExamined 0. Keeping _id in the projection would force a fetch, because _id is not in this index (Session 6, Concept 5).',
+          code: 'db.orders.createIndex({ customer_id: 1, status: 1, amount: 1 }, { name: "cust_status_amt" })',
+          active: ['outer', 'idx', 'cov'],
+          edges: ['outer-idx', 'idx-cov'],
+          subs: { idx: '+ amount', cov: '1,880 keys, 0 docs' },
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+The inner index must start with the **join column**. An index on `(status, created_at)` serves "paid orders in June" on its own, but inside a nested loop it cannot be searched by `customer_id`, so each outer row would scan the whole paid-in-June range. Design inner indexes as join key first, then the inner filters, then (optionally) the returned columns, and check `loops=` and the per-loop buffers in the plan.
+</Pitfall>
+
+## Real-world scenario: the account page
+
+An account page shows a customer's open orders with their items: `customers (1 row) → orders (open ones) → order_items`. Two nested loops, each with few outer rows.
+
+| Inner side | Index | Per-loop cost |
+|---|---|---|
+| orders for the customer, `status IN ('pending', 'paid')`, newest first | `(customer_id, status, created_at)` | One descent per status value, rows already in date order |
+| items of each order | `order_items (order_id)` | One descent, 2 rows |
+
+Measured in PostgreSQL for customer 4242 (15 orders, 9 of them pending or paid): 57 buffers with `(customer_id)`, of which 6 orders were fetched and discarded; 51 buffers with `(customer_id, status, created_at)`; the 9 item lookups cost 36 of them. The gain is small for a customer with 15 orders and grows with the history: with `(customer_id)` alone the first loop fetches every order the customer ever placed. Without `order_items (order_id)`, each of the 9 orders would scan 2M items instead (Concept 1).
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 3: foreign keys | A foreign-key check is an inner lookup on the child table, with the same multiplier |
+| Concept 4: join order | Which table is inner decides which index is needed |
+| Session 10: pagination | "Newest 20 orders with their items" is a nested loop whose outer side is a LIMIT |
+| Session 11: capstone | Reading `loops=` × per-loop buffers is the core of diagnosing slow joins |
+
+## Key takeaways
+
+1. Nested loop cost ≈ outer rows × (descent + fetches); in PostgreSQL the hash join took over between 300 and 1,000 customers.
+2. Put the inner filter into the inner index after the join key: 13 → 6.5 buffers per customer in PostgreSQL, 5,643 → 2,393 index reads in MySQL, 5,130 → 1,880 keys in MongoDB.
+3. Cover the returned columns to skip the fetch: 3 buffers per customer, `Using index`, 0 documents examined.
+4. MySQL never switches to a hash join while an index exists, so its inner index design matters at every size.
+5. Covering indexes cost space and write time (47 MB here): add them for hot joins, not by default.
+
+## Check questions
+
+1. Write the cost of a nested loop as a formula, and say which part an inner index changes.
+2. In the PostgreSQL table, why does the hash join cost stay at ≈ 10,300 buffers from 1,000 to 10,000 customers while the nested loop grows?
+3. With only `(customer_id)` on orders, the planner chose a hash join for "paid orders of SG gold customers". What changed when `(customer_id, status)` was added?
+4. Why is `(status, customer_id)` as good as `(customer_id, status)` for this join, but `(status, created_at)` useless?
+5. In MySQL, what do `Handler_read_key` and `Handler_read_next` count, and why did `Handler_read_next` stay at 2,393 when the covering index was added?
+6. Why does a MySQL covering index for this query need only `amount` added, while PostgreSQL needed `INCLUDE (id, amount)`?
+7. A MongoDB `$lookup` pipeline projects `{ amount: 1 }`, and the index is `{ customer_id: 1, status: 1, amount: 1 }`. Why are documents still fetched?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-9-indexes-for-joins/concept-2-inner-index/answers">Worked answers to Q1–Q7</DeepDive>

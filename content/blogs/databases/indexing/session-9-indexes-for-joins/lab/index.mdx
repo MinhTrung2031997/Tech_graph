@@ -1,0 +1,312 @@
+---
+title: "Lab and session quiz: Indexes for joins"
+description: "Add customers (100k) and order_items (2M) to the lab, then measure nested loop vs hash vs merge join, find where PostgreSQL switches algorithms, design inner indexes, time cascaded deletes with and without a foreign-key index, and see what the wrong driving table costs in all three engines."
+type: "how-to"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "joins", "foreign-keys", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/using-explain.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/explain.html#explain-analyze"
+  - "https://www.mongodb.com/docs/manual/reference/operator/aggregation/lookup/"
+---
+
+<Tldr>
+Uses the containers and the 1M-row `orders` from the [Session 1 lab](/blogs/databases/indexing/session-1-storage-basics/lab) and the `pg` / `my` / `mg` aliases defined there. Step 1 resets `orders` to three indexes and adds two tables that **Sessions 10 and 11 reuse**. Page and key counts below should match yours exactly; timings will not. Run the shell loops with `bash`.
+</Tldr>
+
+## 1. Setup: reset orders, add customers and order_items
+
+Earlier labs left extra indexes on `orders`. Reset it to the primary key, `(customer_id)` and `(status, created_at)`, so plans match this page.
+
+```sql
+-- pg: drop every orders index except the three baseline ones
+DO $$ DECLARE r record; BEGIN
+  FOR r IN SELECT indexname FROM pg_indexes
+           WHERE tablename = 'orders' AND indexname NOT IN ('orders_pkey', 'orders_customer_idx', 'orders_status_created_idx')
+  LOOP EXECUTE format('DROP INDEX %I', r.indexname); END LOOP;
+END $$;
+VACUUM ANALYZE orders;
+```
+
+```sql
+-- my: list the indexes, then drop every one except PRIMARY, orders_customer_idx, orders_status_created_idx
+SHOW INDEX FROM orders;
+ALTER TABLE orders DROP INDEX orders_cust_created_amt, DROP INDEX orders_day, DROP INDEX orders_sku_lower;  -- the ones left by earlier labs
+ANALYZE TABLE orders;
+```
+
+```js
+// mg: keep _id_, customer_id_1 and es ({ status: 1, created_at: -1 })
+db.orders.getIndexes().map(i => i.name)
+  .filter(n => !['_id_', 'customer_id_1', 'es'].includes(n))
+  .forEach(n => db.orders.dropIndex(n));
+```
+
+New tables, identical in the three engines (country and tier are derived from md5, so they are independent of each other and of the order formulas):
+
+| Table | Rows | Columns |
+|---|---|---|
+| `customers` | 100,000 | `id`, `country` (40% VN, 30% TH, 10% SG / MY / PH), `tier` (5% gold, 20% silver, 75% basic), `email`, `created_at` (rises with `id`) |
+| `order_items` | 2,000,000 | `id`, `order_id` (items 2g−1 and 2g belong to order g), `sku`, `qty`, `price` |
+
+Check after loading: 10,050 SG customers, 513 of them gold, in every engine.
+
+### PostgreSQL
+
+Save as `pg-s9-seed.sql`, run `docker exec -i idx-pg psql -U postgres < pg-s9-seed.sql` (≈ 3 s).
+
+```sql
+-- Session 9 dataset: 100k customers and 2M order items, joined to the existing 1M orders.
+DROP TABLE IF EXISTS order_items, customers;
+CREATE TABLE customers (
+  id         integer     PRIMARY KEY,
+  country    text        NOT NULL,
+  tier       text        NOT NULL,
+  email      text        NOT NULL,
+  created_at timestamptz NOT NULL
+);
+INSERT INTO customers
+-- Country and tier come from md5 so they are independent of each other and of the orders' formulas.
+SELECT c,
+       CASE WHEN h.n % 10 < 4 THEN 'VN' WHEN h.n % 10 < 7 THEN 'TH'                     -- 40% VN, 30% TH
+            WHEN h.n % 10 = 7 THEN 'SG' WHEN h.n % 10 = 8 THEN 'MY' ELSE 'PH' END,      -- 10% each
+       CASE WHEN h.t % 20 = 0 THEN 'gold' WHEN h.t % 5 = 1 THEN 'silver' ELSE 'basic' END,  -- 5% / 20% / 75%
+       'c' || c || '@example.com',
+       timestamptz '2023-01-01' + c * interval '10 minutes'
+FROM generate_series(1, 100000) AS c,
+     LATERAL (SELECT ('x' || substr(md5('n' || c), 1, 8))::bit(32)::bigint AS n,
+                     ('x' || substr(md5('t' || c), 1, 8))::bit(32)::bigint AS t) AS h;
+-- Two items per order, stored in order_id order (items 2g-1 and 2g belong to order g).
+CREATE TABLE order_items (
+  id       bigint        PRIMARY KEY,
+  order_id bigint        NOT NULL,
+  sku      text          NOT NULL,
+  qty      integer       NOT NULL,
+  price    numeric(10,2) NOT NULL
+);
+INSERT INTO order_items
+SELECT i, (i + 1) / 2,
+       'SKU-' || lpad(((hashint4(i * 5) & 2147483647) % 5000)::text, 6, '0'),
+       1 + i % 3,
+       ((hashint4(i * 11) & 2147483647) % 20000) / 100.0
+FROM generate_series(1, 2000000) AS i;
+VACUUM ANALYZE customers;
+VACUUM ANALYZE order_items;
+```
+
+### MySQL
+
+Save as `mysql-s9-seed.sql`, run `docker exec -i idx-mysql mysql -uroot -plab lab < mysql-s9-seed.sql` (≈ 4 s).
+
+```sql
+-- Session 9 dataset: 100k customers and 2M order items, same values as PostgreSQL where possible.
+DROP TABLE IF EXISTS order_items, customers;
+CREATE TABLE customers (
+  id         INT          NOT NULL PRIMARY KEY,
+  country    CHAR(2)      NOT NULL,
+  tier       VARCHAR(8)   NOT NULL,
+  email      VARCHAR(40)  NOT NULL,
+  created_at DATETIME     NOT NULL
+) ENGINE = InnoDB;
+CREATE TABLE order_items (
+  id       BIGINT        NOT NULL PRIMARY KEY,
+  order_id BIGINT        NOT NULL,
+  sku      VARCHAR(12)   NOT NULL,
+  qty      INT           NOT NULL,
+  price    DECIMAL(10,2) NOT NULL
+) ENGINE = InnoDB;
+SET SESSION cte_max_recursion_depth = 2000;
+INSERT INTO customers
+WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < 999),
+     nums AS (SELECT a.n * 1000 + b.n + 1 AS c FROM seq a CROSS JOIN seq b WHERE a.n < 100),
+     -- Country and tier come from md5 so they are independent of each other and of the orders' formulas.
+     h AS (SELECT c, CONV(SUBSTR(MD5(CONCAT('n', c)), 1, 8), 16, 10) AS n,
+                     CONV(SUBSTR(MD5(CONCAT('t', c)), 1, 8), 16, 10) AS t FROM nums)
+SELECT c,
+       CASE WHEN n % 10 < 4 THEN 'VN' WHEN n % 10 < 7 THEN 'TH'
+            WHEN n % 10 = 7 THEN 'SG' WHEN n % 10 = 8 THEN 'MY' ELSE 'PH' END,
+       CASE WHEN t % 20 = 0 THEN 'gold' WHEN t % 5 = 1 THEN 'silver' ELSE 'basic' END,
+       CONCAT('c', c, '@example.com'),
+       TIMESTAMP '2023-01-01 00:00:00' + INTERVAL c * 10 MINUTE
+FROM h ORDER BY c;
+-- Two items per order: items 2g-1 and 2g belong to order g.
+INSERT INTO order_items
+WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < 1999),
+     nums AS (SELECT a.n * 1000 + b.n + 1 AS i FROM seq a CROSS JOIN seq b WHERE b.n < 1000)
+SELECT i, (i + 1) DIV 2,
+       CONCAT('SKU-', LPAD((i * 48271) % 5000, 6, '0')),
+       1 + i % 3,
+       ((i * 7907) % 20000) / 100
+FROM nums ORDER BY i;
+ANALYZE TABLE customers, order_items;
+```
+
+### MongoDB
+
+Save as `mongo-s9-seed.js`, run `docker cp mongo-s9-seed.js idx-mongo:/ && docker exec idx-mongo mongosh --quiet /mongo-s9-seed.js` (≈ 5–30 s).
+
+```js
+// Session 9 dataset: 100k customers and 2M order items; _id is the customer / item number.
+db = db.getSiblingDB('lab');
+db.customers.drop(); db.order_items.drop();
+// Country and tier come from md5 so they are independent of each other and of the orders' formulas.
+const md5n = s => parseInt(require('crypto').createHash('md5').update(s).digest('hex').slice(0, 8), 16);
+const country = c => { const n = md5n('n' + c) % 10; return n < 4 ? 'VN' : n < 7 ? 'TH' : n === 7 ? 'SG' : n === 8 ? 'MY' : 'PH'; };
+const tier = c => { const t = md5n('t' + c); return t % 20 === 0 ? 'gold' : t % 5 === 1 ? 'silver' : 'basic'; };
+const t0 = new Date('2023-01-01T00:00:00Z').getTime();
+let batch = [];
+for (let c = 1; c <= 100000; c++) {
+  batch.push({ _id: c, country: country(c), tier: tier(c), email: `c${c}@example.com`, created_at: new Date(t0 + c * 600000) });
+  if (batch.length === 10000) { db.customers.insertMany(batch, { ordered: false }); batch = []; }
+}
+// Two items per order: items 2g-1 and 2g belong to order g.
+for (let i = 1; i <= 2000000; i++) {
+  batch.push({ _id: i, order_id: Math.floor((i + 1) / 2), sku: 'SKU-' + String((i * 48271) % 5000).padStart(6, '0'),
+               qty: 1 + i % 3, price: ((i * 7907) % 20000) / 100 });
+  if (batch.length === 10000) { db.order_items.insertMany(batch, { ordered: false }); batch = []; }
+}
+printjson({ customers: db.customers.countDocuments(), items: db.order_items.countDocuments() });
+```
+
+A data note: in the MySQL and MongoDB `orders` (Session 1 seed), `customer_id` is a multiplicative hash of the order id, so all 10 orders of one customer share the same `status`. PostgreSQL's hash spreads statuses within a customer. Totals agree; per-customer counts differ (for example 3,483 SG customers with a paid order in MySQL, 9,728 in PostgreSQL).
+
+## 2. Exercise: three join algorithms (Concept 1)
+
+Predict each plan before running it.
+
+```sql
+-- pg
+EXPLAIN (ANALYZE, BUFFERS) SELECT o.id, o.amount, c.email
+FROM customers c JOIN orders o ON o.customer_id = c.id WHERE c.id = 4242;          -- Nested Loop, 21 buffers
+
+EXPLAIN (ANALYZE, BUFFERS) SELECT c.country, sum(o.amount)
+FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.country;          -- Hash Join, 12,815 buffers
+
+EXPLAIN (ANALYZE, BUFFERS) SELECT o.id, o.created_at, sum(i.qty * i.price)
+FROM orders o JOIN order_items i ON i.order_id = o.id
+WHERE o.id <= 200000 GROUP BY o.id;      -- Hash Join + external sort: 23,691 buffers, temp 3,632
+CREATE INDEX order_items_order_idx ON order_items (order_id);
+-- run it again                           -- Merge Join, no Sort: 10,850 buffers
+```
+
+```sql
+-- my: the same three; then compare the default and a forced hash join for the full aggregate
+EXPLAIN ANALYZE SELECT c.country, sum(o.amount) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.country;
+EXPLAIN ANALYZE SELECT /*+ NO_INDEX(o orders_customer_idx) NO_INDEX(c PRIMARY) */ c.country, sum(o.amount)
+FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.country;          -- ≈ 1.3–2.0 s vs ≈ 0.24 s
+```
+
+```js
+// mg: one strategy per case (look for "strategy" in the explain output)
+db.countries.insertMany([{ code: "VN" }, { code: "TH" }, { code: "SG" }, { code: "MY" }, { code: "PH" }]);
+db.customers.explain("executionStats").aggregate([{ $match: { country: "SG", tier: "gold" } },
+  { $lookup: { from: "orders", localField: "_id", foreignField: "customer_id", as: "o" } }]);      // IndexedLoopJoin
+db.customers.explain("executionStats").aggregate([{ $match: { country: "SG", tier: "gold" } },
+  { $lookup: { from: "countries", localField: "country", foreignField: "code", as: "c" } }]);     // HashJoin
+db.orders.explain("executionStats").aggregate([{ $match: { _id: { $gte: 500000, $lte: 500004 } } },
+  { $lookup: { from: "order_items", localField: "_id", foreignField: "order_id", as: "i" } }]);   // NestedLoopJoin: 10,000,005 docs
+```
+
+## 3. Exercise: find the crossover (Concept 2)
+
+```bash
+#!/bin/bash
+# For a growing number of customers, print the PostgreSQL join plan and its buffers.
+for n in 1 10 100 300 1000 3000 10000 100000; do
+  echo "== $n customers"
+  docker exec idx-pg psql -U postgres -c "EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+    SELECT o.id, o.amount, c.email FROM customers c JOIN orders o ON o.customer_id = c.id
+    WHERE c.id <= $n" | grep -E 'Nested Loop|Hash Join|Buffers: shared' | head -2
+done
+```
+
+Expected: Nested Loop up to 300 (3,895 buffers), Hash Join from 1,000 (≈ 10,300 buffers, flat). Then rerun 1,000 and 10,000 with `SET enable_hashjoin = off; SET enable_mergejoin = off;` in the same `psql -c` call to see the nested loop's real cost (12,963 and 130,354 buffers).
+
+## 4. Exercise: design the inner index (Concept 2)
+
+Query: `WHERE c.country = 'SG' AND c.tier = 'gold' AND o.status = 'paid'`, returning `c.id, o.id, o.amount`. Add, in order, and measure after each step:
+
+| Step | PostgreSQL | MySQL | MongoDB (`$lookup` pipeline `$match status`) |
+|---|---|---|---|
+| Outer index | `customers (country, tier)` | same | `{ country: 1, tier: 1 }` |
+| Inner composite | `orders (customer_id, status)` | same | `{ customer_id: 1, status: 1 }` |
+| Covering | `INCLUDE (id, amount)` + `VACUUM` | `(customer_id, status, amount)` | `+ amount`, project `{ _id: 0, amount: 1 }` |
+| Expected | 11,436 (hash) → 3,691 → 1,927 buffers | Handler_read_next 5,643 → 2,393, `Using index` | 5,130 → 1,880 keys, 1,880 → 0 docs |
+
+For MySQL counters use `FLUSH STATUS; <query>; SHOW SESSION STATUS LIKE 'Handler_read%';`. Never put `FLUSH STATUS` inside a transaction you plan to roll back: `FLUSH` commits the open transaction implicitly, so everything after it is committed.
+
+Drop the composite and covering indexes afterwards; keep `customers (country, tier)`.
+
+## 5. Exercise: foreign keys (Concept 3)
+
+```sql
+-- pg: first without an index on order_items.order_id
+DROP INDEX IF EXISTS order_items_order_idx;
+ALTER TABLE order_items ADD CONSTRAINT order_items_order_fk
+  FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE;
+SELECT seq_scan, seq_tup_read FROM pg_stat_user_tables WHERE relname = 'order_items';
+BEGIN;
+EXPLAIN (ANALYZE) DELETE FROM orders WHERE id BETWEEN 600001 AND 600100;   -- Trigger … time≈5,500 calls=100
+ROLLBACK;
+SELECT seq_scan, seq_tup_read FROM pg_stat_user_tables WHERE relname = 'order_items';   -- +100 scans, +≈200M rows
+CREATE INDEX order_items_order_idx ON order_items (order_id);
+-- repeat the BEGIN / EXPLAIN / ROLLBACK                                    -- Trigger … time≈2 calls=100
+```
+
+```sql
+-- my
+ALTER TABLE order_items ADD CONSTRAINT order_items_order_fk
+  FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE;
+SHOW INDEX FROM order_items;                                  -- order_items_order_fk created for you
+ALTER TABLE order_items DROP INDEX order_items_order_fk;      -- ERROR 1553
+```
+
+```js
+// mg: an application-level cascade, measured without deleting
+const ids = Array.from({ length: 100 }, (_, k) => 600001 + k);
+const ex = () => db.runCommand({ explain: { delete: "order_items", deletes: [{ q: { order_id: { $in: ids } }, limit: 0 }] }, verbosity: "executionStats" }).executionStats;
+ex();                                          // COLLSCAN, totalDocsExamined 2,000,000
+db.order_items.createIndex({ order_id: 1 });
+ex();                                          // 201 keys, 200 docs
+```
+
+Optional, two terminals: insert an item for order 7 in an open transaction, then in the other terminal try `UPDATE orders SET amount = amount WHERE id = 7` and `DELETE FROM orders WHERE id = 7` with a 2-second lock timeout, in PostgreSQL and in MySQL. Roll both back.
+
+## 6. Exercise: driving side (Concept 4)
+
+```sql
+-- my
+ALTER TABLE orders ADD INDEX orders_sku_idx (sku);
+EXPLAIN ANALYZE SELECT o.id, o.amount, c.email FROM orders o JOIN customers c ON c.id = o.customer_id
+WHERE o.sku = 'SKU-000123';                                                   -- 201 descents
+EXPLAIN ANALYZE SELECT /*+ JOIN_ORDER(c, o) */ o.id, o.amount, c.email FROM orders o JOIN customers c ON c.id = o.customer_id
+WHERE o.sku = 'SKU-000123';                                                   -- 100,001 descents, ≈ 2.5 s
+```
+
+```sql
+-- pg: correlated filters
+CREATE INDEX orders_sku_idx ON orders (sku);
+EXPLAIN (ANALYZE, BUFFERS) SELECT o.id, o.amount FROM customers c JOIN orders o ON o.customer_id = c.id
+WHERE c.id > 95000 AND c.created_at >= '2024-10-21 17:20';   -- rows=242 estimated, 5,000 actual: Nested Loop
+```
+
+```js
+// mg
+db.orders.createIndex({ sku: 1 }, { name: "sku" });
+// start from orders, then from customers; compare the $lookup stage's totalKeysExamined
+```
+
+At the end of this lab the tables have: `orders` primary key, `(customer_id)`, `(status, created_at)`, `(sku)`; `customers` primary key, `(country, tier)`; `order_items` primary key, `(order_id)` and, in PostgreSQL and MySQL, the foreign key with `ON DELETE CASCADE`. Sessions 10 and 11 assume this state.
+
+## Session quiz
+
+1. A query joins 20 orders to their items. Which algorithm do you expect, and which index must exist?
+2. Why does PostgreSQL's hash join cost stay flat from 1,000 to 10,000 customers while the nested loop's grows linearly?
+3. In MySQL, the full-table aggregate was 5–8× faster with the join index hinted away. Why does the optimizer not find that plan itself?
+4. For "paid orders of SG gold customers", list the three inner-index designs and the per-customer cost of each in PostgreSQL.
+5. Deleting 100 orders took 5.5 s in PostgreSQL and 2.2 ms in MySQL. Name the single difference responsible.
+6. What does a child insert lock in each SQL engine, and which ordinary statement on the parent row is blocked only in MySQL?
+7. A MongoDB pipeline starts at `customers` and looks up orders filtered by `sku`. What do you change, and what index do you need?
+8. Name two situations from this session where an index on the join column did **not** make the join faster.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-9-indexes-for-joins/lab/answers">Answers to the session quiz</DeepDive>

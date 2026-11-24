@@ -1,0 +1,88 @@
+---
+title: "Answers: Indexes for joins session quiz"
+description: "Worked answers to the Session 9 quiz."
+companion: "answers"
+tags: ["indexing", "joins", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/using-explain.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/hash-joins.html"
+  - "https://www.mongodb.com/docs/manual/reference/operator/aggregation/lookup/"
+---
+
+<Tldr>
+An index helps a join exactly where something is looked up once per outer row: the inner side of a nested loop, a foreign-key check, a `$lookup`. Everywhere else, reading each side once wins.
+</Tldr>
+
+## Q1. 20 orders and their items
+
+**Question:** a query joins 20 orders to their items. Which algorithm do you expect, and which index must exist?
+
+A nested loop: 20 outer rows, each with one lookup into `order_items`. It needs `order_items (order_id)`; with it, each lookup is one descent and 2 rows (5 orders cost 27 buffers in the lab). Without it PostgreSQL would hash the 20 orders and scan all 2M items (16,790 buffers for 5 orders), MySQL would do the same as a hash join (2,000,001 rows read), and MongoDB would scan the collection once per order.
+
+> **Common mistake:** assuming the primary key on `order_items.id` helps. The join searches by `order_id`.
+
+## Q2. Flat vs linear
+
+**Question:** why does PostgreSQL's hash join cost stay flat from 1,000 to 10,000 customers while the nested loop's grows linearly?
+
+The hash join reads all of `orders` once (10,205 pages) regardless of how many customers are in the hash table; only the small customer side grows. The nested loop does one descent and ≈ 10 heap fetches per customer, ≈ 13 buffers each: 12,963 at 1,000, 130,354 at 10,000. The two lines cross between 300 and 1,000 customers, where the planner switches.
+
+> **Common mistake:** reading the switch as a planner bug. It is the planner following the cheaper line.
+
+## Q3. MySQL and the hidden hash join
+
+**Question:** in MySQL, the full-table aggregate was 5–8× faster with the join index hinted away. Why does the optimizer not find that plan itself?
+
+MySQL considers a hash join only when no index can serve the equi-join; with `orders_customer_idx` present it plans an index nested loop. Its cost model also prices the hash join very high (9.96e+9 in EXPLAIN), so even when shown both it prefers the loop. For a full-table join the loop does 100,000 descents and 1M row fetches (1.3–2.0 s); the hash join reads each table once (≈ 0.24 s).
+
+> **Common mistake:** concluding that MySQL's hash join is slow or rare. It is fast; it is just not chosen while an index exists.
+
+## Q4. Three inner indexes
+
+**Question:** for "paid orders of SG gold customers", list the three inner-index designs and the per-customer cost of each in PostgreSQL.
+
+| Inner index | Per customer | Total (513 customers) |
+|---|---|---|
+| `(customer_id)` | ≈ 13 buffers: all ≈ 10 orders fetched, 7 discarded | 7,064 (nested loop forced); the planner preferred a hash join at 11,436 |
+| `(customer_id, status)` | ≈ 6.5 buffers: only the paid orders fetched | 3,691 |
+| `(customer_id, status) INCLUDE (id, amount)` | ≈ 3 buffers: index only | 1,927 |
+
+> **Common mistake:** stopping at `(customer_id)` because "the join column is indexed". The inner filter belongs in the index too.
+
+## Q5. 5.5 s vs 2.2 ms
+
+**Question:** deleting 100 orders took 5.5 s in PostgreSQL and 2.2 ms in MySQL. Name the single difference responsible.
+
+The index on `order_items.order_id`. MySQL created it automatically with the foreign key; PostgreSQL did not, so each of the 100 cascade checks scanned all 2M items. After `CREATE INDEX ON order_items (order_id)` PostgreSQL took 2 ms too.
+
+> **Common mistake:** attributing it to "MySQL being faster at deletes".
+
+## Q6. Child-insert locks
+
+**Question:** what does a child insert lock in each SQL engine, and which ordinary statement on the parent row is blocked only in MySQL?
+
+PostgreSQL locks the parent row `FOR KEY SHARE`; InnoDB takes a shared record lock (`S,REC_NOT_GAP`) on the parent's primary key entry. Both stop a DELETE (or key change) of the parent until the child's transaction ends. Only in MySQL does an ordinary UPDATE of a non-key column (`SET amount = …`) also wait, because InnoDB has no weaker "no key update" mode; in PostgreSQL that UPDATE finished in 4 ms.
+
+> **Common mistake:** keeping long transactions that insert child rows in MySQL and wondering why updates to the parent table time out.
+
+## Q7. A pipeline from the wrong side
+
+**Question:** a MongoDB pipeline starts at `customers` and looks up orders filtered by `sku`. What do you change, and what index do you need?
+
+Start the pipeline at `orders` with `$match: { sku: … }` (index `{ sku: 1 }`), then `$lookup` the customer by `_id` (already indexed). In the lab: 200 + 200 keys, ≈ 4 ms, against 100,000 outer customers and 1,000,000 keys, ≈ 2.7 s. If only customers of one country are wanted, put that filter in the `$lookup` pipeline (20 results, still 400 keys).
+
+> **Common mistake:** adding `{ customer_id: 1, sku: 1 }` to make the customers-first pipeline faster; it still runs 100,000 lookups.
+
+## Q8. When the join index did not help
+
+**Question:** name two situations from this session where an index on the join column did **not** make the join faster.
+
+Any two of:
+
+- Revenue per country over all orders: PostgreSQL chose a hash join (12,815 buffers) and ignored `orders_customer_idx`; MySQL used the index and was 5–8× slower than its hash join.
+- 10,000 customers in the crossover test: the forced nested loop read 130,354 buffers against 10,318 for the hash join.
+- "Paid orders of SG gold customers" with only `(customer_id)`: the planner preferred a hash join, because each lookup fetched and discarded 7 of 10 orders.
+- A `$lookup` into the 5-document `countries` collection: HashJoin without any index, 518 documents examined.
+
+> **Common mistake:** treating "index the join columns" as a complete rule. It is the rule for the inner side of joins with few outer rows.

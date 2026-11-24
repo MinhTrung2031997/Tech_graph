@@ -1,0 +1,81 @@
+---
+title: "Answers: Foreign keys need an index on the child"
+description: "Worked answers to the Session 9 Concept 3 check questions."
+companion: "answers"
+tags: ["indexing", "foreign-keys", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK"
+  - "https://dev.mysql.com/doc/refman/8.4/en/create-table-foreign-keys.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locks-set.html"
+---
+
+<Tldr>
+Inserts check the parent's key; deletes check the child's column. Only the first is indexed automatically everywhere.
+</Tldr>
+
+## Q1. Which side is checked
+
+**Question:** which operations check the parent's primary key, and which check the child's foreign key column?
+
+| Operation | Check | Index used |
+|---|---|---|
+| INSERT a child, or UPDATE its `order_id` | Does the parent exist? | Parent primary key (always exists) |
+| DELETE a parent, or UPDATE its `id` | Do children exist? (cascade: delete or update them) | **Child column** `order_items.order_id` |
+| `ALTER TABLE … ADD FOREIGN KEY` | Every existing child has a parent | Parent primary key, scanning the child table once |
+
+> **Common mistake:** "a foreign key is indexed because the referenced column is a primary key". That index serves only the child-side checks.
+
+## Q2. 200 million rows
+
+**Question:** why did deleting 100 orders read ≈ 200 million rows without an index on `order_items.order_id`?
+
+The referential trigger runs once per deleted parent row (`calls=100`). Each call executes the cascade delete for one `order_id`, and with no index on that column the only plan is a sequential scan of `order_items`: 2M rows × 100 calls. `pg_stat_user_tables` confirmed it: `seq_scan` +100, `seq_tup_read` +199,990,100. The checks are per row, not one join for the whole statement.
+
+> **Common mistake:** expecting the cost to be one scan per DELETE statement. It is one per deleted row.
+
+## Q3. Where the cost appears
+
+**Question:** where do you see the cost of the foreign-key check in PostgreSQL's `EXPLAIN ANALYZE`, and why is it not in the plan tree?
+
+Below the plan: `Trigger for constraint order_items_order_fk: time=5489.029 calls=100`. The checks are run by referential-integrity **triggers** after the DELETE node has produced its rows, each trigger running its own internal query, so they are not nodes of the DELETE's plan. The DELETE node itself was cheap (≈ 0.1 ms); the plan tree alone would hide the 5.5 s.
+
+> **Common mistake:** reading only the plan tree and missing the trigger lines at the bottom; `Execution Time` includes them.
+
+## Q4. MySQL adds and protects the index
+
+**Question:** what does MySQL do when you add a foreign key on a column with no index, and what happens if you try to drop that index?
+
+InnoDB requires an index on the referencing column(s) so its checks and cascades are fast. If no index starts with them, `ADD FOREIGN KEY` creates one (named after the constraint: `order_items_order_fk`). Dropping it fails while the constraint exists: `ERROR 1553 (HY000): Cannot drop index 'order_items_order_fk': needed in a foreign key constraint`. You must drop the constraint first, or create another index starting with `order_id` that can take over.
+
+> **Common mistake:** carrying PostgreSQL's "remember to index the FK" habit into MySQL and adding a duplicate index next to the one InnoDB already created (Session 8: redundant indexes).
+
+## Q5. KEY (note, order_id)
+
+**Question:** a table has `KEY (note, order_id)`. Does MySQL reuse it for a foreign key on `order_id`? Why?
+
+No. The check searches by `order_id` alone, and an index sorted by `note` first has no contiguous range for one `order_id` (leftmost prefix, Session 4). Measured: with `KEY (note, order_id)` InnoDB created a separate index on `(order_id)`; with `KEY (order_id, note)` it created none.
+
+> **Common mistake:** "the column is in an index, so it is indexed". Its position decides whether the index can be searched by it.
+
+## Q6. Who waits behind a child insert
+
+**Question:** while a transaction has inserted an item for order 7, which statements on order 7 wait in PostgreSQL, and which in MySQL?
+
+| Statement on order 7 | PostgreSQL (parent row locked `FOR KEY SHARE`) | MySQL (shared record lock on `PRIMARY` 7) |
+|---|---|---|
+| SELECT | Runs | Runs (consistent read takes no lock) |
+| UPDATE a non-key column (`amount`) | Runs (4 ms): its `FOR NO KEY UPDATE` lock is compatible | **Waits** (exclusive record lock needed); timed out after 2 s |
+| DELETE, or UPDATE of `id` | **Waits**; timed out after 2 s | **Waits** |
+
+PostgreSQL's weaker lock exists exactly so that child inserts do not block ordinary updates of the parent.
+
+> **Common mistake:** assuming a foreign key never causes lock waits on the parent table. In InnoDB, a long transaction that inserted children blocks every update of their parents.
+
+## Q7. MongoDB still needs it
+
+**Question:** MongoDB has no foreign keys. Name two situations in which you still need an index on `order_items.order_id`.
+
+Any two of: a `$lookup` from orders to items (Concept 1: NestedLoopJoin scanned 2M documents per order without it); an application-level cascade delete or archive of items when orders are removed (2,000,000 → 200 documents examined); loading the items of one order for an order page; a periodic job that checks for orphaned items.
+
+> **Common mistake:** thinking that without enforced references there is nothing to index. The queries that follow references are still there.

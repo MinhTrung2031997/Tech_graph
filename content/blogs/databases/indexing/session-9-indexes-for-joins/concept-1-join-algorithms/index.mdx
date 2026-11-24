@@ -1,0 +1,397 @@
+---
+title: "Concept 1: Three ways to join"
+description: "Nested loop, hash join and merge join: what each one reads, which one needs an index, and how PostgreSQL, MySQL and MongoDB ($lookup) choose between them. Measured on customers (100k), orders (1M) and order_items (2M): 21 buffers for one customer, 12,815 for a full hash join, and a merge join that halves the buffers of a hash join with a spilling sort."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "joins", "nested-loop", "hash-join", "merge-join", "lookup"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/planner-optimizer.html"
+  - "https://www.postgresql.org/docs/current/using-explain.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/hash-joins.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/nested-loop-joins.html"
+  - "https://www.mongodb.com/docs/manual/reference/operator/aggregation/lookup/"
+  - "https://www.mongodb.com/docs/manual/reference/explain-results/"
+---
+
+<Tldr>
+A join has an **outer** input and an **inner** input, and there are only three ways to combine them. A **nested loop** looks up the inner input once per outer row, so it needs an **index on the inner join column**: one customer and their orders cost **21 buffers**. A **hash join** reads both inputs once and matches them in a memory hash table, so it needs no index at all: all 100k customers joined to 1M orders cost **12,815 buffers**, about one sequential read of each table. A **merge join** walks two inputs that are already sorted on the join key, side by side: 200,000 orders joined to their 400,000 items through two indexes read **10,850 buffers**, against **23,691 buffers plus a 4.7 MB sort spilled to disk** for the hash join it replaced. PostgreSQL has all three. MySQL has nested loop and hash join, and only uses hash join when **no index** fits the join. MongoDB's `$lookup` runs as an indexed loop, a hash join (foreign collection ≤ 10,000 documents) or a plain nested loop that scans the foreign collection **once per outer document**: 10,000,005 documents examined to join 5 orders to their items.
+</Tldr>
+
+## The dataset for this session
+
+Session 9 adds two tables to the 1M `orders` of the earlier sessions (setup in the [Session 9 lab](/blogs/databases/indexing/session-9-indexes-for-joins/lab)):
+
+| Table | Rows | Join column | Notes |
+|---|---|---|---|
+| `customers` | 100,000 | `id` (primary key) | `country`: 40% VN, 30% TH, 10% each SG, MY, PH; `tier`: 5% gold, 20% silver, 75% basic, independent of country |
+| `orders` | 1,000,000 | `customer_id` → `customers.id` | ≈ 10 orders per customer; indexes: primary key, `(customer_id)`, `(status, created_at)` |
+| `order_items` | 2,000,000 | `order_id` → `orders.id` | Two items per order, stored in `order_id` order; no secondary index at the start |
+
+## Three algorithms
+
+| Term | Meaning |
+|---|---|
+| Outer (driving) input | The side read first; for each of its rows the join looks for partners |
+| Inner input | The side searched for partners of each outer row |
+| Nested loop | For each outer row, search the inner input. With an index on the inner join column each search is one descent; without one it is a full scan per outer row |
+| Hash join | Read the smaller input (the **build** side) into a hash table keyed on the join column, then read the other (the **probe** side) once and look each row up in the table |
+| Merge join | Read both inputs sorted on the join key and advance them together, like merging two sorted lists |
+| **✓ Index serves the join** | The inner side is reached by descents, so the cost grows with the outer row count, not the table size |
+| **✗ No usable index** | The engine must hash, sort, or rescan the inner input |
+
+| Algorithm | Needs | Cost grows with | Best when |
+|---|---|---|---|
+| Nested loop | An index on the inner join column (or a tiny inner input) | Outer rows × (descent + fetch) | Few outer rows |
+| Hash join | Memory for the build side (`work_mem` in PostgreSQL, `join_buffer_size` in MySQL) | Size of both inputs, read once | Many rows on both sides, equality join |
+| Merge join | Both inputs sorted on the key (from an index, or a Sort step) | Size of both inputs, read once in order | Both sides large and already ordered by indexes |
+
+Session 3 explained how the planner prices each plan. Here the same cost model decides between join algorithms: a nested loop pays a random descent per outer row (`random_page_cost` = 4), a hash join pays a sequential read of each table (`seq_page_cost` = 1) plus CPU for hashing.
+
+## PostgreSQL: all three algorithms
+
+<Flow
+  title="PostgreSQL: nested loop, hash join, merge join"
+  height={360}
+  nodes={[
+    { id: 'outer', label: 'Outer rows', sub: 'customers_pkey', x: 20, y: 20, w: 220 },
+    { id: 'idx', label: 'Inner index', sub: 'orders_customer_idx', x: 300, y: 20, w: 200 },
+    { id: 'heap', label: 'Inner heap', sub: 'orders pages', x: 580, y: 20, w: 200 },
+    { id: 'build', label: 'Build side', sub: 'read once', x: 20, y: 150, w: 220 },
+    { id: 'hash', label: 'Hash table', sub: 'in work_mem', x: 300, y: 150, w: 200 },
+    { id: 'probe', label: 'Probe side', sub: 'read once', x: 580, y: 150, w: 200 },
+    { id: 'left', label: 'Sorted input 1', sub: 'orders_pkey', x: 20, y: 280, w: 220 },
+    { id: 'merge', label: 'Merge Join', sub: 'advance both', x: 300, y: 280, w: 200 },
+    { id: 'right', label: 'Sorted input 2', sub: 'order_items_order_idx', x: 580, y: 280, w: 200 },
+  ]}
+  edges={[
+    { id: 'outer-idx', from: 'outer', to: 'idx' },
+    { id: 'idx-heap', from: 'idx', to: 'heap' },
+    { id: 'build-hash', from: 'build', to: 'hash' },
+    { id: 'probe-hash', from: 'probe', to: 'hash' },
+    { id: 'left-merge', from: 'left', to: 'merge' },
+    { id: 'right-merge', from: 'right', to: 'merge' },
+  ]}
+  cases={[
+    {
+      title: '✓ Nested loop: one customer',
+      path: 'customers_pkey: 1 row → orders_customer_idx ✓ one descent → 15 heap pages → 15 rows, 21 buffers',
+      summary: 'WHERE c.id = 4242: one outer row, so one descent into the orders index.',
+      subs: { outer: 'customers_pkey: 1 row' },
+      steps: [
+        {
+          title: 'Read the outer row',
+          note: 'Index Scan using customers_pkey, Index Cond id = 4242: 3 buffers (root, leaf, heap page). The planner put customers on the outside because the filter leaves one row.',
+          code: "EXPLAIN (ANALYZE, BUFFERS)\nSELECT o.id, o.amount, c.email\nFROM customers c JOIN orders o ON o.customer_id = c.id\nWHERE c.id = 4242;",
+          active: ['outer'],
+        },
+        {
+          title: 'One descent per outer row',
+          note: 'For the outer row, the inner side runs with customer_id = 4242 as an index condition: Bitmap Index Scan on orders_customer_idx, 3 buffers. This is the whole point of a nested loop: the inner search is an index descent, not a scan.',
+          active: ['outer', 'idx'],
+          edges: ['outer-idx'],
+          subs: { idx: '3 buffers, 15 matches' },
+        },
+        {
+          title: 'Fetch the matching rows',
+          note: 'The 15 orders sit on 15 different heap pages (Heap Blocks: exact=15). Total: 21 buffers, 0.3 ms. The cost depends on the number of outer rows and their matches, not on the 1M rows in orders.',
+          active: ['idx', 'heap'],
+          edges: ['idx-heap'],
+          subs: { heap: '15 pages → 15 rows' },
+        },
+      ],
+    },
+    {
+      title: '✓ Hash join: every customer',
+      path: 'customers ✗ no filter → build hash (100k rows, 4.9 MB) → orders seq scan probes it → 12,815 buffers',
+      summary: 'Revenue per country over all 1M orders: no index can beat reading both tables once.',
+      subs: { build: 'Seq Scan customers', probe: 'Seq Scan orders' },
+      steps: [
+        {
+          title: 'Build the hash table',
+          note: 'Seq Scan on customers: 100,000 rows into a hash table on id, Buckets 131072, Batches 1, Memory Usage 4,931 kB. Batches 1 means it fit in work_mem (4 MB per worker here, times hash_mem_multiplier 2).',
+          code: "EXPLAIN (ANALYZE, BUFFERS)\nSELECT c.country, sum(o.amount)\nFROM customers c JOIN orders o ON o.customer_id = c.id\nGROUP BY c.country;",
+          active: ['build', 'hash'],
+          edges: ['build-hash'],
+          subs: { hash: '100k keys, 4.9 MB' },
+        },
+        {
+          title: 'Probe it with every order',
+          note: 'Parallel Seq Scan on orders (10,205 buffers): each order looks up its customer_id in the hash table, which costs CPU, not I/O. Total 12,815 buffers, ≈ 70–135 ms over several runs with 2 workers. A nested loop would need 100,000 descents into orders_customer_idx.',
+          active: ['probe', 'hash'],
+          edges: ['probe-hash'],
+          subs: { probe: '1M rows, 10,205 buffers' },
+        },
+      ],
+    },
+    {
+      title: '✓ Merge join: orders + items',
+      path: 'orders_pkey (sorted) + order_items_order_idx (sorted) → Merge Join ✓ no sort → 10,850 buffers',
+      summary: '200,000 orders and their 400,000 items, summed per order. Both sides come out of an index in id order.',
+      steps: [
+        {
+          title: '✗ Without an index on order_items',
+          note: 'Before the index: Parallel Hash Join (order_items seq scan, 16,667 buffers), then a Sort by o.id for the GROUP BY that spilled: external merge, 4.7 MB on disk. Total 23,691 buffers + 3,632 temp blocks, ≈ 350 ms.',
+          code: "SELECT o.id, o.created_at, sum(i.qty * i.price)\nFROM orders o JOIN order_items i ON i.order_id = o.id\nWHERE o.id <= 200000\nGROUP BY o.id;",
+          active: ['left'],
+        },
+        {
+          title: '✓ Both inputs already sorted',
+          note: 'After CREATE INDEX ON order_items (order_id): Index Scan using orders_pkey (6,528 buffers, id order) and Index Scan using order_items_order_idx (4,322 buffers, order_id order).',
+          code: 'CREATE INDEX order_items_order_idx ON order_items (order_id);',
+          active: ['left', 'right'],
+          subs: { left: 'orders_pkey: 200,000 rows', right: 'items idx: 400,001 rows' },
+        },
+        {
+          title: 'Advance both sides together',
+          note: 'Merge Join, Merge Cond (o.id = i.order_id): read the next order, consume every item with that order_id, move on. Rows come out in id order, so the GROUP BY needs no Sort either. Total 10,850 buffers, ≈ 160 ms. Forcing a hash join with the index present goes back to 23,619 buffers and the disk sort.',
+          active: ['left', 'merge', 'right'],
+          edges: ['left-merge', 'right-merge'],
+          subs: { merge: '400,000 rows, no Sort' },
+        },
+      ],
+    },
+  ]}
+/>
+
+The planner's choice for the same pair of tables moves with the number of outer rows. Concept 2 measures exactly where nested loop gives way to hash join (between 300 and 1,000 customers in this lab).
+
+## MySQL: index nested loop, or hash join when no index fits
+
+MySQL 8.4 has no merge join. Every join is a nested loop, and since 8.0.18 the old block nested loop (rescanning the inner table from a join buffer) is replaced by a **hash join**. The hash join is used **only when no index can serve the join condition**: as soon as an index exists, MySQL picks the index nested loop.
+
+<Flow
+  title="MySQL: index lookups or hash join"
+  height={300}
+  nodes={[
+    { id: 'outer', label: 'Outer table', sub: 'range on PRIMARY', x: 20, y: 20, w: 220 },
+    { id: 'ref', label: 'Inner index lookup', sub: 'type ref / eq_ref', x: 300, y: 20, w: 200 },
+    { id: 'ok', label: '✓ Few handler reads', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'build', label: 'Hash table', sub: 'join buffer', x: 300, y: 150, w: 200 },
+    { id: 'scan', label: '✗ Table scan inner', sub: 'every row once', x: 580, y: 150, w: 200 },
+  ]}
+  edges={[
+    { id: 'outer-ref', from: 'outer', to: 'ref' },
+    { id: 'ref-ok', from: 'ref', to: 'ok' },
+    { id: 'outer-build', from: 'outer', to: 'build' },
+    { id: 'scan-build', from: 'scan', to: 'build' },
+  ]}
+  cases={[
+    {
+      title: '✓ Index on the inner join column',
+      path: '5 orders (PRIMARY range) → order_items_order_fk ✓ 5 lookups → 10 items, 35 index reads',
+      summary: 'The 10 items of orders 500,000–500,004, with an index on order_items.order_id.',
+      subs: { outer: 'orders: 5 rows' },
+      steps: [
+        {
+          title: 'Outer: a range on the primary key',
+          note: 'Covering index range scan on o using PRIMARY over (500000 <= id <= 500004): 5 rows.',
+          code: "EXPLAIN ANALYZE\nSELECT o.id, i.sku FROM orders o JOIN order_items i ON i.order_id = o.id\nWHERE o.id BETWEEN 500000 AND 500004;",
+          active: ['outer'],
+        },
+        {
+          title: 'One index lookup per outer row',
+          note: 'Index lookup on i using order_items_order_fk (order_id=o.id), loops=5, 2 rows each. EXPLAIN type: ref. Each lookup descends the secondary index, then the clustered index for the rest of the row (Session 6).',
+          active: ['outer', 'ref'],
+          edges: ['outer-ref'],
+          subs: { ref: 'loops=5, 2 rows each' },
+        },
+        {
+          title: 'The handler counters',
+          note: 'FLUSH STATUS before the query, SHOW SESSION STATUS after: Handler_read_key 23, Handler_read_next 35, Handler_read_rnd_next 0. ≈ 1 ms.',
+          active: ['ref', 'ok'],
+          edges: ['ref-ok'],
+          subs: { ok: 'read_key 23, read_next 35' },
+        },
+      ],
+    },
+    {
+      title: '✗ No usable index: hash join',
+      path: '5 orders → hash table → order_items ✗ table scan 2,000,001 rows → 10 matches',
+      summary: 'Same query with IGNORE INDEX (order_items_order_fk), which is what the table looked like before the index.',
+      subs: { outer: 'orders: 5 rows' },
+      steps: [
+        {
+          title: 'Build from the small side',
+          note: 'The 5 orders go into an in-memory hash table on id. EXPLAIN shows the inner table with type ALL and Extra: Using where; Using join buffer (hash join).',
+          code: "EXPLAIN\nSELECT o.id, i.sku FROM orders o\nJOIN order_items i IGNORE INDEX (order_items_order_fk) ON i.order_id = o.id\nWHERE o.id BETWEEN 500000 AND 500004;",
+          active: ['outer', 'build'],
+          edges: ['outer-build'],
+          subs: { build: '5 order ids' },
+        },
+        {
+          title: 'Scan the big side once',
+          note: 'Table scan on i: 2,000,000 rows, each probing the hash table. Handler_read_rnd_next 2,000,001, ≈ 182 ms, for 10 result rows. Far better than the old block nested loop, but still a full scan of a 2M-row table.',
+          active: ['scan', 'build'],
+          edges: ['scan-build'],
+          subs: { scan: '2,000,001 rows read' },
+        },
+      ],
+    },
+    {
+      title: 'Every customer: index loop vs hash',
+      path: 'index present → 100,000 index lookups ≈ 1.3–2.0 s; NO_INDEX hints → ✓ hash join ≈ 0.24 s',
+      summary: 'Revenue per country over all orders. Here the index makes the join slower.',
+      steps: [
+        {
+          title: 'Default: one lookup per customer',
+          note: 'Nested loop inner join: Covering index scan on c (100,000 rows), Index lookup on o using orders_customer_idx, loops=100000. 1.3 to 2.0 s over several runs: 100,000 descents plus 1M clustered-index fetches.',
+          code: "EXPLAIN ANALYZE\nSELECT c.country, sum(o.amount)\nFROM customers c JOIN orders o ON o.customer_id = c.id\nGROUP BY c.country;",
+          active: ['outer', 'ref'],
+          edges: ['outer-ref'],
+          subs: { outer: 'customers: 100,000 rows', ref: 'loops=100000' },
+        },
+        {
+          title: 'Forced hash join',
+          note: 'With /*+ NO_INDEX(o orders_customer_idx) NO_INDEX(c PRIMARY) */: Inner hash join, table scan on o (1M rows) probing a hash of 100,000 customers: ≈ 0.24 s, 5–8× faster. EXPLAIN prints the hash join cost as 9.96e+9, which is why the optimizer never prefers it over an index.',
+          code: "SELECT /*+ NO_INDEX(o orders_customer_idx) NO_INDEX(c PRIMARY) */\n       c.country, sum(o.amount)\nFROM customers c JOIN orders o ON o.customer_id = c.id\nGROUP BY c.country;",
+          active: ['outer', 'build', 'scan'],
+          edges: ['outer-build', 'scan-build'],
+          subs: { build: '100,000 customers', scan: 'orders: 1M rows' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: $lookup and its three strategies
+
+`$lookup` is MongoDB's join: for each document coming out of the earlier stages, find the documents in another collection whose `foreignField` equals the `localField`. When the slot-based engine (SBE) runs it, `explain` shows an `EQ_LOOKUP` stage with a `strategy`:
+
+| Strategy | When | Cost |
+|---|---|---|
+| `IndexedLoopJoin` | An index on `foreignField` exists | One index descent per outer document |
+| `HashJoin` | No index, and the foreign collection has ≤ 10,000 documents and ≤ 100 MB (`internalQueryCollectionMaxNoOfDocumentsToChooseHashJoin`, `…MaxDataSizeBytesToChooseHashJoin`) | Foreign collection read once into a hash table |
+| `NestedLoopJoin` | No index, foreign collection too big to hash | **One collection scan per outer document** |
+
+<Flow
+  title="MongoDB: how $lookup finds the foreign documents"
+  height={300}
+  nodes={[
+    { id: 'outer', label: 'Outer documents', sub: 'from $match', x: 20, y: 20, w: 220 },
+    { id: 'eq', label: 'EQ_LOOKUP', sub: 'strategy', x: 300, y: 20, w: 200 },
+    { id: 'fidx', label: '✓ foreignField index', sub: 'IndexedLoopJoin', x: 580, y: 20, w: 200 },
+    { id: 'hash', label: 'Hash table', sub: 'HashJoin', x: 300, y: 150, w: 200 },
+    { id: 'coll', label: '✗ Foreign COLLSCAN', sub: 'no index', x: 580, y: 150, w: 200 },
+  ]}
+  edges={[
+    { id: 'outer-eq', from: 'outer', to: 'eq' },
+    { id: 'eq-fidx', from: 'eq', to: 'fidx' },
+    { id: 'coll-hash', from: 'coll', to: 'hash' },
+    { id: 'eq-hash', from: 'eq', to: 'hash' },
+    { id: 'eq-coll', from: 'eq', to: 'coll', quiet: true },
+  ]}
+  cases={[
+    {
+      title: '✓ IndexedLoopJoin',
+      path: '513 SG gold customers → customer_id_1 ✓ one descent each → 5,130 orders; 5,643 keys, 5,643 docs',
+      summary: 'Each SG gold customer with their orders, using the index on orders.customer_id.',
+      subs: { outer: '513 customers' },
+      steps: [
+        {
+          title: 'Outer documents',
+          note: 'The pipeline starts at customers: $match country SG, tier gold uses the country_tier index (513 keys, 513 documents).',
+          code: 'db.customers.explain("executionStats").aggregate([\n  { $match: { country: "SG", tier: "gold" } },\n  { $lookup: { from: "orders", localField: "_id",\n               foreignField: "customer_id", as: "orders" } }\n])',
+          active: ['outer'],
+        },
+        {
+          title: 'One index descent per customer',
+          note: 'EQ_LOOKUP strategy IndexedLoopJoin, index customer_id_1. totalKeysExamined 5,643 = 513 for the customers + 5,130 order keys; totalDocsExamined 5,643. ≈ 41 ms.',
+          active: ['outer', 'eq', 'fidx'],
+          edges: ['outer-eq', 'eq-fidx'],
+          subs: { fidx: '5,130 order keys' },
+        },
+      ],
+    },
+    {
+      title: '✓ HashJoin on a small collection',
+      path: '513 customers → countries ✗ no index, but 5 documents → hash table ✓ → 518 docs examined',
+      summary: 'Join each customer to a 5-document countries collection on country = code, with no index on code.',
+      subs: { outer: '513 customers' },
+      steps: [
+        {
+          title: 'Read the small collection once',
+          note: 'countries has 5 documents (VN, TH, SG, MY, PH) and no index on code. Below the 10,000-document threshold, so SBE scans it once into a hash table.',
+          code: 'db.customers.aggregate([\n  { $match: { country: "SG", tier: "gold" } },\n  { $lookup: { from: "countries", localField: "country",\n               foreignField: "code", as: "c" } }\n])',
+          active: ['eq', 'coll', 'hash'],
+          edges: ['eq-coll', 'coll-hash'],
+          subs: { coll: 'countries: 5 docs' },
+        },
+        {
+          title: 'Probe per outer document',
+          note: 'strategy HashJoin: totalDocsExamined 518 = 513 customers + 5 countries. ≈ 3 ms. A dimension table like this does not need an index.',
+          active: ['outer', 'eq', 'hash'],
+          edges: ['outer-eq', 'eq-hash'],
+          subs: { hash: '5 keys' },
+        },
+      ],
+    },
+    {
+      title: '✗ NestedLoopJoin: no index, big collection',
+      path: '5 orders → order_items ✗ no index, 2M documents → a full scan per order → 10,000,005 docs',
+      summary: 'Join 5 orders to their items with the order_id index hidden.',
+      subs: { outer: '5 orders' },
+      steps: [
+        {
+          title: 'Too big to hash',
+          note: 'order_items has 2,000,000 documents, far above the 10,000 limit, and the order_id index is hidden. SBE falls back to strategy NestedLoopJoin.',
+          code: 'db.order_items.hideIndex("order_id_1")\ndb.orders.explain("executionStats").aggregate([\n  { $match: { _id: { $gte: 500000, $lte: 500004 } } },\n  { $lookup: { from: "order_items", localField: "_id",\n               foreignField: "order_id", as: "items" } }\n])',
+          active: ['outer', 'eq'],
+          edges: ['outer-eq'],
+        },
+        {
+          title: 'One collection scan per outer document',
+          note: 'totalDocsExamined 10,000,005: five full scans of 2M items plus the 5 orders, ≈ 940 ms for 10 items. With the index visible: IndexedLoopJoin, 15 keys, 15 documents, ≈ 1 ms.',
+          active: ['eq', 'coll'],
+          edges: ['eq-coll'],
+          subs: { coll: '5 × 2,000,000 docs' },
+        },
+      ],
+    },
+  ]}
+/>
+
+When a pipeline cannot run in SBE (for example a `$lookup` with its own `pipeline`, or followed by `$unwind`), the classic engine runs it. `explain` then has no `strategy`, but the `$lookup` stage still reports `indexesUsed`, `totalKeysExamined`, `totalDocsExamined` and `collectionScans`, which answer the same question.
+
+<Pitfall>
+"The join is slow, so add an index" is right for a nested loop and wrong for a hash join. When the query joins most of both tables (a report, a nightly aggregate), reading each table once is the cheapest plan, and in MySQL an index can even **remove** the hash join: the full-table aggregate took 1.3–2.0 s through `orders_customer_idx` and 0.24 s with the index hinted away. Check how many outer rows the join really has before reaching for an index.
+</Pitfall>
+
+## Real-world scenario: the order detail page vs the monthly report
+
+| Query | Outer rows | Right algorithm | Index needed |
+|---|---|---|---|
+| Order detail page: one order and its items | 1 | Nested loop | `order_items (order_id)` |
+| "My orders" page: one customer's last 20 orders with items | 20 | Nested loop | `orders (customer_id, created_at)` (Session 4), `order_items (order_id)` |
+| Monthly revenue by country | All | Hash join (or merge join on sorted indexes) | None for the join; maybe one for the date filter |
+| Nightly export of all orders with items | All | Merge join if both sides have indexes in key order; otherwise hash | Optional; avoids a large sort |
+
+The same two tables need an index for the first two queries and are better off without one for the third.
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 2: the inner index | Nested loop cost = outer rows × inner lookup; that lookup is what an index design controls |
+| Concept 3: foreign keys | Every foreign-key check is a nested-loop lookup on the child table |
+| Concept 4: join order | Which side is outer decides which index is used |
+| Session 10: pagination and aggregation | GROUP BY after a join; merge join's sorted output saves a sort |
+
+## Key takeaways
+
+1. Nested loop: one inner lookup per outer row; it needs an index on the inner join column (21 buffers for one customer).
+2. Hash join: both inputs read once, no index needed; best when many rows join (12,815 buffers for the full join).
+3. Merge join: two inputs sorted on the key, advanced together; indexes on both sides remove every sort (10,850 vs 23,691 buffers + spill).
+4. MySQL uses a hash join only when no index serves the join; for a full-table join that can make the index the slower plan.
+5. MongoDB `$lookup`: IndexedLoopJoin with an index on `foreignField`, HashJoin for small collections, otherwise a full scan of the foreign collection per outer document.
+
+## Check questions
+
+1. What does each of the three join algorithms need from the inputs, and which one is the only one that benefits from an index on the inner join column?
+2. Why did PostgreSQL choose a hash join for revenue per country, even though `orders_customer_idx` exists?
+3. The merge join read 10,850 buffers and the hash join 23,691 plus temp blocks. Where did the hash join's extra work come from?
+4. In MySQL, when is a hash join used, and why was the full-table aggregate faster with the index hinted away?
+5. What does `Using join buffer (hash join)` in MySQL's EXPLAIN tell you about the indexes on the inner table?
+6. Why did MongoDB examine 10,000,005 documents to join 5 orders to their items, and what two things would avoid it?
+7. A `$lookup` joins 1M events to a 300-document `event_types` collection on `type`. Does it need an index on `event_types.type`?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-9-indexes-for-joins/concept-1-join-algorithms/answers">Worked answers to Q1–Q7</DeepDive>

@@ -1,0 +1,327 @@
+---
+title: "Concept 3: Foreign keys need an index on the child"
+description: "A foreign key is checked by a lookup on the child table every time a parent row is deleted or its key changes. PostgreSQL does not index the child column for you: deleting 100 orders with ON DELETE CASCADE took 5.5 s and 100 full scans of order_items, and 2 ms after CREATE INDEX. MySQL creates the index itself and refuses to drop it. MongoDB has no foreign keys, so application cascades need the same index. Plus the row locks a child insert takes on its parent."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "foreign-keys", "joins", "locking", "cascade"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK"
+  - "https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/create-table-foreign-keys.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locks-set.html"
+  - "https://www.mongodb.com/docs/manual/data-modeling/concepts/embedding-vs-references/"
+---
+
+<Tldr>
+A foreign key `order_items.order_id → orders.id` is enforced in **both directions**. Inserting an item looks up its parent through `orders`' primary key, which always exists. Deleting an order (or changing its `id`) must find the **children**, which is a lookup on `order_items.order_id`, and **PostgreSQL does not create that index**. In the lab, deleting 100 orders with `ON DELETE CASCADE` ran the foreign-key trigger 100 times, and each run was a full scan of the 2M-row `order_items`: **5.5 seconds** and ≈ 200 million rows read. After `CREATE INDEX ON order_items (order_id)`: **2 ms**. MySQL InnoDB **requires** an index on the child column, creates one if none exists, and refuses to drop it (`ERROR 1553`). MongoDB has no foreign keys; an application-level cascade `deleteMany({ order_id: { $in: … } })` scanned **2,000,000 documents** without the index and **200** with it. Separately, a child insert **locks the parent row** until it commits: `FOR KEY SHARE` in PostgreSQL (non-key updates of the parent still run), a shared record lock in InnoDB (any update of the parent waits).
+</Tldr>
+
+## Two directions of checking
+
+| Term | Meaning |
+|---|---|
+| Parent / referenced table | `orders`; the referenced column must have a primary key or unique index |
+| Child / referencing table | `order_items`; `order_id` is the foreign key column |
+| Child-side check | On INSERT or UPDATE of a child row: "does the parent exist?" A lookup on the parent's primary key |
+| Parent-side check | On DELETE of a parent row, or UPDATE of its key: "do children exist?" (and with `ON DELETE CASCADE`, delete them). A lookup on the **child column** |
+| RI trigger | PostgreSQL's referential-integrity triggers that run these checks; `EXPLAIN ANALYZE` shows them as `Trigger for constraint …: time=… calls=…` |
+| **✓ Child column indexed** | Each parent-side check is one index descent |
+| **✗ Not indexed** | Each parent-side check scans the whole child table |
+
+| Engine | Parent key index | Child column index |
+|---|---|---|
+| PostgreSQL | Required (primary key or unique) | **Not created**; your job |
+| MySQL InnoDB | Required | **Created automatically** if no index starts with the column; cannot be dropped while the FK exists |
+| MongoDB | (no foreign keys) | Your job, for every lookup or cascade your application does |
+
+## PostgreSQL: the missing index
+
+<Flow
+  title="PostgreSQL: DELETE on the parent, check on the child"
+  height={300}
+  nodes={[
+    { id: 'del', label: 'DELETE FROM orders', sub: '100 rows', x: 20, y: 20, w: 220 },
+    { id: 'trig', label: 'RI trigger', sub: 'once per deleted row', x: 300, y: 20, w: 200 },
+    { id: 'idx', label: '✓ order_items_order_idx', sub: 'one descent', x: 560, y: 20, w: 220 },
+    { id: 'scan', label: '✗ Seq Scan order_items', sub: '2M rows', x: 560, y: 150, w: 220 },
+    { id: 'lock', label: 'Parent row lock', sub: 'FOR KEY SHARE', x: 20, y: 150, w: 220 },
+    { id: 'ins', label: 'INSERT order_items', sub: 'child row', x: 300, y: 150, w: 200 },
+  ]}
+  edges={[
+    { id: 'del-trig', from: 'del', to: 'trig' },
+    { id: 'trig-idx', from: 'trig', to: 'idx' },
+    { id: 'trig-scan', from: 'trig', to: 'scan' },
+    { id: 'ins-lock', from: 'ins', to: 'lock' },
+  ]}
+  cases={[
+    {
+      title: '✗ No index on order_items.order_id',
+      path: 'DELETE 100 orders → RI trigger × 100 → ✗ Seq Scan of 2M items each → 5.5 s',
+      summary: 'ON DELETE CASCADE, and only order_items_pkey on the child table.',
+      steps: [
+        {
+          title: 'Add the foreign key',
+          note: 'ALTER TABLE … ADD CONSTRAINT validates every existing item against orders_pkey (385 ms). Afterwards order_items still has exactly one index: order_items_pkey. PostgreSQL never indexes the referencing column for you.',
+          code: 'ALTER TABLE order_items ADD CONSTRAINT order_items_order_fk\n  FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE;',
+          active: ['del'],
+          subs: { del: 'FK added, no child index' },
+        },
+        {
+          title: 'One trigger call per deleted order',
+          note: 'The DELETE itself is cheap (an index range on orders_pkey). Then the trigger runs once per deleted row: Trigger for constraint order_items_order_fk: calls=100.',
+          code: 'BEGIN;\nEXPLAIN (ANALYZE, BUFFERS)\nDELETE FROM orders WHERE id BETWEEN 600001 AND 600100;\nROLLBACK;',
+          active: ['del', 'trig'],
+          edges: ['del-trig'],
+          subs: { trig: 'calls=100' },
+        },
+        {
+          title: '✗ Each call scans the child table',
+          note: 'Each call runs DELETE FROM order_items WHERE order_id = $1, which has no index: a full scan. pg_stat_user_tables.seq_scan on order_items rose by exactly 100 and seq_tup_read by 199,990,100. Trigger time 5,489 ms (1 order: 53 ms, 10 orders: 558 ms).',
+          active: ['trig', 'scan'],
+          edges: ['trig-scan'],
+          subs: { scan: '100 scans, ≈ 200M rows' },
+        },
+      ],
+    },
+    {
+      title: '✓ CREATE INDEX ON order_items (order_id)',
+      path: 'DELETE 100 orders → RI trigger × 100 → ✓ one descent each → 2 ms',
+      summary: 'The same DELETE after building the index (253 ms to build).',
+      steps: [
+        {
+          title: 'Index the child column',
+          note: 'A plain B-tree on the referencing column. On a busy table, CREATE INDEX CONCURRENTLY (Session 8).',
+          code: 'CREATE INDEX order_items_order_idx ON order_items (order_id);',
+          active: ['idx'],
+        },
+        {
+          title: '✓ One descent per call',
+          note: 'Trigger for constraint order_items_order_fk: time=2.0 calls=100. idx_scan on order_items rose by 100, seq_scan by 0. 1 order: 0.3 ms; 10,000 orders: 66 ms.',
+          active: ['del', 'trig', 'idx'],
+          edges: ['del-trig', 'trig-idx'],
+          subs: { trig: 'calls=100, 2.0 ms', idx: '100 index scans' },
+        },
+      ],
+    },
+    {
+      title: 'Child insert locks the parent',
+      path: 'INSERT item for order 7 → orders (0,7) FOR KEY SHARE → ✓ UPDATE amount runs, ✗ DELETE order 7 waits',
+      summary: 'Session A inserts an item and keeps its transaction open; session B touches the parent.',
+      steps: [
+        {
+          title: 'The child-side check locks the parent row',
+          note: 'pgrowlocks(orders) shows row (0,7) locked with modes For Key Share: the parent cannot disappear before the child commits.',
+          code: "-- session A\nBEGIN;\nINSERT INTO order_items VALUES (3000001, 7, 'SKU-000001', 1, 9.99);\n-- session B\nSELECT locked_row, modes FROM pgrowlocks('orders');",
+          active: ['ins', 'lock'],
+          edges: ['ins-lock'],
+          subs: { lock: '(0,7) For Key Share' },
+        },
+        {
+          title: 'Non-key updates pass, deletes wait',
+          note: 'Session B: UPDATE orders SET amount = amount WHERE id = 7 finished in 4 ms (FOR NO KEY UPDATE does not conflict with FOR KEY SHARE). DELETE FROM orders WHERE id = 7 waited and hit lock_timeout = 2 s.',
+          code: "SET lock_timeout = '2s';\nUPDATE orders SET amount = amount WHERE id = 7;   -- 4 ms\nDELETE FROM orders WHERE id = 7;                  -- ERROR: canceling statement due to lock timeout",
+          active: ['lock', 'del'],
+          subs: { del: '✗ waits for session A' },
+        },
+      ],
+    },
+  ]}
+/>
+
+The slow deletes also hold their locks longer: while the 5.5-second cascade runs, the deleted orders stay locked and the transaction stays open, which is exactly the long transaction that blocks VACUUM and index builds (Session 8).
+
+## MySQL: the index is mandatory
+
+<Flow
+  title="MySQL: InnoDB creates and protects the child index"
+  height={300}
+  nodes={[
+    { id: 'fk', label: 'ADD FOREIGN KEY', sub: 'order_items.order_id', x: 20, y: 20, w: 220 },
+    { id: 'reuse', label: '✓ Reuse an index', sub: 'one starting with order_id', x: 300, y: 20, w: 220 },
+    { id: 'new', label: 'Create an index', sub: 'named after the FK', x: 580, y: 20, w: 200 },
+    { id: 'drop', label: '✗ DROP INDEX', sub: 'ERROR 1553', x: 580, y: 150, w: 200 },
+    { id: 'lock', label: 'Parent record lock', sub: 'S on PRIMARY', x: 20, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'fk-reuse', from: 'fk', to: 'reuse' },
+    { id: 'reuse-new', from: 'reuse', to: 'new' },
+    { id: 'new-drop', from: 'new', to: 'drop' },
+    { id: 'fk-lock', from: 'fk', to: 'lock' },
+  ]}
+  cases={[
+    {
+      title: 'Adding the foreign key',
+      path: 'ADD FOREIGN KEY → index starting with order_id? ✓ reuse : create order_items_order_fk → ✗ cannot drop it',
+      summary: 'order_items had no index on order_id.',
+      steps: [
+        {
+          title: 'Look for a usable index',
+          note: 'InnoDB needs an index whose first column is the foreign key column. On a test table with KEY (order_id, note), ADD FOREIGN KEY created nothing new. With KEY (note, order_id) it created a separate index on (order_id).',
+          code: 'ALTER TABLE order_items ADD CONSTRAINT order_items_order_fk\n  FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE;',
+          active: ['fk', 'reuse'],
+          edges: ['fk-reuse'],
+        },
+        {
+          title: 'None found: create one',
+          note: 'SHOW INDEX FROM order_items now lists order_items_order_fk on order_id, created implicitly.',
+          active: ['reuse', 'new'],
+          edges: ['reuse-new'],
+          subs: { new: 'order_items_order_fk' },
+        },
+        {
+          title: '✗ It cannot be dropped',
+          note: 'Dropping it fails while the constraint exists. You can replace it with another index that starts with order_id, but you cannot leave the column unindexed.',
+          code: 'ALTER TABLE order_items DROP INDEX order_items_order_fk;\n-- ERROR 1553 (HY000): Cannot drop index \'order_items_order_fk\':\n-- needed in a foreign key constraint',
+          active: ['new', 'drop'],
+          edges: ['new-drop'],
+        },
+      ],
+    },
+    {
+      title: '✓ Cascade delete through the index',
+      path: 'DELETE 100 orders → cascade via order_items_order_fk ✓ → 2.2 ms',
+      summary: 'The same 100-order delete as in PostgreSQL, in a transaction that is rolled back.',
+      steps: [
+        {
+          title: 'Fast by construction',
+          note: '100 orders and their 200 items: 2.2 ms (SHOW PROFILES). 10,000 orders: 0.17 s. Cascades run inside InnoDB, so they do not appear in the Handler_* counters (Handler_delete showed 100, the orders only).',
+          code: 'START TRANSACTION;\nDELETE FROM orders WHERE id BETWEEN 600001 AND 600100;\nROLLBACK;',
+          active: ['fk', 'new'],
+          subs: { new: 'used by the cascade' },
+        },
+      ],
+    },
+    {
+      title: 'Child insert locks the parent',
+      path: 'INSERT item for order 7 → S,REC_NOT_GAP on orders PRIMARY 7 → ✗ even UPDATE amount waits',
+      summary: 'Session A inserts an item and keeps its transaction open.',
+      steps: [
+        {
+          title: 'A shared lock on the parent record',
+          note: 'performance_schema.data_locks: orders, PRIMARY, RECORD, S,REC_NOT_GAP, lock_data 7 (plus a table-level IS lock).',
+          code: "-- session A\nSTART TRANSACTION;\nINSERT INTO order_items VALUES (3000001, 7, 'SKU-000001', 1, 9.99);\n-- session B\nSELECT index_name, lock_type, lock_mode, lock_data\nFROM performance_schema.data_locks WHERE object_name = 'orders';",
+          active: ['fk', 'lock'],
+          edges: ['fk-lock'],
+          subs: { lock: 'S,REC_NOT_GAP on id 7' },
+        },
+        {
+          title: '✗ Any update of the parent row waits',
+          note: 'Unlike PostgreSQL, InnoDB has no weaker "key share" mode: UPDATE orders SET amount = amount + 1 WHERE id = 7 needs an exclusive record lock and timed out after innodb_lock_wait_timeout = 2 s (ERROR 1205).',
+          active: ['lock'],
+          subs: { lock: '✗ UPDATE waits' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: no foreign keys, same index
+
+MongoDB does not check references. If the application deletes an order and then its items, the item delete is a query on `order_items.order_id`, and it needs the index exactly as PostgreSQL's trigger did:
+
+<Flow
+  title="MongoDB: an application-level cascade"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'deletes 100 orders', x: 20, y: 20, w: 220 },
+    { id: 'q', label: 'deleteMany items', sub: 'order_id $in [100 ids]', x: 300, y: 20, w: 220 },
+    { id: 'idx', label: '✓ IXSCAN order_id_1', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'coll', label: '✗ COLLSCAN', sub: 'order_items', x: 580, y: 150, w: 200 },
+  ]}
+  edges={[
+    { id: 'app-q', from: 'app', to: 'q' },
+    { id: 'q-idx', from: 'q', to: 'idx' },
+    { id: 'q-coll', from: 'q', to: 'coll' },
+  ]}
+  cases={[
+    {
+      title: '✗ No index on order_id',
+      path: 'deleteMany order_id $in 100 ids → ✗ COLLSCAN 2,000,000 docs → 200 deleted, 364 ms',
+      summary: 'Measured with explain, which reports without deleting anything.',
+      steps: [
+        {
+          title: 'One query for all 100 orders',
+          note: 'Batching the ids in one $in is already the better application pattern: one scan instead of one per order.',
+          code: 'db.runCommand({ explain: { delete: "order_items",\n  deletes: [ { q: { order_id: { $in: ids } }, limit: 0 } ] },\n  verbosity: "executionStats" })',
+          active: ['app', 'q'],
+          edges: ['app-q'],
+        },
+        {
+          title: '✗ Still a full scan',
+          note: 'COLLSCAN: totalDocsExamined 2,000,000, nWouldDelete 200, 364 ms. Deleting order by order is worse: 10 single-order finds took 2.6 s (≈ 260 ms each, a full scan each time).',
+          active: ['q', 'coll'],
+          edges: ['q-coll'],
+          subs: { coll: '2,000,000 docs' },
+        },
+      ],
+    },
+    {
+      title: '✓ Index on order_id',
+      path: 'deleteMany order_id $in 100 ids → ✓ IXSCAN 201 keys → 200 docs, 2 ms',
+      summary: 'db.order_items.createIndex({ order_id: 1 })',
+      steps: [
+        {
+          title: '✓ One range per id',
+          note: 'DELETE ← FETCH ← IXSCAN on order_id_1: totalKeysExamined 201, totalDocsExamined 200, 2 ms. 100 single-order finds: 46 ms in total.',
+          code: 'db.order_items.createIndex({ order_id: 1 })',
+          active: ['app', 'q', 'idx'],
+          edges: ['app-q', 'q-idx'],
+          subs: { idx: '201 keys, 200 docs' },
+        },
+      ],
+    },
+  ]}
+/>
+
+If items are always read and deleted with their order, MongoDB's other answer is to **embed** them in the order document: no second collection, no index, no cascade. Referencing (a separate collection plus an index) fits when items are queried on their own or grow without bound.
+
+<Pitfall>
+The cost of a missing child index does not show up in `SELECT` testing. Reads by `order_id` may be rare, and inserts are fine (they check the parent's primary key). It shows up when someone deletes or archives parents, often in a batch job, as one full scan of the child table **per deleted parent row**, while holding locks. In PostgreSQL, check every foreign key for a matching index (query below) before that job runs.
+</Pitfall>
+
+```sql
+-- PostgreSQL: foreign keys whose referencing columns are not the leading columns of any index.
+SELECT c.conrelid::regclass AS child_table, c.conname, a.attname AS fk_column
+FROM pg_constraint c
+JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+WHERE c.contype = 'f'
+  AND NOT EXISTS (
+    SELECT 1 FROM pg_index i
+    WHERE i.indrelid = c.conrelid
+      AND i.indkey[0] = c.conkey[1]          -- the index starts with the FK column
+  );
+```
+
+The query checks single-column foreign keys (the first key column); for a composite foreign key, the index must start with all its columns.
+
+## Real-world scenario: the data-retention job
+
+A retention job deletes orders older than two years, 50,000 per night, with `ON DELETE CASCADE` to `order_items`, `payments` and `shipments`. In development it was instant (small tables). In production, `payments.order_id` had no index: 50,000 trigger calls, each a full scan of `payments`. The job ran for hours, held row locks on the deleted orders, and kept a transaction open that stopped VACUUM. The fix was one `CREATE INDEX CONCURRENTLY` per child table, found with the query above.
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 4: join order | Joins from parent to child use the same child index |
+| Session 8: write cost | Every child index is maintained on every insert; still required here |
+| Session 11: capstone | Missing foreign-key indexes are a standard audit item |
+
+## Key takeaways
+
+1. Deleting or re-keying a parent row checks the child table by its foreign key column.
+2. PostgreSQL does not index that column: 100 cascaded deletes took 5.5 s (100 full scans), 2 ms with the index.
+3. MySQL InnoDB creates the index if none starts with the column, and refuses to drop it (ERROR 1553).
+4. MongoDB has no foreign keys; application cascades need the same index (2,000,000 → 200 documents examined).
+5. A child insert locks its parent row until commit: `FOR KEY SHARE` in PostgreSQL (non-key updates still run), a shared record lock in InnoDB (any update waits).
+
+## Check questions
+
+1. Which operations check the parent's primary key, and which check the child's foreign key column?
+2. Why did deleting 100 orders read ≈ 200 million rows without an index on `order_items.order_id`?
+3. Where do you see the cost of the foreign-key check in PostgreSQL's `EXPLAIN ANALYZE`, and why is it not in the plan tree?
+4. What does MySQL do when you add a foreign key on a column with no index, and what happens if you try to drop that index?
+5. A table has `KEY (note, order_id)`. Does MySQL reuse it for a foreign key on `order_id`? Why?
+6. While a transaction has inserted an item for order 7, which statements on order 7 wait in PostgreSQL, and which in MySQL?
+7. MongoDB has no foreign keys. Name two situations in which you still need an index on `order_items.order_id`.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-9-indexes-for-joins/concept-3-foreign-keys/answers">Worked answers to Q1–Q7</DeepDive>

@@ -1,0 +1,363 @@
+---
+title: "Concept 4: Which side drives the join"
+description: "The side with the most selective filter should be the outer input, and the other side needs an index on the join column. Measured: 200 vs 100,000 outer rows for the same result in MySQL (1.2 ms vs 2.5 s), a 20× row underestimate from correlated filters that made PostgreSQL pick a nested loop costing 6× the buffers, EXISTS vs JOIN + DISTINCT in each engine, and MongoDB, where you choose the driving collection yourself."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "joins", "join-order", "semi-join", "statistics", "lookup"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/explicit-joins.html"
+  - "https://www.postgresql.org/docs/current/planner-stats.html#PLANNER-STATS-EXTENDED"
+  - "https://dev.mysql.com/doc/refman/8.4/en/optimizer-hints.html#optimizer-hints-join-order"
+  - "https://dev.mysql.com/doc/refman/8.4/en/semijoins.html"
+  - "https://www.mongodb.com/docs/manual/core/aggregation-pipeline-optimization/"
+---
+
+<Tldr>
+With filters on both tables, the join should start from the side whose filter leaves **fewer rows**, and the other side needs an index on the join column. For "orders of SKU-000123 with their customers", starting from `orders` (200 rows through an index on `sku`) and looking up each customer by primary key cost **201 index descents and ≈ 1.2 ms** in MySQL; forcing it to start from `customers` cost **100,001 descents and 1,000,000 index reads, ≈ 2.5 s**, for the same 200 rows. SQL optimizers choose the order from **row estimates**, so estimate errors carry into the join: two correlated filters on customers made PostgreSQL estimate **242** customers instead of **5,000**, pick a nested loop, and read **64,584 buffers** instead of the **10,485** of a hash join. For "customers who have at least one paid order", `EXISTS` lets the engine stop at the first match: MySQL's semi-join with `(customer_id, status)` read **10,050** index entries instead of 360,050. MongoDB does not reorder: the pipeline starts at the collection you call `aggregate` on, so starting from the selective side is your job (**4 ms vs 2.7 s**), and grouping before a `$lookup` cut a 1M-document join to 100,000 lookups (**10.5 s → 1.4 s**).
+</Tldr>
+
+## Choosing the outer side
+
+| Term | Meaning |
+|---|---|
+| Driving (outer) side | Read first; its row count is the number of inner lookups in a nested loop, or the size of the hash build side |
+| Filter selectivity | Fraction of a table's rows that pass its own filters (Session 3) |
+| Join order | Which table is outer at each step; SQL optimizers choose it, MongoDB pipelines fix it |
+| Semi-join | "Rows of A that have **at least one** match in B" (`EXISTS`, `IN`): B's matches are not returned, so the search can stop at the first |
+| **✓ Selective side drives** | Few outer rows, each with one cheap lookup into the other side's join index |
+| **✗ Wrong side drives** | Many outer rows, most finding nothing that passes the other side's filter |
+
+The general rule for a two-table join with a filter on each side:
+
+| Filter that leaves fewer rows | Outer side | Index needed on the inner side |
+|---|---|---|
+| On `orders` (`sku = 'SKU-000123'`: 200 rows) | orders, via `orders (sku)` | `customers` primary key (exists) |
+| On `customers` (`country = 'SG' AND tier = 'gold'`: 513 rows) | customers, via `customers (country, tier)` | `orders (customer_id, …)` (Concept 2) |
+| On both, combined result small | The smaller one | The join column of the other |
+| Neither selective | Either; a hash join reads both once | None |
+
+## PostgreSQL: estimates decide the order
+
+<Flow
+  title="PostgreSQL: driving side and estimate errors"
+  height={300}
+  nodes={[
+    { id: 'orders', label: 'orders via sku index', sub: '207 rows', x: 20, y: 20, w: 220 },
+    { id: 'pk', label: 'customers_pkey', sub: 'one lookup per order', x: 300, y: 20, w: 200 },
+    { id: 'ok', label: '✓ Few outer rows', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'cust', label: 'customers filter', sub: 'id + created_at', x: 20, y: 150, w: 220 },
+    { id: 'nl', label: 'Nested loop', sub: 'orders_customer_idx', x: 300, y: 150, w: 200 },
+    { id: 'bad', label: '✗ Underestimate', sub: '242 est vs 5,000', x: 580, y: 150, w: 200 },
+  ]}
+  edges={[
+    { id: 'orders-pk', from: 'orders', to: 'pk' },
+    { id: 'pk-ok', from: 'pk', to: 'ok' },
+    { id: 'cust-nl', from: 'cust', to: 'nl' },
+    { id: 'nl-bad', from: 'nl', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: '✓ Selective orders filter drives',
+      path: "orders: sku = 'SKU-000123' ✓ 207 rows → customers_pkey × 207 → 827 buffers",
+      summary: 'Orders of one product with each buyer’s email. Index added: orders (sku).',
+      steps: [
+        {
+          title: 'Outer: 207 orders',
+          note: 'Bitmap Index Scan on orders_sku_idx, then 206 heap buffers: 207 orders.',
+          code: "CREATE INDEX orders_sku_idx ON orders (sku);\nEXPLAIN (ANALYZE, BUFFERS)\nSELECT o.id, o.amount, c.email\nFROM orders o JOIN customers c ON c.id = o.customer_id\nWHERE o.sku = 'SKU-000123';",
+          active: ['orders'],
+        },
+        {
+          title: 'Inner: the primary key',
+          note: 'Index Scan using customers_pkey, loops=207, 3 buffers each (621). Total 827 buffers, ≈ 1 ms warm. The FROM clause order does not matter: PostgreSQL picks the outer side from estimates.',
+          active: ['orders', 'pk', 'ok'],
+          edges: ['orders-pk', 'pk-ok'],
+          subs: { pk: 'loops=207, 621 buffers', ok: '827 buffers' },
+        },
+        {
+          title: 'Filters on both sides',
+          note: "Adding c.country = 'SG' (10,050 customers) the planner chose a Hash Join: hash the 10,050 SG customers (865 buffers), probe with the 207 orders: 1,071 buffers, ≈ 2 ms. The nested loop from orders (forced) read 827. Both are fine; the estimates were close.",
+          code: "... WHERE o.sku = 'SKU-000123' AND c.country = 'SG';   -- 21 rows",
+          active: ['orders', 'pk'],
+          subs: { orders: '207 rows → 21 SG' },
+        },
+      ],
+    },
+    {
+      title: '✗ Correlated filters, wrong algorithm',
+      path: 'id > 95000 AND created_at ≥ … → est 242, actual 5,000 → nested loop chosen → ✗ 64,584 buffers',
+      summary: 'customers.created_at rises with id, so the two filters select the same 5,000 rows.',
+      steps: [
+        {
+          title: 'The planner multiplies selectivities',
+          note: 'Each filter alone keeps 5% of customers. Assuming independence, the planner estimates 5% × 5% ≈ 0.24% = 242 rows. Actual: 5,000, because both filters pick the newest 5,000 customers.',
+          code: "EXPLAIN (ANALYZE, BUFFERS)\nSELECT o.id, o.amount\nFROM customers c JOIN orders o ON o.customer_id = c.id\nWHERE c.id > 95000 AND c.created_at >= '2024-10-21 17:20';",
+          active: ['cust'],
+          subs: { cust: 'est 242, actual 5,000' },
+        },
+        {
+          title: 'Below the crossover, so a nested loop',
+          note: '242 customers is below the nested-loop / hash-join crossover (Concept 2), so the plan is Nested Loop with orders_customer_idx inside: loops=5000 in reality, 64,524 buffers on the inner side.',
+          active: ['cust', 'nl', 'bad'],
+          edges: ['cust-nl', 'nl-bad'],
+          subs: { nl: 'loops=5000', bad: '64,584 buffers, ≈ 74 ms' },
+        },
+        {
+          title: 'Fix the estimate, not the plan',
+          note: 'Forced hash join: 10,485 buffers, ≈ 25 ms. Dropping the redundant condition (id > 95000 alone) gives est 4,916, and the planner chooses that hash join by itself (10,356 buffers). For correlated equality columns (city and country), CREATE STATISTICS … (dependencies) teaches the planner the correlation.',
+          active: ['cust', 'bad'],
+          subs: { bad: 'hash: 10,485 buffers' },
+        },
+      ],
+    },
+    {
+      title: 'EXISTS vs JOIN + DISTINCT',
+      path: 'SG customers with a paid order: JOIN → 35,111 rows → DISTINCT 9,728; EXISTS → ✓ stops at the first paid order',
+      summary: 'Same answer (9,728 customers); EXISTS never produces the duplicates.',
+      steps: [
+        {
+          title: 'JOIN + DISTINCT',
+          note: 'Without (customer_id, status): Hash Join over all paid orders, then Aggregate for DISTINCT: 12,838 buffers, ≈ 42 ms. With it: nested loop producing 35,111 rows (every paid order of every SG customer), then de-duplicated to 9,728: 31,401 buffers.',
+          code: "SELECT DISTINCT c.id, c.email\nFROM customers c JOIN orders o ON o.customer_id = c.id\nWHERE c.country = 'SG' AND o.status = 'paid';",
+          active: ['cust', 'nl'],
+          edges: ['cust-nl'],
+          subs: { cust: '10,050 SG customers', nl: '35,111 rows → 9,728' },
+        },
+        {
+          title: 'EXISTS: a semi-join',
+          note: 'With (customer_id, status): Nested Loop (semi join), Index Only Scan orders_cust_status, rows=1 per loop: it stops at the first paid order. 31,069 buffers, ≈ 13 ms. Here the buffers are close, because the 10,050 descents dominate; the saving is the 35,111-row intermediate result and the de-duplication step.',
+          code: "SELECT c.id, c.email FROM customers c\nWHERE c.country = 'SG'\n  AND EXISTS (SELECT 1 FROM orders o\n              WHERE o.customer_id = c.id AND o.status = 'paid');",
+          active: ['cust', 'nl', 'ok'],
+          edges: ['cust-nl'],
+          subs: { nl: 'rows=1 per loop', ok: '9,728 customers' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: forcing the order shows the cost
+
+MySQL also orders joins by estimated rows. Optimizer hints such as `JOIN_ORDER(c, o)` (or the older `STRAIGHT_JOIN`) force an order, which is a good way to see what the wrong one costs, and occasionally a fix when estimates are wrong.
+
+<Flow
+  title="MySQL: the right and wrong driving table"
+  height={300}
+  nodes={[
+    { id: 'o', label: 'orders via sku index', sub: '200 rows', x: 20, y: 20, w: 220 },
+    { id: 'pk', label: 'customers PRIMARY', sub: 'eq_ref', x: 300, y: 20, w: 200 },
+    { id: 'ok', label: '✓ 201 descents', sub: '≈ 1.2 ms', x: 580, y: 20, w: 200 },
+    { id: 'c', label: 'customers first', sub: 'JOIN_ORDER(c, o)', x: 20, y: 150, w: 220 },
+    { id: 'ci', label: 'orders_customer_idx', sub: 'then filter sku', x: 300, y: 150, w: 200 },
+    { id: 'bad', label: '✗ 100,001 descents', sub: '≈ 2.5 s', x: 580, y: 150, w: 200 },
+  ]}
+  edges={[
+    { id: 'o-pk', from: 'o', to: 'pk' },
+    { id: 'pk-ok', from: 'pk', to: 'ok' },
+    { id: 'c-ci', from: 'c', to: 'ci' },
+    { id: 'ci-bad', from: 'ci', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: '✓ Optimizer: orders first',
+      path: "orders_sku_idx ✓ 200 rows → customers PRIMARY × 200 → Handler_read_key 201",
+      summary: 'Index added: ALTER TABLE orders ADD INDEX orders_sku_idx (sku).',
+      steps: [
+        {
+          title: 'The selective side drives',
+          note: 'Index lookup on o using orders_sku_idx: 200 rows. Single-row index lookup on c using PRIMARY, loops=200. Handler_read_key 201, Handler_read_next 200, Handler_read_rnd_next 0. ≈ 1.2 ms.',
+          code: "EXPLAIN ANALYZE\nSELECT o.id, o.amount, c.email\nFROM orders o JOIN customers c ON c.id = o.customer_id\nWHERE o.sku = 'SKU-000123';",
+          active: ['o', 'pk', 'ok'],
+          edges: ['o-pk', 'pk-ok'],
+        },
+      ],
+    },
+    {
+      title: '✗ JOIN_ORDER(c, o)',
+      path: 'customers ✗ table scan 100,000 → orders_customer_idx × 100,000 → 1,000,000 entries → sku filter → 200 rows',
+      summary: 'Same query, customers forced to be the outer table.',
+      steps: [
+        {
+          title: 'No filter on customers',
+          note: 'Table scan on c: 100,000 rows (Handler_read_rnd_next 100,001). Every customer becomes an outer row.',
+          code: "SELECT /*+ JOIN_ORDER(c, o) */ o.id, o.amount, c.email\nFROM orders o JOIN customers c ON c.id = o.customer_id\nWHERE o.sku = 'SKU-000123';",
+          active: ['c'],
+          subs: { c: 'table scan: 100,000' },
+        },
+        {
+          title: 'Each finds 10 orders, keeps almost none',
+          note: 'Index lookup on o using orders_customer_idx, loops=100000, then Filter sku = SKU-000123: rows=0.002 per loop. Handler_read_key 100,001, Handler_read_next 1,000,000. ≈ 2.5 s for the same 200 rows.',
+          active: ['c', 'ci', 'bad'],
+          edges: ['c-ci', 'ci-bad'],
+        },
+        {
+          title: 'With a filter on customers too',
+          note: "Adding c.country = 'SG': the optimizer still starts from orders (201 descents, 20 rows, ≈ 0.5 ms). Forced customers-first: 10,050 SG customers, Handler_read_key 10,051, Handler_read_next 110,550, ≈ 184 ms.",
+          active: ['c', 'ci'],
+          edges: ['c-ci'],
+          subs: { c: 'SG: 10,050 rows' },
+        },
+      ],
+    },
+    {
+      title: 'EXISTS: three semi-join plans',
+      path: 'materialize 350,000 paid orders → ✗ 360,050 reads; JOIN DISTINCT → 75,720; ✓ FirstMatch with (customer_id, status) → 10,050',
+      summary: 'SG customers with at least one paid order: 3,483 in MySQL.',
+      steps: [
+        {
+          title: 'Semi-join by materialization',
+          note: 'With only orders_customer_idx and orders_status_created_idx, EXISTS became: Materialize with deduplication of all 350,000 paid orders (via the status index) into 35,000 customer ids, then one lookup per SG customer. Handler_read_next 360,050, ≈ 189 ms.',
+          code: "SELECT c.id, c.email FROM customers c\nWHERE c.country = 'SG'\n  AND EXISTS (SELECT 1 FROM orders o\n              WHERE o.customer_id = c.id AND o.status = 'paid');",
+          active: ['c'],
+          subs: { c: 'SG: 10,050 rows' },
+        },
+        {
+          title: 'JOIN + DISTINCT',
+          note: 'The JOIN version ran as a nested loop with "Limit: 1 row(s)" per customer (MySQL turned DISTINCT into stop-at-first-match): Handler_read_next 75,720, ≈ 225 ms.',
+          active: ['c', 'ci'],
+          edges: ['c-ci'],
+          subs: { ci: 'stop at first paid' },
+        },
+        {
+          title: '✓ FirstMatch on (customer_id, status)',
+          note: 'After ADD INDEX (customer_id, status): Nested loop semijoin, covering index lookup per customer, EXPLAIN Extra: Using index; FirstMatch(c). Handler_read_next 10,050 (one per customer), ≈ 13 ms.',
+          code: 'ALTER TABLE orders ADD INDEX orders_cust_status (customer_id, status);',
+          active: ['c', 'ci', 'ok'],
+          edges: ['c-ci'],
+          subs: { ci: '(customer_id, status)', ok: 'FirstMatch: 10,050 reads' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: you choose the driving collection
+
+A `$lookup` pipeline runs in the order written: the collection you call `aggregate` on is always the outer side. MongoDB moves a `$match` earlier when it can, but it never swaps the two collections.
+
+<Flow
+  title="MongoDB: where the pipeline starts"
+  height={300}
+  nodes={[
+    { id: 'o', label: 'orders $match sku', sub: 'sku index: 200 docs', x: 20, y: 20, w: 220 },
+    { id: 'lk', label: '$lookup customers', sub: 'by _id', x: 300, y: 20, w: 200 },
+    { id: 'ok', label: '✓ 400 keys', sub: '≈ 4 ms', x: 580, y: 20, w: 200 },
+    { id: 'c', label: 'customers (all)', sub: 'COLLSCAN 100,000', x: 20, y: 150, w: 220 },
+    { id: 'lk2', label: '$lookup orders', sub: 'customer_id_1', x: 300, y: 150, w: 200 },
+    { id: 'bad', label: '✗ 1,000,000 keys', sub: '≈ 2.7 s', x: 580, y: 150, w: 200 },
+  ]}
+  edges={[
+    { id: 'o-lk', from: 'o', to: 'lk' },
+    { id: 'lk-ok', from: 'lk', to: 'ok' },
+    { id: 'c-lk2', from: 'c', to: 'lk2' },
+    { id: 'lk2-bad', from: 'lk2', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: '✓ Start from orders',
+      path: 'orders: sku index ✓ 200 docs → $lookup customers by _id × 200 → 200 results',
+      summary: 'Index added: db.orders.createIndex({ sku: 1 }).',
+      steps: [
+        {
+          title: 'Selective $match first',
+          note: 'IXSCAN on sku: 200 keys, 200 documents.',
+          code: 'db.orders.aggregate([\n  { $match: { sku: "SKU-000123" } },\n  { $lookup: { from: "customers", localField: "customer_id",\n               foreignField: "_id", as: "c" } },\n  { $unwind: "$c" }\n])',
+          active: ['o'],
+        },
+        {
+          title: 'One _id lookup per order',
+          note: 'The $lookup stage: indexesUsed ["_id_"], 200 keys, 200 documents. ≈ 4 ms. With a country filter inside the lookup pipeline (SG only): same 200 + 200 keys, 20 results, ≈ 5 ms.',
+          active: ['o', 'lk', 'ok'],
+          edges: ['o-lk', 'lk-ok'],
+        },
+      ],
+    },
+    {
+      title: '✗ Start from customers',
+      path: 'customers ✗ COLLSCAN 100,000 → $lookup orders × 100,000 → 1,000,000 keys → sku filter → 200',
+      summary: 'Same question asked from the other collection.',
+      steps: [
+        {
+          title: 'Every customer is an outer document',
+          note: 'No filter applies to customers, so the pipeline starts with a COLLSCAN of 100,000 documents.',
+          code: 'db.customers.aggregate([\n  { $lookup: { from: "orders", localField: "_id", foreignField: "customer_id",\n      pipeline: [ { $match: { sku: "SKU-000123" } } ], as: "o" } },\n  { $unwind: "$o" }\n])',
+          active: ['c'],
+        },
+        {
+          title: 'A lookup for each, mostly empty',
+          note: 'The $lookup stage: indexesUsed ["customer_id_1"], 1,000,000 keys and 1,000,000 documents (every order of every customer, then the sku filter). ≈ 2.7 s. Starting from the 10,050 SG customers instead: 100,500 keys, ≈ 294 ms. Still 60× the orders-first pipeline.',
+          active: ['c', 'lk2', 'bad'],
+          edges: ['c-lk2', 'lk2-bad'],
+        },
+      ],
+    },
+    {
+      title: '✓ Reduce before joining',
+      path: 'orders → $group by customer_id (100,000) → $lookup × 100,000 → $group by country: ≈ 1.4 s vs 10.5 s',
+      summary: 'Revenue per country: join first, or aggregate per customer first?',
+      steps: [
+        {
+          title: '✗ Join 1M orders, then group',
+          note: 'orders → $lookup customers by _id → $unwind → $group by country: 1,000,001 lookups on _id, ≈ 10.5 s.',
+          code: 'db.orders.aggregate([\n  { $lookup: { from: "customers", localField: "customer_id", foreignField: "_id", as: "c" } },\n  { $unwind: "$c" },\n  { $group: { _id: "$c.country", revenue: { $sum: "$amount" } } }\n])',
+          active: ['o', 'lk'],
+          edges: ['o-lk'],
+          subs: { o: 'all 1,000,000 orders', lk: '1,000,001 lookups' },
+        },
+        {
+          title: '✓ Group by the join key first',
+          note: 'First $group orders by customer_id (100,000 groups), then $lookup each customer, then $group by country: 100,001 lookups, ≈ 1.4–1.6 s. The same answer, because revenue per customer adds up to revenue per country. SQL planners do the equivalent with a hash join; in MongoDB the pipeline order is yours.',
+          code: 'db.orders.aggregate([\n  { $group: { _id: "$customer_id", revenue: { $sum: "$amount" } } },\n  { $lookup: { from: "customers", localField: "_id", foreignField: "_id", as: "c" } },\n  { $unwind: "$c" },\n  { $group: { _id: "$c.country", revenue: { $sum: "$revenue" } } }\n])',
+          active: ['o', 'lk', 'ok'],
+          edges: ['o-lk', 'lk-ok'],
+          subs: { o: '100,000 customer groups', lk: '100,001 lookups', ok: '≈ 1.4 s' },
+        },
+      ],
+    },
+  ]}
+/>
+
+A MongoDB semi-join ("customers with at least one paid order") is a `$lookup` whose pipeline ends in `{ $limit: 1 }`, followed by `{ $match: { "p.0": { $exists: true } } }`. For the 10,050 SG customers: 100,500 keys without the limit, 69,153 with it (customers with no paid order still read all their orders), **3,483** with `$limit: 1` and an index `{ customer_id: 1, status: 1 }`.
+
+<Pitfall>
+A query that is fast with one filter value can be slow with another, because the best driving side changes. "Orders of SKU-000123 by SG customers" should start from orders; "orders of any SKU by the 3 customers of a new market" should start from customers. SQL optimizers handle this with statistics (and get it wrong when estimates are wrong, as above); a MongoDB pipeline written for one case runs the same way for the other. Keep both join indexes, `orders (sku)` and `orders (customer_id)`, when both shapes are common.
+</Pitfall>
+
+## Real-world scenario: the marketplace search page
+
+A seller dashboard lists orders filtered by seller and date, joined to customers for the buyer's country, optionally filtered by country.
+
+| Filter combination | Selective side | Needed indexes |
+|---|---|---|
+| Seller + last 7 days | orders | `orders (seller_id, created_at)`, `customers` primary key |
+| Seller + last 7 days + country = SG | orders (still) | the same; country checked per joined customer |
+| Country = SG + tier = gold, all sellers | customers | `customers (country, tier)`, `orders (customer_id, created_at)` |
+
+Run `EXPLAIN ANALYZE` for each combination the page allows, compare estimated and actual rows on the outer side, and make sure each combination has the index its driving side needs.
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 10: pagination with joins | "Newest 20 orders with customer names" should drive from the orders index and stop after 20 |
+| Session 11: capstone | Estimated vs actual rows on the outer side is the first thing to check in a slow join |
+
+## Key takeaways
+
+1. Start from the side whose filter leaves the fewest rows; give the other side an index on the join column.
+2. Wrong order is expensive: 201 vs 100,001 descents in MySQL, 400 vs 1,000,000 keys in MongoDB, for the same 200 rows.
+3. SQL optimizers choose the order from estimates; correlated filters (242 estimated vs 5,000 actual) can flip the algorithm.
+4. `EXISTS` stops at the first match; with an index on (join key, filter) MySQL's FirstMatch read 10,050 entries instead of 360,050.
+5. MongoDB runs the pipeline as written: choose the starting collection, filter early, and group before `$lookup` when the result is aggregated.
+
+## Check questions
+
+1. For `orders WHERE sku = ?` joined to `customers WHERE country = ?`, which side should drive, and which index does the other side need?
+2. Why did MySQL read 1,000,000 index entries when forced to start from customers, even though only 200 rows came out?
+3. How did PostgreSQL arrive at an estimate of 242 rows for `id > 95000 AND created_at >= …`, and why did that change the join algorithm?
+4. Give two ways to fix the plan in Q3 without forcing it with `enable_*` settings.
+5. Why can `EXISTS` be cheaper than `JOIN … DISTINCT`, and what made MySQL's FirstMatch plan read only 10,050 entries?
+6. In MongoDB, why is the choice of collection in `db.X.aggregate` a performance decision, and how does `$limit: 1` inside a `$lookup` pipeline relate to `EXISTS`?
+7. Why did grouping orders by `customer_id` before the `$lookup` give the same revenue per country, and why was it 7× faster?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-9-indexes-for-joins/concept-4-join-order-and-filters/answers">Worked answers to Q1–Q7</DeepDive>
