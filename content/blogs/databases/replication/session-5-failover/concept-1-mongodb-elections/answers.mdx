@@ -1,0 +1,64 @@
+---
+title: "Answers: MongoDB elections and retryable writes"
+description: "Worked answers to the Session 5 Concept 1 check questions."
+companion: "answers"
+tags: ["replication", "failover", "mongodb", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/replica-set-elections/"
+  - "https://www.mongodb.com/docs/manual/core/retryable-writes/"
+---
+
+<Tldr>
+The length of a MongoDB failover is set by how quickly the other members **learn** that the primary is gone. The application's experience is set by retryable writes and by its own timeouts.
+</Tldr>
+
+## Q1. 100 ms vs 11 s
+
+**Question:** why did a stepdown stall writes for about 100 ms while a crash stalled them for 11 s?
+
+In a stepdown the primary itself knows it is leaving. It waits for a secondary to catch up, steps down, and sends that secondary a request to run for election at once. The election took milliseconds; the slowest write took 117–216 ms. After a crash nobody announces anything. The secondaries only conclude the primary is gone when they have not heard from it for `electionTimeoutMillis` (10 s), then hold the election. The write in flight waited 11,395 ms: 10 s of waiting, plus heartbeat timing, plus the election.
+
+> **Common mistake:** testing failover with `rs.stepDown()` and assuming a crash behaves the same. It is two orders of magnitude slower.
+
+## Q2. stepUpRequestSkipDryRun
+
+**Question:** what does `stepUpRequestSkipDryRun` tell you about how the new primary was chosen?
+
+That the election was started on request of the old primary, which picked a secondary that was caught up and asked it to stand. "Skip dry run" means the candidate did not first poll the other members to see if it could win; it went straight to a real election. Both the stepdown and the clean `docker stop` produced this reason; the crash produced `electionTimeout`.
+
+> **Common mistake:** reading the election reason as an error. It is the normal, fast path.
+
+## Q3. A failed write after a crash
+
+**Question:** with `retryWrites=false`, the write in flight during a crash failed with `ECONNRESET`. What can the application conclude about that write?
+
+Nothing. A network error means the reply never arrived. The write may never have reached the primary, may have been applied on the primary only (and lost or rolled back later), or may have been applied and replicated to a majority (and therefore kept). In this run the document (`i = 2345`) was not in the collection afterwards. In another crash run, with `retryWrites=true`, a write that returned `connection … closed` **was** in the collection afterwards. The same kind of error, opposite outcomes. The only safe responses are to retry with a key that makes duplicates impossible, or to read back and check.
+
+> **Common mistake:** treating a network error on a write as "the write did not happen".
+
+## Q4. Why a retryable write is safe to retry
+
+**Question:** why can a retryable write be retried safely when a plain application retry can create a duplicate?
+
+The driver sends each retryable write with a logical session id and a transaction number. The server records which (session, number) pairs it has executed, and that record is replicated with the write in the oplog. If the write had already been applied and replicated before the failover, the new primary finds the pair and returns the original result instead of applying it again. A plain application retry is a **new** write with no such identity, so it is applied a second time if the first one had succeeded.
+
+Note that the driver retries **once**. In 5 of 10 crash runs that single retry also met a closed connection and the error reached the application; the safety of the retry mechanism is that it never duplicates, not that it never fails.
+
+> **Common mistake:** writing "retry 3 times on any error" around `insertOne` and believing it is idempotent.
+
+## Q5. Slower after the crash
+
+**Question:** why did `w: "majority"` throughput fall after the crash even though a primary was available again?
+
+A majority of three is two. With all three members up, a write needs the primary plus whichever secondary acknowledges first. With one member down, it needs the primary plus **the** remaining secondary, with no faster alternative. Each write now waited for that one member's replication and apply, and throughput fell from about 600–650 to about 200–400 writes per second until the killed member rejoined.
+
+> **Common mistake:** treating "the set has a primary" as "the set is healthy". A 3-member set with one member down has no slack left: losing one more member stops all majority writes.
+
+## Q6. Faster failover
+
+**Question:** you want failover after a crash to take 3 s instead of 11 s. What would you change, and what is the risk?
+
+Lower `settings.electionTimeoutMillis` in the replica set configuration (for example to 2000) with `rs.reconfig()`. Secondaries then call an election after 2 s without contact. The risk is **false failovers**: a garbage-collection pause, a slow disk or a short network hiccup on the primary now triggers an election, each of which interrupts writes and can roll back `w: 1` writes (Concept 2). Raising the application's timeouts so they ride out the normal 11 s is often the better trade.
+
+> **Common mistake:** setting the election timeout to a few hundred milliseconds on cloud VMs with noisy networks, then seeing several elections a day.

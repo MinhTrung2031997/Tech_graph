@@ -1,0 +1,181 @@
+---
+title: "Concept 5: Split brain and fencing"
+description: "After promoting a PostgreSQL standby while the old primary was still running, both servers accepted writes: timeline 1 with rows from client 201, timeline 2 with rows from client 202, and neither knew about the other. MongoDB's old primary stepped down by itself 9.7 s after losing the majority, 189 ms before the new one was elected. MySQL servers are writable unless told otherwise. Fencing, making sure the old primary cannot accept writes, is the job of the failover tooling, not of PostgreSQL or MySQL."
+type: "concept"
+tags: ["replication", "failover", "split-brain", "fencing", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/warm-standby-failover.html"
+  - "https://www.mongodb.com/docs/manual/core/replica-set-elections/"
+  - "https://patroni.readthedocs.io/en/latest/watchdog.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/group-replication.html"
+---
+
+<Tldr>
+**Split brain** is two servers both accepting writes as primary. It happened as soon as a PostgreSQL standby was promoted while the old primary was still alive behind a network cut: the old primary kept **timeline 1** and accepted client 201's rows, the new one started **timeline 2** and accepted client 202's rows, and nothing in either server noticed. PostgreSQL's documentation says it does "not provide the system software required to identify a failure on the primary and notify the standby database server". **MongoDB** guards against this inside the database: a primary needs to reach a majority to stay primary, and the cut-off one **stepped down by itself after 9.7 s**, **189 ms before** the new primary was elected. That window still allowed `w: 1` writes that were later rolled back (Concept 2). **MySQL** with plain replication behaves like PostgreSQL. The fix is **fencing**: before or while promoting, make sure the old primary cannot accept writes, by shutting it down, cutting it off from clients, or making it read-only.
+</Tldr>
+
+## The setup
+
+PostgreSQL: the standby `rpc-pg2` is disconnected from the network and promoted with `pg_promote()`, then reconnected. The old primary `rpc-pg1` was never stopped. Ten rows are inserted on each server.
+
+MongoDB: the run from Concept 2, with the primary cut off from the other two members.
+
+| Term | Meaning |
+|---|---|
+| Split brain | Two nodes act as primary at the same time and accept writes |
+| Fencing | Making a node that should not be primary unable to write: power off, network isolation, read-only, revoked lease |
+| STONITH | "Shoot the other node in the head": a fencing method that powers off the old primary through its host or hypervisor |
+| Lease | A primary may write only while it holds a lease renewed in a consensus store (etcd, ZooKeeper) or from a majority |
+| **✓ / ✗** | Accepts writes / refuses writes |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: promote while the old primary still runs"
+  height={330}
+  nodes={[
+    { id: 'appa', label: 'Clients A', sub: 'still connected to pg1', x: 20, y: 20, w: 200 },
+    { id: 'appb', label: 'Clients B', sub: 'repointed to pg2', x: 580, y: 20, w: 200 },
+    { id: 'pg1', label: 'rpc-pg1', sub: 'old primary', x: 20, y: 160, w: 200 },
+    { id: 'pg2', label: 'rpc-pg2', sub: 'promoted standby', x: 580, y: 160, w: 200 },
+    { id: 'net', label: 'Network cut', sub: 'no WAL between them', x: 300, y: 270, w: 200 },
+  ]}
+  edges={[
+    { id: 'a-pg1', from: 'appa', to: 'pg1' },
+    { id: 'b-pg2', from: 'appb', to: 'pg2' },
+    { id: 'pg1-net', from: 'pg1', to: 'net' },
+    { id: 'net-pg2', from: 'net', to: 'pg2' },
+  ]}
+  cases={[
+    {
+      title: 'No fencing',
+      path: 'pg2 cut off ✗ → pg_promote on pg2 ✓ → pg1 still primary ✓ → writes on both ✓ ✓ → two histories',
+      summary: 'Two primaries, two timelines, no error anywhere.',
+      steps: [
+        {
+          title: 'Promote the standby',
+          note: 'pg2 is disconnected, so it sees no primary, and an operator (or a script that only checks "can I reach the primary?") promotes it.',
+          code: 'SELECT pg_promote();   -- on rpc-pg2',
+          active: ['pg2', 'net', 'pg1'],
+          edges: ['pg1-net', 'net-pg2'],
+          subs: { pg2: '✓ primary, timeline 2', net: '✗ no WAL either way' },
+        },
+        {
+          title: 'Both accept writes',
+          note: 'pg1: pg_is_in_recovery() = f, timeline 1, 1,010 rows, clients 1 and 201. pg2: pg_is_in_recovery() = f, timeline 2, 1,010 rows, clients 1 and 202, max id 1033 (the sequence jumped by 32 on promotion).',
+          code: 'INSERT INTO ev (client) SELECT 201 FROM generate_series(1,10);   -- on pg1: ok\nINSERT INTO ev (client) SELECT 202 FROM generate_series(1,10);   -- on pg2: ok',
+          active: ['appa', 'appb', 'pg1', 'pg2'],
+          edges: ['a-pg1', 'b-pg2'],
+          subs: { pg1: '✓ writes, timeline 1', pg2: '✓ writes, timeline 2' },
+        },
+      ],
+    },
+  ]}
+/>
+
+| Server | `pg_is_in_recovery()` | Timeline | Rows | Clients |
+|---|---|---|---|---|
+| `rpc-pg1` (old primary) | f | 1 | 1,010 | 1, 201 |
+| `rpc-pg2` (promoted) | f | 2 | 1,010 | 1, 202 |
+
+Same row count, different data. One of the two histories must eventually be thrown away: when `rpc-pg1` was rewound to follow `rpc-pg2` (Concept 3), client 201's rows were gone.
+
+## MongoDB
+
+<Flow
+  title="MongoDB: the majority decides who is primary"
+  height={300}
+  nodes={[
+    { id: 'm1', label: 'mongo1', sub: 'old primary, alone', x: 20, y: 20, w: 200 },
+    { id: 'm2', label: 'mongo2', sub: 'secondary', x: 580, y: 20, w: 200 },
+    { id: 'm3', label: 'mongo3', sub: 'secondary', x: 580, y: 200, w: 200 },
+    { id: 'maj', label: 'Majority check', sub: '2 of 3 reachable?', x: 20, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'm1-maj', from: 'm1', to: 'maj' },
+    { id: 'm2-m3', from: 'm2', to: 'm3' },
+  ]}
+  cases={[
+    {
+      title: 'Primary cut off',
+      path: 'mongo1 sees 1 of 3 ✗ → steps down at 9.7 s → mongo2 + mongo3 elect mongo3 at 9.9 s ✓ → never two primaries accepting majority writes',
+      summary: 'The old primary fences itself, but only after electionTimeoutMillis.',
+      steps: [
+        {
+          title: 'mongo1 loses the majority',
+          note: 'It can reach only itself. It keeps accepting w: 1 writes until about electionTimeoutMillis has passed, then logs "Can\'t see a majority of the set, relinquishing primary" (15:32:58.441).',
+          active: ['m1', 'maj'],
+          edges: ['m1-maj'],
+          subs: { maj: '✗ 1 of 3', m1: '✗ steps down at 9.7 s' },
+        },
+        {
+          title: 'The majority elects mongo3',
+          note: 'mongo2 and mongo3 can reach each other: 2 of 3. mongo3 was elected at 15:32:58.630, 189 ms after mongo1 stepped down. In this run the two never overlapped; MongoDB\'s documentation allows a brief overlap, during which only the side with the majority can confirm w: "majority" writes.',
+          active: ['m2', 'm3'],
+          edges: ['m2-m3'],
+          subs: { m3: '✓ primary' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL
+
+Plain asynchronous or semi-synchronous replication has no notion of a primary at all; any server with `read_only = 0` accepts writes. In the lab a fresh replica had `read_only = 0` and `super_read_only = 0`, and a single write on it stopped replication with error 1062 (Concept 4). A former source that is restarted after a failover comes back with whatever its configuration file says, which is writable unless `super_read_only` is set there. MySQL Group Replication / InnoDB Cluster adds majority-based membership like MongoDB's (from the documentation; not set up in this lab).
+
+## Fencing options (from the documentation)
+
+| Method | How it fences | Used by |
+|---|---|---|
+| Leader lease in a consensus store | The primary must renew a key in etcd/Consul/ZooKeeper every few seconds; if it cannot, it demotes itself | Patroni (PostgreSQL) |
+| Watchdog | If the demotion does not happen in time, a hardware or software watchdog reboots the node | Patroni with `/dev/watchdog` |
+| STONITH | The failover manager powers off the old primary's VM or host before promoting | Pacemaker, cloud failover scripts |
+| Majority membership in the database | A node that cannot reach a majority stops being primary | MongoDB replica sets, MySQL Group Replication |
+| Read-only by default | Every server starts read-only (`super_read_only = ON`, `default_transaction_read_only` in PostgreSQL); only the failover tool turns writes on | Orchestrator, custom tooling |
+| Routing switch | Clients reach the primary only through a proxy or a virtual IP that the failover tool moves | HAProxy, ProxySQL, PgBouncer, cloud load balancers |
+
+<Pitfall>
+Moving only the virtual IP or DNS name is not fencing. Connection pools keep existing connections to the old primary, and a batch job with a hard-coded host name keeps writing to it, exactly like "Clients A" in the flow. Fencing has to act on the **server**: stop it, make it read-only, or cut it off from every client. Do it **before** promoting, or accept that some writes will land on the losing side.
+</Pitfall>
+
+## Real-world scenario: two primaries for 40 minutes
+
+A home-made failover script on a PostgreSQL pair checks "can the standby reach the primary on port 5432?" every 10 s and promotes after three failures. A network switch between the two racks fails; both servers stay up and reachable from the application servers in their own rack.
+
+| Time | Event |
+|---|---|
+| 00:00 | Switch fails. The standby cannot reach the primary |
+| 00:30 | The script promotes the standby and updates DNS |
+| 00:30–40:00 | Application servers in rack A still use the old primary (cached DNS, open pool connections); rack B uses the new one. Orders are written on both |
+| 40:00 | Switch replaced. The team finds two diverged databases; one side must be rewound, and its 40 minutes of orders reconciled by hand from its data directory |
+
+What would have prevented it: a lease (Patroni with etcd across three racks), so the old primary demotes itself when it loses the lease, and a quorum of three locations, so a single cut cannot leave both sides believing they are in charge.
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 2 | The MongoDB window before step-down, and the rollback that follows it |
+| Concept 3 | Rewinding the losing PostgreSQL server discards its side of the split |
+| Concept 4 | MySQL errant GTIDs are the data from the losing side |
+| [Transactions Session 8, Concept 4](/blogs/databases/transactions/session-8-when-transactions-hurt/concept-4-distributed-transactions) | Another place where agreement between nodes needs a coordinator |
+
+## Key takeaways
+
+1. Promoting a PostgreSQL standby does nothing to the old primary: both accepted writes, on timelines 1 and 2.
+2. MySQL's plain replication is the same; servers are writable unless configured otherwise.
+3. MongoDB requires a majority to stay primary: the cut-off primary stepped down after 9.7 s, before the new one was elected.
+4. Fencing, making the old primary unable to write, must come from the failover tooling: leases, watchdogs, STONITH, read-only defaults.
+5. Moving a VIP or DNS name is routing, not fencing.
+
+## Check questions
+
+1. Both PostgreSQL servers had 1,010 rows. Why is that not reassuring?
+2. Why can a MongoDB replica set not keep two primaries confirming `w: "majority"` writes, while two PostgreSQL primaries can both confirm commits?
+3. Why does a 2-node setup with automatic failover need a third party (a witness or consensus store)?
+4. Why is moving the virtual IP not enough to fence the old primary?
+5. Which fencing method would you choose for a PostgreSQL pair on cloud VMs, and why?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-5-failover/concept-5-split-brain-and-fencing/answers">Worked answers to Q1–Q5</DeepDive>

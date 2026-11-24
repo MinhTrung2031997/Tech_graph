@@ -1,0 +1,206 @@
+---
+title: "Concept 3: Promoting a PostgreSQL standby"
+description: "PostgreSQL has no built-in failover: you promote a standby with pg_promote() (0.14–0.26 s here) and it starts timeline 2. With async replication and the standby cut off 2 s before the primary crashed, 8,207 and 15,883 acknowledged commits were missing after promotion. With synchronous_commit and a synchronous standby, none were, but commits stopped while the standby was unreachable, and statement_timeout did not end that wait. The old primary cannot simply rejoin: pg_rewind needs wal_log_hints or checksums, and WAL the new primary still has."
+type: "concept"
+tags: ["replication", "failover", "promotion", "pg_rewind", "synchronous-commit", "postgresql"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/warm-standby-failover.html"
+  - "https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-RECOVERY-CONTROL"
+  - "https://www.postgresql.org/docs/17/app-pgrewind.html"
+  - "https://www.postgresql.org/docs/17/warm-standby.html#SYNCHRONOUS-REPLICATION"
+---
+
+<Tldr>
+PostgreSQL does not fail over by itself. Someone, or a tool such as Patroni, decides the primary is gone and runs `SELECT pg_promote()` on a standby: here that took **0.14–0.26 s**, and the standby became a primary on **timeline 2**. What the promoted standby is missing is lost. With **asynchronous** replication and a healthy network little was lost (0 of 11,141 and 3 of 18,882 acknowledged commits), but with the standby cut off from the network 2 s before the primary crashed, **8,207 of 14,578** and **15,883 of 18,360** acknowledged commits were gone. With **synchronous** replication none were lost, at a price: while the standby was unreachable, commits **stopped**, `statement_timeout` did not end the wait (one commit hung for **2 min 58 s**), and cancelling it returned a warning that the commit had already happened locally. Afterwards, the old primary cannot just follow the new one: its history has forked. `pg_rewind` repairs that in seconds, but only if the server runs with `wal_log_hints = on` or data checksums, and only if the new primary still has the WAL the old one needs.
+</Tldr>
+
+## The setup
+
+`rpc-pg1` (primary) streams to `rpc-pg2` (standby) through the physical slot `standby1`, asynchronous by default. A client container runs `pgbench` with 8 clients, each inserting one row per transaction into `ev`, and logs every transaction that was acknowledged (`pgbench -l`). At 5 s the primary is killed with `docker kill`. Then `pg_promote()` runs on the standby, and acknowledged commits are compared with the rows that survived.
+
+| Term | Meaning |
+|---|---|
+| `pg_promote()` | Ends recovery on a standby: it becomes a read-write primary |
+| Timeline | A numbered branch of WAL history. Each promotion starts a new one (here 1 → 2), visible in WAL file names (`000000020000…`) |
+| `synchronous_standby_names` | Standbys a commit must wait for. With `'*'` any connected standby counts |
+| `synchronous_commit = on` | With a synchronous standby, COMMIT returns only after the standby has flushed the WAL |
+| `pg_rewind` | Rewinds a former primary to the point where the timelines forked, so it can follow the new primary without a full copy |
+| **✓ / ✗** | Commit kept / lost |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: crash the primary, promote the standby"
+  height={340}
+  nodes={[
+    { id: 'cli', label: 'pgbench, 8 clients', sub: 'one INSERT per commit', x: 20, y: 20, w: 200 },
+    { id: 'pg1', label: 'rpc-pg1', sub: 'primary, timeline 1', x: 300, y: 20, w: 200 },
+    { id: 'pg2', label: 'rpc-pg2', sub: 'standby', x: 580, y: 20, w: 200 },
+    { id: 'ack', label: 'Acknowledged', sub: 'pgbench transaction log', x: 20, y: 270, w: 200 },
+    { id: 'tl2', label: 'Promoted rpc-pg2', sub: 'timeline 2', x: 580, y: 270, w: 200 },
+  ]}
+  edges={[
+    { id: 'cli-pg1', from: 'cli', to: 'pg1' },
+    { id: 'pg1-pg2', from: 'pg1', to: 'pg2' },
+    { id: 'cli-ack', from: 'cli', to: 'ack' },
+    { id: 'pg2-tl2', from: 'pg2', to: 'tl2' },
+  ]}
+  cases={[
+    {
+      title: 'Async, standby cut off before the crash',
+      path: 'commits on pg1 ✓ → standby cut off ✗ → commits still acknowledged ✓ → pg1 killed → pg_promote ✓ → 8,207 acknowledged commits missing ✗',
+      summary: 'The primary never waits for the standby, so it confirms what the standby will never get.',
+      steps: [
+        {
+          title: 't0–3 s: normal streaming',
+          note: 'Each COMMIT returns as soon as pg1 has flushed its own WAL. The WAL sender ships it to pg2 a moment later; at the kill in a healthy run the standby was 760 bytes behind.',
+          active: ['cli', 'pg1', 'pg2', 'ack'],
+          edges: ['cli-pg1', 'pg1-pg2', 'cli-ack'],
+        },
+        {
+          title: 't3 s: standby cut off',
+          note: 'docker network disconnect on pg2. pg1 keeps committing and acknowledging: it does not need pg2. At the kill pg2 was 1.53 MB of WAL behind.',
+          active: ['cli', 'pg1', 'ack'],
+          edges: ['cli-pg1', 'cli-ack'],
+          subs: { pg2: '✗ unreachable', ack: '✓ 14,578 acknowledged' },
+        },
+        {
+          title: 't5 s: kill pg1, promote pg2',
+          note: 'pg_promote(wait => true) returned in 0.15 s. The new primary had 6,371 rows: 8,207 commits that clients had been told were saved do not exist on it.',
+          code: 'SELECT pg_promote(wait => true);',
+          active: ['pg1', 'pg2', 'tl2'],
+          edges: ['pg2-tl2'],
+          subs: { pg1: '✗ killed', tl2: '✗ 8,207 commits missing' },
+        },
+      ],
+    },
+    {
+      title: 'Synchronous standby',
+      path: "synchronous_standby_names = '*' → each COMMIT waits for pg2 ✓ → standby cut off → commits wait ✗ → pg1 killed → pg_promote ✓ → 0 acknowledged commits missing ✓",
+      summary: 'Nothing confirmed is lost, because nothing is confirmed that pg2 does not have.',
+      steps: [
+        {
+          title: 'Turn it on',
+          note: 'On the primary. pg_stat_replication.sync_state changes from async to sync.',
+          code: "ALTER SYSTEM SET synchronous_standby_names = '*';\nSELECT pg_reload_conf();",
+          active: ['pg1', 'pg2'],
+          edges: ['pg1-pg2'],
+          subs: { pg2: 'sync_state = sync' },
+        },
+        {
+          title: 'Standby cut off: commits stop',
+          note: 'Each backend waits with wait_event = SyncRep. Only 1,935 transactions were acknowledged in the run, against 14,578 in the async run: everything after the cut was waiting.',
+          active: ['cli', 'pg1', 'ack'],
+          edges: ['cli-pg1', 'cli-ack'],
+          subs: { pg1: '✗ COMMIT waits (SyncRep)', ack: '1,935 acknowledged' },
+        },
+        {
+          title: 'Kill and promote',
+          note: 'The promoted standby had 1,936 rows: every acknowledged commit, plus one that was replicated but whose acknowledgement never reached the client.',
+          active: ['pg1', 'pg2', 'tl2'],
+          edges: ['pg2-tl2'],
+          subs: { tl2: '✓ 0 commits missing' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Measured: commits lost by a crash and promotion
+
+`pgbench -c 8` single-row inserts; primary killed at 5 s; `pg_promote(wait => true)` on the standby.
+
+| Replication | Standby at the crash | Acknowledged commits | Rows after promotion | Lost |
+|---|---|---|---|---|
+| async | connected, 760 bytes behind | 11,141 | 11,141 | 0 |
+| async | connected, 2,600 bytes behind | 18,882 | 18,879 | **3** |
+| async | cut off at 3 s, 1.53 MB behind | 14,578 | 6,371 | **8,207** |
+| async | cut off at 3 s, 2.98 MB behind | 18,360 | 2,477 | **15,883** |
+| async | cut off at 3 s, 2.72 MB behind | 18,733 | 4,242 | **14,491** |
+| sync | connected | 9,947 | 9,948 | 0 (one extra) |
+| sync | cut off at 3 s | 1,935 | 1,936 | 0 (one extra) |
+
+`pg_promote()` took 0.14–0.26 s in every run. The "one extra" row is a commit that reached the standby but whose reply never reached the client before the kill: from the client's point of view it failed, yet it exists.
+
+**Pausing is not cutting.** `docker pause` on the standby, instead of disconnecting it, lost only 550 and 3 commits: the WAL kept arriving in the paused container's network buffers and was applied after unpausing. A real network partition or a dead standby host does not do that.
+
+## The wait that does not time out
+
+With the synchronous standby unreachable:
+
+```sql
+SET statement_timeout = '2s';
+INSERT INTO ev (client) VALUES (101);   -- still waiting after 2 min 58 s
+```
+
+`pg_stat_activity` showed the backend with `wait_event = SyncRep`. Only `pg_cancel_backend()` ended it:
+
+```
+WARNING:  canceling wait for synchronous replication due to user request
+DETAIL:  The transaction has already committed locally, but might not have been replicated to the standby.
+INSERT 0 1
+```
+
+The insert **was** committed on the primary, the client saw a warning rather than an error, and once the standby reconnected it received rows 101, 102 and 103.
+
+## Bringing the old primary back
+
+After a promotion the old primary has WAL on timeline 1 that the new primary never had. Telling it to follow the new primary (`standby.signal` + `primary_conninfo`) without repairing it fails, every 5 s:
+
+```
+LOG:  new timeline 2 forked off current database system timeline 1 before current recovery point 0/3056A58
+```
+
+| Step | Result |
+|---|---|
+| `pg_rewind` with defaults (`data_checksums = off`, `wal_log_hints = off`) | `pg_rewind: error: target server needs to use either data checksums or "wal_log_hints = on"` |
+| `pg_rewind` with `wal_log_hints = on` (set before the incident) | 1.42–2.78 s; the old primary's 10 inserts and 1,000 updates are gone; it then streams from the new primary |
+| Old primary restarted after rewind, slot not created on the new primary | `FATAL: could not start WAL streaming: ERROR: replication slot "standby1" does not exist` |
+| Slot created later, WAL already recycled | `requested WAL segment 000000020000000000000014 has already been removed`: rewind wasted, re-clone needed |
+| Full re-clone instead: `pg_basebackup --checkpoint=fast` of the same 234 MB | 1.48 s (without `--checkpoint=fast` it waited minutes for the next checkpoint) |
+
+On this small cluster a rewind was no faster than a re-clone: `pg_rewind` reported 348,081 kB copied, almost all of it the new primary's 337 MB of WAL. It wins on large databases, where copying only changed blocks beats copying everything. In two earlier runs without a `VACUUM FREEZE` of the table first, it copied 531,625 kB, the table included.
+
+<Pitfall>
+`wal_log_hints` (or initdb with `--data-checksums`) must be set **before** the incident: it needs a restart and only affects WAL written afterwards. The `postgres` Docker image starts with both off. And promotion does not move replication slots: create the old primary's slot on the new primary **right after** promoting, or set `wal_keep_size`, or keep a WAL archive, or the rewound server will find its WAL gone.
+</Pitfall>
+
+## Real-world scenario: Patroni-less failover at 03:00
+
+A team runs one primary and one async standby and promotes by hand. At 03:00 the primary's host loses its network for 40 s, then reboots. The on-call engineer promotes the standby at 03:05 and points the application at it.
+
+| Question | Answer from this concept |
+|---|---|
+| What was lost? | Every commit after the network loss, all acknowledged to customers (in the lab, 8,207 commits in 2 s) |
+| Can it be recovered? | Only from the old primary's data directory, before anyone rewinds or re-clones it: copy it aside first |
+| Why does the old primary not rejoin? | Its timeline forked; it needs `pg_rewind` (and `wal_log_hints` / checksums) or a re-clone |
+| Would sync replication have helped? | No commit would have been lost, but with one standby, every commit would have stopped during the 40 s; use two standbys with `ANY 1 (…)` |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Transactions Session 1, Concept 3](/blogs/databases/transactions/session-1-transaction-guarantees/concept-3-durability) | Durability on one server; this concept is durability across a failover |
+| Concept 2 | MongoDB's version of the same loss, with automatic rollback files |
+| Concept 5 | The old primary kept accepting writes after the promotion: split brain |
+| [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) | The primary/standby setup |
+
+## Key takeaways
+
+1. `pg_promote()` takes a fraction of a second; deciding to promote is the hard part, and PostgreSQL leaves it to you or a tool.
+2. With async replication, commits the standby had not received are lost: 0 and 3 with a healthy network, 8,207 and 15,883 with the standby cut off 2 s before the crash.
+3. With a synchronous standby no acknowledged commit was lost, but commits wait while the standby is unreachable, and `statement_timeout` does not end that wait.
+4. A cancelled synchronous wait means "committed locally, maybe not replicated".
+5. Rejoining the old primary needs `pg_rewind` (with `wal_log_hints` or checksums set beforehand) and WAL still available on the new primary, or a re-clone.
+
+## Check questions
+
+1. Why could the async primary acknowledge commits its standby would never receive?
+2. In the sync runs the promoted standby had one row more than the client had seen acknowledged. How is that possible?
+3. A commit waited 2 min 58 s despite `statement_timeout = '2s'`. Why did the timeout not fire, and what state was the row in?
+4. Why does the old primary need `pg_rewind` before following the new primary?
+5. `pg_rewind` succeeded, yet the old primary could not stream. Name the two problems seen and how to avoid each.
+6. Your company has one primary and one standby. Argue for or against `synchronous_standby_names = '*'`.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-5-failover/concept-3-promoting-postgresql/answers">Worked answers to Q1–Q6</DeepDive>

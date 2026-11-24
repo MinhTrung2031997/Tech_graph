@@ -1,0 +1,13 @@
+{
+  "title": "Session 5: Failover",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-mongodb-elections/index",
+    "concept-2-lost-writes-and-rollback/index",
+    "concept-3-promoting-postgresql/index",
+    "concept-4-promoting-mysql/index",
+    "concept-5-split-brain-and-fencing/index",
+    "lab/index"
+  ]
+}

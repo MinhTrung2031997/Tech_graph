@@ -1,0 +1,80 @@
+---
+title: "Answers: Failover session quiz"
+description: "Worked answers to the Session 5 quiz, with the lab's measured values."
+companion: "answers"
+tags: ["replication", "failover", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/replica-set-elections/"
+  - "https://www.postgresql.org/docs/17/app-pgrewind.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-gtids-concepts.html"
+---
+
+<Tldr>
+A failover keeps the database available, not every write. What is lost depends on what the new primary had received, and what the application sees depends on retries and on how it treats errors of unknown outcome.
+</Tldr>
+
+## Q1. 100 ms vs 11.4 s
+
+**Question:** a planned `rs.stepDown()` stalled writes for about 100 ms; a crash for up to 11.4 s. What decides the difference?
+
+Who knows that the primary is leaving. In a stepdown the primary itself hands over to a caught-up secondary (`stepUpRequestSkipDryRun`), so the election starts at once. After a crash the secondaries must first notice missing heartbeats for `electionTimeoutMillis` (10 s), then hold the election (`electionTimeout`). Lab: stepdown slowest write 117–216 ms; crash stalls 5.9–11.4 s.
+
+> **Common mistake:** rehearsing failover only with `rs.stepDown()`.
+
+## Q2. A failed write that was stored
+
+**Question:** with `retryWrites=true` a write still failed with `connection … closed` after a crash, and the document was in the collection afterwards. Explain both facts.
+
+The driver retries a retryable write **once**. When the primary was killed, the first attempt's connection broke, and the single retry also met a closed connection, so the error reached the application (5 of 10 crash runs). The first attempt had nonetheless been applied on the old primary and replicated to a majority before the kill, so the new primary had it. The error said "I do not know", not "it did not happen".
+
+> **Common mistake:** retrying the failed insert with a new `_id`, creating a duplicate order.
+
+## Q3. The cut-off primary's writes
+
+**Question:** a cut-off MongoDB primary confirmed about 20,000 `w: 1` writes. What happened to them, and where can you find them?
+
+They were rolled back when the old primary rejoined the majority: 19,333 in the first run and 20,328 in the second, including one majority write that had timed out. MongoDB saved them as BSON in `/data/db/rollback/<collection UUID>/removed.<timestamp>.bson` on that node (1.18 MB for the first run, `bsondump`: 19,333 objects). They are never reapplied automatically.
+
+> **Common mistake:** not monitoring for rollbacks, so the files are found only by accident.
+
+## Q4. A timed-out majority write
+
+**Question:** why is a `w: "majority"` write that timed out neither "failed" nor "succeeded"?
+
+`wtimeout` stops the client waiting; it does not undo the write. The document is on the primary and will be kept if a majority receives it before a new primary is elected, or rolled back otherwise. In the lab the network never came back in time, so it was rolled back, but the client could not have known that when it received `WriteConcernFailed` after 3,016 ms.
+
+> **Common mistake:** treating `WriteConcernFailed` as a clean failure and retrying without an idempotency key.
+
+## Q5. PostgreSQL commits lost
+
+**Question:** with async replication, how many acknowledged PostgreSQL commits were lost when the standby was cut off 2 s before the crash, and why does a healthy-network test not show this?
+
+8,207, 14,491 and 15,883 in three runs: everything committed after the cut. With a healthy network the standby is only a few hundred to a few thousand bytes behind, so a crash loses 0–3 commits (0 and 3 in the runs). The loss is proportional to how far behind the standby is at the moment of the crash, and the dangerous cases are exactly those where it has fallen behind: a network problem, a slow standby, a big batch.
+
+> **Common mistake:** testing failover with `docker pause` on the standby, which kept WAL in network buffers and lost only 3–550 commits.
+
+## Q6. The cost of a synchronous standby
+
+**Question:** what does a synchronous standby cost when it becomes unreachable, and what happens if you cancel a waiting commit?
+
+Every commit waits (`wait_event = SyncRep`) until the standby returns or the setting is changed: in the lab only 1,935 transactions were acknowledged in the cut-off run, against about 14,500–18,000 with async, and `statement_timeout = '2s'` did not end a wait that lasted 2 min 58 s. Cancelling with `pg_cancel_backend()` returns `WARNING: canceling wait for synchronous replication due to user request` with `DETAIL: The transaction has already committed locally, but might not have been replicated to the standby.` The row stays committed on the primary.
+
+> **Common mistake:** running one synchronous standby and expecting writes to continue when it is down.
+
+## Q7. pg_rewind preconditions
+
+**Question:** name the two preconditions for `pg_rewind` to bring an old primary back, besides stopping it.
+
+1. The old primary must have run with `wal_log_hints = on` or data checksums **before** the divergence; otherwise `pg_rewind: error: target server needs to use either data checksums or "wal_log_hints = on"`.
+2. The new primary must still have all WAL from the fork point onwards, or a WAL archive must provide it; otherwise the rewound server fails with `requested WAL segment … has already been removed`. Create its replication slot on the new primary right after promotion (and expect `replication slot "standby1" does not exist` if you forget).
+
+> **Common mistake:** discovering the first precondition during the incident; changing `wal_log_hints` needs a restart and only helps for later divergences.
+
+## Q8. Errant transactions
+
+**Question:** after a MySQL failover, re-pointing the old source failed with error 1062. What are the leftover transactions called, how do you list them, and what should you do with them?
+
+**Errant GTIDs**: transactions in the old source's `gtid_executed` that the new primary does not have (lab: `…:1211-2825`, 1,615 transactions; `…:1037-1791` in a second run). List them with `SELECT GTID_SUBTRACT(<old source gtid_executed>, <new primary gtid_executed>)`. Keep the old source read-only, extract those transactions from its binlog (`mysqlbinlog --include-gtids=…`), decide which must be re-applied on the new primary as new transactions, then re-clone the old source from the new primary. Never skip the 1062 error.
+
+> **Common mistake:** setting `replica_skip_errors` to get replication running, leaving two different databases.
