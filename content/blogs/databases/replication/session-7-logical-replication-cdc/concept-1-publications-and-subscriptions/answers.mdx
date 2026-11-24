@@ -1,0 +1,63 @@
+---
+title: "Answers: Publications and subscriptions"
+description: "Worked answers to the Session 7 Concept 1 check questions."
+companion: "answers"
+tags: ["replication", "logical-replication", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/logical-replication-architecture.html"
+  - "https://www.postgresql.org/docs/17/logical-replication-restrictions.html"
+  - "https://www.postgresql.org/docs/17/logical-replication-conflicts.html"
+---
+
+<Tldr>
+Logical replication is a stream of row changes into a server you can write to. Everything it does not carry (DDL, sequences, conflicts) is your job.
+</Tldr>
+
+## Q1. The initial copy
+
+**Question:** what does a subscription copy first, and how does it avoid missing changes made during the copy?
+
+`CREATE SUBSCRIPTION` creates the subscription's slot on the publisher, then one tablesync worker per table. Each tablesync worker creates a temporary slot, which exports a snapshot, runs `COPY` of the table in that snapshot, and then applies the changes its slot decoded after the snapshot until it reaches the main apply worker's position. Only then does the table switch to `r` (ready) in `pg_subscription_rel` and the apply worker takes over. In the lab that took 0.41 s for 100,000 orders.
+
+> **Common mistake:** pre-loading the subscriber with `pg_dump` and also leaving `copy_data` on. The copy then fails with duplicate keys; use `copy_data = false` when the data is already there and consistent.
+
+## Q2. DDL on the publisher only
+
+**Question:** an `ALTER TABLE … ADD COLUMN` ran only on the publisher. What happens to the change that uses the column, and to changes after it?
+
+The ALTER itself is not sent. The first INSERT or UPDATE that carries the new column fails on the subscriber: "logical replication target relation "public.orders" is missing replicated column: "note"". The apply worker exits and retries every 5 seconds, and because transactions are applied strictly in commit order, **nothing** after it is applied either, including changes to other tables in the same subscription. The slot keeps the WAL (25 MB after one full-table update). Adding the column on the subscriber let it catch up in 2.30 s.
+
+> **Common mistake:** thinking only the affected table is stale. The whole subscription stops.
+
+## Q3. The sequence
+
+**Question:** why did the subscriber's first insert into `refunds` fail after 1,000 rows had been replicated?
+
+The rows were replicated with their explicit ids 1 to 1,000, but the identity sequence on the subscriber was never advanced: `last_value` 1, `is_called` false. The first local insert asked the sequence for 1 and hit `Key (id)=(1) already exists`. Sequence state is not part of the logical stream in PostgreSQL 17. Before moving writes to a subscriber (for example after a major-version upgrade), run `setval` for every sequence, usually to the publisher's value plus a margin.
+
+> **Common mistake:** discovering this during the cut-over, when the first customer order fails.
+
+## Q4. A key-less table in a publication
+
+**Question:** which statement fails, on which server, when a key-less table is added to a publication?
+
+`UPDATE` and `DELETE` on that table fail **on the publisher**, in the application's own session: "cannot update table "audit_log" because it does not have a replica identity and publishes updates" (and the same for deletes). INSERT still works. The publisher refuses because it could not log which row changed. Fix it with a primary key, `REPLICA IDENTITY USING INDEX` on a unique index over NOT NULL columns, or `REPLICA IDENTITY FULL` (whole old row in WAL: 303–306 bytes per updated row instead of 251–261 here).
+
+> **Common mistake:** `FOR ALL TABLES` publications. They include every key-less table, current and future.
+
+## Q5. Row filter and replica identity
+
+**Question:** why does a row filter on `marketplace` break `UPDATE … SET status = …` on the publisher, and how did the lab fix it?
+
+For an UPDATE, PostgreSQL evaluates the filter on the old row and the new row to decide between UPDATE, INSERT and DELETE. With the default identity, only `id` of the old row is in the WAL, so the old `marketplace` is unknown. PostgreSQL therefore rejects every UPDATE and DELETE on the table: "Column used in the publication WHERE expression is not part of the replica identity." The lab created a unique index on `(id, marketplace)` and made it the replica identity. Then a change of marketplace from shopee to lazada was applied as a DELETE on the subscriber, and lazada to shopee as an INSERT.
+
+> **Common mistake:** creating the filtered publication during the day "because there is no subscriber yet". The check runs on the publisher immediately.
+
+## Q6. Resolving a conflict
+
+**Question:** a duplicate-key error stopped apply. Compare deleting the subscriber's row with `ALTER SUBSCRIPTION … SKIP`.
+
+Deleting (or fixing) the local row lets the remote transaction apply as written, so both servers end up with the publisher's version. `SKIP (lsn = …)`, using the LSN from the error's CONTEXT line, throws away the **entire** remote transaction: the conflicting insert and every other change in it. The lab's skip left the subscriber with seller 1 / tiktok while the publisher had seller 7 / shopee. Prefer fixing the data; use SKIP only when you know what the transaction contained and will repair it afterwards.
+
+> **Common mistake:** setting `disable_on_error` or skipping without recording which transaction was dropped.

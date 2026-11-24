@@ -6,6 +6,7 @@
     "session-3-replica-lag",
     "session-4-read-write-concerns",
     "session-5-failover",
-    "session-6-queries-on-replicas"
+    "session-6-queries-on-replicas",
+    "session-7-logical-replication-cdc"
   ]
 }

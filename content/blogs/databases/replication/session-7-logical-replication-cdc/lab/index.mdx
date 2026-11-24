@@ -1,0 +1,278 @@
+---
+title: "Lab and session quiz: Logical replication and CDC"
+description: "Build a PostgreSQL publication and subscription, break it with DDL, sequences and a local write; read a logical slot with test_decoding, watch an unread slot keep WAL until max_slot_wal_keep_size invalidates it, and keep a slot across failover; read the MySQL binlog as a CDC consumer and make it fall off a purged log; watch MongoDB change streams wait for the majority, lose precision with updateLookup and lose history after an oplog rollover; and write an outbox relay that duplicates instead of losing."
+type: "how-to"
+tags: ["replication", "cdc", "logical-replication", "postgresql", "mysql", "mongodb", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/logical-replication-quick-setup.html"
+  - "https://www.postgresql.org/docs/17/logicaldecoding-example.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/binary-log.html"
+  - "https://www.mongodb.com/docs/manual/changeStreams/"
+---
+
+<Tldr>
+Uses the Docker scripts from the [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) (`rp-setup.sh`, `rp-teardown.sh`, prefix `rp`) plus a few extra containers on the same `rp-net` network, created below. Run **one engine at a time** and tear it down before the next: the lab was measured that way on a laptop with other containers running. Every exercise lists the numbers measured in the course lab (containers prefixed `rpd`); compare ratios and orders of magnitude, not exact milliseconds.
+</Tldr>
+
+## Data
+
+The same 100,000 orders in each engine (same formulas as the Partitioning and sharding course, one order every 631.584 s over 2024–2025).
+
+PostgreSQL, `orders-100k.sql`:
+
+```sql
+-- Replication course: 100,000 orders (same formulas as the Partitioning course seed, rows 631.584 s apart).
+CREATE TABLE orders (
+  id          bigint        PRIMARY KEY,
+  seller_id   integer       NOT NULL,
+  marketplace text          NOT NULL,
+  status      text          NOT NULL,
+  amount      numeric(12,2) NOT NULL,
+  created_at  timestamptz   NOT NULL
+);
+INSERT INTO orders
+SELECT g,
+       ('x' || substr(md5('s' || g), 1, 8))::bit(32)::bigint % 5000 + 1,
+       CASE WHEN ('x' || substr(md5('m' || g), 1, 8))::bit(32)::bigint % 10 < 5 THEN 'shopee'
+            WHEN ('x' || substr(md5('m' || g), 1, 8))::bit(32)::bigint % 10 < 8 THEN 'tiktok'
+            ELSE 'lazada' END,
+       CASE WHEN ('x' || substr(md5('t' || g), 1, 8))::bit(32)::bigint % 20 < 2 THEN 'cancelled'
+            WHEN ('x' || substr(md5('t' || g), 1, 8))::bit(32)::bigint % 20 = 2 THEN 'returned'
+            ELSE 'delivered' END,
+       (g * 7907) % 50000 / 100.0 + 1,
+       timestamptz '2024-01-01 00:00:00+00' + ((g - 1) * 631584 / 1000) * interval '1 second'
+FROM generate_series(1::bigint, 100000) AS g;
+```
+
+MySQL, `mysql-orders-100k.sql`:
+
+```sql
+CREATE DATABASE IF NOT EXISTS shop;
+USE shop;
+CREATE TABLE orders (
+  id          BIGINT        NOT NULL PRIMARY KEY,
+  seller_id   INT           NOT NULL,
+  marketplace VARCHAR(8)    NOT NULL,
+  status      VARCHAR(10)   NOT NULL,
+  amount      DECIMAL(12,2) NOT NULL,
+  created_at  DATETIME      NOT NULL
+) ENGINE = InnoDB;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO orders
+WITH RECURSIVE s(g) AS (SELECT 1 UNION ALL SELECT g + 1 FROM s WHERE g < 100000)
+SELECT g,
+       CONV(SUBSTR(MD5(CONCAT('s', g)), 1, 8), 16, 10) % 5000 + 1,
+       CASE WHEN CONV(SUBSTR(MD5(CONCAT('m', g)), 1, 8), 16, 10) % 10 < 5 THEN 'shopee'
+            WHEN CONV(SUBSTR(MD5(CONCAT('m', g)), 1, 8), 16, 10) % 10 < 8 THEN 'tiktok'
+            ELSE 'lazada' END,
+       CASE WHEN CONV(SUBSTR(MD5(CONCAT('t', g)), 1, 8), 16, 10) % 20 < 2 THEN 'cancelled'
+            WHEN CONV(SUBSTR(MD5(CONCAT('t', g)), 1, 8), 16, 10) % 20 = 2 THEN 'returned'
+            ELSE 'delivered' END,
+       (g * 7907) % 50000 / 100 + 1,
+       TIMESTAMP '2024-01-01 00:00:00' + INTERVAL ((g - 1) * 631584 DIV 1000) SECOND
+FROM s;
+```
+
+MongoDB, `mongo-orders-100k.js` (run against the primary, database `shop`):
+
+```js
+const md5n = s => parseInt(require('crypto').createHash('md5').update(s).digest('hex').slice(0, 8), 16);
+const t0 = new Date('2024-01-01T00:00:00Z').getTime();
+db.orders.drop();
+let batch = [];
+for (let g = 1; g <= 100000; g++) {
+  const m = md5n('m' + g) % 10, t = md5n('t' + g) % 20;
+  batch.push({
+    _id: g,
+    seller_id: md5n('s' + g) % 5000 + 1,
+    marketplace: m < 5 ? 'shopee' : m < 8 ? 'tiktok' : 'lazada',
+    status: t < 2 ? 'cancelled' : t === 2 ? 'returned' : 'delivered',
+    amount: Decimal128(((g * 7907) % 50000 / 100 + 1).toFixed(2)),
+    created_at: new Date(t0 + Math.floor((g - 1) * 631584 / 1000) * 1000)
+  });
+  if (batch.length === 10000) { db.orders.insertMany(batch, { ordered: false }); batch = []; }
+}
+```
+
+## Exercise 1: publication, subscription and what breaks them (PostgreSQL)
+
+Two standalone servers; the publisher needs `wal_level = logical`:
+
+```bash
+docker network create rp-net 2>/dev/null
+for n in pub sub; do
+  docker run -d --name rp-$n --network rp-net -e POSTGRES_HOST_AUTH_METHOD=trust postgres:17-alpine \
+    -c shared_buffers=64MB -c wal_level=logical
+done
+sleep 5
+docker exec rp-pub sh -c 'echo "host replication all all trust" >> /var/lib/postgresql/data/pg_hba.conf'
+docker exec rp-pub psql -U postgres -c "SELECT pg_reload_conf()"
+docker exec -i rp-pub psql -U postgres < orders-100k.sql
+# the subscriber needs the table definition only: DDL is not replicated
+sed -n '/CREATE TABLE/,/);/p' orders-100k.sql | docker exec -i rp-sub psql -U postgres
+alias pub='docker exec -it rp-pub psql -U postgres'
+alias sub='docker exec -it rp-sub psql -U postgres'
+```
+
+1. Publish and subscribe; time the initial copy by polling `pg_subscription_rel`:
+   ```sql
+   -- pub
+   CREATE PUBLICATION orders_pub FOR TABLE orders;
+   -- sub
+   CREATE SUBSCRIPTION orders_sub CONNECTION 'host=rp-pub user=postgres dbname=postgres' PUBLICATION orders_pub;
+   SELECT srsubstate FROM pg_subscription_rel;   -- i, d, … then r
+   SELECT count(*), sum(amount) FROM orders;
+   ```
+   Lab: ready after **0.41 s**; `100000 | 25099500.00` on both sides.
+2. Measure apply delay with a replica-only trigger:
+   ```sql
+   -- pub
+   CREATE TABLE pings (id int PRIMARY KEY, sent_at timestamptz NOT NULL);
+   ALTER PUBLICATION orders_pub ADD TABLE pings;
+   -- sub
+   CREATE TABLE pings (id int PRIMARY KEY, sent_at timestamptz NOT NULL, seen_at timestamptz);
+   CREATE FUNCTION stamp() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.seen_at := clock_timestamp(); RETURN NEW; END $$;
+   CREATE TRIGGER pings_stamp BEFORE INSERT ON pings FOR EACH ROW EXECUTE FUNCTION stamp();
+   ALTER TABLE pings ENABLE REPLICA TRIGGER pings_stamp;
+   ALTER SUBSCRIPTION orders_sub REFRESH PUBLICATION;
+   ```
+   Insert 100 pings on the publisher (`INSERT INTO pings VALUES (n, clock_timestamp())`, 20 per second), then on the subscriber: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY seen_at - sent_at) FROM pings;`. Lab: p50 **2.24 ms**, p95 5.00 ms, max 17.1 ms.
+3. Break it with DDL: `ALTER TABLE orders ADD COLUMN note text;` and an insert with a note, **on the publisher only**. Read `docker logs rp-sub`, `pg_stat_subscription_stats`, and the slot on the publisher after `UPDATE orders SET amount = amount + 1;`. Then add the column on the subscriber and time the catch-up. Lab: "missing replicated column", retries every 5 s, slot retained 25 MB, caught up in **2.30 s**.
+4. Sequences: create `refunds (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, order_id bigint, amount numeric(12,2))` on both sides, add it to the publication, `REFRESH`, insert 1,000 rows on the publisher, compare `refunds_id_seq` on both sides, insert one row on the subscriber. Lab: subscriber sequence 1, duplicate key `(id)=(1)`.
+5. Replica identity and row filters: a table without a key in the publication (UPDATE fails on the publisher), then `REPLICA IDENTITY FULL`; then `CREATE PUBLICATION shopee_pub FOR TABLE orders WHERE (marketplace = 'shopee')` and any `UPDATE orders …` on the publisher. Fix it with a unique index `(id, marketplace)` as the replica identity, subscribe a second database (`CREATE DATABASE shop` on `rp-sub`) to `shopee_pub`, and move one order from shopee to lazada and one back. Lab: 50,135 rows copied; the moved orders became a DELETE and an INSERT.
+6. Conflict: insert order 200000 on the subscriber, then a different order 200000 on the publisher. Read the error's `finished at` LSN and skip it: `ALTER SUBSCRIPTION orders_sub SKIP (lsn = '…');`. Compare the row on both sides.
+
+## Exercise 2: logical decoding, retention and failover slots (PostgreSQL)
+
+On `rp-pub`:
+
+```sql
+SELECT * FROM pg_create_logical_replication_slot('cdc', 'test_decoding');
+BEGIN; INSERT INTO orders VALUES (300001, 11, 'tiktok', 'delivered', 20.00, now());
+       UPDATE orders SET status = 'returned' WHERE id = 300001; COMMIT;
+BEGIN; INSERT INTO orders VALUES (300002, 12, 'tiktok', 'delivered', 20.00, now()); ROLLBACK;
+BEGIN; SELECT pg_logical_emit_message(true, 'outbox', '{"type":"OrderPlaced","order_id":300003}'); COMMIT;
+SELECT lsn, xid, data FROM pg_logical_slot_peek_changes('cdc', NULL, NULL);
+```
+
+1. Run peek twice, `get` once, then peek again; count rows each time.
+2. Spill: `UPDATE orders SET amount = amount + 1;`, then in one session `SET logical_decoding_work_mem = '64kB'` and `\timing` a peek; read `spill_txns, spill_count, spill_bytes` from `pg_stat_replication_slots`; reset with `pg_stat_reset_replication_slot('cdc')` and repeat with `64MB`. Lab: 17 MB spilled in 269 spills, 255 ms vs 147 ms.
+3. Retention: leave `cdc` unread, run five full-table updates and `CHECKPOINT`, and watch `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`, `wal_status` and `du -sh` of `pg_wal`. Then `ALTER SYSTEM SET max_slot_wal_keep_size = '256MB'; SELECT pg_reload_conf();`, three more updates, `CHECKPOINT`, and read the slot. Lab: 44 → 206 MB retained, then `unreserved`, then `lost` and "can no longer get changes from replication slot". Reset the setting afterwards and drop the slot.
+4. Optional, failover slots: create a standby of `rp-pub` that synchronizes slots (it needs `wal_level = logical` itself), create one slot with `failover = true` and one without, consume both once, promote the standby and read both slots there.
+   ```bash
+   docker exec rp-pub psql -U postgres -c "ALTER SYSTEM SET synchronized_standby_slots = 'pubs_phys'" -c "SELECT pg_reload_conf()" -c "CHECKPOINT"
+   docker run -d --name rp-pubs --network rp-net --user postgres --entrypoint sh postgres:17-alpine -c \
+     "pg_basebackup -d 'host=rp-pub user=postgres dbname=postgres' -D /var/lib/postgresql/data -R -X stream -C -S pubs_phys \
+      && chmod 700 /var/lib/postgresql/data && exec postgres -c shared_buffers=64MB -c wal_level=logical \
+         -c hot_standby=on -c hot_standby_feedback=on -c sync_replication_slots=on -c primary_slot_name=pubs_phys"
+   ```
+   ```sql
+   -- rp-pub
+   SELECT * FROM pg_create_logical_replication_slot('cdc_failover', 'test_decoding', false, false, true);
+   SELECT * FROM pg_create_logical_replication_slot('cdc_plain', 'test_decoding');
+   -- rp-pubs, after a few writes and a get_changes on both slots on rp-pub
+   SELECT slot_name, synced, temporary, confirmed_flush_lsn FROM pg_replication_slots;
+   ```
+   Stop `rp-pub`, run `SELECT pg_promote();` on `rp-pubs`, then `ALTER SYSTEM RESET synchronized_standby_slots; SELECT pg_reload_conf();` (copied from the old primary by the base backup; without the reset the read hangs) and read both slots. Lab: `cdc_failover` delivered the last change, `cdc_plain` did not exist.
+
+Tear down: `docker rm -f -v rp-pub rp-sub rp-pubs`.
+
+## Exercise 3: the MySQL binlog as a change stream
+
+```bash
+./rp-setup.sh rp mysql                                 # rp-my1 -> rp-my2, GTID, row format
+docker exec -i rp-my1 mysql -uroot -plab < mysql-orders-100k.sql
+docker run -d --name rp-cdc --network rp-net python:3.12-slim sleep infinity
+docker exec rp-cdc pip install -q mysql-replication   # the mysql:8.4 image has no mysqlbinlog
+```
+
+`cdc_reader.py`, copied into the container with `docker cp cdc_reader.py rp-cdc:/cdc_reader.py`:
+
+```python
+# Minimal MySQL CDC consumer: reads the binlog over the replication protocol (like Debezium) and prints
+# each change with its GTID. Usage: python cdc_reader.py <binlog-file> <position>   (stops when caught up)
+import sys
+from pymysqlreplication import BinLogStreamReader
+from pymysqlreplication.event import GtidEvent, QueryEvent
+from pymysqlreplication.row_event import WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent
+
+stream = BinLogStreamReader(
+    connection_settings={"host": "rp-my1", "port": 3306, "user": "root", "passwd": "lab"},
+    server_id=99,                      # every binlog reader needs a unique server id
+    log_file=sys.argv[1], log_pos=int(sys.argv[2]), resume_stream=True,
+    blocking=False,                    # return when there is nothing new
+    only_events=[GtidEvent, QueryEvent, WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent],
+)
+for ev in stream:
+    if isinstance(ev, GtidEvent):
+        print("GTID", ev.gtid)
+    elif isinstance(ev, QueryEvent):
+        if ev.query not in ("BEGIN", "COMMIT"):
+            print("  QUERY", ev.query)
+    else:
+        kind = type(ev).__name__.replace("RowsEvent", "").upper()
+        for row in ev.rows:
+            print(" ", kind, f"{ev.schema}.{ev.table}", row)
+print("position", stream.log_file, stream.log_pos)
+stream.close()
+```
+
+1. `FLUSH BINARY LOGS; SHOW BINARY LOG STATUS;` (note file and position), run an UPDATE and a DELETE, and read them with `docker exec rp-cdc python /cdc_reader.py <file> <position>`. Repeat after `SET GLOBAL binlog_row_metadata = FULL;` with an UPDATE, an `ALTER TABLE shop.orders ADD COLUMN note VARCHAR(40) NULL` and an INSERT. Lab: `UNKNOWN_COL0…5` then named columns; the ALTER appears as a QUERY event with its own GTID.
+2. Row image size: for `FULL` and `MINIMAL`, `FLUSH BINARY LOGS`, note the position, run `SET SESSION binlog_row_image = …; UPDATE shop.orders SET amount = amount + 1 WHERE id <= 10000;` and subtract positions. Lab: 822,952 vs 161,046 bytes. Read one MINIMAL update with the consumer.
+3. Purge under a lagging reader: note the position, `STOP REPLICA` on `rp-my2`, write something, `FLUSH BINARY LOGS`, `PURGE BINARY LOGS TO '<newest file>'`, resume the consumer from the noted position and `START REPLICA`. Lab: error 1236 for both; the replica names the missing GTID.
+
+Tear down: `./rp-teardown.sh rp` (also removes `rp-cdc`).
+
+## Exercise 4: MongoDB change streams
+
+```bash
+./rp-setup.sh rp mongo
+RS='mongodb://rp-mongo1:27017,rp-mongo2:27017,rp-mongo3:27017/shop?replicaSet=rprs'   # always reaches the primary
+docker cp mongo-orders-100k.js rp-mongo1:/tmp/seed.js
+docker exec rp-mongo1 mongosh --quiet "$RS" /tmp/seed.js
+```
+
+1. Latency: in one terminal, watch `pings` and print `Date.now() - e.fullDocument.sent.getTime()` for each insert; in another, insert 100 documents `{ i, sent: new Date() }` 50 ms apart. Lab: p50 3 ms, p95 10 ms.
+2. Majority only: find the primary (`db.hello().primary`), start a watcher, `docker pause` both secondaries, insert one document with `{ writeConcern: { w: 1 } }`, read it with and without `readConcern('majority')`, wait 5 s, `docker unpause`. Lab: acknowledged, local read 1, majority read 0, event delivered 5,087 ms after the insert. Do not pause longer than 10 s unless you also want to watch an election.
+3. Update events: update one order to `paid` then `shipped`, then read both events from a saved token with `fullDocument: 'updateLookup'`; enable `changeStreamPreAndPostImages` with `collMod` and repeat with `fullDocument: 'required', fullDocumentBeforeChange: 'required'`. Count `config.system.preimages`.
+4. History lost: start a single-member replica set with a tiny oplog (commands below), save a token, write about 30 MB of other documents and resume. Lab: after 29 batches of about 1 MB the token's position was gone: ChangeStreamHistoryLost (286).
+
+```bash
+docker run -d --name rp-tiny --network rp-net mongo:8.0 --replSet tiny --bind_ip_all --oplogSize 10 --wiredTigerCacheSizeGB 0.25
+docker exec rp-tiny mongosh --quiet --eval 'rs.initiate({_id: "tiny", members: [{ _id: 0, host: "rp-tiny:27017" }]})'
+```
+
+Tear down: `./rp-teardown.sh rp` (also removes `rp-tiny`).
+
+## Exercise 5: an outbox relay that does not lose events (PostgreSQL)
+
+Recreate `rp-pub` from Exercise 1, then:
+
+```sql
+CREATE TABLE outbox (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, aggregate_id bigint NOT NULL,
+                     type text NOT NULL, payload jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
+SELECT * FROM pg_create_logical_replication_slot('relay', 'test_decoding');
+-- five times, n = 1..5
+BEGIN; UPDATE orders SET status = 'shipped' WHERE id = n;
+       INSERT INTO outbox (aggregate_id, type, payload) VALUES (n, 'OrderShipped', jsonb_build_object('order_id', n)); COMMIT;
+```
+
+1. "Publish" the first three outbox inserts with `pg_logical_slot_peek_changes`, then pretend to crash. Peek again and count outbox inserts. Lab: 5.
+2. Find the COMMIT LSN of the third transaction in the peek output, `SELECT pg_replication_slot_advance('relay', '<lsn>');`, and peek again. Lab: 2.
+3. Read the remaining two with `pg_logical_slot_get_changes` and peek once more. Lab: 0. Which step would lose events if the relay crashed right after it?
+
+Clean up: `SELECT pg_drop_replication_slot('relay');` and `docker rm -f -v rp-pub`.
+
+## Session quiz
+
+1. Logical replication of `orders` is running. A developer adds a column on the publisher. What stops, what keeps growing, and what is the safe order for schema changes?
+2. Why does `UPDATE orders SET status = …` fail on the publisher after someone creates a publication with `WHERE (marketplace = 'shopee')`, and what are two fixes?
+3. You move writes from an old PostgreSQL server to a logical subscriber during an upgrade. Which object types must you copy by hand at cut-over?
+4. A Debezium connector on PostgreSQL has been stopped for a week. What happens on the primary, and what does `max_slot_wal_keep_size` change?
+5. Name three things a MySQL server must be configured with to be a good CDC source, and what goes wrong without each.
+6. A MongoDB consumer uses `fullDocument: 'updateLookup'` to compute "previous status → new status" for each order. Why is that wrong, and what should it use?
+7. Compare who keeps the change history for a slow consumer in PostgreSQL, MySQL and MongoDB, and what each failure looks like.
+8. An outbox relay publishes to Kafka and then advances its slot. A crash happens between the two. What do downstream consumers see, and how do they cope?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-7-logical-replication-cdc/lab/answers">Quiz answers</DeepDive>

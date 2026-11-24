@@ -1,0 +1,67 @@
+---
+title: "Answers: The MySQL binlog as a change stream"
+description: "Worked answers to the Session 7 Concept 3 check questions."
+companion: "answers"
+tags: ["replication", "cdc", "binlog", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-gtids-concepts.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/purge-binary-logs.html"
+---
+
+<Tldr>
+In MySQL the reader owns its position and the source owes it nothing. Configure full row images and metadata, keep binlogs longer than your longest consumer outage, and resume by GTID.
+</Tldr>
+
+## Q1. server_id
+
+**Question:** why does a CDC connector need a `server_id`, and what happens if two readers use the same one?
+
+A binlog reader registers with the source through the replication protocol, and the source identifies each connected replica by its `server_id` (and server UUID). The id is also how the source knows not to send a replica its own transactions back in circular setups. From the documentation and common Debezium incidents: when a second reader connects with an id already in use, the source drops the older connection, so two connectors with the same id keep kicking each other off. Give every connector its own id, distinct from all real replicas.
+
+> **Common mistake:** copying a connector configuration for a second pipeline without changing `database.server.id`.
+
+## Q2. MINIMAL metadata
+
+**Question:** with metadata MINIMAL, the consumer saw `UNKNOWN_COL0 … UNKNOWN_COL5`. What else must it know to use those events, and when does that go wrong?
+
+It must know the table's column order at the moment each event was written, so it has to query `information_schema` and track every DDL in the stream to keep its own schema history. It goes wrong when the consumer starts after a DDL (it maps old events to the new layout), when DDL is run with `sql_log_bin = 0`, or on tools such as online schema change that swap tables. With `binlog_row_metadata = FULL` the names travel inside the table-map event and these cases stop mattering.
+
+> **Common mistake:** assuming the current table definition applies to old events when replaying from an earlier position.
+
+## Q3. MINIMAL row image
+
+**Question:** what did MINIMAL row image save, and what did it cost the consumer?
+
+The 10,000-row update wrote 161,046 bytes instead of 822,952 (16 instead of 82 bytes per row): smaller binlogs, less network to replicas, faster apply. The consumer received only `id` in the before image and only `status` (the changed column) in the after image; every other column was absent. A replica can apply that (it finds the row by key and sets one column); a CDC consumer that publishes complete rows or keeps a full copy elsewhere cannot, unless it looks the row up again, which races with later changes.
+
+> **Common mistake:** changing `binlog_row_image` for replication performance without asking the data team which consumers read the binlog.
+
+## Q4. A dead consumer in each engine
+
+**Question:** compare what happens to a dead consumer in PostgreSQL and in MySQL.
+
+In PostgreSQL, the consumer's slot keeps all WAL since its confirmed position: the **source** pays, its disk fills (206 MB after five table rewrites in Concept 2), until someone drops the slot or `max_slot_wal_keep_size` invalidates it. In MySQL, the source keeps binlogs only by age; the **consumer** pays: when it comes back after the files expired or were purged, it gets error 1236 and must take a new snapshot. Both end with a resnapshot if the outage is long enough; the difference is whether the primary is in danger meanwhile.
+
+> **Common mistake:** setting long binlog retention on MySQL and assuming that also protects PostgreSQL CDC. PostgreSQL has the opposite risk.
+
+## Q5. GTIDs
+
+**Question:** the replica's error listed the missing GTID `…:23`. What does a GTID give you over file and offset?
+
+A GTID names a transaction independently of which file it is in and which server wrote the file. A reader that stores the set of GTIDs it has processed can reconnect to a **different** server (for example a replica promoted after a failover, whose binlog files and offsets are completely different) and ask for "everything not in my set". It also makes gaps explicit: the source answered with exactly which transaction was missing. File and offset are only meaningful on the server that wrote them.
+
+> **Common mistake:** CDC connectors configured with file/offset positions on a cluster that fails over; after failover the stored position points into the wrong file.
+
+## Q6. Before PURGE BINARY LOGS
+
+**Question:** write the checklist you would run before `PURGE BINARY LOGS` on a production source.
+
+1. `SHOW REPLICAS` and, on each replica, `SHOW REPLICA STATUS`: the oldest file any replica still needs.
+2. Every CDC connector's stored position (offsets topic, state file): the oldest file or GTID it needs; map GTIDs to files with the binlog index if needed.
+3. Point-in-time recovery: the binlog must cover from the last full backup to now.
+4. Purge only up to the oldest of those, with `PURGE BINARY LOGS TO 'binlog.0000NN'`, never `BEFORE NOW()` on a hunch.
+5. Afterwards, check every replica's IO thread and every connector's status.
+
+> **Common mistake:** purging to free disk during an incident and creating a second incident: every lagging reader needs a rebuild.

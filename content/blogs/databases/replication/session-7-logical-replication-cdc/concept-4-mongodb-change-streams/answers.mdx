@@ -1,0 +1,63 @@
+---
+title: "Answers: MongoDB change streams"
+description: "Worked answers to the Session 7 Concept 4 check questions."
+companion: "answers"
+tags: ["replication", "cdc", "change-streams", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/changeStreams/"
+  - "https://www.mongodb.com/docs/manual/reference/change-events/update/"
+  - "https://www.mongodb.com/docs/manual/core/replica-set-oplog/"
+---
+
+<Tldr>
+A change stream is safe by default (majority-committed only) and incomplete by default (changed fields only). Store the resume token after processing, and keep the oplog window longer than your longest outage.
+</Tldr>
+
+## Q1. The acknowledged insert that did not appear
+
+**Question:** why did the change stream not show the `w: 1` insert that the primary had already acknowledged?
+
+`w: 1` means only the primary has the write. With both secondaries paused, the majority commit point could not advance past it, and change streams only return entries at or before that point (they read with majority semantics). The write was visible to a normal read on the primary and invisible to a `readConcern: 'majority'` read, and the stream behaved like the majority read. It arrived 5,087 ms after the insert, as soon as the secondaries caught up.
+
+> **Common mistake:** treating change-stream lag as "consumer slowness". It includes replication lag to a majority; a lagging secondary delays every stream.
+
+## Q2. updateLookup
+
+**Question:** two updates set status to `paid` then `shipped`. What did `updateLookup` show for the first event, and why?
+
+`shipped`. The update event itself contains only `updatedFields: { status: 'paid' }`; `updateLookup` makes the server read the document by `_id` at the time the event is returned to the consumer. By then the second update had happened, so both events showed the latest version. After a delete the lookup finds nothing and returns `null`.
+
+> **Common mistake:** computing "previous status" from consecutive `updateLookup` documents. Under concurrency both can be identical.
+
+## Q3. Pre- and post-images
+
+**Question:** when would you enable pre- and post-images, and what do they cost?
+
+When the consumer needs the exact document before and after each change: audit trails, syncing to a store where you must remove the old version (for example an old SKU-to-shop mapping), or computing deltas such as stock decrements. The cost is an extra document per change in `config.system.preimages` (10,003 documents, 2,255 KB after 10,000 updates in the lab), extra write work on every update and delete (each of three rounds was slower with images: 12.6–16.6 s vs 8.2–13.0 s for 5,000 updates), and the space until the images expire. Enable it per collection, only where a consumer uses it.
+
+> **Common mistake:** enabling it on every collection "for CDC" and doubling write amplification on high-churn collections nobody consumes.
+
+## Q4. Saving the token too early
+
+**Question:** a consumer saves the resume token before processing each event. What can go wrong?
+
+If it crashes after saving the token and before the side effect (an API call, a write to another database), it resumes **after** that event and the change is lost. Saving the token after the side effect gives at-least-once delivery instead: a crash between the side effect and the save makes it process that event twice on restart, so the side effect must be idempotent (Concept 5).
+
+> **Common mistake:** saving the token on a timer, which can lose or repeat many events at once.
+
+## Q5. How long can a consumer stop?
+
+**Question:** how do you estimate how long a consumer can be stopped before its token is lost?
+
+The oplog window: `rs.printReplicationInfo()` reports "log length start to end", the time between the oldest and newest entries. At peak write rate the window is shortest; that peak value, minus a margin, is the longest safe outage. The lab set had a 29,175 MB oplog but only 544 s of history because it was new; a 10 MB oplog lost the token after about 29 MB of writes. Resize the oplog (`replSetResizeOplog`) or set `oplogMinRetentionHours` if the window is shorter than your recovery procedures.
+
+> **Common mistake:** reasoning in megabytes. Bulk imports or index builds can shrink the window from days to hours.
+
+## Q6. Who keeps history for a slow consumer
+
+**Question:** compare what keeps the change history available for a slow consumer in PostgreSQL, MySQL and MongoDB.
+
+PostgreSQL: the consumer's replication slot makes the primary keep WAL until the consumer confirms it; the history is guaranteed and the primary's disk is at risk (capped by `max_slot_wal_keep_size`). MySQL: nothing per consumer; binlogs are kept by age (`binlog_expire_logs_seconds`) or until `PURGE`. MongoDB: nothing per consumer; the oplog is a capped collection sized in MB, optionally with `oplogMinRetentionHours`. In MySQL and MongoDB a consumer that is away too long gets an error (1236, 286) and must resnapshot; in PostgreSQL the primary pays until someone intervenes.
+
+> **Common mistake:** reusing a PostgreSQL CDC runbook for MongoDB. "The slot will hold the data" has no MongoDB equivalent.

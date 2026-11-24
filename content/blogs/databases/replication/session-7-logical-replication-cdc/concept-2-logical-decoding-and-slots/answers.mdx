@@ -1,0 +1,63 @@
+---
+title: "Answers: Logical decoding and replication slots"
+description: "Worked answers to the Session 7 Concept 2 check questions."
+companion: "answers"
+tags: ["replication", "cdc", "logical-decoding", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/logicaldecoding-explanation.html"
+  - "https://www.postgresql.org/docs/17/view-pg-replication-slots.html"
+  - "https://www.postgresql.org/docs/17/runtime-config-replication.html"
+---
+
+<Tldr>
+A slot is a bookmark that holds WAL. Watch how much it holds, cap it, and make sure it exists on the server your consumer will connect to after a failover.
+</Tldr>
+
+## Q1. The missing transaction
+
+**Question:** why did transaction 945 never appear in the slot, and when does a transaction's first change reach the consumer?
+
+Transaction 945 rolled back. The decoder collects each transaction's changes in the reorder buffer and only hands them to the output plugin when it reads that transaction's COMMIT record; an ABORT record makes it discard them. So the first change of a transaction reaches the consumer **after the transaction commits**, together with all its other changes. (PostgreSQL can stream large in-progress transactions to a subscriber with `streaming = on`; the subscriber still applies them only at commit.)
+
+> **Common mistake:** expecting CDC to show work in progress, or worrying that rolled-back writes leak to Kafka. They do not.
+
+## Q2. Two positions
+
+**Question:** what is the difference between `restart_lsn` and `confirmed_flush_lsn`?
+
+`confirmed_flush_lsn` is how far the consumer has confirmed: changes committed before it will not be sent again. `restart_lsn` is the oldest WAL position the decoder must re-read to rebuild the transactions that were still open at the confirmed point; it is usually a little behind. WAL older than the minimum `restart_lsn` of all slots cannot be removed, which is why retained size is measured as `pg_current_wal_lsn() - restart_lsn`.
+
+> **Common mistake:** measuring lag from `restart_lsn` and alarming on a slot whose consumer is fully caught up but has a long-open transaction in flight.
+
+## Q3. A consumer down for three days
+
+**Question:** a slot's consumer has been down for three days. What do you check, and what are your two options?
+
+Check `active`, `wal_status`, retained bytes (`pg_current_wal_lsn() - restart_lsn`), `safe_wal_size`, and free space on the WAL volume. Then either: bring the consumer back quickly and let it catch up (it will replay three days of changes; check it has the throughput), or drop the slot to free the WAL and rebuild the consumer from a new snapshot. Dropping is the right call when the disk is close to full: a full WAL disk stops the primary for everyone.
+
+> **Common mistake:** deleting files in `pg_wal` by hand. That corrupts the database; drop the slot instead.
+
+## Q4. After invalidation
+
+**Question:** after `max_slot_wal_keep_size` invalidated a slot, what must the consumer do to be correct again?
+
+The changes between its last confirmed position and the removed WAL are gone for good, so it cannot catch up. It must drop the invalidated slot, create a new one, take a fresh consistent snapshot of the tables it mirrors (a subscription does this with its initial copy; Debezium with a snapshot), and continue streaming from the new slot. Anything derived downstream from the old stream should be reconciled against that snapshot.
+
+> **Common mistake:** recreating the slot and continuing to stream. That skips every change made while the slot was lost.
+
+## Q5. Slots and promotion
+
+**Question:** why was the plain slot missing after promotion, and what two settings made the failover slot usable?
+
+Slots are local to a server and are not part of the WAL a physical standby replays, so the promoted standby had no `cdc_plain`. The failover slot existed because the standby ran with `sync_replication_slots = on` (which also needs `wal_level = logical`, `hot_standby_feedback = on`, `primary_slot_name` and a `dbname` in `primary_conninfo`). It became readable after `synchronized_standby_slots` was reset on the new primary: the value had been copied from the old primary and named a slot that did not exist there, so the walsender waited for it forever.
+
+> **Common mistake:** testing failover slots only by checking `synced = t` on the standby. Test a real promotion and a read on the new primary.
+
+## Q6. What a logical slot holds back
+
+**Question:** what does a logical slot hold back besides WAL, and what does it not hold back?
+
+It holds `catalog_xmin`: VACUUM keeps old versions of system-catalog rows the decoder may need to interpret old WAL with the table definition that was current then. It does not set `xmin`, so ordinary user tables are vacuumed normally. A physical slot used with `hot_standby_feedback = on` is different: it reports the standby's oldest snapshot as `xmin` and holds back cleanup of every table (Session 6).
+
+> **Common mistake:** blaming an idle logical slot for table bloat. Look at long transactions and physical slots with feedback first.

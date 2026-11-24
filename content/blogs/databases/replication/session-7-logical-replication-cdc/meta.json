@@ -1,0 +1,13 @@
+{
+  "title": "Session 7: Logical replication and CDC",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-publications-and-subscriptions/index",
+    "concept-2-logical-decoding-and-slots/index",
+    "concept-3-mysql-binlog-cdc/index",
+    "concept-4-mongodb-change-streams/index",
+    "concept-5-delivery-and-outbox/index",
+    "lab/index"
+  ]
+}
