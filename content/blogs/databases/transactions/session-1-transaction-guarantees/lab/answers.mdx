@@ -1,0 +1,78 @@
+---
+title: "Answers: What a transaction guarantees session quiz"
+description: "Worked answers to the Session 1 quiz."
+companion: "answers"
+tags: ["transactions", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/wal-async-commit.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions/"
+---
+
+<Tldr>
+A transaction is only as atomic as its boundaries and its error handling, and only as durable as the flush it waits for.
+</Tldr>
+
+## Q1. The missing property
+
+**Question:** Exercise 1 created 1,500 in every engine. Which ACID property was missing, and why didn't the CHECK constraint prevent it?
+
+**Atomicity** across the two statements: each ran as its own transaction. The CHECK constraint did its job: it rejected the debit that would have made account 1 negative. Nothing declared says "the total must not change", so the committed credit was valid on its own.
+
+> **Common mistake:** "add a constraint for that". A rule over the sum of all rows cannot be a CHECK constraint; atomic transactions are the tool.
+
+## Q2. Who committed the credit
+
+**Question:** in Exercise 2, which engine committed the credit, and what line of application code would have prevented it?
+
+**MySQL**: InnoDB rolled back only the failing `UPDATE`; the `COMMIT` then committed the credit (total 10,001,500). A `ROLLBACK` in the error handler (or not catching the exception inside the transaction block) prevents it. PostgreSQL refused to commit (`COMMIT` → `ROLLBACK`), MongoDB had already aborted the transaction.
+
+> **Common mistake:** assuming the three engines behave like whichever one you learned first.
+
+## Q3. Why a replica set
+
+**Question:** why does MongoDB need `--replSet` for this lab, even with a single node?
+
+Multi-document transactions are built on the oplog and on replica-set read and write concerns. A standalone `mongod` has no oplog and rejects transactions ("Transaction numbers are only allowed on a replica set member or mongos", checked on the Indexing course's standalone container). A one-node replica set has an oplog and accepts them.
+
+> **Common mistake:** running integration tests against a standalone MongoDB and mocking the transaction away.
+
+## Q4. ON_ERROR_ROLLBACK
+
+**Question:** in Exercise 3, why did `ON_ERROR_ROLLBACK` change the result of the same SQL?
+
+psql silently wrapped each statement in a savepoint and rolled back to it on error. The failed debit was undone alone, the transaction stayed usable, and `COMMIT` committed the credit: 10,001,500, MySQL's behaviour. The SQL was identical; the client changed what an error does.
+
+> **Common mistake:** assuming the server setting decides everything; client and driver options change transaction semantics too.
+
+## Q5. Cost of one commit
+
+**Question:** Exercise 4: compute the approximate cost of one durable commit in PostgreSQL and MySQL on your machine.
+
+(autocommit time − one-transaction time) / 5,000. Lab: PostgreSQL (3,514…4,630 − ≈ 140) / 5,000 ≈ **0.7–0.9 ms**; MySQL (5,334…7,101 − ≈ 110) / 5,000 ≈ **1.0–1.4 ms** (redo log plus binary log). A laptop NVMe outside Docker is usually faster; cloud network disks are often slower.
+
+> **Common mistake:** dividing the autocommit time by 5,000 and calling all of it commit cost; subtract the work that the one-transaction run also did.
+
+## Q6. synchronous_commit = off
+
+**Question:** why did `synchronous_commit = off` make the autocommit file as fast as one transaction, and what does it risk?
+
+The only difference between the two runs was the WAL flush each commit waited for. With `off`, commits return without waiting (136–160 ms vs 128–152 ms for one transaction). Risk: a server crash loses the commits of the last ≈ 0.6 s (3 × `wal_writer_delay`), although the client was told they succeeded. No corruption, no partial transactions.
+
+> **Common mistake:** concluding that batching is pointless; batching gets the same speed without the crash window.
+
+## Q7. 16 clients
+
+**Question:** why did 16 clients reach about 9× the commits per second of 1 client, while each commit took longer?
+
+Group commit: while one WAL flush runs, other backends queue commit records, and the next flush covers all of them. Throughput rose from 1,274 to 12,027 tps; latency rose from 0.79 to 1.33 ms because each client now also waits for the batch it joined, and the CPU is shared.
+
+> **Common mistake:** benchmarking with one client and extrapolating linearly to production concurrency.
+
+## Q8. The 200,000-row job
+
+**Question:** a nightly job updates 200,000 rows. Propose a batch size and explain how the job resumes after a crash.
+
+For example 1,000 rows per transaction: 200 commits instead of 200,000, each batch locking only 1,000 rows for a fraction of a second. Process rows in primary-key order and record the last committed key (in the same transaction as the batch, or derive it from the data), so a restart continues from the next key. Make the change idempotent (`SET price = :new`) so repeating a batch is harmless.
+
+> **Common mistake:** a single 200,000-row transaction "for safety", which locks every row until the end and holds back cleanup (Session 4).

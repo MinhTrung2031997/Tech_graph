@@ -1,0 +1,12 @@
+{
+  "title": "Session 1: What a transaction guarantees",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-acid-in-practice/index",
+    "concept-2-errors-inside-a-transaction/index",
+    "concept-3-durability/index",
+    "concept-4-cost-of-a-commit/index",
+    "lab/index"
+  ]
+}

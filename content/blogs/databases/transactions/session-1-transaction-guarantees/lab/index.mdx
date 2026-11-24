@@ -1,0 +1,306 @@
+---
+title: "Lab and session quiz: What a transaction guarantees"
+description: "Set up the Transactions course lab (PostgreSQL 17, MySQL 8.4 and a one-node MongoDB 8.0 replica set with the bank dataset used by every session), then break a transfer without a transaction, watch each engine react to an error inside one, and measure what a durable commit costs."
+type: "how-to"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "lab"]
+status: "draft"
+sources:
+  - "https://hub.docker.com/_/postgres"
+  - "https://hub.docker.com/_/mysql"
+  - "https://hub.docker.com/_/mongo"
+  - "https://www.mongodb.com/docs/manual/tutorial/convert-standalone-to-replica-set/"
+  - "https://www.postgresql.org/docs/current/pgbench.html"
+---
+
+<Tldr>
+This lab builds the environment every later Transactions lab reuses: a database called **`bank`** in each engine with **10,000 accounts** (1,000.00 each), **5,000 SKUs** of stock and a **100,000-job queue**. MongoDB runs as a **one-node replica set**, because multi-document transactions do not work on a standalone server. Most exercises need **two terminals**: concurrency only shows up between sessions. Outputs below are from the lab runs; timings depend on your disk, the ratios should not.
+</Tldr>
+
+## 1. Start the databases
+
+PostgreSQL and MySQL are the containers from the [Indexing course lab](/blogs/databases/indexing/session-1-storage-basics/lab); start them if you do not have them yet. MongoDB needs a **new** container started as a replica set (the Indexing course's `idx-mongo` is standalone).
+
+```bash
+# Skip the first two if they already exist from the Indexing course.
+docker run -d --name idx-pg    -e POSTGRES_PASSWORD=lab -p 5433:5432 postgres:17-alpine -c shared_buffers=128MB
+docker run -d --name idx-mysql -e MYSQL_ROOT_PASSWORD=lab -e MYSQL_DATABASE=lab -p 3307:3306 mysql:8.4
+
+# MongoDB as a one-node replica set named rs0.
+docker run -d --name tx-mongo -p 27019:27017 mongo:8.0 --replSet rs0
+sleep 5
+docker exec tx-mongo mongosh --quiet --eval 'rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "localhost:27017" }] })'
+docker exec tx-mongo mongosh --quiet --eval 'rs.status().members[0].stateStr'   # PRIMARY (after a few seconds)
+
+# The bank database in the SQL engines.
+docker exec idx-pg    psql -U postgres -c "CREATE DATABASE bank"
+docker exec idx-mysql mysql -uroot -plab -e "CREATE DATABASE bank"
+```
+
+Shortcuts used in every Transactions lab (open two terminals with the same alias to get two sessions):
+
+```bash
+alias tpg='docker exec -it idx-pg psql -U postgres -d bank'
+alias tmy='docker exec -it idx-mysql mysql -uroot -plab bank'
+alias tmg='docker exec -it tx-mongo mongosh --quiet bank'
+```
+
+## 2. Load the dataset
+
+| Table / collection | Rows | Columns |
+|---|---|---|
+| `accounts` | 10,000 | `id`, `owner`, `branch` (B00–B09), `balance` (1,000.00, `CHECK balance >= 0`), `version` (1) |
+| `inventory` | 5,000 | `sku` (SKU-000000 … SKU-004999), `stock` (100, `CHECK stock >= 0`), `shelf` (0–49, not indexed) |
+| `jobs` | 100,000 | `id`, `status` (90,000 `done`, 10,000 `queued`), `payload`, `created_at`, `locked_by` |
+
+Total money: `sum(balance) = 10,000,000.00`. Every exercise that moves money should leave it there.
+
+### PostgreSQL
+
+Save as `pg-tx-seed.sql`, then `docker exec -i idx-pg psql -U postgres -d bank < pg-tx-seed.sql`.
+
+```sql
+-- Transactions course dataset: bank accounts, product stock and a job queue.
+DROP TABLE IF EXISTS jobs, inventory, accounts;
+CREATE TABLE accounts (
+  id       integer       PRIMARY KEY,
+  owner    text          NOT NULL,
+  branch   text          NOT NULL,              -- 10 branches
+  balance  numeric(12,2) NOT NULL CHECK (balance >= 0),
+  version  integer       NOT NULL DEFAULT 1     -- for optimistic locking
+);
+INSERT INTO accounts
+SELECT a, 'owner-' || a, 'B' || lpad((a % 10)::text, 2, '0'), 1000.00, 1
+FROM generate_series(1, 10000) AS a;
+
+CREATE TABLE inventory (
+  sku    text    PRIMARY KEY,
+  stock  integer NOT NULL CHECK (stock >= 0),
+  shelf  integer NOT NULL                        -- not indexed: used for locking demos
+);
+INSERT INTO inventory
+SELECT 'SKU-' || lpad(s::text, 6, '0'), 100, s % 50
+FROM generate_series(0, 4999) AS s;
+
+CREATE TABLE jobs (
+  id          bigint      PRIMARY KEY,
+  status      text        NOT NULL,              -- queued / running / done
+  payload     text        NOT NULL,
+  created_at  timestamptz NOT NULL,
+  locked_by   text
+);
+INSERT INTO jobs
+SELECT j, CASE WHEN j <= 90000 THEN 'done' ELSE 'queued' END, md5(j::text),
+       timestamptz '2025-01-01' + j * interval '1 minute', NULL
+FROM generate_series(1, 100000) AS j;
+VACUUM ANALYZE accounts; VACUUM ANALYZE inventory; VACUUM ANALYZE jobs;
+```
+
+### MySQL
+
+Save as `mysql-tx-seed.sql`, then `docker exec -i idx-mysql mysql -uroot -plab bank < mysql-tx-seed.sql`.
+
+```sql
+-- Transactions course dataset: bank accounts, product stock and a job queue.
+DROP TABLE IF EXISTS jobs, inventory, accounts;
+CREATE TABLE accounts (
+  id       INT           NOT NULL PRIMARY KEY,
+  owner    VARCHAR(20)   NOT NULL,
+  branch   CHAR(3)       NOT NULL,
+  balance  DECIMAL(12,2) NOT NULL CHECK (balance >= 0),
+  version  INT           NOT NULL DEFAULT 1
+) ENGINE = InnoDB;
+CREATE TABLE inventory (
+  sku    VARCHAR(12) NOT NULL PRIMARY KEY,
+  stock  INT         NOT NULL CHECK (stock >= 0),
+  shelf  INT         NOT NULL
+) ENGINE = InnoDB;
+CREATE TABLE jobs (
+  id          BIGINT      NOT NULL PRIMARY KEY,
+  status      VARCHAR(8)  NOT NULL,
+  payload     CHAR(32)    NOT NULL,
+  created_at  DATETIME    NOT NULL,
+  locked_by   VARCHAR(20)
+) ENGINE = InnoDB;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO accounts
+WITH RECURSIVE seq(a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM seq WHERE a < 10000)
+SELECT a, CONCAT('owner-', a), CONCAT('B', LPAD(a % 10, 2, '0')), 1000.00, 1 FROM seq;
+INSERT INTO inventory
+WITH RECURSIVE seq(s) AS (SELECT 0 UNION ALL SELECT s + 1 FROM seq WHERE s < 4999)
+SELECT CONCAT('SKU-', LPAD(s, 6, '0')), 100, s % 50 FROM seq;
+INSERT INTO jobs
+WITH RECURSIVE seq(j) AS (SELECT 1 UNION ALL SELECT j + 1 FROM seq WHERE j < 100000)
+SELECT j, IF(j <= 90000, 'done', 'queued'), MD5(j), TIMESTAMP '2025-01-01 00:00:00' + INTERVAL j MINUTE, NULL FROM seq;
+ANALYZE TABLE accounts, inventory, jobs;
+```
+
+### MongoDB
+
+Save as `mongo-tx-seed.js`, then `docker cp mongo-tx-seed.js tx-mongo:/tmp/ && docker exec tx-mongo mongosh --quiet /tmp/mongo-tx-seed.js`.
+
+```js
+// Transactions course dataset (replica set required for multi-document transactions).
+db = db.getSiblingDB('bank');
+db.accounts.drop(); db.inventory.drop(); db.jobs.drop();
+db.accounts.insertMany(Array.from({ length: 10000 }, (_, i) => ({
+  _id: i + 1, owner: `owner-${i + 1}`, branch: 'B' + String((i + 1) % 10).padStart(2, '0'),
+  balance: NumberDecimal('1000.00'), version: 1 })));
+db.inventory.insertMany(Array.from({ length: 5000 }, (_, s) => ({
+  _id: 'SKU-' + String(s).padStart(6, '0'), stock: 100, shelf: s % 50 })));
+const t0 = new Date('2025-01-01T00:00:00Z').getTime();
+for (let base = 1; base <= 100000; base += 10000) {
+  db.jobs.insertMany(Array.from({ length: 10000 }, (_, k) => { const j = base + k; return {
+    _id: j, status: j <= 90000 ? 'done' : 'queued', payload: j.toString(16), created_at: new Date(t0 + j * 60000), locked_by: null }; }));
+}
+printjson({ accounts: db.accounts.countDocuments(), inventory: db.inventory.countDocuments(), jobs: db.jobs.countDocuments() });
+```
+
+Expected: `{ accounts: 10000, inventory: 5000, jobs: 100000 }`. MongoDB has no CHECK constraints; Exercise 1 adds the balance rule as a validator.
+
+### Two-session exercises
+
+When an exercise says **T1** and **T2**, run them in two terminals (`tpg` twice, `tmy` twice, `tmg` twice), in the order of the time column. `pg_sleep(n)` / `SLEEP(n)` / `sleep(ms)` stand in for "the application is thinking" so you have time to switch terminals.
+
+## Exercise 1: a transfer without a transaction (Concept 1)
+
+Predict the total after each block, then run it. Reset with the last line.
+
+```sql
+-- PostgreSQL (tpg) and MySQL (tmy): autocommit
+UPDATE accounts SET balance = balance + 1500 WHERE id = 2;
+UPDATE accounts SET balance = balance - 1500 WHERE id = 1;     -- fails the CHECK
+SELECT sum(balance) FROM accounts;                              -- 10001500.00
+UPDATE accounts SET balance = 1000 WHERE id IN (1, 2);          -- reset
+```
+
+```js
+// MongoDB (tmg): add the rule, then the same two writes
+db.runCommand({ collMod: "accounts", validator: { balance: { $gte: 0 } }, validationLevel: "strict" });
+db.accounts.updateOne({ _id: 2 }, { $inc: { balance: NumberDecimal("1500") } });
+db.accounts.updateOne({ _id: 1 }, { $inc: { balance: NumberDecimal("-1500") } });   // Document failed validation
+db.accounts.aggregate([{ $group: { _id: null, s: { $sum: "$balance" } } }]);          // 10001500.00
+db.accounts.updateMany({ _id: { $in: [1, 2] } }, { $set: { balance: NumberDecimal("1000.00") } });
+```
+
+## Exercise 2: an error inside a transaction (Concept 2)
+
+Same transfer, wrapped in a transaction, ending with `COMMIT` despite the error.
+
+```sql
+-- PostgreSQL
+BEGIN;
+UPDATE accounts SET balance = balance + 1500 WHERE id = 2;
+UPDATE accounts SET balance = balance - 1500 WHERE id = 1;    -- ERROR … accounts_balance_check
+SELECT balance FROM accounts WHERE id = 2;                     -- ERROR: current transaction is aborted …
+COMMIT;                                                         -- ROLLBACK
+SELECT sum(balance) FROM accounts;                              -- 10000000.00
+```
+
+```sql
+-- MySQL
+START TRANSACTION;
+UPDATE accounts SET balance = balance + 1500 WHERE id = 2;
+UPDATE accounts SET balance = balance - 1500 WHERE id = 1;    -- ERROR 3819
+SELECT balance FROM accounts WHERE id = 2;                     -- 2500.00 (still pending)
+COMMIT;                                                         -- Query OK
+SELECT sum(balance) FROM accounts;                              -- 10001500.00
+UPDATE accounts SET balance = 1000 WHERE id IN (1, 2);          -- reset
+```
+
+```js
+// MongoDB
+const s = db.getMongo().startSession(); const a = s.getDatabase("bank").accounts;
+s.startTransaction();
+a.updateOne({ _id: 2 }, { $inc: { balance: NumberDecimal("1500") } });
+a.updateOne({ _id: 1 }, { $inc: { balance: NumberDecimal("-1500") } });   // Document failed validation
+a.findOne({ _id: 2 });            // NoSuchTransaction: Transaction with { txnNumber: … } has been aborted.
+s.commitTransaction();            // NoSuchTransaction
+db.accounts.aggregate([{ $group: { _id: null, s: { $sum: "$balance" } } }]);   // 10000000.00
+```
+
+## Exercise 3: savepoints and ON_ERROR_ROLLBACK (Concept 2)
+
+```sql
+-- PostgreSQL: deliberate partial rollback
+BEGIN;
+UPDATE accounts SET balance = balance + 100 WHERE id = 3;
+SAVEPOINT before_debit;
+UPDATE accounts SET balance = balance - 1500 WHERE id = 4;   -- ERROR
+ROLLBACK TO SAVEPOINT before_debit;
+UPDATE accounts SET balance = balance - 100 WHERE id = 5;
+COMMIT;
+SELECT id, balance FROM accounts WHERE id IN (3, 4, 5) ORDER BY id;   -- 1100.00, 1000.00, 900.00
+UPDATE accounts SET balance = 1000 WHERE id IN (3, 4, 5);
+```
+
+Then repeat Exercise 2's PostgreSQL block after `\set ON_ERROR_ROLLBACK on`. Predict the total before you look: the lab got **10001500.00**. Reset accounts 1 and 2 and `\set ON_ERROR_ROLLBACK off`.
+
+## Exercise 4: what a commit costs (Concepts 3 and 4)
+
+Generate 5,000 one-row updates and run them twice per engine: in autocommit and in one transaction.
+
+```bash
+for i in $(seq 0 4999); do echo "UPDATE accounts SET version = version + 1 WHERE id = $(( 1 + (i * 7919) % 10000 ));"; done > updates.sql
+
+time docker exec -i idx-pg psql -U postgres -d bank -q < updates.sql                                   # lab: 3.5–4.6 s
+time (echo 'BEGIN;'; cat updates.sql; echo 'COMMIT;') | docker exec -i idx-pg psql -U postgres -d bank -q   # 0.13–0.15 s
+time docker exec -i -e PGOPTIONS='-c synchronous_commit=off' idx-pg psql -U postgres -d bank -q < updates.sql   # 0.14–0.16 s
+
+time docker exec -i idx-mysql mysql -uroot -plab bank < updates.sql                                    # 5.3–7.1 s
+time (echo 'START TRANSACTION;'; cat updates.sql; echo 'COMMIT;') | docker exec -i idx-mysql mysql -uroot -plab bank   # 0.10–0.12 s
+```
+
+For MySQL, also read `SHOW GLOBAL STATUS LIKE 'Innodb_os_log_fsyncs'` before and after each run (lab: ≈ +5,300 vs ≈ +20).
+
+```js
+// MongoDB: save as wc.js, docker cp it into tx-mongo, run with mongosh --quiet
+db = db.getSiblingDB('bank');
+const ids = Array.from({ length: 5000 }, (_, i) => 1 + (i * 7919) % 10000);
+function run(label, f) { const t = Date.now(); f(); print(label.padEnd(34), Date.now() - t, 'ms'); }
+run('w:majority (default)', () => ids.forEach(id => db.accounts.updateOne({ _id: id }, { $inc: { version: 1 } })));
+run('w:1, j:false', () => ids.forEach(id => db.accounts.updateOne({ _id: id }, { $inc: { version: 1 } }, { writeConcern: { w: 1, j: false } })));
+run('w:1, j:true', () => ids.forEach(id => db.accounts.updateOne({ _id: id }, { $inc: { version: 1 } }, { writeConcern: { w: 1, j: true } })));
+run('one transaction', () => { const s = db.getMongo().startSession(); const a = s.getDatabase('bank').accounts; s.startTransaction();
+  ids.forEach(id => a.updateOne({ _id: id }, { $inc: { version: 1 } })); s.commitTransaction(); s.endSession(); });
+run('bulkWrite (not atomic)', () => db.accounts.bulkWrite(ids.map(id => ({ updateOne: { filter: { _id: id }, update: { $inc: { version: 1 } } } })), { ordered: false }));
+```
+
+| Run | Lab |
+|---|---|
+| w: majority | 9,003 / 14,248 ms |
+| w: 1, j: false | 562 / 703 ms |
+| w: 1, j: true | 16,362 / 14,402 ms |
+| One transaction | 503 / 520 ms |
+| bulkWrite | 87 / 89 ms |
+
+## Exercise 5: synchronous commit and group commit (Concepts 3 and 4)
+
+```bash
+docker exec -i idx-pg sh -c 'cat > /tmp/upd.sql' <<'EOF'
+\set id random(1, 10000)
+UPDATE accounts SET balance = balance + 0 WHERE id = :id;
+EOF
+docker exec idx-pg pgbench -n -U postgres -T 10 -c 1 -f /tmp/upd.sql bank                                     # lab: tps ≈ 1,564
+docker exec -e PGOPTIONS='-c synchronous_commit=off' idx-pg pgbench -n -U postgres -T 10 -c 1 -f /tmp/upd.sql bank   # ≈ 36,110
+docker exec idx-pg pgbench -n -U postgres -T 10 -c 4  -j 4  -f /tmp/upd.sql bank                              # ≈ 3,323
+docker exec idx-pg pgbench -n -U postgres -T 10 -c 16 -j 16 -f /tmp/upd.sql bank                              # ≈ 12,027
+```
+
+Check MySQL's durability settings (they are server-wide; change them only on a throwaway server):
+
+```sql
+SELECT @@innodb_flush_log_at_trx_commit, @@sync_binlog, @@log_bin;   -- 1, 1, 1
+```
+
+## Session quiz
+
+1. Exercise 1 created 1,500 in every engine. Which ACID property was missing, and why didn't the CHECK constraint prevent it?
+2. In Exercise 2, which engine committed the credit, and what line of application code would have prevented it?
+3. Why does MongoDB need `--replSet` for this lab, even with a single node?
+4. In Exercise 3, why did `ON_ERROR_ROLLBACK` change the result of the same SQL?
+5. Exercise 4: compute the approximate cost of one durable commit in PostgreSQL and MySQL on your machine.
+6. Why did `synchronous_commit = off` make the autocommit file as fast as one transaction, and what does it risk?
+7. Why did 16 clients reach about 9× the commits per second of 1 client, while each commit took longer?
+8. A nightly job updates 200,000 rows. Propose a batch size and explain how the job resumes after a crash.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-1-transaction-guarantees/lab/answers">Answers to the session quiz</DeepDive>

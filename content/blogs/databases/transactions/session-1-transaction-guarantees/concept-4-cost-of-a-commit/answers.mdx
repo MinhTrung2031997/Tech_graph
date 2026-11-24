@@ -1,0 +1,62 @@
+---
+title: "Answers: The cost of a commit"
+description: "Worked answers to the Session 1 Concept 4 check questions."
+companion: "answers"
+tags: ["transactions", "commit", "batching", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/wal-configuration.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/optimizing-innodb-transaction-management.html"
+---
+
+<Tldr>
+Count commits, not rows: the flush is paid per commit, and every design choice about batch size trades that cost against locking, visibility and retry scope.
+</Tldr>
+
+## Q1. 23–36 times longer
+
+**Question:** why did the 5,000-update file take 23–36 times longer in autocommit in PostgreSQL, although the same rows changed?
+
+The row work (find the row, write a new version, write WAL) is the same in both runs and costs a few hundredths of a millisecond per row on a warm cache. Autocommit adds a WAL flush per statement, ≈ 0.7–0.9 ms on the lab disk, 5,000 times. One transaction flushes once. The `synchronous_commit = off` run confirms it: autocommit without waiting for the flush took 136–160 ms, the same as one transaction.
+
+> **Common mistake:** blaming network round trips. They exist, but the `synchronous_commit = off` run had the same 5,000 round trips and was fast.
+
+## Q2. Group commit
+
+**Question:** how does group commit raise throughput without making any single commit faster?
+
+While one fsync is in progress, other transactions finish their work and queue their commit records. The next fsync covers all of them. Each client still waits about one flush (latency even rose from 0.79 to 1.33 ms in PostgreSQL), but each flush now completes many commits: 1,274 → 12,027 commits/s from 1 to 16 clients (PostgreSQL), 352 → 4,066 (MySQL).
+
+> **Common mistake:** concluding that adding clients makes each request faster. It makes the server do more per flush; each request is no faster.
+
+## Q3. bulkWrite vs transaction
+
+**Question:** why was MongoDB's `bulkWrite` faster than the transaction, and what does it give up?
+
+The transaction still sent 5,000 separate `updateOne` requests (5,000 round trips) and committed once: ≈ 0.5 s. `bulkWrite` sent all 5,000 operations in a few large requests: 87–89 ms. But each document update in a bulk write commits independently. If the bulk fails halfway, the earlier updates stay, and other clients see them before it finishes. It is a batching tool, not an atomicity tool.
+
+> **Common mistake:** using `bulkWrite` for a set of changes that must be all-or-nothing.
+
+## Q4. Crash at row 5,500
+
+**Question:** a job commits every 1,000 rows and crashes at row 5,500. What is in the database, and how should the job restart?
+
+Batches 1–5 (rows 1–5,000) are committed; the open sixth batch (rows 5,001–5,500) was rolled back by the crash. The job should restart from row 5,001. To make that possible, process rows in a stable order (for example by primary key) and store the last committed key in the same transaction as each batch, or make the update idempotent (`SET price = new_price`, not `price = price * 1.1`) so repeating rows is harmless.
+
+> **Common mistake:** restarting from row 1 with a non-idempotent update and applying the change twice to 5,000 rows.
+
+## Q5. One huge transaction
+
+**Question:** list three costs of running a nightly update of 200,000 rows as one transaction.
+
+Any three of: every updated row stays locked until the end, so concurrent writes to those rows wait (Session 5); old row versions cannot be cleaned up while it runs (PostgreSQL VACUUM, InnoDB purge, MongoDB history), and long transactions slow other queries (Session 4); a failure at row 199,999 throws away all the work; replicas receive the whole change at commit and may lag; MongoDB aborts a transaction after 60 s by default (`transactionLifetimeLimitSeconds`, Session 8).
+
+> **Common mistake:** "one transaction is always the safest choice". It is the most atomic, not the least disruptive.
+
+## Q6. synchronous_commit off vs batching
+
+**Question:** `synchronous_commit = off` and batching both made the PostgreSQL file fast. When would you use each?
+
+**Batching** keeps full durability and is the first choice whenever the code can group work: bulk jobs, imports, queues processed in chunks. **`synchronous_commit = off`** fits when the writes arrive one by one from many independent requests that cannot be grouped, and losing the last fraction of a second of them on a crash is acceptable (events, logs). They also combine: a log shipper can batch and skip the flush.
+
+> **Common mistake:** turning off synchronous commit server-wide to fix a batch job that could simply have committed less often.

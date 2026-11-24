@@ -1,0 +1,259 @@
+---
+title: "Concept 3: What COMMIT waits for"
+description: "Durability means the commit record reaches disk before COMMIT returns: the WAL in PostgreSQL, the redo log (and binary log) in MySQL, the journal and the majority of the replica set in MongoDB. The settings that relax it (synchronous_commit, innodb_flush_log_at_trx_commit, write concern j and w), what each can lose in a crash, and what each cost in the lab: 1,564 vs 36,110 commits per second in PostgreSQL."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "durability", "wal", "write-concern"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/wal-async-commit.html"
+  - "https://www.postgresql.org/docs/current/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-parameters.html#sysvar_innodb_flush_log_at_trx_commit"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html#sysvar_sync_binlog"
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+  - "https://www.mongodb.com/docs/manual/core/journaling/"
+---
+
+<Tldr>
+Data pages are written to disk lazily; what makes a commit **durable** is a small **log record** forced to disk (`fsync`) before `COMMIT` returns. After a crash the engine replays the log. Every engine lets you skip or delay that flush for speed, at the price of losing the last commits in a crash (never of corrupting data). In the lab, one client updating one row per transaction managed **1,564 commits/s** in PostgreSQL with `synchronous_commit = on` and **36,110/s** with `off`. MySQL defaults to two flushes per commit (redo log and binary log); 5,000 autocommitted updates caused about **5,300 redo-log fsyncs**. In MongoDB, 5,000 updates took **9.0–14.2 s** with the default write concern `w: "majority"` and **0.56–0.70 s** with `w: 1, j: false`.
+</Tldr>
+
+## Where a commit goes
+
+| Engine | The log that makes a commit durable | Flushed at commit by default | Relaxed by |
+|---|---|---|---|
+| PostgreSQL | WAL (write-ahead log) | Yes (`synchronous_commit = on`) | `synchronous_commit = off` (per transaction, session, role or database) |
+| MySQL InnoDB | Redo log, plus the binary log when enabled (default in 8.x) | Yes (`innodb_flush_log_at_trx_commit = 1`, `sync_binlog = 1`) | `innodb_flush_log_at_trx_commit = 2` or `0`, `sync_binlog = 0` or N (server-wide only) |
+| MongoDB | Journal (WiredTiger log) and, on a replica set, the oplog on a majority of members | Default write concern `w: "majority"` waits for a majority, journaled | Write concern per operation: `w: 1`, `j: false`, `w: 0` |
+
+| Term | Meaning |
+|---|---|
+| fsync | System call that returns only when the data is on stable storage; ≈ 0.5–3 ms on the lab's Docker disk |
+| Group commit | Several transactions waiting to commit share one fsync |
+| Crash window | Commits acknowledged to the client but lost if the server crashes now |
+| **✓ Durable** | The commit survives a crash of the database server |
+| **✗ At risk** | The client was told "committed", but a crash can lose it |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: COMMIT and the WAL flush"
+  height={300}
+  nodes={[
+    { id: 'tx', label: 'UPDATE + COMMIT', sub: 'one row', x: 20, y: 20, w: 200 },
+    { id: 'buf', label: 'WAL buffers', sub: 'in memory', x: 300, y: 20, w: 200 },
+    { id: 'disk', label: 'WAL file on disk', sub: 'fsync', x: 580, y: 20, w: 200 },
+    { id: 'ok', label: '✓ Durable', sub: 'then OK', x: 580, y: 160, w: 200 },
+    { id: 'risk', label: '✗ At risk', sub: 'OK before flush', x: 300, y: 160, w: 200 },
+  ]}
+  edges={[
+    { id: 'tx-buf', from: 'tx', to: 'buf' },
+    { id: 'buf-disk', from: 'buf', to: 'disk' },
+    { id: 'disk-ok', from: 'disk', to: 'ok' },
+    { id: 'buf-risk', from: 'buf', to: 'risk' },
+  ]}
+  cases={[
+    {
+      title: 'synchronous_commit = on',
+      path: 'commit record → WAL buffers → fsync of the WAL → ✓ COMMIT returns',
+      summary: '1 client, one-row transactions: 1,564 commits/s, 0.64 ms each.',
+      subs: { disk: 'fsync before OK', ok: '1,564 commits/s' },
+      steps: [
+        {
+          title: 'The commit record is written',
+          note: 'The UPDATE already produced WAL records in memory. COMMIT adds a commit record and asks for the WAL up to that point to be flushed.',
+          code: 'UPDATE accounts SET balance = balance + 0 WHERE id = :id;   -- pgbench, autocommit',
+          active: ['tx', 'buf'],
+          edges: ['tx-buf'],
+        },
+        {
+          title: 'Flush, then acknowledge',
+          note: 'The backend waits for the fsync of the WAL file. Only then does the client get COMMIT. pgbench, 1 client, 10 s: 1,564 transactions/s, latency 0.639 ms. A crash at any time after this point cannot lose the change.',
+          code: 'pgbench -n -T 10 -c 1 -f upd.sql bank\n-- tps = 1563.9, latency average = 0.639 ms',
+          active: ['buf', 'disk', 'ok'],
+          edges: ['buf-disk', 'disk-ok'],
+        },
+      ],
+    },
+    {
+      title: 'synchronous_commit = off',
+      path: 'commit record → WAL buffers → ✗ COMMIT returns at once; the WAL writer flushes within ≈ 0.6 s',
+      summary: '36,110 commits/s, 0.028 ms each: 23× faster, with a crash window.',
+      subs: { risk: '36,110 commits/s', disk: 'flushed later' },
+      steps: [
+        {
+          title: 'Acknowledge before the flush',
+          note: 'With synchronous_commit = off the backend returns as soon as the commit record is in WAL buffers. The WAL writer flushes in the background, at most 3 × wal_writer_delay (200 ms) later.',
+          code: "SET synchronous_commit = off;   -- per session; or SET LOCAL inside one transaction\n-- pgbench: tps = 36110, latency 0.028 ms",
+          active: ['tx', 'buf', 'risk'],
+          edges: ['tx-buf', 'buf-risk'],
+        },
+        {
+          title: 'What a crash costs',
+          note: 'A crash loses the commits from the last ≈ 0.6 s, but the database stays consistent: those transactions are simply missing, as if they had never committed. Data corruption needs fsync = off, which is a different (dangerous) setting.',
+          active: ['buf', 'disk', 'risk'],
+          edges: ['buf-disk'],
+        },
+      ],
+    },
+  ]}
+/>
+
+Because `synchronous_commit` can be set per transaction (`SET LOCAL synchronous_commit = off`), one application can keep payments durable and let click tracking skip the flush.
+
+## MySQL
+
+<Flow
+  title="MySQL: redo log and binary log at commit"
+  height={300}
+  nodes={[
+    { id: 'tx', label: 'UPDATE + COMMIT', sub: 'autocommit', x: 20, y: 20, w: 200 },
+    { id: 'redo', label: 'Redo log', sub: 'innodb_flush_log…', x: 300, y: 20, w: 200 },
+    { id: 'binlog', label: 'Binary log', sub: 'sync_binlog', x: 580, y: 20, w: 200 },
+    { id: 'ok', label: '✓ Durable', sub: '', x: 580, y: 160, w: 200 },
+    { id: 'risk', label: '✗ At risk', sub: 'setting 0 or 2', x: 300, y: 160, w: 200 },
+  ]}
+  edges={[
+    { id: 'tx-redo', from: 'tx', to: 'redo' },
+    { id: 'redo-binlog', from: 'redo', to: 'binlog' },
+    { id: 'binlog-ok', from: 'binlog', to: 'ok' },
+    { id: 'redo-risk', from: 'redo', to: 'risk' },
+  ]}
+  cases={[
+    {
+      title: 'Defaults: 1 and 1',
+      path: 'redo log fsync (prepare) → binary log fsync → commit → ✓ durable',
+      summary: '5,000 autocommitted updates: ≈ 5,300 redo fsyncs, 5.3–7.1 s.',
+      subs: { redo: 'fsync per commit', binlog: 'fsync per commit', ok: '≈ 1.1–1.4 ms per commit' },
+      steps: [
+        {
+          title: 'Two logs, one commit',
+          note: 'With the binary log enabled (log_bin = 1 by default), MySQL commits in two phases: InnoDB prepares and flushes its redo log, the server writes and syncs the binary log, then InnoDB marks the transaction committed. After a crash, the binary log decides whether a prepared transaction counts as committed.',
+          code: 'SELECT @@innodb_flush_log_at_trx_commit, @@sync_binlog, @@log_bin;   -- 1, 1, 1',
+          active: ['tx', 'redo', 'binlog'],
+          edges: ['tx-redo', 'redo-binlog'],
+        },
+        {
+          title: 'Measured',
+          note: '5,000 one-row UPDATEs from a client in autocommit took 5.3–7.1 s and Innodb_os_log_fsyncs rose by 5,236–5,412 (other lab sessions add a few). The same 5,000 in one transaction: 0.10–0.12 s and ≈ 20–30 fsyncs (Concept 4).',
+          code: "SHOW GLOBAL STATUS LIKE 'Innodb_os_log_fsyncs';",
+          active: ['binlog', 'ok'],
+          edges: ['binlog-ok'],
+        },
+      ],
+    },
+    {
+      title: 'Relaxed: 2 or 0',
+      path: 'redo written to the OS (2) or to memory (0) → flushed once per second → ✗ crash window',
+      summary: 'Server-wide settings; not changed in the shared lab, effects from the documentation.',
+      subs: { risk: 'up to ≈ 1 s of commits' },
+      steps: [
+        {
+          title: 'What the values mean',
+          note: '2: write the redo log to the OS cache at each commit, fsync once per second. Survives a MySQL crash, loses up to ≈ 1 s on an OS crash or power loss. 0: write and fsync once per second; a MySQL crash can lose up to ≈ 1 s. sync_binlog = 0 leaves binary-log syncing to the OS, which can lose binlog events that replicas then never receive.',
+          code: 'SET GLOBAL innodb_flush_log_at_trx_commit = 2;   -- global only: not run in the lab',
+          active: ['tx', 'redo', 'risk'],
+          edges: ['tx-redo', 'redo-risk'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: write concern decides what acknowledged means"
+  height={300}
+  nodes={[
+    { id: 'w', label: 'updateOne', sub: '5,000 times', x: 20, y: 20, w: 200 },
+    { id: 'mem', label: 'Applied in memory', sub: 'WiredTiger cache', x: 300, y: 20, w: 200 },
+    { id: 'journal', label: 'Journal + majority', sub: 'replica set', x: 580, y: 20, w: 200 },
+    { id: 'ok', label: '✓ Durable', sub: '', x: 580, y: 160, w: 200 },
+    { id: 'risk', label: '✗ At risk', sub: '', x: 300, y: 160, w: 200 },
+  ]}
+  edges={[
+    { id: 'w-mem', from: 'w', to: 'mem' },
+    { id: 'mem-journal', from: 'mem', to: 'journal' },
+    { id: 'journal-ok', from: 'journal', to: 'ok' },
+    { id: 'mem-risk', from: 'mem', to: 'risk' },
+  ]}
+  cases={[
+    {
+      title: 'w: "majority" (default)',
+      path: 'apply → journal → majority of the replica set has it → ✓ acknowledged',
+      summary: '5,000 updates, one-node replica set: 9.0–14.2 s.',
+      subs: { journal: 'waited for', ok: '9.0–14.2 s / 5,000' },
+      steps: [
+        {
+          title: 'The default write concern',
+          note: 'getDefaultRWConcern returned { w: "majority" }. On a replica set, majority acknowledgement also implies the write is journaled (writeConcernMajorityJournalDefault is true).',
+          code: 'db.adminCommand({ getDefaultRWConcern: 1 }).defaultWriteConcern   // { w: "majority", wtimeout: 0 }',
+          active: ['w', 'mem', 'journal'],
+          edges: ['w-mem', 'mem-journal'],
+        },
+        {
+          title: 'Measured',
+          note: '5,000 updateOne calls with the default took 9.0 s and 14.2 s in two runs; with { w: 1, j: true } 14.4–16.4 s. The journal flush dominates: each acknowledged write waited for one.',
+          active: ['journal', 'ok'],
+          edges: ['journal-ok'],
+        },
+      ],
+    },
+    {
+      title: 'w: 1, j: false',
+      path: 'apply on the primary → ✗ acknowledged before the journal flush (every 100 ms) and before replication',
+      summary: '5,000 updates: 0.56–0.70 s. w: 0 (no acknowledgement at all): 0.23–0.25 s.',
+      subs: { risk: '0.56–0.70 s / 5,000' },
+      steps: [
+        {
+          title: 'Acknowledged from memory',
+          note: 'With j: false the primary acknowledges once the write is applied in memory. The journal is flushed every 100 ms (storage.journal.commitIntervalMs), so a crash can lose up to ≈ 100 ms of writes; on a real replica set, a failover can also roll back writes that had not reached the new primary.',
+          code: 'db.accounts.updateOne({ _id: id }, { $inc: { version: 1 } }, { writeConcern: { w: 1, j: false } })',
+          active: ['w', 'mem', 'risk'],
+          edges: ['w-mem', 'mem-risk'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+Relaxed durability is invisible in testing: nothing is lost until a crash. Decide per kind of data. Payments, orders and anything a customer was told "done" need the default flush; metrics, sessions and caches can usually afford `synchronous_commit = off` or `w: 1`. Never turn off `fsync` itself (PostgreSQL `fsync = off`): that risks corruption, not just lost commits.
+</Pitfall>
+
+## Real-world scenario: the slow event log
+
+An event-tracking service writes 3,000 one-row inserts per second into PostgreSQL and its latency doubles at peaks; disk graphs show fsync-bound WAL writes. The same database also stores orders.
+
+| Option | Effect | Risk |
+|---|---|---|
+| `ALTER ROLE events_writer SET synchronous_commit = off` | Event inserts stop waiting for fsync (23× in the lab) | Last ≈ 0.6 s of events lost on a crash |
+| Batch events (Concept 4) | One commit per 100–1,000 events | A failed batch must be retried |
+| Keep orders on the default | Orders stay durable | None |
+
+## Why this matters for transactions
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 4: cost of a commit | The flush is the price of each commit; batching and group commit share it |
+| [Session 8: when transactions hurt](/blogs/databases/transactions/session-8-when-transactions-hurt/lab) | Big transactions write large amounts of WAL/redo and replicate slowly |
+| [Indexing Session 8: write amplification](/blogs/databases/indexing/session-8-when-indexes-hurt/concept-1-write-amplification) | Every index adds WAL that the commit must flush |
+
+## Key takeaways
+
+1. A commit is durable when its log record is on disk; data pages follow later.
+2. PostgreSQL `synchronous_commit = off` (per session or transaction) gave 36,110 vs 1,564 commits/s, at the price of losing the last ≈ 0.6 s on a crash.
+3. MySQL flushes the redo log and the binary log at each commit by default; relaxing them is server-wide.
+4. MongoDB's default write concern is `w: "majority"`; `w: 1, j: false` was 13–25× faster in the lab but can lose ≈ 100 ms of writes.
+5. Relaxed durability loses recent commits but does not corrupt data; `fsync = off` does.
+
+## Check questions
+
+1. Why is flushing the log enough for durability, when the changed data pages are still only in memory?
+2. What exactly can a crash lose with PostgreSQL `synchronous_commit = off`, and what can it not do?
+3. Why does MySQL flush two logs per commit with the default settings?
+4. What does `innodb_flush_log_at_trx_commit = 2` protect against, and what not?
+5. What does MongoDB `w: "majority"` add over `w: 1, j: true` on a real three-node replica set?
+6. Which data in an e-commerce system would you allow to use relaxed durability, and how would you scope the setting?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-1-transaction-guarantees/concept-3-durability/answers">Worked answers to Q1–Q6</DeepDive>

@@ -1,0 +1,243 @@
+---
+title: "Concept 4: The cost of a commit"
+description: "Each durable commit waits for one log flush, so 5,000 one-row updates cost 3.5–4.6 s as 5,000 transactions in PostgreSQL and 0.13–0.15 s as one; 5.3–7.1 s vs 0.10–0.12 s in MySQL; 9–14 s vs 0.5 s in MongoDB. Group commit shares the flush between concurrent clients (1,274 → 12,027 commits/s from 1 to 16 clients), and why bigger is not always better."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "commit", "batching", "group-commit"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/wal-configuration.html"
+  - "https://www.postgresql.org/docs/current/pgbench.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/optimizing-innodb-transaction-management.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-production-consideration/"
+---
+
+<Tldr>
+The flush at each commit (Concept 3) is a fixed cost of roughly a millisecond, paid **per transaction**, not per row. 5,000 one-row updates as **5,000 transactions** took **3.5–4.6 s** in PostgreSQL, **5.3–7.1 s** in MySQL and **9–14 s** in MongoDB; as **one transaction** they took **0.13–0.15 s**, **0.10–0.12 s** and **0.50–0.52 s**. Concurrent clients share flushes (**group commit**): PostgreSQL went from 1,274 commits/s with 1 client to 12,027 with 16, MySQL from 352 to 4,066. The opposite extreme also hurts: a huge transaction holds locks and keeps old row versions alive until it ends, so batches of hundreds to a few thousand rows are the usual sweet spot.
+</Tldr>
+
+## Per-transaction vs per-row cost
+
+| Work | Paid | Lab order of magnitude |
+|---|---|---|
+| Find and change the row, write its log records | Per row | ≈ 0.02–0.03 ms in PostgreSQL (warm cache) |
+| Flush the log at commit | **Per transaction** | ≈ 0.6–1.4 ms on the lab disk |
+| Round trip client ↔ server | Per statement | ≈ 0.02–0.1 ms through `docker exec` |
+
+| Term | Meaning |
+|---|---|
+| Batching | Putting many changes in one transaction so they share one commit |
+| Group commit | Concurrent transactions committing at the same moment share one fsync |
+| **✓ Shared flush** | Many rows or transactions per fsync |
+| **✗ Flush per row** | One fsync for every row changed |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: 5,000 updates, three ways"
+  height={300}
+  nodes={[
+    { id: 'rows', label: '5,000 UPDATEs', sub: 'one row each', x: 20, y: 20, w: 200 },
+    { id: 'each', label: '5,000 commits', sub: 'autocommit', x: 300, y: 20, w: 200 },
+    { id: 'one', label: '1 commit', sub: 'BEGIN … COMMIT', x: 300, y: 160, w: 200 },
+    { id: 'slow', label: '✗ Flush per row', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'fast', label: '✓ Shared flush', sub: '', x: 580, y: 160, w: 200 },
+  ]}
+  edges={[
+    { id: 'rows-each', from: 'rows', to: 'each' },
+    { id: 'rows-one', from: 'rows', to: 'one' },
+    { id: 'each-slow', from: 'each', to: 'slow' },
+    { id: 'one-fast', from: 'one', to: 'fast' },
+  ]}
+  cases={[
+    {
+      title: 'Autocommit vs one transaction',
+      path: '5,000 transactions ✗ 3.5–4.6 s → 1 transaction ✓ 0.13–0.15 s',
+      summary: 'Same rows, same WAL for the changes; 4,999 fewer flushes.',
+      subs: { slow: '3.5–4.6 s', fast: '0.13–0.15 s' },
+      steps: [
+        {
+          title: 'One flush per statement',
+          note: 'A file of 5,000 UPDATE statements run through psql in autocommit: 3,514, 3,930 and 4,630 ms in three runs, ≈ 0.7–0.9 ms per row, almost all of it waiting for WAL fsyncs.',
+          code: 'psql -f updates.sql bank   -- 5,000 × UPDATE accounts SET version = version + 1 WHERE id = …',
+          active: ['rows', 'each', 'slow'],
+          edges: ['rows-each', 'each-slow'],
+        },
+        {
+          title: 'One flush in total',
+          note: 'The same file between BEGIN and COMMIT: 128, 144 and 152 ms. With synchronous_commit = off the autocommit file also dropped to 136–160 ms: proof that the flush was the cost.',
+          code: 'BEGIN;\n\\i updates.sql\nCOMMIT;',
+          active: ['rows', 'one', 'fast'],
+          edges: ['rows-one', 'one-fast'],
+        },
+      ],
+    },
+    {
+      title: 'Group commit',
+      path: '1 client 1,274 commits/s → 4 clients 3,323 → 16 clients 12,027 (synchronous_commit on)',
+      summary: 'Concurrent commits share fsyncs, so throughput grows while each client still waits for a flush.',
+      subs: { each: 'concurrent clients', fast: '12,027 commits/s at 16' },
+      steps: [
+        {
+          title: 'Several clients, same disk',
+          note: 'pgbench, one-row UPDATE per transaction, 10 s each: 1 client 1,274 tps (0.79 ms), 4 clients 3,323 tps (1.20 ms), 16 clients 12,027 tps (1.33 ms). When a backend flushes the WAL, it flushes every commit record written so far, including those of other backends.',
+          code: 'pgbench -n -T 10 -c 16 -j 16 -f upd.sql bank   -- tps = 12027',
+          active: ['rows', 'each', 'fast'],
+          edges: ['rows-each'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL
+
+<Flow
+  title="MySQL: 5,000 updates and group commit"
+  height={300}
+  nodes={[
+    { id: 'rows', label: '5,000 UPDATEs', sub: 'one row each', x: 20, y: 20, w: 200 },
+    { id: 'each', label: '5,000 commits', sub: 'autocommit = 1', x: 300, y: 20, w: 200 },
+    { id: 'one', label: '1 commit', sub: 'START TRANSACTION', x: 300, y: 160, w: 200 },
+    { id: 'slow', label: '✗ Flush per row', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'fast', label: '✓ Shared flush', sub: '', x: 580, y: 160, w: 200 },
+  ]}
+  edges={[
+    { id: 'rows-each', from: 'rows', to: 'each' },
+    { id: 'rows-one', from: 'rows', to: 'one' },
+    { id: 'each-slow', from: 'each', to: 'slow' },
+    { id: 'one-fast', from: 'one', to: 'fast' },
+  ]}
+  cases={[
+    {
+      title: 'Autocommit vs one transaction',
+      path: '5,000 transactions ✗ 5.3–7.1 s, ≈ 5,300 redo fsyncs → 1 transaction ✓ 0.10–0.12 s',
+      summary: 'MySQL pays two flushes per commit by default (redo + binary log).',
+      subs: { slow: '5.3–7.1 s', fast: '0.10–0.12 s' },
+      steps: [
+        {
+          title: 'Autocommit',
+          note: 'Three runs: 6,381, 7,101 and 5,334 ms; Innodb_os_log_fsyncs rose by 5,379, 5,412 and 5,236 (the lab server is shared, so a few belong to other sessions).',
+          code: 'mysql bank < updates.sql',
+          active: ['rows', 'each', 'slow'],
+          edges: ['rows-each', 'each-slow'],
+        },
+        {
+          title: 'One transaction',
+          note: 'Wrapped in START TRANSACTION … COMMIT: 124, 104 and 114 ms, with 19–33 redo fsyncs in the window (mostly other sessions).',
+          active: ['rows', 'one', 'fast'],
+          edges: ['rows-one', 'one-fast'],
+        },
+      ],
+    },
+    {
+      title: 'Group commit',
+      path: '4,000 commits: 1 client 352/s → 4 clients 1,172/s → 16 clients 4,066/s',
+      summary: 'The binary log groups the commits that arrive while a flush is in progress.',
+      subs: { fast: '4,066 commits/s at 16' },
+      steps: [
+        {
+          title: 'More clients, same flush rate',
+          note: '4,000 random one-row UPDATEs split across 1, 4 and 16 concurrent clients: 11.36 s, 3.41 s and 0.98 s. Binary log group commit collects all transactions waiting in its flush queue into one fsync.',
+          active: ['rows', 'each', 'fast'],
+          edges: ['rows-each'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: 5,000 updates, four ways"
+  height={300}
+  nodes={[
+    { id: 'rows', label: '5,000 updates', sub: 'one document each', x: 20, y: 20, w: 200 },
+    { id: 'each', label: '5,000 acknowledgements', sub: 'w: majority', x: 300, y: 20, w: 200 },
+    { id: 'one', label: '1 transaction', sub: 'or 1 bulkWrite', x: 300, y: 160, w: 200 },
+    { id: 'slow', label: '✗ Flush per write', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'fast', label: '✓ Shared flush', sub: '', x: 580, y: 160, w: 200 },
+  ]}
+  edges={[
+    { id: 'rows-each', from: 'rows', to: 'each' },
+    { id: 'rows-one', from: 'rows', to: 'one' },
+    { id: 'each-slow', from: 'each', to: 'slow' },
+    { id: 'one-fast', from: 'one', to: 'fast' },
+  ]}
+  cases={[
+    {
+      title: 'Individual writes vs one transaction',
+      path: '5,000 × updateOne ✗ 9.0–14.2 s → one transaction ✓ 0.50–0.52 s → bulkWrite ✓ 0.087 s (not atomic)',
+      summary: 'A transaction commits once; bulkWrite also saves the round trips but each document commits separately.',
+      subs: { slow: '9.0–14.2 s', fast: 'txn 0.5 s · bulk 0.09 s' },
+      steps: [
+        {
+          title: 'One acknowledgement per write',
+          note: 'Each updateOne with the default write concern waited for its own journaled majority acknowledgement: 9.0 s and 14.2 s in two runs.',
+          code: 'ids.forEach(id => db.accounts.updateOne({ _id: id }, { $inc: { version: 1 } }))',
+          active: ['rows', 'each', 'slow'],
+          edges: ['rows-each', 'each-slow'],
+        },
+        {
+          title: 'One commit',
+          note: 'The same 5,000 updates inside one transaction: 503 and 520 ms (one commit, still 5,000 round trips). An unordered bulkWrite sent them in one request: 87–89 ms, but without all-or-nothing.',
+          code: 's.startTransaction();\nids.forEach(id => a.updateOne({ _id: id }, { $inc: { version: 1 } }));\ns.commitTransaction();',
+          active: ['rows', 'one', 'fast'],
+          edges: ['rows-one', 'one-fast'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## How big should a transaction be?
+
+| Too small (one row each) | Too big (millions of rows) |
+|---|---|
+| One flush per row: 23–36× slower in PostgreSQL, 43–68× in MySQL | Row locks held until the end block other writers ([Session 5](/blogs/databases/transactions/session-5-locks-and-indexes/lab)) |
+| Partial results visible while the job runs | Old row versions kept for the whole time: VACUUM / purge cannot clean ([Session 4](/blogs/databases/transactions/session-4-mvcc-internals/lab)) |
+| | A failure throws away all the work; replicas apply it in one burst ([Session 8](/blogs/databases/transactions/session-8-when-transactions-hurt/lab)) |
+| | MongoDB: a transaction is aborted after 60 s by default (`transactionLifetimeLimitSeconds`) |
+
+A practical default for bulk jobs: commit every few hundred to a few thousand rows, and make each batch safe to retry.
+
+<Pitfall>
+Batching changes **when** the work becomes visible and **what** a failure undoes. A job that commits every 1,000 rows and crashes at row 5,500 has committed 5,000 rows: it must be able to resume (for example by processing rows in key order and remembering the last committed key), or be idempotent.
+</Pitfall>
+
+## Real-world scenario: the nightly price update
+
+A job updates the price of 200,000 SKUs, one `UPDATE` per SKU in autocommit, and takes 4 minutes on a fast disk, longer on a cloud volume with 2 ms fsyncs.
+
+| Version | Commits | Expected |
+|---|---|---|
+| Autocommit | 200,000 | ≈ 200,000 × flush cost |
+| Batches of 1,000 | 200 | Seconds; each batch atomic and retryable |
+| One transaction | 1 | Fastest, but every price row stays locked until the end |
+
+## Why this matters for transactions
+
+| Later topic | Why this concept matters |
+|---|---|
+| [Session 4: MVCC internals](/blogs/databases/transactions/session-4-mvcc-internals/lab) | Long transactions keep old versions alive |
+| [Session 5: locks](/blogs/databases/transactions/session-5-locks-and-indexes/lab) | Locks are held until commit |
+| [Session 8: when transactions hurt](/blogs/databases/transactions/session-8-when-transactions-hurt/lab) | The cost of very large transactions |
+
+## Key takeaways
+
+1. A durable commit costs one log flush, about a millisecond on the lab disk, whatever the number of rows.
+2. 5,000 one-row updates: 3.5–4.6 s vs 0.13–0.15 s (PostgreSQL), 5.3–7.1 s vs 0.10–0.12 s (MySQL), 9–14 s vs 0.5 s (MongoDB transaction).
+3. Group commit shares flushes between concurrent clients: 1,274 → 12,027 commits/s from 1 to 16 clients in PostgreSQL.
+4. MongoDB `bulkWrite` saves round trips but is not atomic; a transaction is.
+5. Batch in moderate sizes and make each batch retryable; huge transactions bring locking and cleanup problems.
+
+## Check questions
+
+1. Why did the 5,000-update file take 23–36 times longer in autocommit in PostgreSQL, although the same rows changed?
+2. How does group commit raise throughput without making any single commit faster?
+3. Why was MongoDB's `bulkWrite` faster than the transaction, and what does it give up?
+4. A job commits every 1,000 rows and crashes at row 5,500. What is in the database, and how should the job restart?
+5. List three costs of running a nightly update of 200,000 rows as one transaction.
+6. `synchronous_commit = off` and batching both made the PostgreSQL file fast. When would you use each?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-1-transaction-guarantees/concept-4-cost-of-a-commit/answers">Worked answers to Q1–Q6</DeepDive>
