@@ -1,0 +1,192 @@
+---
+title: "Concept 1: Read concern levels"
+description: "MongoDB lets each read choose how 'committed' the data must be. With both secondaries frozen, a w:1 write was acknowledged in 4 ms: readConcern local and available returned it at once, majority and snapshot returned the previous value, and linearizable waited until maxTimeMS (3006 ms). On a healthy set the levels cost about the same (0.19–0.25 ms median) except linearizable (1.91 ms), which confirms with a majority on every read."
+type: "concept"
+tags: ["replication", "consistency", "read-concern", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/reference/read-concern/"
+  - "https://www.mongodb.com/docs/manual/reference/read-concern-majority/"
+  - "https://www.mongodb.com/docs/manual/reference/read-concern-linearizable/"
+  - "https://www.mongodb.com/docs/manual/reference/mongodb-defaults/"
+---
+
+<Tldr>
+A **read concern** says which version of the data a read may return. `local` (the default) and `available` return the newest data on the node, even if it could still be rolled back. `majority` and `snapshot` return only data acknowledged by a majority of members, so they never show a write that a failover could undo. `linearizable` additionally confirms, at read time, that the node is still the primary and the majority agrees. In the lab both secondaries were frozen with `fsyncLock`, so the **majority commit point stopped**: a `w: 1` update was acknowledged in 4 ms; `local`/`available` returned the new status, `majority`/`snapshot` the **old** one, and `linearizable` hung until `maxTimeMS` (**MaxTimeMSExpired after 3006 ms**). A `w: "majority"` write in the same state failed with WriteConcernFailed after its 3 s `wtimeout`; without a `wtimeout` (the default) it would wait forever. On a healthy set `local`, `majority` and `snapshot` cost 0.19–0.25 ms (median); `linearizable` 1.91 ms.
+</Tldr>
+
+## The levels
+
+| Term | Meaning |
+|---|---|
+| Majority commit point | The newest oplog entry known to be applied on a majority of voting members; data at or before it survives any failover |
+| `local` | Newest data on this node. Default for reads (the `getDefaultRWConcern` result in the lab: `defaultReadConcern: local`) |
+| `available` | Same as `local` on a replica set; on sharded clusters it may also return orphaned documents (from the documentation) |
+| `majority` | Data as of the majority commit point |
+| `snapshot` | Majority-committed data from one point in time across the whole operation; required inside multi-document transactions with majority writes |
+| `linearizable` | Majority data **and** a check that no newer majority write exists: the read waits for a majority acknowledgement of a no-op write. Primary only |
+| **✓ / ✗** | Returns the newest acknowledged value / returns an older value or waits |
+
+Every level returns committed data; the difference is **committed where**. A `w: 1` write is committed on the primary only, and can still disappear in a failover (Concept 4).
+
+## Experiment
+
+Order 9 starts as `delivered` on all three members (written with `w: 3`). Both secondaries are frozen with `db.fsyncLock()`, which stops them applying the oplog while they keep answering heartbeats, so the primary stays primary. Then:
+
+```js
+db.orders.updateOne({ _id: 9 }, { $set: { status: 'cancelled' } }, { writeConcern: { w: 1 } });   // ack in 4 ms
+// read the same document at each level, with a 3 s limit
+db.runCommand({ find: 'orders', filter: { _id: 9 }, readConcern: { level: L }, maxTimeMS: 3000 });
+```
+
+<Flow
+  title="MongoDB: one document, five read concerns, majority frozen"
+  height={420}
+  nodes={[
+    { id: 'pri', label: 'Primary rpb-mongo1', sub: 'has status cancelled', x: 20, y: 20, w: 220 },
+    { id: 'secs', label: 'rpb-mongo2 + 3', sub: 'fsyncLock: frozen', x: 560, y: 20, w: 220 },
+    { id: 'mcp', label: 'Majority commit point', sub: 'stuck before the write', x: 300, y: 20, w: 200 },
+    { id: 'local', label: 'local / available', sub: 'newest on node', x: 20, y: 180, w: 220 },
+    { id: 'maj', label: 'majority / snapshot', sub: 'at commit point', x: 290, y: 180, w: 220 },
+    { id: 'lin', label: 'linearizable', sub: 'confirms with majority', x: 560, y: 180, w: 220 },
+    { id: 'localv', label: 'Result', sub: 'value', x: 20, y: 320, w: 220 },
+    { id: 'majv', label: 'Result', sub: 'value', x: 290, y: 320, w: 220 },
+    { id: 'linv', label: 'Result', sub: 'value', x: 560, y: 320, w: 220 },
+  ]}
+  edges={[
+    { id: 'pri-mcp', from: 'pri', to: 'mcp' },
+    { id: 'mcp-secs', from: 'mcp', to: 'secs', label: 'needs 2 of 3' },
+    { id: 'pri-local', from: 'pri', to: 'local' },
+    { id: 'mcp-maj', from: 'mcp', to: 'maj' },
+    { id: 'secs-lin', from: 'secs', to: 'lin' },
+    { id: 'local-v', from: 'local', to: 'localv' },
+    { id: 'maj-v', from: 'maj', to: 'majv' },
+    { id: 'lin-v', from: 'lin', to: 'linv' },
+  ]}
+  cases={[
+    {
+      title: 'Healthy set',
+      path: 'local ✓ 0.21 ms → majority ✓ 0.19 ms → snapshot ✓ 0.25 ms → linearizable ✓ 1.91 ms',
+      summary: 'With replication current, every level returns the same value; only linearizable costs more.',
+      steps: [
+        {
+          title: '50 reads per level',
+          note: 'Medians (p90): local 0.21 ms (0.36), majority 0.19 ms (0.29), snapshot 0.25 ms (0.49), linearizable 1.91 ms (2.86). Majority reads are cheap because the node keeps a snapshot at the commit point; linearizable waits for a round trip to a majority on every read.',
+          active: ['pri', 'mcp', 'secs', 'local', 'maj', 'lin', 'localv', 'majv', 'linv'],
+          edges: ['pri-mcp', 'mcp-secs', 'pri-local', 'mcp-maj', 'secs-lin', 'local-v', 'maj-v', 'lin-v'],
+          subs: { secs: 'current', mcp: 'current', localv: '✓ 0.21 ms', majv: '✓ 0.19 ms', linv: '✓ 1.91 ms' },
+        },
+      ],
+    },
+    {
+      title: 'Both secondaries frozen, w:1 write',
+      path: 'local ✓ cancelled → majority ✗ delivered → snapshot ✗ delivered → linearizable ✗ MaxTimeMSExpired 3006 ms',
+      summary: 'The write is committed on one node only; each level decides whether that counts.',
+      steps: [
+        {
+          title: 'The write',
+          note: 'w:1: acknowledged in 4 ms. The primary has applied it; neither secondary can, so the majority commit point stays at the last write before the freeze. db.hello().isWritablePrimary stayed true throughout.',
+          code: "db.orders.updateOne({ _id: 9 }, { $set: { status: 'cancelled' } }, { writeConcern: { w: 1 } })",
+          active: ['pri', 'mcp', 'secs'],
+          edges: ['pri-mcp', 'mcp-secs'],
+          subs: { mcp: '✗ not advancing' },
+        },
+        {
+          title: 'local and available',
+          note: 'Both returned status = cancelled after 0–1 ms: the newest data on the primary.',
+          active: ['pri', 'local', 'localv'],
+          edges: ['pri-local', 'local-v'],
+          subs: { localv: '✓ cancelled' },
+        },
+        {
+          title: 'majority and snapshot',
+          note: 'Both returned status = delivered (1 ms and 3 ms): the value as of the stuck majority commit point. No error, no wait: just the older committed value.',
+          active: ['mcp', 'maj', 'majv'],
+          edges: ['mcp-maj', 'maj-v'],
+          subs: { majv: '✗ delivered (older)' },
+        },
+        {
+          title: 'linearizable',
+          note: 'It cannot confirm with a majority, so it waits: ERROR MaxTimeMSExpired after 3006 ms. Without maxTimeMS it would wait until the majority returns. Use it only with a time limit.',
+          active: ['secs', 'lin', 'linv'],
+          edges: ['secs-lin', 'lin-v'],
+          subs: { linv: '✗ waits, 3006 ms' },
+        },
+      ],
+    },
+    {
+      title: 'Unfrozen',
+      path: 'fsyncUnlock → commit point advances → every level ✓ cancelled',
+      summary: 'The majority view catches up as soon as a majority has applied the write.',
+      steps: [
+        {
+          title: 'Release the secondaries',
+          note: 'db.fsyncUnlock() on both. One second later every level returned cancelled: local 2 ms, majority 1 ms, linearizable 2 ms, snapshot 1 ms.',
+          active: ['secs', 'mcp', 'maj', 'majv', 'lin', 'linv'],
+          edges: ['mcp-secs', 'mcp-maj', 'maj-v', 'secs-lin', 'lin-v'],
+          subs: { secs: 'applied', mcp: '✓ advanced', majv: '✓ cancelled', linv: '✓ cancelled' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Writes in the same state
+
+| Write concern | Result with both secondaries frozen |
+|---|---|
+| `w: 1` | acknowledged in 4 ms |
+| `w: "majority", wtimeout: 3000` | WriteConcernFailed after 3014 ms; the write is applied on the primary anyway |
+| `w: "majority"` with no `wtimeout` (the implicit default: `w: majority, wtimeout: 0`) | blocked; a lab script using it hung for over 3 minutes until it was stopped |
+
+The write and read concerns pair up: data written with `w: "majority"` is visible to `majority` reads as soon as the write is acknowledged; data written with `w: 1` becomes visible to `local` reads at once and to `majority` reads only when a majority has it.
+
+## Which level for which read
+
+| Read | Level | Why |
+|---|---|---|
+| Product page, search | `local` | Fast; a value that might be rolled back is harmless |
+| Order status after payment, shown to the buyer | `majority` | Never show a payment that a failover could undo |
+| Read used to decide a write (stock, balance) on the primary | `majority` in a transaction, or a single atomic update | Avoid acting on data that disappears |
+| "Is this coupon still unused?" across failovers | `linearizable` with `maxTimeMS` | Rare; when the read must reflect every acknowledged majority write |
+| Reports that read several collections consistently | `snapshot` | One point in time across the operation |
+
+<Pitfall>
+`majority` does not mean "fresh". With the commit point stuck, `majority` returned the old value instantly and without an error, which is correct (the old value is the newest one that cannot be rolled back) and easy to misread as data loss. If a read must reflect a write that was itself acknowledged with `w: 1`, a `majority` read may not show it; pair `majority` reads with `majority` writes.
+</Pitfall>
+
+## Real-world scenario: the refund that came back
+
+A marketplace writes refunds with `w: 1` for speed and shows the refund page with the default `local` read. The primary acknowledges a refund, the page shows "Refunded", then the primary fails before any secondary has the entry. The new primary never had the refund; the old primary rolls it back when it rejoins (Concept 4). The buyer saw "Refunded"; the ledger says otherwise.
+
+| Fix | Effect |
+|---|---|
+| Write refunds with `w: "majority"` (the default since MongoDB 5.0) and a `wtimeout` | The acknowledgement means the refund survives failover |
+| Read the confirmation with `readConcern: "majority"` | The page never shows a refund that could be rolled back |
+| Treat WriteConcernFailed as "unknown", not "failed" | Retry idempotently; the write may exist |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 2, Concept 3](/blogs/databases/replication/session-2-sync-vs-async/concept-3-mongodb-write-concern) | What each write concern costs |
+| Concept 4 | The failover that makes the difference between `local` and `majority` visible |
+| [Transactions Session 3](/blogs/databases/transactions/session-3-isolation-levels/concept-1-when-the-snapshot-starts) | `snapshot` inside transactions |
+
+## Key takeaways
+
+1. `local` and `available` return the newest data on the node; `majority` and `snapshot` return only majority-committed data; `linearizable` also confirms with a majority at read time.
+2. With the majority commit point stuck, `majority` returned the older value with no error, and `linearizable` waited until `maxTimeMS` (3006 ms).
+3. On a healthy set `majority` reads cost the same as `local` (about 0.2 ms); `linearizable` about 1.9 ms.
+4. A `w: "majority"` write with no `wtimeout` waits forever when a majority is unavailable; set `wtimeout` and treat the error as "unknown outcome".
+5. Pair majority reads with majority writes.
+
+## Check questions
+
+1. Both secondaries are frozen. Why does a `majority` read return the old value instead of an error?
+2. Why did the `linearizable` read wait, and what must every linearizable read include?
+3. Why were `majority` reads as cheap as `local` reads on the healthy set?
+4. A `w: "majority"` write failed after its `wtimeout`. What is the state of the data?
+5. Which read concern would you use for an order confirmation page, and with which write concern?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-4-read-write-concerns/concept-1-read-concern-levels/answers">Worked answers to Q1–Q5</DeepDive>

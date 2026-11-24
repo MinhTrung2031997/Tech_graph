@@ -1,0 +1,54 @@
+---
+title: "Answers: The same choices in PostgreSQL and MySQL"
+description: "Worked answers to the Session 4 Concept 5 check questions."
+companion: "answers"
+tags: ["replication", "consistency", "postgresql", "mysql", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html"
+---
+
+<Tldr>
+Same questions, different knobs: where to read, how long the writer waits, and how a reader waits for a specific write.
+</Tldr>
+
+## Q1. Read preference without the word
+
+**Question:** what plays the role of read preference in PostgreSQL and MySQL, and what replaces `maxStalenessSeconds`?
+
+The application or a proxy decides which server each read goes to: separate connection pools for primary and replicas, an ORM's replica configuration, or a proxy such as ProxySQL or PgBouncer in front of several servers. Nothing in the server excludes a lagging replica automatically. A staleness bound has to be built: before routing, check the replica's lag by position (`pg_wal_lsn_diff` against the primary, missing GTIDs) or by a heartbeat row written every second on the primary, and take the replica out of the pool when it exceeds the bound.
+
+> **Common mistake:** a load balancer health check that only tests "accepts connections". A replica 10 minutes behind passes it.
+
+## Q2. Synchronous but stale
+
+**Question:** why was the standby read stale with `synchronous_commit = on` although the standby is synchronous?
+
+`on` with a synchronous standby waits until the standby has **flushed** the WAL to disk. Applying it to the data is a separate step; the standby applied 5 s later because of `recovery_min_apply_delay`, and in production it can lag behind its flush position because of conflicts or load. The commit was safe on two servers in 2.7–5.8 ms, but the row on the standby was still the old one.
+
+> **Common mistake:** equating "synchronous replication" with "consistent replicas". The setting names the step that is waited for.
+
+## Q3. The price of remote_apply
+
+**Question:** what did `remote_apply` cost against a standby delayed 5 s, and why?
+
+5,003–5,011 ms per commit. `remote_apply` waits until the synchronous standby reports that it has replayed the commit record, and the standby replayed only after the 5 s delay. In general a `remote_apply` commit takes as long as the standby's apply lag, which includes any wait for conflicting queries on the standby.
+
+> **Common mistake:** benchmarking `remote_apply` on an idle standby (3.0–4.8 ms here) and enabling it in production, where standby queries and bursts make apply lag much larger.
+
+## Q4. MySQL counterparts
+
+**Question:** which MySQL mechanism corresponds to a MongoDB causal read, and which to `w: "majority"`?
+
+Causal read: `WAIT_FOR_EXECUTED_GTID_SET` with the write's GTID set before reading on the replica (in Group Replication, `group_replication_consistency = BEFORE`, from the documentation). `w: "majority"` (the write survives the loss of the primary): semi-synchronous replication with `AFTER_SYNC`, where COMMIT waits until at least `rpl_semi_sync_source_wait_for_replica_count` replicas have the transaction in their relay log. Neither semi-sync setting waits for the replica to apply.
+
+> **Common mistake:** expecting semi-sync to make replica reads fresh.
+
+## Q5. Every standby read fresh
+
+**Question:** a team wants every standby read to be fresh. Compare `remote_apply` with an LSN wait.
+
+`remote_apply` makes every commit wait for apply on the synchronous standby: all writers pay the standby's apply lag (5 s per commit in the lab), and the guarantee covers only the standby named in `synchronous_standby_names`. An LSN wait leaves commits fast and makes only the reads that carry a position wait, bounded by a timeout with a primary fallback. If literally every standby read must be fresh for every user, `remote_apply` is the direct tool; if "fresh for the user who wrote" is the real requirement, the LSN wait is cheaper.
+
+> **Common mistake:** choosing `remote_apply` for a requirement that is per user.

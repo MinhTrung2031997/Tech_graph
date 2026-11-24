@@ -3,6 +3,7 @@
   "pages": [
     "session-1-how-replication-works",
     "session-2-sync-vs-async",
-    "session-3-replica-lag"
+    "session-3-replica-lag",
+    "session-4-read-write-concerns"
   ]
 }

@@ -1,0 +1,54 @@
+---
+title: "Answers: Read preference and staleness"
+description: "Worked answers to the Session 4 Concept 2 check questions."
+companion: "answers"
+tags: ["replication", "read-preference", "mongodb", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/read-preference/"
+  - "https://www.mongodb.com/docs/manual/core/read-preference-staleness/"
+---
+
+<Tldr>
+Read preference chooses a server, not a freshness. `maxStalenessSeconds` caps how bad the choice can be; it does not make it good.
+</Tldr>
+
+## Q1. Stale about half the time
+
+**Question:** why did `secondary` reads return stale data about half the time?
+
+Server selection takes all eligible members (both secondaries, since neither was excluded by tags or staleness), keeps those within `localThresholdMS` of the fastest, and picks one at random for each operation. Locally both secondaries were equally fast, so reads split roughly evenly: 21 on the current one, 19 on the one 115 s behind. The frozen member was still a perfectly valid secondary as far as the read preference was concerned.
+
+> **Common mistake:** assuming the driver prefers the least-lagged secondary. Without `maxStalenessSeconds` it does not look at lag at all.
+
+## Q2. The 90-second minimum
+
+**Question:** why does the driver refuse `maxStalenessSeconds` below 90?
+
+Staleness is estimated, not measured: the driver compares each secondary's `lastWriteDate` with the primary's, using `hello` responses it receives every `heartbeatFrequencyMS` (10 s by default), and idle primaries only write a no-op every 10 s. The estimate can be off by tens of seconds, so the specification requires the value to be at least 90 s (and at least heartbeat frequency plus the idle write period; from the documentation). The driver rejected 30 with `Option "maxStalenessSeconds" must be at least 90 seconds`.
+
+> **Common mistake:** trying to get "at most 1 s stale" from `maxStalenessSeconds`. Use causal consistency or read from the primary.
+
+## Q3. All secondaries stale
+
+**Question:** both secondaries are 3 minutes behind. What do `secondaryPreferred` and `secondaryPreferred` with `maxStalenessSeconds=90` do?
+
+`secondaryPreferred` alone uses a secondary whenever one is available, however old: 40 of 40 reads returned data 3–5 minutes old, with no error. With `maxStalenessSeconds=90` both secondaries are excluded, no secondary is eligible, and the "preferred" fallback sends reads to the primary: 40 of 40 fresh. With plain `secondary` there is no fallback: server selection failed after `serverSelectionTimeoutMS` (5 s here).
+
+> **Common mistake:** using `secondary` (not `secondaryPreferred`) for user-facing reads: a replication problem becomes an outage.
+
+## Q4. The unreachable delayed member
+
+**Question:** why could no read preference reach the delayed member?
+
+MongoDB does not advertise delayed members to drivers: with `secondaryDelaySecs: 120` the `hello` response listed only `rpb-mongo1` and `rpb-mongo2` in `hosts` and had no `passives`, so the driver's topology simply did not contain `rpb-mongo3`. A tag set matching only that member therefore had no eligible server and timed out after 30 s. Only a direct connection (`directConnection=true`) reaches it.
+
+> **Common mistake:** planning to use the delayed member as a cheap analytics replica. It is deliberately excluded; use a separate hidden or tagged member without delay.
+
+## Q5. Dashboard vs order confirmation
+
+**Question:** which read preference and options would you use for a seller dashboard, and why not for the order confirmation page?
+
+Dashboard: `secondaryPreferred` with `maxStalenessSeconds` around 120 (minutes-old data is acceptable, but not hours), optionally tags to send it to analytics members. Order confirmation: the buyer must see their own order, which no staleness bound guarantees: read from the primary, or from a secondary inside a causally consistent session with majority read and write concerns (Concept 3).
+
+> **Common mistake:** one connection string with one read preference for the whole application. Set it per operation.

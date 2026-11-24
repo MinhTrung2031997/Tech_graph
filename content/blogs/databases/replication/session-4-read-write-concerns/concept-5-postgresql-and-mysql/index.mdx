@@ -1,0 +1,229 @@
+---
+title: "Concept 5: The same choices in PostgreSQL and MySQL"
+description: "PostgreSQL and MySQL have no per-read 'read concern': a read is as fresh as the server it is sent to, so the application's routing is the read preference. The write side is synchronous_commit in PostgreSQL: against a standby delayed 5 s, local and on committed in 2.3–5.8 ms and the standby read was stale; remote_apply committed in 5,003–5,011 ms and the standby read was fresh. Read-your-writes on replicas is a position wait (LSN, GTID set), MongoDB's causal session done by hand."
+type: "concept"
+tags: ["replication", "consistency", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT"
+  - "https://www.postgresql.org/docs/17/runtime-config-replication.html#GUC-SYNCHRONOUS-STANDBY-NAMES"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/group-replication-configuring-consistency-guarantees.html"
+---
+
+<Tldr>
+In PostgreSQL and MySQL the **server** you read from is the read concern: the primary returns the newest committed data, an asynchronous replica returns its past. Choosing the server is the application's job (connection pools, a proxy, an ORM's replica setting), which plays the role of MongoDB's read preference, without `maxStalenessSeconds` unless you build it. On the write side, PostgreSQL's `synchronous_commit` is the write concern. With a synchronous standby delayed 5 s: `local` committed in 2.3–3.6 ms and `on` in 2.7–5.8 ms, and a standby read right after returned the **old** value; `remote_apply` committed in **5,003–5,011 ms** and the standby read returned the **new** value. With no delay all three committed in 2–8 ms. Read-your-writes on a replica is a wait for the write's LSN or GTID set ([Session 3](/blogs/databases/replication/session-3-replica-lag/concept-4-reading-your-own-writes)), which is what a MongoDB causal session automates. MySQL semi-sync waits for the replica to **receive**, not apply; MySQL Group Replication's `group_replication_consistency` is the closest thing to per-transaction read concerns (from the documentation, not run).
+</Tldr>
+
+## Mapping the vocabulary
+
+| MongoDB | PostgreSQL | MySQL |
+|---|---|---|
+| `readPreference: primary` | connect to the primary | connect to the source |
+| `readPreference: secondary` | connect to a standby (hot standby) | connect to a replica |
+| `maxStalenessSeconds` | none built in: check `pg_last_wal_replay_lsn()` or a heartbeat row before routing | none built in: check missing GTIDs or a heartbeat table |
+| `readConcern: local` on a secondary | a standby read | a replica read |
+| `readConcern: majority` | no equivalent for reads; with quorum commit (`ANY k (…)`) a committed write is on k standbys, but reads on the primary can still show it first (from the documentation) | no equivalent in async replication |
+| Causal session (`afterClusterTime`) | wait for the write's LSN on the standby | `WAIT_FOR_EXECUTED_GTID_SET`; Group Replication `BEFORE` (from the documentation) |
+| `w: 1` | `synchronous_commit = local` (or no sync standby) | asynchronous replication |
+| `w: "majority"` / `w: 2` | `synchronous_commit = on` with a sync standby (flushed there) | semi-sync `AFTER_SYNC` (received and logged) |
+| `w: <all>` with apply | `synchronous_commit = remote_apply` | Group Replication `AFTER` (from the documentation) |
+
+## PostgreSQL
+
+Lab: `synchronous_standby_names = 'walreceiver'` on the primary (the standby connects with that application name), so `pg_stat_replication.sync_state = sync`. The standby has `recovery_min_apply_delay = '5s'` to make the difference between "flushed there" and "applied there" visible. Each run: one UPDATE with `\timing`, then a read of the same row on the standby.
+
+<Flow
+  title="PostgreSQL: synchronous_commit and what a standby read sees"
+  height={380}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'UPDATE, then read', x: 20, y: 20, w: 200 },
+    { id: 'pri', label: 'Primary rpb-pg1', sub: 'COMMIT waits for …', x: 280, y: 20, w: 210 },
+    { id: 'stb', label: 'Sync standby rpb-pg2', sub: 'applies 5 s late', x: 560, y: 20, w: 220 },
+    { id: 'ack', label: 'Commit returns', sub: 'latency', x: 290, y: 170, w: 220 },
+    { id: 'fresh', label: '✓ Standby: new value', sub: 'applied before ack', x: 560, y: 170, w: 220 },
+    { id: 'stale', label: '✗ Standby: old value', sub: 'not applied yet', x: 560, y: 290, w: 220 },
+  ]}
+  edges={[
+    { id: 'app-pri', from: 'app', to: 'pri', label: 'UPDATE' },
+    { id: 'pri-stb', from: 'pri', to: 'stb', label: 'WAL' },
+    { id: 'pri-ack', from: 'pri', to: 'ack' },
+    { id: 'stb-fresh', from: 'stb', to: 'fresh' },
+    { id: 'ack-stale', from: 'ack', to: 'stale' },
+  ]}
+  cases={[
+    {
+      title: 'synchronous_commit = local',
+      path: 'COMMIT after the local flush ✓ 2.3–3.6 ms → standby read ✗ old value',
+      summary: 'Like w:1: the standby is not waited for at all.',
+      steps: [
+        {
+          title: 'Three commits',
+          note: '3.6, 2.4 and 2.3 ms. The standby returned the value from before the three updates every time.',
+          code: "SET synchronous_commit = local;\nUPDATE orders SET amount = amount + 0.01 WHERE id = 5 RETURNING amount;",
+          active: ['app', 'pri', 'ack', 'stale'],
+          edges: ['app-pri', 'pri-ack', 'ack-stale'],
+          subs: { ack: '2.3–3.6 ms' },
+        },
+      ],
+    },
+    {
+      title: 'synchronous_commit = on',
+      path: 'COMMIT after the standby flushed the WAL ✓ 2.7–5.8 ms → standby read ✗ old value',
+      summary: 'Like w:2 / majority: durable on two servers, not yet visible on the second.',
+      steps: [
+        {
+          title: 'Three commits',
+          note: '2.7, 4.0 and 5.8 ms: the standby receives and flushes at once, so the wait is short. But it applies 5 s later, so a read there returned the old value. "Durable on the standby" is not "visible on the standby".',
+          code: "SET synchronous_commit = on;\nUPDATE orders SET amount = amount + 0.01 WHERE id = 5 RETURNING amount;",
+          active: ['app', 'pri', 'stb', 'ack', 'stale'],
+          edges: ['app-pri', 'pri-stb', 'pri-ack', 'ack-stale'],
+          subs: { stb: 'flushed, not applied', ack: '2.7–5.8 ms' },
+        },
+      ],
+    },
+    {
+      title: 'synchronous_commit = remote_apply',
+      path: 'COMMIT after the standby applied ✓ 5,003–5,011 ms → standby read ✓ new value',
+      summary: 'Like w:<all> with apply: every standby read after the commit is fresh, and every commit pays the standby\'s lag.',
+      steps: [
+        {
+          title: 'Three commits',
+          note: '5,002.8, 5,006.7 and 5,010.5 ms: each commit waited for the 5 s apply delay. The standby read right after returned the new value each time.',
+          code: "SET synchronous_commit = remote_apply;\nUPDATE orders SET amount = amount + 0.01 WHERE id = 5 RETURNING amount;   -- 5,003 ms",
+          active: ['app', 'pri', 'stb', 'ack', 'fresh'],
+          edges: ['app-pri', 'pri-stb', 'pri-ack', 'stb-fresh'],
+          subs: { stb: 'applied', ack: '5,003–5,011 ms' },
+        },
+      ],
+    },
+    {
+      title: 'No delay',
+      path: 'local 1.9–7.9 ms, on 3.4–4.7 ms, remote_apply 3.0–4.8 ms → standby read ✓ new value (read about 50 ms later)',
+      summary: 'On a healthy standby the levels cost about the same; the difference appears when the standby is behind.',
+      steps: [
+        {
+          title: 'Nine commits',
+          note: 'With recovery_min_apply_delay = 0, all nine standby reads (issued about 50 ms after each commit) were fresh, at every level. The levels differ in what they promise, which only shows when something is slow.',
+          active: ['pri', 'stb', 'ack', 'fresh'],
+          edges: ['pri-stb', 'pri-ack', 'stb-fresh'],
+          subs: { stb: 'current', ack: '1.9–7.9 ms' },
+        },
+      ],
+    },
+  ]}
+/>
+
+`synchronous_commit` is a session (even per-transaction) setting, like a per-operation write concern: an application can commit a payment with `remote_apply` and everything else with `local`. [Session 2](/blogs/databases/replication/session-2-sync-vs-async/concept-1-postgresql-synchronous-commit) measures what each level costs and what happens when the synchronous standby is down (commits wait).
+
+## MySQL InnoDB
+
+Asynchronous replication gives MySQL exactly two read "concerns": the source (newest) and a replica (its past). The lab's replica, delayed with `SOURCE_DELAY = 5`, returned the previous status on every read right after a write; waiting for the write's GTID set on the replica gave a fresh read after 5.56–5.63 s, or a timeout (1) after 201–203 ms with a 0.2 s limit (Session 3, Concept 4).
+
+<Flow
+  title="MySQL: routing as read preference, GTID wait as causal read"
+  height={360}
+  nodes={[
+    { id: 'app', label: 'Application / proxy', sub: 'routes each read', x: 20, y: 20, w: 220 },
+    { id: 'src', label: 'Source rpb-my1', sub: 'newest data', x: 280, y: 20, w: 210 },
+    { id: 'rep', label: 'Replica rpb-my2', sub: 'SOURCE_DELAY 5', x: 560, y: 20, w: 220 },
+    { id: 'srcv', label: '✓ Fresh', sub: 'read on source', x: 290, y: 170, w: 220 },
+    { id: 'stale', label: '✗ Old value', sub: 'plain replica read', x: 560, y: 170, w: 220 },
+    { id: 'wait', label: 'GTID wait', sub: 'then read replica', x: 560, y: 290, w: 220 },
+  ]}
+  edges={[
+    { id: 'app-src', from: 'app', to: 'src' },
+    { id: 'src-rep', from: 'src', to: 'rep', label: 'binlog' },
+    { id: 'src-v', from: 'src', to: 'srcv' },
+    { id: 'rep-stale', from: 'rep', to: 'stale' },
+    { id: 'stale-wait', from: 'stale', to: 'wait' },
+  ]}
+  cases={[
+    {
+      title: 'Route to the source ("primary")',
+      path: 'read on source ✓ new value',
+      summary: 'Always fresh, costs source capacity.',
+      steps: [
+        {
+          title: 'Read after write on the source',
+          note: 'The source returned the new status every time.',
+          active: ['app', 'src', 'srcv'],
+          edges: ['app-src', 'src-v'],
+        },
+      ],
+    },
+    {
+      title: 'Route to the replica ("secondary")',
+      path: 'plain read ✗ old value → GTID wait ✓ after 5.56–5.63 s or ✗ timeout at 0.2 s',
+      summary: 'The replica read is "local"; the GTID wait is the causal read.',
+      steps: [
+        {
+          title: 'Plain replica read',
+          note: 'Three flips of order 11: the replica returned the previous status each time.',
+          active: ['src', 'rep', 'stale'],
+          edges: ['src-rep', 'rep-stale'],
+          subs: { stale: '3 of 3 stale' },
+        },
+        {
+          title: 'With the write\'s GTID set',
+          note: 'WAIT_FOR_EXECUTED_GTID_SET(set, 10) returned 0 after 5.56–5.63 s, then the read was fresh; with 0.2 it returned 1 after 201–203 ms and the application should read the source.',
+          active: ['rep', 'stale', 'wait'],
+          edges: ['rep-stale', 'stale-wait'],
+          subs: { wait: '0 after 5.6 s / 1 after 0.2 s' },
+        },
+      ],
+    },
+  ]}
+/>
+
+Write side: semi-synchronous replication (`rpl_semi_sync_source_wait_point = AFTER_SYNC`) makes COMMIT wait until a replica has written the transaction to its relay log, roughly `w: 2` for durability, but nothing about the replica having **applied** it ([Session 2](/blogs/databases/replication/session-2-sync-vs-async/concept-2-mysql-semi-sync)). Group Replication adds `group_replication_consistency` with values `EVENTUAL`, `BEFORE`, `AFTER`, `BEFORE_AND_AFTER`: `BEFORE` makes a transaction wait until the member has applied everything committed before it (like a causal read), `AFTER` makes a commit wait until all members have applied it (like `remote_apply`) (from the documentation; Group Replication is not part of this lab).
+
+## Comparison
+
+| Need | MongoDB | PostgreSQL | MySQL (async) |
+|---|---|---|---|
+| Choose the server per read | read preference | application routing | application routing / ProxySQL |
+| Exclude stale replicas | `maxStalenessSeconds` (≥ 90 s) | own check | own check |
+| Read your own write on a replica | causal session | LSN wait | GTID wait |
+| Write not lost on failover | `w: "majority"` | sync standby (`on`), quorum with `ANY k` | semi-sync (`AFTER_SYNC`) |
+| Every replica read fresh after commit | `w: <all>` (applied) | `remote_apply` | Group Replication `AFTER` |
+
+<Pitfall>
+"We use synchronous replication, so the standby is consistent" is only true for `remote_apply`. With `synchronous_commit = on` the commit returned in 2.7–5.8 ms while the standby still showed the old value for 5 s: the WAL was safe there, but not applied. If reads go to the standby, the write side must say `remote_apply`, or the read side must wait for the LSN.
+</Pitfall>
+
+## Real-world scenario: moving a MongoDB habit to PostgreSQL
+
+A team used MongoDB causal sessions for "save then view" pages and is moving the orders service to PostgreSQL with one standby for reads. They first set `synchronous_commit = on` globally, expecting fresh standby reads, and still see stale pages during busy hours (the standby is synchronous for durability but applies a few hundred milliseconds behind). They switch to: `local` or `on` for normal writes, the write's LSN returned to the client, and an LSN wait of up to 100 ms before standby reads for that user, falling back to the primary.
+
+| Option | Write latency | Standby read after write |
+|---|---|---|
+| `on` globally | flush round trip | can be stale |
+| `remote_apply` globally | waits for apply on every commit | fresh |
+| LSN wait for the writer's next reads | unchanged | fresh, or primary fallback |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 2, Concept 1](/blogs/databases/replication/session-2-sync-vs-async/concept-1-postgresql-synchronous-commit) | Costs of each `synchronous_commit` level |
+| [Session 3, Concept 4](/blogs/databases/replication/session-3-replica-lag/concept-4-reading-your-own-writes) | LSN and GTID waits in detail |
+| Concept 3 | The MongoDB feature these patterns rebuild |
+
+## Key takeaways
+
+1. PostgreSQL and MySQL have no read concern: the server you read decides freshness, and routing is the read preference.
+2. `synchronous_commit` is the write concern; `on` makes the standby durable, only `remote_apply` makes it visible.
+3. Against a standby 5 s behind: `local`/`on` 2.3–5.8 ms and stale standby reads; `remote_apply` 5,003–5,011 ms and fresh reads.
+4. LSN and GTID waits are hand-made causal reads; MySQL semi-sync waits for receipt, not apply.
+5. Group Replication's consistency levels are MySQL's closest match to read/write concerns (documentation only here).
+
+## Check questions
+
+1. What plays the role of read preference in PostgreSQL and MySQL, and what replaces `maxStalenessSeconds`?
+2. Why was the standby read stale with `synchronous_commit = on` although the standby is synchronous?
+3. What did `remote_apply` cost against a standby delayed 5 s, and why?
+4. Which MySQL mechanism corresponds to a MongoDB causal read, and which to `w: "majority"`?
+5. A team wants every standby read to be fresh. Compare `remote_apply` with an LSN wait.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-4-read-write-concerns/concept-5-postgresql-and-mysql/answers">Worked answers to Q1–Q5</DeepDive>

@@ -1,0 +1,189 @@
+---
+title: "Concept 2: Read preference and staleness"
+description: "Read preference decides which member answers; read concern decides which version it returns. With one secondary about 2 minutes behind, 40 reads right after a write returned stale data 19 times with readPreference secondary, 23 with secondaryPreferred and 7 with nearest; adding maxStalenessSeconds = 90 removed the lagging member (0 stale). With both secondaries 3–5 minutes behind, secondaryPreferred returned stale data 40 of 40 times, secondary + maxStalenessSeconds failed server selection after 5 s, and secondaryPreferred + maxStalenessSeconds fell back to the primary. Delayed members are never offered to drivers."
+type: "concept"
+tags: ["replication", "read-preference", "consistency", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/read-preference/"
+  - "https://www.mongodb.com/docs/manual/core/read-preference-staleness/"
+  - "https://www.mongodb.com/docs/manual/core/read-preference-tags/"
+  - "https://www.mongodb.com/docs/manual/core/replica-set-delayed-member/"
+---
+
+<Tldr>
+**Read preference** is chosen in the driver and picks the member: `primary` (default), `primaryPreferred`, `secondary`, `secondaryPreferred`, `nearest`, optionally narrowed by **tags** and by **`maxStalenessSeconds`**. It says nothing about freshness by itself. With `rpb-mongo3` frozen about 115 s behind and `rpb-mongo2` current, 40 reads right after a write returned the **old value 19 times** with `secondary`, 23 with `secondaryPreferred` and 7 with `nearest` (which also uses the primary); `maxStalenessSeconds = 90` excluded the lagging member: **0 stale**. Values under 90 are rejected by the driver (`Option "maxStalenessSeconds" must be at least 90 seconds`). With both secondaries 188 s and 305 s behind, `secondaryPreferred` served **3–5-minute-old data 40 of 40 times**; with `maxStalenessSeconds = 90`, `secondary` failed (`Server selection timed out after 5000 ms`) and `secondaryPreferred` fell back to the primary. Members with `secondaryDelaySecs` are left out of `hello` and are never chosen: a tag pointing at one timed out after 30 s.
+</Tldr>
+
+## Modes and filters
+
+| Term | Meaning |
+|---|---|
+| `primary` | Only the primary (default); fails if there is none |
+| `primaryPreferred` | Primary; a secondary if there is no primary |
+| `secondary` | Only secondaries; fails if none is eligible |
+| `secondaryPreferred` | Secondaries; the primary if none is eligible |
+| `nearest` | Any member within `localThresholdMS` (15 ms) of the fastest, primary included |
+| Tag set | Restricts eligible members to those with matching `tags` in the replica set config |
+| `maxStalenessSeconds` | Excludes secondaries whose estimated staleness exceeds it; minimum 90 s |
+| Staleness estimate | The driver's estimate from each member's `lastWrite` in `hello` responses, refreshed every `heartbeatFrequencyMS` (10 s) |
+| **✓ / ✗** | Read returned the value just written / an older value |
+
+The test: write a new value with `w: "majority"` on the primary, then read the same document 40 times through a replica-set connection with the given options, and count fresh vs stale answers.
+
+```js
+const c = new Mongo('mongodb://rpb-mongo1:27017,rpb-mongo2:27017,rpb-mongo3:27017/shop?replicaSet=rpbrs'
+                    + '&readPreference=secondary&maxStalenessSeconds=90');
+c.getDB('shop').orders.findOne({ _id: 11 });   // 40 times
+```
+
+<Flow
+  title="MongoDB: which member answers, one secondary 115 s behind"
+  height={420}
+  nodes={[
+    { id: 'drv', label: 'Driver', sub: 'read preference', x: 290, y: 20, w: 220 },
+    { id: 'pri', label: 'rpb-mongo1', sub: 'primary, current', x: 20, y: 160, w: 220 },
+    { id: 'm2', label: 'rpb-mongo2', sub: 'secondary, current', x: 290, y: 160, w: 220 },
+    { id: 'm3', label: 'rpb-mongo3', sub: 'secondary, 115 s behind', x: 560, y: 160, w: 220 },
+    { id: 'pv', label: 'From primary', sub: 'answers', x: 20, y: 300, w: 220 },
+    { id: 'm2v', label: 'From rpb-mongo2', sub: 'answers', x: 290, y: 300, w: 220 },
+    { id: 'm3v', label: 'From rpb-mongo3', sub: 'answers', x: 560, y: 300, w: 220 },
+  ]}
+  edges={[
+    { id: 'drv-pri', from: 'drv', to: 'pri' },
+    { id: 'drv-m2', from: 'drv', to: 'm2' },
+    { id: 'drv-m3', from: 'drv', to: 'm3' },
+    { id: 'pri-v', from: 'pri', to: 'pv' },
+    { id: 'm2-v', from: 'm2', to: 'm2v' },
+    { id: 'm3-v', from: 'm3', to: 'm3v' },
+  ]}
+  cases={[
+    {
+      title: 'primary (default)',
+      path: 'driver → primary ✓ 40 of 40 fresh',
+      summary: 'The default never reads stale data from replication.',
+      steps: [
+        {
+          title: '40 reads',
+          note: 'Every read went to rpb-mongo1: 40 fresh, 0 stale. primaryPreferred behaved the same while a primary existed.',
+          active: ['drv', 'pri', 'pv'],
+          edges: ['drv-pri', 'pri-v'],
+          subs: { pv: '✓ 40 fresh' },
+        },
+      ],
+    },
+    {
+      title: 'secondary / secondaryPreferred',
+      path: 'driver → rpb-mongo2 ✓ or rpb-mongo3 ✗ → 19 (secondary) and 23 (secondaryPreferred) of 40 stale',
+      summary: 'The driver picks randomly among eligible secondaries; a 2-minute-old one is eligible.',
+      steps: [
+        {
+          title: 'rpb-mongo3 frozen for about 2 minutes',
+          note: 'db.fsyncLock() on rpb-mongo3; printSecondaryReplicationInfo: "115 secs (0.03 hrs) behind the primary". Both secondaries are within the latency window, so reads are spread between them.',
+          active: ['drv', 'm2', 'm3'],
+          edges: ['drv-m2', 'drv-m3'],
+        },
+        {
+          title: 'Count',
+          note: 'secondary: 21 fresh, 19 stale. secondaryPreferred: 17 fresh, 23 stale. Each stale answer was a document as it was about 2 minutes earlier.',
+          active: ['m2', 'm3', 'm2v', 'm3v'],
+          edges: ['m2-v', 'm3-v'],
+          subs: { m2v: '✓ fresh', m3v: '✗ 2 min old' },
+        },
+      ],
+    },
+    {
+      title: 'nearest',
+      path: 'driver → any of 3 → 33 fresh, 7 stale',
+      summary: 'nearest includes the primary, which dilutes the stale share but does not remove it.',
+      steps: [
+        {
+          title: 'All three in the latency window',
+          note: 'Locally every member answers in well under 15 ms, so nearest spreads reads over all three. 7 of 40 hit rpb-mongo3.',
+          active: ['drv', 'pri', 'm2', 'm3', 'pv', 'm2v', 'm3v'],
+          edges: ['drv-pri', 'drv-m2', 'drv-m3', 'pri-v', 'm2-v', 'm3-v'],
+          subs: { pv: '✓', m2v: '✓', m3v: '✗ 7 of 40' },
+        },
+      ],
+    },
+    {
+      title: 'secondary + maxStalenessSeconds = 90',
+      path: 'driver excludes rpb-mongo3 (✗ 115 s behind) → rpb-mongo2 ✓ 40 of 40 fresh',
+      summary: 'A bound on staleness, enforced by the driver.',
+      steps: [
+        {
+          title: 'Exclude the lagging member',
+          note: 'The driver estimates rpb-mongo3\'s staleness from the lastWriteDate in its hello responses (the formula, from the documentation, adds one heartbeat interval) and drops it. 40 fresh, 0 stale. With maxStalenessSeconds = 30 the connection was refused: Option "maxStalenessSeconds" must be at least 90 seconds (the estimate is only accurate to about a heartbeat).',
+          code: "...&readPreference=secondary&maxStalenessSeconds=90",
+          active: ['drv', 'm2', 'm2v', 'm3'],
+          edges: ['drv-m2', 'm2-v'],
+          subs: { m3: '✗ excluded', m2v: '✓ 40 fresh' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## When every secondary is stale
+
+Both secondaries frozen until they were 188 s and 305 s behind (writes for this test used `w: 1`, since a majority was unavailable):
+
+| Options | Result |
+|---|---|
+| `secondaryPreferred` | ✗ 40 of 40 stale: data 3–5 minutes old, no error |
+| `secondaryPreferred&maxStalenessSeconds=90` | ✓ 40 of 40 fresh: no eligible secondary, so the driver used the primary |
+| `secondary&maxStalenessSeconds=90` | ✗ `Server selection timed out after 5000 ms` (with `serverSelectionTimeoutMS=5000`) |
+
+## Delayed members are invisible to drivers
+
+With `rpb-mongo3` configured `priority: 0, secondaryDelaySecs: 120, hidden: false`, the primary's `db.hello().hosts` listed only `rpb-mongo1` and `rpb-mongo2`. Reads with `secondary` went to `rpb-mongo2` 40 of 40 times (checked with `explain().serverInfo.host`), and a read with the tag set `[{ name: 'm3' }]` failed with `MongoServerSelectionError: Server selection timed out after 30000 ms`. A delayed member is for recovery, not for serving reads; only a direct connection reaches it.
+
+## Comparison of choices
+
+| Goal | Read preference | Add |
+|---|---|---|
+| Never stale from replication | `primary` | — |
+| Offload reads that can be minutes old | `secondaryPreferred` | `maxStalenessSeconds` to cap "minutes" |
+| Bounded staleness, never the primary | `secondary` | `maxStalenessSeconds` and handle selection errors |
+| Lowest latency across regions | `nearest` | tags for the local region |
+| Read-your-writes on secondaries | any secondary mode | causally consistent session (Concept 3) |
+
+<Pitfall>
+`secondaryPreferred` without `maxStalenessSeconds` has no upper bound: in the lab it served 5-minute-old data with no error and no warning. And `maxStalenessSeconds` is a coarse safety net (90 s minimum, estimated from heartbeats every 10 s); it cannot give read-your-writes. Use it to stop a broken secondary from serving, and a causal session or the primary for freshness.
+</Pitfall>
+
+## Real-world scenario: seller analytics on a lagging secondary
+
+A seller dashboard reads with `secondaryPreferred` to keep load off the primary. A nightly index build makes one secondary fall 20 minutes behind. Half the dashboard requests show yesterday's numbers; sellers report "orders missing". With `maxStalenessSeconds = 120`, the driver stops using that secondary as soon as its estimated staleness passes 2 minutes, and the healthy secondary (or the primary) serves instead.
+
+| Setting | Effect on the incident |
+|---|---|
+| `secondaryPreferred` only | 20-minute-old data for half the requests |
+| `+ maxStalenessSeconds=120` | lagging member excluded within about a heartbeat after crossing 120 s |
+| `+ tags` for an analytics member | dashboard traffic isolated from the members serving checkout |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 3, Concept 1](/blogs/databases/replication/session-3-replica-lag/concept-1-measuring-lag) | How lag is measured, and why heartbeat-based numbers are coarse |
+| [Session 3, Concept 3](/blogs/databases/replication/session-3-replica-lag/concept-3-stale-reads) | What a stale read does to users |
+| Concept 3 | Making secondary reads causally consistent |
+
+## Key takeaways
+
+1. Read preference picks the member; it does not bound staleness by itself.
+2. With one secondary 2 minutes behind, `secondary` returned stale data in 19 of 40 reads, `nearest` in 7.
+3. `maxStalenessSeconds` (minimum 90) removed the lagging member; with no eligible secondary, `secondaryPreferred` fell back to the primary and `secondary` failed server selection.
+4. `secondaryPreferred` alone served 3–5-minute-old data without any error.
+5. Delayed members are not advertised in `hello` and never serve driver reads.
+
+## Check questions
+
+1. Why did `secondary` reads return stale data about half the time?
+2. Why does the driver refuse `maxStalenessSeconds` below 90?
+3. Both secondaries are 3 minutes behind. What do `secondaryPreferred` and `secondaryPreferred` with `maxStalenessSeconds=90` do?
+4. Why could no read preference reach the delayed member?
+5. Which read preference and options would you use for a seller dashboard, and why not for the order confirmation page?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-4-read-write-concerns/concept-2-read-preference/answers">Worked answers to Q1–Q5</DeepDive>
