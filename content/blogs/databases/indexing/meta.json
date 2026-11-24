@@ -8,6 +8,7 @@
     "session-5-covering-partial-expression",
     "session-6-engine-differences",
     "session-7-specialist-indexes",
-    "session-8-when-indexes-hurt"
+    "session-8-when-indexes-hurt",
+    "session-9-indexes-for-joins"
   ]
 }

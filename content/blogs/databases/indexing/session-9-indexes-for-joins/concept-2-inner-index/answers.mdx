@@ -1,0 +1,73 @@
+---
+title: "Answers: The index on the inner side"
+description: "Worked answers to the Session 9 Concept 2 check questions."
+companion: "answers"
+tags: ["indexing", "joins", "nested-loop", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/using-explain.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/server-status-variables.html"
+  - "https://www.mongodb.com/docs/manual/reference/operator/aggregation/lookup/"
+---
+
+<Tldr>
+Nested loop cost = outer rows × per-loop cost. The inner index decides the per-loop cost: join key first, inner filters next, returned columns last.
+</Tldr>
+
+## Q1. The formula
+
+**Question:** write the cost of a nested loop as a formula, and say which part an inner index changes.
+
+**Cost ≈ cost of the outer side + outer rows × (descent + rows fetched per loop × fetch cost).**
+
+The inner index changes the bracket: without an index the "descent" is a scan of the inner table; with `(join key)` it is ≈ 3 pages plus one fetch per matching row; with `(join key, filters)` only rows passing the filters are fetched; with a covering index the fetch disappears. In the lab: ≈ 13 → 6.5 → 3 buffers per customer. The outer row count is changed by the outer side's filter and index (Concept 4), not by the inner index.
+
+> **Common mistake:** looking only at the inner node's total buffers. Divide by `loops` to see the per-loop cost, and multiply mentally when the outer side grows.
+
+## Q2. Flat hash join cost
+
+**Question:** in the PostgreSQL table, why does the hash join cost stay at ≈ 10,300 buffers from 1,000 to 10,000 customers while the nested loop grows?
+
+The hash join reads `orders` completely once (10,205 pages) whatever the number of customers; only the small build side grows (a few dozen to a few hundred pages of customers via the primary key). The nested loop pays ≈ 13 buffers per customer: 3,895 at 300, 12,963 at 1,000, 130,354 at 10,000. The planner switches between 300 and 1,000, where the two lines cross.
+
+> **Common mistake:** thinking the planner "gave up on the index" at 1,000 customers. It compared two costs, and the full scan really was cheaper.
+
+## Q3. What the composite changed
+
+**Question:** with only `(customer_id)` on orders, the planner chose a hash join for "paid orders of SG gold customers". What changed when `(customer_id, status)` was added?
+
+With `(customer_id)`, each of the 513 inner lookups would fetch all ≈ 10 orders and discard 7 (forced nested loop: 7,064 buffers, cost 20,256), so a hash join over all of orders (11,436 buffers, cost 17,766) was estimated cheaper. With `(customer_id, status)`, the status condition joins the index condition, each lookup fetches only the ≈ 3.5 paid orders, the cost dropped to 10,234 and the nested loop won: 3,691 buffers, ≈ 10 ms.
+
+> **Common mistake:** concluding from the first plan that "the join needs a hash join". The plan depended on how expensive the inner lookups were.
+
+## Q4. Which column orders work
+
+**Question:** why is `(status, customer_id)` as good as `(customer_id, status)` for this join, but `(status, created_at)` useless?
+
+Inside the loop both conditions are equalities: `customer_id = c.id` and `status = 'paid'`. With two equality columns, either order gives one contiguous stretch to descend to (Session 4, Concept 3); MongoDB examined 1,880 keys with either order. `(status, created_at)` has no `customer_id` at all: for each customer the lookup could only seek to `status = 'paid'` and walk all 350,000 paid orders. Leading with the join key (or with only equality columns before it) is what makes the inner lookup a descent.
+
+> **Common mistake:** picking the inner index by the query's WHERE clause alone and forgetting the join condition, which is the most important condition inside the loop.
+
+## Q5. MySQL handler counters
+
+**Question:** in MySQL, what do `Handler_read_key` and `Handler_read_next` count, and why did `Handler_read_next` stay at 2,393 when the covering index was added?
+
+`Handler_read_key` counts index descents (one for the outer lookup, one per inner loop: 514). `Handler_read_next` counts entries read by moving to the next index entry after a descent: 1,880 matches + one read per customer that finds the end of its range = 2,393. A covering index reads the same index entries; what it removes is the clustered-index fetch for each entry, which these counters do not show. The time showed it: ≈ 3.7 ms → ≈ 1.1 ms.
+
+> **Common mistake:** expecting every improvement to show in `Handler_read_next`. It counts index entries, not the clustered-index lookups behind them.
+
+## Q6. amount vs INCLUDE (id, amount)
+
+**Question:** why does a MySQL covering index for this query need only `amount` added, while PostgreSQL needed `INCLUDE (id, amount)`?
+
+The query returns `o.id` and `o.amount`. In InnoDB every secondary index entry ends with the primary key, so `(customer_id, status, amount)` already contains `id`. A PostgreSQL index entry holds only its key columns (and INCLUDE columns) plus a ctid pointing at the heap, not the primary key, so `id` must be included explicitly (Session 6, Concept 2).
+
+> **Common mistake:** copying an index design between engines without checking what each one stores in an entry.
+
+## Q7. MongoDB still fetching
+
+**Question:** a MongoDB `$lookup` pipeline projects `{ amount: 1 }`, and the index is `{ customer_id: 1, status: 1, amount: 1 }`. Why are documents still fetched?
+
+A projection includes `_id` unless it is excluded. `_id` is not in this index, so MongoDB must fetch each document to return it: 1,880 documents examined. With `{ _id: 0, amount: 1 }`, totalDocsExamined fell to 0.
+
+> **Common mistake:** assuming MongoDB covers a query whenever the filtered fields are indexed. Every returned field, `_id` included, must be in the index.

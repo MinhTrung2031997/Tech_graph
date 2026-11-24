@@ -1,0 +1,73 @@
+---
+title: "Answers: Which side drives the join"
+description: "Worked answers to the Session 9 Concept 4 check questions."
+companion: "answers"
+tags: ["indexing", "joins", "join-order", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/planner-stats.html#PLANNER-STATS-EXTENDED"
+  - "https://dev.mysql.com/doc/refman/8.4/en/semijoins.html"
+  - "https://www.mongodb.com/docs/manual/core/aggregation-pipeline-optimization/"
+---
+
+<Tldr>
+Drive from the smallest filtered side, index the other side's join column, check estimated vs actual outer rows, and in MongoDB write the pipeline in that order yourself.
+</Tldr>
+
+## Q1. Which side drives
+
+**Question:** for `orders WHERE sku = ?` joined to `customers WHERE country = ?`, which side should drive, and which index does the other side need?
+
+Compare the rows each filter leaves: `sku = 'SKU-000123'` leaves 200 orders (0.02%); `country = 'SG'` leaves 10,050 customers (10%). Orders should drive, through an index on `orders (sku)`, and each order looks up its customer through the `customers` primary key, which already exists; the country is checked on each of the 200 customers (21 match). If the country filter were the rare one (a new market with 3 customers), customers would drive and `orders (customer_id)` would be the needed index.
+
+> **Common mistake:** deciding by table size ("customers is smaller, so it drives"). What matters is the row count **after** each side's filter.
+
+## Q2. 1,000,000 index entries for 200 rows
+
+**Question:** why did MySQL read 1,000,000 index entries when forced to start from customers, even though only 200 rows came out?
+
+Customers had no filter, so all 100,000 became outer rows. For each, the inner lookup could only use `customer_id` (the `sku` condition is not in `orders_customer_idx`), so it read all ≈ 10 orders of that customer and then filtered on `sku`: 100,000 × 10 = 1,000,000 `Handler_read_next`, 100,001 `Handler_read_key`. The `sku` filter, which is what makes the query selective, was applied last.
+
+> **Common mistake:** thinking the join "uses an index, so it is fine". It used one, 100,000 times.
+
+## Q3. The 242-row estimate
+
+**Question:** how did PostgreSQL arrive at an estimate of 242 rows for `id > 95000 AND created_at >= …`, and why did that change the join algorithm?
+
+Each condition alone selects ≈ 5% of 100,000 customers. Without extended statistics, the planner assumes the columns are independent and multiplies: 0.049 × 0.049 × 100,000 ≈ 242. In this table `created_at` rises with `id`, so the two conditions select the **same** 5,000 rows. With 242 outer rows the nested loop looked cheaper than a hash join (the crossover is between 300 and 1,000, Concept 2); with the real 5,000 it read 64,584 buffers against 10,485 for the hash join.
+
+> **Common mistake:** blaming the join algorithm. The algorithm was right for 242 rows; the input to the decision was wrong.
+
+## Q4. Fixing it without enable_*
+
+**Question:** give two ways to fix the plan in Q3 without forcing it with `enable_*` settings.
+
+- **Remove the redundant condition.** `id > 95000` alone describes the same customers; the estimate becomes 4,916 and the planner chooses the hash join (10,356 buffers).
+- **Teach the planner the correlation.** For equality conditions on correlated columns, `CREATE STATISTICS s (dependencies) ON a, b FROM t; ANALYZE t;`. Range conditions like these two benefit less, which is why rewriting the condition is the more reliable fix here.
+- **Express the intent directly**, for example a `signup_cohort` column or a filter on one column that the application already knows.
+
+> **Common mistake:** "fixing" it with `SET enable_nestloop = off` for the session, which also removes nested loops from every other join that needs them.
+
+## Q5. EXISTS and FirstMatch
+
+**Question:** why can `EXISTS` be cheaper than `JOIN … DISTINCT`, and what made MySQL's FirstMatch plan read only 10,050 entries?
+
+`EXISTS` asks whether **any** matching row exists, so the engine may stop at the first one and never produces duplicates to remove; `JOIN … DISTINCT` (semantically) produces every match and then de-duplicates (PostgreSQL: 35,111 joined rows → 9,728). In MySQL, with `(customer_id, status)` the semi-join became FirstMatch: per SG customer, one descent to `(customer_id, 'paid')` in a covering index, stop at the first entry or at the first non-matching one: one `Handler_read_next` per customer, 10,050 in total. Without that index MySQL chose to materialize the set of all customers with a paid order (350,000 orders read, 360,050 entries).
+
+> **Common mistake:** writing `JOIN … DISTINCT` (or `IN (SELECT …)` with a huge subquery) and assuming the engine always finds the semi-join plan; the plan still depends on an index for the "first match" probe.
+
+## Q6. MongoDB's driving collection
+
+**Question:** in MongoDB, why is the choice of collection in `db.X.aggregate` a performance decision, and how does `$limit: 1` inside a `$lookup` pipeline relate to `EXISTS`?
+
+MongoDB does not reorder joins: the collection you aggregate on is the outer side, and each of its documents (after the first `$match`) triggers one `$lookup`. Starting from orders with the `sku` index: 200 outer documents, 400 keys, ≈ 4 ms. Starting from customers: 100,000 outer documents, 1,000,000 keys, ≈ 2.7 s. `$limit: 1` in the lookup pipeline is MongoDB's "stop at the first match": with `{ customer_id: 1, status: 1 }` it examined 3,483 keys for the 10,050 SG customers, against 100,500 without the limit.
+
+> **Common mistake:** writing the pipeline from the collection the API endpoint is named after, rather than from the one with the selective filter.
+
+## Q7. Group before the lookup
+
+**Question:** why did grouping orders by `customer_id` before the `$lookup` give the same revenue per country, and why was it 7× faster?
+
+Revenue per country is the sum, over the customers in that country, of their revenue; summing orders per customer first and then per country gives the same totals (a sum can be split into partial sums). The pipeline then does one `$lookup` per **customer** (100,001) instead of one per **order** (1,000,001), and the expensive part of this pipeline is the lookup: ≈ 10.5 s → ≈ 1.4 s. This works for sums, counts, minimums and maximums; an average must be rebuilt from sums and counts.
+
+> **Common mistake:** grouping per customer and then averaging the per-customer averages, which weights each customer equally instead of each order.
