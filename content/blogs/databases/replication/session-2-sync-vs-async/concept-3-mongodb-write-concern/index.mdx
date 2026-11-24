@@ -1,0 +1,177 @@
+---
+title: "Concept 3: MongoDB write concern"
+description: "MongoDB 8.0 acknowledges writes with w: 'majority' by default. With secondaries 20 ms and 50 ms away, single-document inserts took 0.19 ms with w: 1, 1.24 ms with j: true, 26.7 ms with w: 'majority' and 55.3 ms with w: 3. With both secondaries paused, w: 1 still succeeded; w: 'majority' with wtimeout 2000 failed after 2,017 ms with WriteConcernFailed 64 while the document stayed on the primary; 9.6 s later the primary stepped down and every write failed with NotWritablePrimary."
+type: "concept"
+tags: ["replication", "write-concern", "mongodb", "durability", "latency"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+  - "https://www.mongodb.com/docs/manual/reference/mongodb-defaults/"
+  - "https://www.mongodb.com/docs/manual/core/replica-set-elections/"
+---
+
+<Tldr>
+In MongoDB the client chooses, per operation, how many members must confirm a write: the **write concern**. MongoDB 8.0's default is `{ w: "majority", wtimeout: 0 }` (read from `getDefaultRWConcern` on the lab set). On a 3-member set with secondaries **20 ms** and **50 ms** away, single-document inserts took **0.19 ms** with `w: 1`, **1.24 ms** with `w: 1, j: true`, **26.7 ms** with `w: "majority"` (primary + nearest secondary) and **55.3 ms** with `w: 3` (the slowest member too). With both secondaries paused, `w: 1` still succeeded in 5 ms; `w: "majority"` with `wtimeout: 2000` failed after **2,017 ms** with **WriteConcernFailed (64)** "waiting for replication timed out", yet the document **was written** on the primary. Without a majority in sight, the primary **stepped down after 9.6 s** and then refused even `w: 1` writes with **NotWritablePrimary (10107)**.
+</Tldr>
+
+## The options
+
+| Write concern | Acknowledged when | No delay (median / p95) | Secondaries +20 / +50 ms |
+|---|---|---|---|
+| `w: 1` | Primary applied it (in memory) | 0.21 / 0.48 ms | 0.19 / 0.39 ms |
+| `w: 1, j: true` | + primary's journal flushed | 1.20 / 1.63 ms | 1.24 / 2.48 ms |
+| `w: "majority"` (default) | Majority of voting members applied it, journaled | 1.39 / 1.74 ms | 26.68 / 31.41 ms |
+| `w: 3` | All three members applied it | 0.60 / 1.81 ms | 55.26 / 60.70 ms |
+
+300 inserts per row, client on the primary's host, one document per insert. Without delay `w: 3` was faster than `"majority"` because majority writes are also journaled on each acknowledging member (`writeConcernMajorityJournalDefault`, from the documentation) while `w: 3` without `j` is not.
+
+| Term | Meaning |
+|---|---|
+| `w` | Number of members (or `"majority"`) that must acknowledge |
+| `j` | Wait for the journal (on-disk) on acknowledging members |
+| `wtimeout` | Give up waiting after this many ms; the write is **not** undone |
+| Majority commit point | The newest write known to be on a majority; it survives any election |
+| Step down | A primary that cannot see a majority of voting members becomes secondary |
+| **✓ / ✗** | Acknowledged / not acknowledged |
+
+## What a write waits for
+
+<Flow
+  title="MongoDB: one insert, secondaries 20 ms and 50 ms away"
+  height={350}
+  nodes={[
+    { id: 'client', label: 'Client', sub: 'insertOne', x: 20, y: 20, w: 170 },
+    { id: 'primary', label: 'Primary', sub: 'applies + oplog', x: 20, y: 150, w: 170 },
+    { id: 'journal', label: 'Primary journal', sub: 'j: true', x: 20, y: 280, w: 170 },
+    { id: 'near', label: 'Secondary 2', sub: '+20 ms', x: 600, y: 150, w: 180 },
+    { id: 'far', label: 'Secondary 3', sub: '+50 ms', x: 600, y: 280, w: 180 },
+    { id: 'ack', label: 'Acknowledgement', sub: 'to the client', x: 310, y: 20, w: 180 },
+  ]}
+  edges={[
+    { id: 'client-primary', from: 'client', to: 'primary' },
+    { id: 'primary-journal', from: 'primary', to: 'journal' },
+    { id: 'primary-near', from: 'primary', to: 'near', label: 'oplog' },
+    { id: 'primary-far', from: 'primary', to: 'far' },
+    { id: 'primary-ack', from: 'primary', to: 'ack' },
+    { id: 'ack-client', from: 'ack', to: 'client' },
+  ]}
+  cases={[
+    {
+      title: 'w: 1',
+      path: 'primary applies ✓ → ack (0.19 ms); journal ✗ secondaries ✗ not waited for',
+      summary: 'Fastest; lost if the primary fails before a secondary has it.',
+      steps: [
+        {
+          title: 'Primary only',
+          note: 'The write is acknowledged once applied in the primary\'s memory: 0.19 ms median. Secondaries pull it afterwards. If the primary crashes before that, the write is rolled back when it rejoins (Session 5).',
+          code: "db.wc.insertOne({ _id: 1 }, { writeConcern: { w: 1 } });   // 0.19 ms",
+          active: ['client', 'primary', 'ack'],
+          edges: ['client-primary', 'primary-ack', 'ack-client'],
+          subs: { near: '✗ not waited', far: '✗ not waited' },
+        },
+        {
+          title: 'j: true adds the local disk',
+          note: 'w: 1, j: true waits for the primary\'s journal flush: 1.24 ms. Durable on one server\'s disk, still only one server.',
+          code: "{ writeConcern: { w: 1, j: true } }   // 1.24 ms",
+          active: ['primary', 'journal', 'ack'],
+          edges: ['primary-journal', 'primary-ack'],
+          subs: { journal: '✓ flushed' },
+        },
+      ],
+    },
+    {
+      title: 'w: "majority"',
+      path: 'primary ✓ + nearest secondary ✓ (2 of 3) → ack (26.7 ms); far secondary ✗ not waited for',
+      summary: 'Two of three members, whichever answer first.',
+      steps: [
+        {
+          title: 'Wait for one secondary',
+          note: 'A majority of 3 voting members is 2: the primary plus the first secondary to confirm. The +20 ms secondary answers first: 26.68 ms median, p95 31.41 ms. The write is now part of the majority commit point and cannot be rolled back by an election.',
+          code: "db.wc.insertOne({ _id: 2 }, { writeConcern: { w: 'majority' } });   // 26.7 ms",
+          active: ['client', 'primary', 'near', 'ack'],
+          edges: ['client-primary', 'primary-near', 'primary-ack', 'ack-client'],
+          subs: { near: '✓ applied + journaled', far: '✗ not waited' },
+        },
+      ],
+    },
+    {
+      title: 'w: 3',
+      path: 'primary ✓ + secondary 2 ✓ + secondary 3 ✓ → ack (55.3 ms)',
+      summary: 'The slowest member sets the latency, and any member down blocks the write.',
+      steps: [
+        {
+          title: 'Wait for everyone',
+          note: '55.26 ms median, p95 60.70 ms: the +50 ms secondary decides. With any one member down, w: 3 cannot be satisfied at all.',
+          code: "{ writeConcern: { w: 3 } }   // 55.3 ms",
+          active: ['primary', 'near', 'far', 'ack'],
+          edges: ['primary-near', 'primary-far', 'primary-ack'],
+          subs: { far: '✓ applied' },
+        },
+      ],
+    },
+    {
+      title: 'Both secondaries paused',
+      path: 'w: 1 ✓ 5 ms → w: "majority" ✗ WriteConcernFailed after 2,017 ms (write kept) → primary steps down at 9.6 s → w: 1 ✗ NotWritablePrimary',
+      summary: 'A write-concern timeout is not a rollback, and a lonely primary stops being primary.',
+      steps: [
+        {
+          title: 'w: 1 still works',
+          note: 'docker pause rpa-mongo2 rpa-mongo3. insertOne with w: 1 succeeded in 5 ms.',
+          active: ['client', 'primary', 'ack'],
+          edges: ['client-primary', 'primary-ack', 'ack-client'],
+          subs: { near: '✗ paused', far: '✗ paused' },
+        },
+        {
+          title: 'Majority times out, the write stays',
+          note: 'w: "majority", wtimeout: 2000 failed after 2,017 ms: code 64 WriteConcernFailed, errmsg "waiting for replication timed out", errInfo { wtimeout: true }. Reading the primary with readConcern local found the document: it was written, just not acknowledged by a majority.',
+          code: "db.wc.insertOne({ _id: 'p-maj' }, { writeConcern: { w: 'majority', wtimeout: 2000 } });\n// MongoServerError: waiting for replication timed out (WriteConcernFailed, 64)",
+          active: ['primary', 'near', 'far', 'ack'],
+          edges: ['primary-near', 'primary-far'],
+          subs: { ack: '✗ timeout, write kept' },
+        },
+        {
+          title: 'The primary steps down',
+          note: 'A primary that cannot reach a majority steps down, so that two primaries never accept writes at once. Here it became SECONDARY 9,607 ms after the pause; insertOne with w: 1 then failed: NotWritablePrimary 10107 "not primary". After docker unpause, rpa-mongo2 won an election ("Starting an election, since we\'ve seen no PRIMARY in election timeout period", electionTimeoutPeriodMillis 10000).',
+          active: ['client', 'primary'],
+          edges: ['client-primary'],
+          subs: { primary: '✗ SECONDARY now' },
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+`WriteConcernFailed` does not mean the write failed. The document `p-maj` was on the primary after the timeout, and after the secondaries returned and rpa-mongo2 was elected, the new primary had it too. An application that retries on this error, or reports "payment failed" to the user, can duplicate or contradict a write that actually happened. Treat a write-concern timeout as **unknown outcome**: make the write idempotent (a unique business key), and check before retrying.
+</Pitfall>
+
+## Real-world scenario: flash-sale writes with w: 1
+
+To survive a flash sale, an order service lowers its write concern to `w: 1` (0.19 ms instead of 26.7 ms in this lab's distances). During the sale the primary's host fails. A secondary is elected within about ten seconds, but orders acknowledged by the old primary in its last moments had not reached any secondary. When the old primary rejoins, MongoDB rolls those writes back into a rollback directory (Session 5): customers hold confirmation e-mails for orders that no longer exist. Keep `w: "majority"` for orders and payments; use `w: 1` for data that can be lost (view counters, events), and reduce majority latency with placement (the nearest secondary decides the latency) rather than by lowering the write concern.
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 1 | PostgreSQL's equivalent decision is per transaction too, but waits without timeout |
+| Concept 4 | Majority as a quorum: what happens when the nearest secondary is down |
+| [Transactions Session 1, Concept 3](/blogs/databases/transactions/session-1-transaction-guarantees/concept-3-durability) | `j: true` and the journal on a single server |
+
+## Key takeaways
+
+1. Write concern is chosen per operation; MongoDB 8.0 defaults to `w: "majority"`.
+2. `w: "majority"` waits for the nearest secondary on a 3-member set: 26.7 ms with 20 ms of delay; `w: 3` waits for the slowest: 55.3 ms.
+3. `wtimeout` turns an endless wait into an error, but the write is not undone.
+4. A primary that cannot see a majority steps down (after about 10 s here) and refuses all writes.
+5. Writes acknowledged with `w: 1` can be rolled back by a failover; majority-acknowledged writes cannot.
+
+## Check questions
+
+1. Why was `w: "majority"` 26.7 ms and not 55 ms on a set with secondaries 20 ms and 50 ms away?
+2. Without network delay, `w: 3` (0.60 ms) was faster than `w: "majority"` (1.39 ms). Why?
+3. After `WriteConcernFailed`, was the document written? Where, and what should the application do?
+4. Why did the primary step down when both secondaries were paused, and why does MongoDB do that?
+5. Which writes in an order service would you allow with `w: 1`, and which never?
+6. With `wtimeout: 0` (the default) and a majority unavailable, what would the client have seen?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-2-sync-vs-async/concept-3-mongodb-write-concern/answers">Worked answers to Q1–Q6</DeepDive>

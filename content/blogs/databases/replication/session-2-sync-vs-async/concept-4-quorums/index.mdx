@@ -1,0 +1,259 @@
+---
+title: "Concept 4: Waiting for one of several replicas"
+description: "With two replicas 20 ms and 50 ms away, waiting for any one of them cost 23 to 26 ms in all three engines, waiting for both 55 to 57 ms. With the near replica down, the any-one commit fell back to the far one (53 to 55 ms) instead of hanging or turning asynchronous. PostgreSQL's FIRST 1 (s2, s1) waited for the listed-first far standby: 55.7 ms. What happens when no quorum is possible differs: PostgreSQL waits, MySQL falls back to async after 10 s, MongoDB times out per write and the primary steps down."
+type: "concept"
+tags: ["replication", "quorum", "synchronous-replication", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/runtime-config-replication.html#GUC-SYNCHRONOUS-STANDBY-NAMES"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-options-source.html#sysvar_rpl_semi_sync_source_wait_for_replica_count"
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+---
+
+<Tldr>
+One synchronous replica turns that replica into a single point of failure for writes. With **two** replicas and a commit that waits for **any one**, the nearest healthy replica sets the latency and one outage costs latency instead of availability. Measured with replicas **20 ms** and **50 ms** away: wait-for-any-one took **22.8–25.5 ms** (PostgreSQL `ANY 1 (s1, s2)`), **26.3 ms** (MySQL `wait_for_replica_count = 1`) and **23.5–26.7 ms** (MongoDB `w: "majority"` on 3 members). With the near replica paused, the same settings took **53.4 ms**, **55.5 ms** and **53.2 ms**: the far replica answered, nothing hung and nothing fell back to async. Waiting for both took **57.5 ms**, **55.7 ms** and **55.3 ms**. PostgreSQL's `FIRST 1 (s2, s1)` waits for the first **listed** healthy standby, here the far one: **55.7 ms**.
+</Tldr>
+
+## The numbers
+
+Single-row commits, replicas delayed 20 ms ("near") and 50 ms ("far") with `netem`, medians of 3 runs (PostgreSQL pgbench 5 s, MySQL 300 commits, MongoDB 300 inserts).
+
+| Wait for | PostgreSQL | MySQL semi-sync | MongoDB |
+|---|---|---|---|
+| Nothing (async / `local` / `w: 1`) | 1.05 ms | 2.24 ms | 0.19 ms |
+| Any 1 of 2, both up | 22.8–25.5 ms `ANY 1 (s1, s2)` | 26.3 ms `count = 1` | 23.5–26.7 ms `"majority"` |
+| Any 1 of 2, near one down | 53.4 ms | 55.5 ms | 53.2 ms |
+| A fixed one (listed first) | 55.7 ms `FIRST 1 (s2, s1)` | n/a | n/a |
+| Both | 57.5 ms `ANY 2 (s1, s2)` | 55.7 ms `count = 2` | 55.3 ms `w: 3` |
+
+| Term | Meaning |
+|---|---|
+| Quorum commit | Wait for any k of n replicas; the k-th fastest decides latency |
+| Priority commit | PostgreSQL `FIRST k (…)`: the first k healthy standbys **in list order** are synchronous, the rest are potential |
+| Majority | MongoDB: more than half of the voting members, counting the primary |
+| **✓ / ✗** | Acknowledged before the commit returns / not waited for |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: synchronous_standby_names with two standbys"
+  height={300}
+  nodes={[
+    { id: 'p', label: 'Primary', sub: 'COMMIT, on', x: 20, y: 120, w: 180 },
+    { id: 's1', label: 'Standby s1', sub: '+20 ms', x: 590, y: 20, w: 190 },
+    { id: 's2', label: 'Standby s2', sub: '+50 ms', x: 590, y: 220, w: 190 },
+    { id: 'ret', label: 'COMMIT returns', sub: 'latency', x: 300, y: 120, w: 190 },
+  ]}
+  edges={[
+    { id: 'p-s1', from: 'p', to: 's1' },
+    { id: 'p-s2', from: 'p', to: 's2' },
+    { id: 'p-ret', from: 'p', to: 'ret' },
+  ]}
+  cases={[
+    {
+      title: "ANY 1 (s1, s2)",
+      path: 's1 ✓ first → returns (22.8–25.5 ms); s2 ✗ not waited for',
+      summary: 'Quorum: whichever standby confirms first.',
+      steps: [
+        {
+          title: 'Both up',
+          note: 'pg_stat_replication shows sync_state = quorum for both. The near standby confirms first: 25.5 ms in one round of runs, 22.8 ms in another.',
+          code: "ALTER SYSTEM SET synchronous_standby_names = 'ANY 1 (s1, s2)'; SELECT pg_reload_conf();",
+          active: ['p', 's1', 'ret'],
+          edges: ['p-s1', 'p-ret'],
+          subs: { s1: '✓ quorum', s2: '✗ not waited', ret: '22.8–25.5 ms' },
+        },
+        {
+          title: 'Near standby paused',
+          note: 'docker pause rpa-pg2 (s1). Commits did not hang: s2 confirmed instead, 53.4 ms median. s1 was still listed as quorum while its connection had not timed out.',
+          active: ['p', 's2', 'ret'],
+          edges: ['p-s2', 'p-ret'],
+          subs: { s1: '✗ paused', s2: '✓ quorum', ret: '53.4 ms' },
+        },
+      ],
+    },
+    {
+      title: "FIRST 1 (s2, s1)",
+      path: 's2 ✓ (listed first) → returns (55.7 ms); s1 potential ✗',
+      summary: 'Priority: the order of the list decides, not the speed.',
+      steps: [
+        {
+          title: 'The far standby is the synchronous one',
+          note: 'sync_state: s2 = sync, s1 = potential. Every commit waits for s2 even though s1 is closer: 55.7 ms. s1 takes over only if s2 disconnects.',
+          code: "ALTER SYSTEM SET synchronous_standby_names = 'FIRST 1 (s2, s1)';",
+          active: ['p', 's2', 'ret'],
+          edges: ['p-s2', 'p-ret'],
+          subs: { s1: 'potential', s2: '✓ sync', ret: '55.7 ms' },
+        },
+      ],
+    },
+    {
+      title: "ANY 2 (s1, s2)",
+      path: 's1 ✓ + s2 ✓ → returns (57.5 ms)',
+      summary: 'Both copies, and both standbys become critical.',
+      steps: [
+        {
+          title: 'Wait for both',
+          note: '57.5 ms median. With either standby down, commits wait as in Concept 1.',
+          active: ['p', 's1', 's2', 'ret'],
+          edges: ['p-s1', 'p-s2', 'p-ret'],
+          subs: { ret: '57.5 ms' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL
+
+<Flow
+  title="MySQL: semi-sync with two replicas"
+  height={300}
+  nodes={[
+    { id: 'src', label: 'Source', sub: 'semi-sync ON', x: 20, y: 120, w: 180 },
+    { id: 'r2', label: 'Replica my2', sub: '+20 ms', x: 590, y: 20, w: 190 },
+    { id: 'r3', label: 'Replica my3', sub: '+50 ms', x: 590, y: 220, w: 190 },
+    { id: 'ret', label: 'COMMIT returns', sub: 'latency', x: 300, y: 120, w: 190 },
+  ]}
+  edges={[
+    { id: 'src-r2', from: 'src', to: 'r2' },
+    { id: 'src-r3', from: 'src', to: 'r3' },
+    { id: 'src-ret', from: 'src', to: 'ret' },
+  ]}
+  cases={[
+    {
+      title: 'rpl_semi_sync_source_wait_for_replica_count = 1',
+      path: 'my2 ACK ✓ first → returns (26.3 ms); my3 ✗ not waited for',
+      summary: 'Any one replica\'s ACK completes the commit.',
+      steps: [
+        {
+          title: 'Both up',
+          note: 'Rpl_semi_sync_source_clients = 2. The near replica acknowledges first: 26.3 ms median.',
+          active: ['src', 'r2', 'ret'],
+          edges: ['src-r2', 'src-ret'],
+          subs: { r2: '✓ ACK', ret: '26.3 ms' },
+        },
+        {
+          title: 'Near replica paused',
+          note: 'docker pause rpa-my2: 55.5 ms median, Rpl_semi_sync_source_status still ON and Rpl_semi_sync_source_no_tx still 0. my3\'s ACK was enough, so the 10 s timeout never triggered.',
+          active: ['src', 'r3', 'ret'],
+          edges: ['src-r3', 'src-ret'],
+          subs: { r2: '✗ paused', r3: '✓ ACK', ret: '55.5 ms, still semi-sync' },
+        },
+      ],
+    },
+    {
+      title: 'wait_for_replica_count = 2',
+      path: 'my2 ✓ + my3 ✓ → returns (55.7 ms)',
+      summary: 'Both replicas must acknowledge.',
+      steps: [
+        {
+          title: 'Wait for both',
+          note: '55.7 ms median. With one replica down, every commit would wait for the 10 s timeout once and then fall back to async (Concept 2).',
+          code: 'SET GLOBAL rpl_semi_sync_source_wait_for_replica_count = 2;',
+          active: ['src', 'r2', 'r3', 'ret'],
+          edges: ['src-r2', 'src-r3', 'src-ret'],
+          subs: { ret: '55.7 ms' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: write concern on a 3-member replica set"
+  height={300}
+  nodes={[
+    { id: 'pri', label: 'Primary', sub: 'counts as 1 of 3', x: 20, y: 120, w: 180 },
+    { id: 'm2', label: 'Secondary 2', sub: '+20 ms', x: 590, y: 20, w: 190 },
+    { id: 'm3', label: 'Secondary 3', sub: '+50 ms', x: 590, y: 220, w: 190 },
+    { id: 'ret', label: 'Write acknowledged', sub: 'latency', x: 300, y: 120, w: 190 },
+  ]}
+  edges={[
+    { id: 'pri-m2', from: 'pri', to: 'm2' },
+    { id: 'pri-m3', from: 'pri', to: 'm3' },
+    { id: 'pri-ret', from: 'pri', to: 'ret' },
+  ]}
+  cases={[
+    {
+      title: 'w: "majority"',
+      path: 'primary ✓ + secondary 2 ✓ = 2 of 3 → acknowledged (23.5–26.7 ms); secondary 3 ✗',
+      summary: 'Majority on three members is a quorum of one secondary.',
+      steps: [
+        {
+          title: 'All members up',
+          note: '26.7 ms in one session, 23.5 ms in another (medians of 300).',
+          active: ['pri', 'm2', 'ret'],
+          edges: ['pri-m2', 'pri-ret'],
+          subs: { m2: '✓ applied', ret: '23.5–26.7 ms' },
+        },
+        {
+          title: 'Near secondary paused',
+          note: 'docker pause rpa-mongo2 for 12 s, then 300 inserts: 53.2 ms median. The primary plus secondary 3 still form a majority, so the primary did not step down (rs.status: mongo2 "not reachable/healthy").',
+          active: ['pri', 'm3', 'ret'],
+          edges: ['pri-m3', 'pri-ret'],
+          subs: { m2: '✗ paused', m3: '✓ applied', ret: '53.2 ms' },
+        },
+      ],
+    },
+    {
+      title: 'w: 3',
+      path: 'primary ✓ + secondary 2 ✓ + secondary 3 ✓ → acknowledged (55.3 ms)',
+      summary: 'Every member must confirm.',
+      steps: [
+        {
+          title: 'Wait for all',
+          note: '55.3 ms median; with any member down, the write waits until wtimeout (Concept 3).',
+          active: ['pri', 'm2', 'm3', 'ret'],
+          edges: ['pri-m2', 'pri-m3', 'pri-ret'],
+          subs: { ret: '55.3 ms' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## When no quorum is possible
+
+| | PostgreSQL | MySQL semi-sync | MongoDB |
+|---|---|---|---|
+| Commit when required replicas are down | Waits without limit (`SyncRep`) | Waits `rpl_semi_sync_source_timeout` (10 s) once, then async | Waits until `wtimeout`, error `WriteConcernFailed`, write kept |
+| Primary keeps accepting writes | Yes, but they all hang | Yes, unprotected | No: steps down after ~10 s without a majority |
+| A cancelled or timed-out commit | Committed locally | Committed (async) | Written on the primary, outcome unknown |
+
+<Pitfall>
+`FIRST 1 (s2, s1)` and `ANY 1 (s1, s2)` look alike and behave differently. With FIRST, the list order picks the synchronous standby: here every commit waited for the far standby (55.7 ms) while the near one was idle as "potential". Use `ANY` when any standby is an acceptable copy; use `FIRST` only when one standby must be preferred, for example the one in the failover zone.
+</Pitfall>
+
+## Real-world scenario: two zones, three replicas
+
+An order database runs in one primary zone with one replica in the same zone (1 ms away) and one in a second zone (8 ms away). Waiting for "any one" will nearly always be satisfied by the same-zone replica, so commits stay fast, but a zone outage takes both the primary and the replica that acknowledged most commits. If the requirement is "a committed order survives the loss of a zone", the acknowledgement must come from the other zone: `FIRST 1 (zone_b_standby, zone_a_standby)` in PostgreSQL, a write concern with tag sets in MongoDB (custom `getLastErrorModes`, from the documentation), and in MySQL a semi-sync replica placed only in the other zone. The price is the cross-zone round trip on every commit, which these measurements show is the whole cost.
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concepts 1–3 | Each engine's single-replica behaviour |
+| Session 5 | Which replica can be promoted without losing acknowledged commits |
+| Session 8 | Choosing durability per write in a marketplace application |
+
+## Key takeaways
+
+1. Waiting for any one of two replicas cost the near replica's round trip: 23–26 ms in all three engines at 20 ms.
+2. With the near replica down, the far one answered (53–55 ms): one outage costs latency, not availability.
+3. Waiting for all replicas costs the slowest round trip (55–57 ms) and makes every replica critical.
+4. PostgreSQL's `FIRST` follows list order, not speed.
+5. When no quorum is possible, PostgreSQL waits, MySQL falls back to async, MongoDB errors per write and the primary steps down.
+
+## Check questions
+
+1. Why did MongoDB's `w: "majority"` behave like "any one of two secondaries"?
+2. With the near replica paused, why did MySQL not hit its 10-second timeout?
+3. `FIRST 1 (s2, s1)` took 55.7 ms and `ANY 1 (s1, s2)` 22.8–25.5 ms. Explain, and say when FIRST is the right choice.
+4. What does a commit acknowledged by "any one" replica guarantee if the primary's whole zone fails?
+5. Which setting would you pick for a payment service with three nodes in two zones, and what does it cost per commit?
+6. Fill in: when no quorum is possible, PostgreSQL …, MySQL …, MongoDB … .
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-2-sync-vs-async/concept-4-quorums/answers">Worked answers to Q1–Q6</DeepDive>

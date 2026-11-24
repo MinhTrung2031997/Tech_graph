@@ -1,0 +1,211 @@
+---
+title: "Lab and session quiz: Synchronous vs asynchronous"
+description: "Measure commit latency at each PostgreSQL synchronous_commit level, with MySQL semi-sync and with each MongoDB write concern, with and without 20 ms and 50 ms of injected network delay; then take replicas away and watch PostgreSQL wait, MySQL fall back to async after 10 s and MongoDB time out and step down; finish with any-one-of-two quorums."
+type: "how-to"
+tags: ["replication", "synchronous-replication", "semi-sync", "write-concern", "postgresql", "mysql", "mongodb", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/pgbench.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-semisync-installation.html"
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+  - "https://man7.org/linux/man-pages/man8/tc-netem.8.html"
+---
+
+<Tldr>
+Uses the clusters, aliases and `delay.sh` from the [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) with prefix `rp`, one engine at a time. Exercise 4 adds a second PostgreSQL standby and a second MySQL replica. Latencies below come from one laptop with `netem` delays; your absolute numbers will differ, the ratios (one round trip per wait, nearest replica wins) should not. No `orders` data is needed: each exercise creates a one-column table.
+</Tldr>
+
+## Exercise 1: PostgreSQL synchronous_commit (Concept 1)
+
+```bash
+bash rp-setup.sh rp pg
+# name the standby s1 (pg_basebackup -R wrote a primary_conninfo without application_name)
+docker exec rp-pg2 psql -U postgres -c "ALTER SYSTEM SET primary_conninfo = 'host=rp-pg1 user=postgres application_name=s1'" -c "SELECT pg_reload_conf()"
+docker exec rp-pg1 psql -U postgres -c "CREATE TABLE t (id bigserial PRIMARY KEY, v int, at timestamptz DEFAULT now())"
+docker exec rp-pg1 sh -c "echo 'INSERT INTO t (v) VALUES (1);' > /tmp/ins.sql"
+docker exec rp-pg1 psql -U postgres -c "ALTER SYSTEM SET synchronous_standby_names = 's1'" -c "SELECT pg_reload_conf()"
+docker exec rp-pg1 psql -U postgres -c "SELECT application_name, sync_state FROM pg_stat_replication"   # s1 | sync
+```
+
+Latency per level, without and then with delay on the standby:
+
+```bash
+for lvl in off local remote_write on remote_apply; do
+  echo "$lvl: $(docker exec -e PGOPTIONS="-c synchronous_commit=$lvl" rp-pg1 pgbench -U postgres -n -c 1 -T 5 -f /tmp/ins.sql postgres | grep 'latency average')"
+done
+sh delay.sh rp-pg2 20      # then run the loop again
+```
+
+Lab medians with +20 ms: off 0.008, local 1.05, remote_write 23.8, on 26.2, remote_apply 26.0 ms.
+
+Stop the synchronous standby and commit (two terminals):
+
+```bash
+sh delay.sh rp-pg2 off; docker pause rp-pg2
+# terminal 1: hangs
+docker exec rp-pg1 psql -U postgres -c "SET statement_timeout = '3s'" -c "INSERT INTO t (v) VALUES (42)"
+# terminal 2
+docker exec rp-pg1 psql -U postgres -c "SELECT pid, wait_event, now() - query_start FROM pg_stat_activity WHERE wait_event = 'SyncRep'"
+docker exec rp-pg1 psql -U postgres -c "SELECT count(*) FROM t WHERE v = 42"            # 0 while waiting
+docker exec rp-pg1 psql -U postgres -c "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE wait_event = 'SyncRep'"
+docker exec rp-pg1 psql -U postgres -c "SELECT count(*) FROM t WHERE v = 42"            # 1: committed anyway
+docker exec -e PGOPTIONS="-c synchronous_commit=local" rp-pg1 psql -U postgres -c "INSERT INTO t (v) VALUES (45)"   # returns at once
+docker unpause rp-pg2
+```
+
+Terminal 1 ends with `WARNING: canceling wait for synchronous replication due to user request`, `DETAIL: The transaction has already committed locally, but might not have been replicated to the standby.` and `INSERT 0 1`. Keep the cluster for Exercise 4 or tear it down.
+
+## Exercise 2: MySQL semi-sync (Concept 2)
+
+```bash
+bash rp-setup.sh rp mysql
+docker exec -i rp-my1 mysql -uroot -plab <<'SQL'
+CREATE DATABASE shop;
+CREATE TABLE shop.t (id BIGINT AUTO_INCREMENT PRIMARY KEY, v INT, at DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6));
+DELIMITER //
+CREATE PROCEDURE shop.ins(n INT)
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  WHILE i < n DO INSERT INTO shop.t (v) VALUES (i); SET i = i + 1; END WHILE;   -- autocommit: one commit per row
+END //
+DELIMITER ;
+SQL
+# average commit time of 300 single-row commits
+docker exec rp-my1 mysql -uroot -plab -N -e "SET @t := NOW(6); CALL shop.ins(300); SELECT TIMESTAMPDIFF(MICROSECOND, @t, NOW(6)) / 300 / 1000 AS ms_per_commit"
+```
+
+Turn semi-sync on, then measure again with and without `sh delay.sh rp-my2 20`:
+
+```sql
+-- rmy1
+INSTALL PLUGIN rpl_semi_sync_source SONAME 'semisync_source.so';
+SET GLOBAL rpl_semi_sync_source_enabled = ON;
+-- rmy2
+INSTALL PLUGIN rpl_semi_sync_replica SONAME 'semisync_replica.so';
+SET GLOBAL rpl_semi_sync_replica_enabled = ON;
+STOP REPLICA IO_THREAD; START REPLICA IO_THREAD;
+-- rmy1
+SHOW GLOBAL STATUS LIKE 'Rpl_semi_sync_source_%';   -- clients 1, status ON
+```
+
+Lab medians with +20 ms: async 2.53 ms, semi-sync 24.95 ms. Visibility during the wait, with a 2,000 ms delay:
+
+```bash
+sh delay.sh rp-my2 2000
+docker exec rp-my1 mysql -uroot -plab -e "INSERT INTO shop.t (v) VALUES (777)" &
+sleep 0.8; docker exec rp-my1 mysql -uroot -plab -N -e "SELECT count(*) FROM shop.t WHERE v = 777"   # 0 with AFTER_SYNC
+wait
+# repeat after: SET GLOBAL rpl_semi_sync_source_wait_point = AFTER_COMMIT;  -> 1
+sh delay.sh rp-my2 off
+```
+
+The timeout and fallback:
+
+```bash
+docker pause rp-my2
+for i in 1 2 3; do time docker exec rp-my1 mysql -uroot -plab -e "INSERT INTO shop.t (v) VALUES (900)"; done   # ~10 s, then fast
+docker exec rp-my1 mysql -uroot -plab -e "SHOW GLOBAL STATUS LIKE 'Rpl_semi_sync_source_%'"                      # status OFF, no_tx 3
+docker exec rp-my1 mysql -uroot -plab -e "SELECT LOGGED, ERROR_CODE, DATA FROM performance_schema.error_log WHERE DATA LIKE '%semi-sync%'"
+docker unpause rp-my2   # status returns to ON
+```
+
+## Exercise 3: MongoDB write concern (Concept 3)
+
+```bash
+bash rp-setup.sh rp mongo
+```
+
+Save as `wc.js`, copy it with `docker cp wc.js rp-mongo1:/tmp/` and run `docker exec rp-mongo1 mongosh --quiet /tmp/wc.js`:
+
+```js
+// Median / p95 latency of single-document inserts under different write concerns (client on the primary's host).
+const c = db.getSiblingDB('shop').wc;
+const wcs = [['w:1', { w: 1, j: false }], ['w:1, j:true', { w: 1, j: true }], ['w:"majority"', { w: 'majority' }], ['w:3', { w: 3 }]];
+const N = 300; let id = Date.now() * 10;
+for (const [label, wc] of wcs) {
+  const t = [];
+  for (let i = 0; i < N; i++) {
+    const s = process.hrtime.bigint();
+    c.insertOne({ _id: id++, v: i }, { writeConcern: wc });
+    t.push(Number(process.hrtime.bigint() - s) / 1e6);
+  }
+  t.sort((a, b) => a - b);
+  print(`${label}|median=${t[N / 2].toFixed(2)} ms|p95=${t[Math.floor(N * 0.95)].toFixed(2)} ms`);
+}
+print('default write concern:', JSON.stringify(db.adminCommand({ getDefaultRWConcern: 1 }).defaultWriteConcern));
+```
+
+Run it, then again after `sh delay.sh rp-mongo2 20; sh delay.sh rp-mongo3 50`. Lab medians with delays: w:1 0.19, j:true 1.24, majority 26.68, w:3 55.26 ms. Remove the delays, then pause both secondaries and run this as `pause.js`:
+
+```js
+const c = db.getSiblingDB('shop').wc;
+const t0 = Date.now();
+let s = Date.now(); c.insertOne({ _id: 'p-w1', at: new Date() }, { writeConcern: { w: 1 } }); print('w:1 insert ok in', Date.now() - s, 'ms');
+s = Date.now();
+try { c.insertOne({ _id: 'p-maj', at: new Date() }, { writeConcern: { w: 'majority', wtimeout: 2000 } }); print('majority ok?!'); }
+catch (e) { print('w:majority, wtimeout 2000 ->', e.codeName || e.name, e.code, '|', JSON.stringify(e.writeConcernError || e.errInfo || e.message).slice(0, 300), '| after', Date.now() - s, 'ms'); }
+print('p-maj on primary (readConcern local):', JSON.stringify(c.findOne({ _id: 'p-maj' }) !== null));
+while (db.hello().isWritablePrimary) sleep(100);
+print('primary stepped down', Date.now() - t0, 'ms after the secondaries were paused (approx)');
+try { c.insertOne({ _id: 'p-after', at: new Date() }, { writeConcern: { w: 1 } }); } catch (e) { print('w:1 after stepdown ->', e.codeName, e.code, e.message.slice(0, 120)); }
+print('state now:', rs.status().members.map(m => m.name + ' ' + m.stateStr).join(', '));
+```
+
+```bash
+sh delay.sh rp-mongo2 off; sh delay.sh rp-mongo3 off
+docker cp pause.js rp-mongo1:/tmp/
+docker pause rp-mongo2 rp-mongo3; docker exec rp-mongo1 mongosh --quiet /tmp/pause.js; docker unpause rp-mongo2 rp-mongo3
+```
+
+Lab output: `w:1 insert ok in 5 ms`, `WriteConcernFailed 64 … waiting for replication timed out … after 2017 ms`, `p-maj on primary: true`, `primary stepped down 9607 ms …`, `w:1 after stepdown -> NotWritablePrimary 10107 not primary`. The lab run used equal member priorities, and `rp-mongo2` was elected after the unpause. With the setup script's `priority: 2`, `rp-mongo1` takes the primary role back once it has caught up.
+
+## Exercise 4: quorums (Concept 4)
+
+PostgreSQL, a second standby `s2` (keep `rp-pg1` and `rp-pg2` from Exercise 1):
+
+```bash
+docker run -d --name rp-pg3 --network rp-net --user postgres --entrypoint sh postgres:17-alpine -c \
+  "{ [ -s /var/lib/postgresql/data/PG_VERSION ] || pg_basebackup -h rp-pg1 -U postgres -D /var/lib/postgresql/data -R -X stream -C -S standby2 -c fast; } && chmod 700 /var/lib/postgresql/data && exec postgres -c shared_buffers=64MB -c hot_standby=on"
+until docker exec rp-pg3 pg_isready -q 2>/dev/null; do sleep 1; done   # -c fast: do not wait for a spread checkpoint
+docker exec rp-pg3 psql -U postgres -c "ALTER SYSTEM SET primary_conninfo = 'host=rp-pg1 user=postgres application_name=s2'" -c "SELECT pg_reload_conf()"
+sh delay.sh rp-pg2 20; sh delay.sh rp-pg3 50
+for names in 'ANY 1 (s1, s2)' 'FIRST 1 (s2, s1)' 'ANY 2 (s1, s2)'; do
+  docker exec rp-pg1 psql -U postgres -qc "ALTER SYSTEM SET synchronous_standby_names = '$names'" -c "SELECT pg_reload_conf()"; sleep 1
+  echo "$names: $(docker exec rp-pg1 pgbench -U postgres -n -c 1 -T 5 -f /tmp/ins.sql postgres | grep 'latency average')"
+done
+```
+
+Then set `ANY 1 (s1, s2)`, `docker pause rp-pg2` and measure again (lab: 22.8–25.5 ms, then 53.4 ms with s1 paused; FIRST 55.7 ms; ANY 2 57.5 ms).
+
+MySQL, a second replica `rp-my3` (semi-sync plugins as in Exercise 2):
+
+```bash
+docker run -d --name rp-my3 --network rp-net -e MYSQL_ROOT_PASSWORD=lab mysql:8.4 --server-id=3 --gtid-mode=ON \
+  --enforce-gtid-consistency=ON --log-bin=binlog --binlog-format=ROW --innodb-buffer-pool-size=64M --performance-schema=ON
+# wait until it accepts connections, then:
+docker exec rp-my3 mysql -uroot -plab -e "CHANGE REPLICATION SOURCE TO SOURCE_HOST='rp-my1', SOURCE_USER='root', SOURCE_PASSWORD='lab', SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1; START REPLICA;"
+docker exec rp-my3 mysql -uroot -plab -e "INSTALL PLUGIN rpl_semi_sync_replica SONAME 'semisync_replica.so'; SET GLOBAL rpl_semi_sync_replica_enabled = ON; STOP REPLICA IO_THREAD; START REPLICA IO_THREAD;"
+sh delay.sh rp-my2 20; sh delay.sh rp-my3 50
+```
+
+Measure with `rpl_semi_sync_source_wait_for_replica_count` 1 and 2, and with 1 while `rp-my2` is paused (lab: 26.3, 55.7 and 55.5 ms). MongoDB: with `rp-mongo2` at +20 ms and `rp-mongo3` at +50 ms, run `wc.js` normally, then after `docker pause rp-mongo2` (lab: majority 23.5 ms, then 53.2 ms with the primary still PRIMARY).
+
+## Reset
+
+```bash
+docker unpause rp-pg2 rp-my2 rp-mongo2 rp-mongo3 2>/dev/null
+bash rp-teardown.sh rp     # also removes rp-pg3 and rp-my3
+```
+
+## Session quiz
+
+1. List PostgreSQL's `synchronous_commit` levels in order and what each one waits for. Which one makes a read on the standby see the row?
+2. With a 20 ms standby, `local` took 1.05 ms and `on` 26.2 ms. What does the extra 25 ms buy?
+3. The synchronous standby was paused. What happened to commits, did `statement_timeout` help, and what did a cancelled commit leave behind?
+4. What does a MySQL semi-sync ACK confirm, and why is AFTER_SYNC the safer wait point?
+5. Why did the first commit with the MySQL replica paused take 10 s and the next one 0.09 s? What should you monitor?
+6. Why was MongoDB's `w: "majority"` 26.7 ms and `w: 3` 55.3 ms on the same set?
+7. A `WriteConcernFailed` error came back. Was the document written? What else happened to the primary 9.6 s later, and why?
+8. With replicas at 20 ms and 50 ms, what did "any one of two" cost when both were up and when the near one was down, and what does it not protect against?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-2-sync-vs-async/lab/answers">Answers to the session quiz</DeepDive>

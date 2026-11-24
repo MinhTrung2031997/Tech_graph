@@ -1,0 +1,186 @@
+---
+title: "Concept 2: MySQL semi-synchronous replication"
+description: "MySQL is asynchronous by default; the semisync plugin makes a commit wait until a replica has written the transaction to its relay log. With the replica 20 ms away, commits took 2.5 ms async and 25.0 ms semi-sync. With AFTER_SYNC (the default) other sessions did not see the row during the wait; with AFTER_COMMIT they did. With the replica paused, the first commit waited the full rpl_semi_sync_source_timeout of 10 s, then the source silently switched to asynchronous: the next commits took 0.09 and 0.06 s."
+type: "concept"
+tags: ["replication", "semi-sync", "mysql", "durability", "latency"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-semisync-installation.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-options-source.html#sysvar_rpl_semi_sync_source_wait_point"
+---
+
+<Tldr>
+MySQL replication is asynchronous unless you load the **semisync** plugins. Then a commit waits until a replica confirms it has the transaction **in its relay log** (received and written, not applied). With 20 ms of delay to the replica, single-row commits took **2.5 ms** async and **25.0 ms** semi-sync (2.3 vs 2.4 ms without delay). The wait point matters: with **AFTER_SYNC** (default) the row stays invisible to other sessions until the replica acknowledges; with **AFTER_COMMIT** another session saw it during the wait, so a reader could see a row that a failover then loses. Semi-sync has a **timeout**: with the replica paused, the first commit waited **10.04 s** (`rpl_semi_sync_source_timeout = 10000`), then the source switched to **asynchronous** (`Rpl_semi_sync_source_status = OFF`) and the next commits took **0.09 s** and **0.06 s**, with only an error-log line to show for it. It switched back on as soon as the replica reconnected.
+</Tldr>
+
+## Turning it on
+
+```sql
+-- source
+INSTALL PLUGIN rpl_semi_sync_source SONAME 'semisync_source.so';
+SET GLOBAL rpl_semi_sync_source_enabled = ON;
+-- each replica
+INSTALL PLUGIN rpl_semi_sync_replica SONAME 'semisync_replica.so';
+SET GLOBAL rpl_semi_sync_replica_enabled = ON;
+STOP REPLICA IO_THREAD; START REPLICA IO_THREAD;   -- reconnect as a semi-sync replica
+```
+
+On the source: `Rpl_semi_sync_source_clients = 1`, `Rpl_semi_sync_source_status = ON`; defaults `rpl_semi_sync_source_timeout = 10000` (ms), `rpl_semi_sync_source_wait_for_replica_count = 1`, `rpl_semi_sync_source_wait_point = AFTER_SYNC`.
+
+| Setup (single-row autocommit INSERT, median of 3 × 300) | Commit time |
+|---|---|
+| Async, no delay | 2.31 ms |
+| Semi-sync, no delay | 2.43 ms |
+| Async, replica +20 ms | 2.53 ms |
+| Semi-sync AFTER_SYNC, replica +20 ms | 24.95 ms |
+| Semi-sync AFTER_COMMIT, replica +20 ms | 25.98 ms |
+
+| Term | Meaning |
+|---|---|
+| Semi-sync ACK | The replica's I/O thread acknowledges after writing the events to its relay log |
+| AFTER_SYNC | Wait for the ACK after the binlog is flushed, **before** the storage engine commit (row invisible meanwhile) |
+| AFTER_COMMIT | Wait for the ACK **after** the storage engine commit (row already visible to others) |
+| Fallback | After `rpl_semi_sync_source_timeout` without an ACK the source continues asynchronously |
+| **✓ / ✗** | Done / waiting or skipped |
+
+## What a commit waits for
+
+<Flow
+  title="MySQL: COMMIT with semi-sync, replica 20 ms away"
+  height={350}
+  nodes={[
+    { id: 'client', label: 'Client', sub: 'COMMIT', x: 20, y: 20, w: 170 },
+    { id: 'binlog', label: 'Binlog flush', sub: 'source', x: 20, y: 150, w: 170 },
+    { id: 'engine', label: 'InnoDB commit', sub: 'row visible to others', x: 20, y: 280, w: 170 },
+    { id: 'dump', label: 'Binlog Dump', sub: 'sends events', x: 310, y: 150, w: 180 },
+    { id: 'relay', label: 'Replica relay log', sub: 'written by replica_io', x: 600, y: 150, w: 180 },
+    { id: 'ack', label: 'Semi-sync ACK', sub: 'back to the source', x: 600, y: 20, w: 180 },
+  ]}
+  edges={[
+    { id: 'client-binlog', from: 'client', to: 'binlog' },
+    { id: 'binlog-engine', from: 'binlog', to: 'engine' },
+    { id: 'binlog-dump', from: 'binlog', to: 'dump' },
+    { id: 'dump-relay', from: 'dump', to: 'relay', label: 'events' },
+    { id: 'relay-ack', from: 'relay', to: 'ack' },
+    { id: 'ack-client', from: 'ack', to: 'client', label: 'OK' },
+  ]}
+  cases={[
+    {
+      title: 'AFTER_SYNC (default)',
+      path: 'binlog flush ✓ → events sent ✓ → relay log ✓ → ACK ✓ → InnoDB commit ✓ → client OK (24.95 ms)',
+      summary: 'Nobody sees the row before a replica has it.',
+      steps: [
+        {
+          title: 't1: flush the binlog, send it',
+          note: 'The transaction is in the source\'s binlog and on its way to the replica, but InnoDB has not committed it yet.',
+          code: 'INSERT INTO shop.t (v) VALUES (777);',
+          active: ['client', 'binlog', 'dump'],
+          edges: ['client-binlog', 'binlog-dump'],
+        },
+        {
+          title: 't2: wait for the ACK',
+          note: 'With the replica\'s replies delayed 2,000 ms, another session counted rows with v = 777 during the wait: 0.',
+          active: ['dump', 'relay', 'ack'],
+          edges: ['dump-relay', 'relay-ack'],
+          subs: { relay: '✓ written', engine: '✗ not yet committed' },
+        },
+        {
+          title: 't3: commit, return',
+          note: 'After the ACK, InnoDB commits and the client gets OK. 24.95 ms median with 20 ms of delay.',
+          active: ['binlog', 'engine', 'ack', 'client'],
+          edges: ['binlog-engine', 'ack-client'],
+          subs: { engine: '✓ committed, visible' },
+        },
+      ],
+    },
+    {
+      title: 'AFTER_COMMIT',
+      path: 'binlog flush ✓ → InnoDB commit ✓ (visible) → events sent → ACK ✓ → client OK (25.98 ms)',
+      summary: 'Others can read the row before any replica has it.',
+      steps: [
+        {
+          title: 'Visible during the wait',
+          note: 'SET GLOBAL rpl_semi_sync_source_wait_point = AFTER_COMMIT. Same 2,000 ms delay: another session counted 1 row with v = 777 while the committing session was still waiting. If the source crashed at that moment and the replica were promoted, a row some users had already seen would vanish.',
+          active: ['client', 'binlog', 'engine', 'dump'],
+          edges: ['client-binlog', 'binlog-engine', 'binlog-dump'],
+          subs: { engine: '✓ visible before ACK' },
+        },
+        {
+          title: 'Then the ACK',
+          note: 'The committing client waits for the ACK as before: 25.98 ms median with 20 ms of delay.',
+          active: ['dump', 'relay', 'ack', 'client'],
+          edges: ['dump-relay', 'relay-ack', 'ack-client'],
+        },
+      ],
+    },
+    {
+      title: 'The replica stops answering',
+      path: 'binlog flush ✓ → ACK ✗ for 10 s → timeout → status OFF → async: next commits 0.09 s, 0.06 s',
+      summary: 'Semi-sync protects you until it is needed, then turns itself off.',
+      steps: [
+        {
+          title: 'One commit waits the full timeout',
+          note: 'docker pause rpa-my2, then three single-row INSERTs: 10.04 s, 0.09 s, 0.06 s. The error log: MY-011153 "Timeout waiting for reply of binlog (file: binlog.000003, pos: 1366018), semi-sync up to file binlog.000003, position 1365719."',
+          active: ['client', 'binlog', 'dump', 'relay'],
+          edges: ['client-binlog', 'binlog-dump', 'dump-relay'],
+          subs: { relay: '✗ paused', ack: '✗ none for 10 s' },
+        },
+        {
+          title: 'Asynchronous from now on',
+          note: 'Rpl_semi_sync_source_status = OFF, Rpl_semi_sync_source_no_tx = 3 (commits not acknowledged). Commits return after the local commit, like async replication. After docker unpause the replica reconnected and the status was back ON within 0.1 s of the first check.',
+          code: "SHOW GLOBAL STATUS LIKE 'Rpl_semi_sync_source_status';   -- OFF, then ON again",
+          active: ['binlog', 'engine', 'ack'],
+          edges: ['binlog-engine'],
+          subs: { ack: 'status OFF → ON' },
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+Semi-sync's default is to fail open. After 10 s without an acknowledgement the source keeps committing asynchronously, and the commits made in that window (`Rpl_semi_sync_source_no_tx`) exist only on the source. If the source dies during that window, promoting the replica loses them, even though "semi-sync is enabled". Alert on `Rpl_semi_sync_source_status = OFF`. If you would rather stop than lose commits, raise `rpl_semi_sync_source_timeout` to a very large value, which turns a replica outage into a write outage, like PostgreSQL's synchronous standby (Concept 1).
+</Pitfall>
+
+## What the ACK means
+
+The replica acknowledges after its I/O thread has **written the events to the relay log** (from the documentation: written and flushed to the relay log), not after applying them. So semi-sync gives:
+
+| Guarantee | Semi-sync AFTER_SYNC |
+|---|---|
+| A committed transaction is on at least one replica | ✓ (while status = ON) |
+| It is visible to queries on the replica | ✗ the applier may be behind |
+| Others saw it only after a replica had it | ✓ (✗ with AFTER_COMMIT) |
+| Commits continue when every replica is down | ✓ after the timeout, unprotected |
+
+## Real-world scenario: "semi-sync" that was off for a week
+
+A payment service runs MySQL with semi-sync to one replica in another zone. A network change raises the round trip above normal for a few seconds, one commit hits the 10-second timeout, and the source falls back to async. The replica reconnects and semi-sync comes back, but a second incident a week later leaves a replica with a broken relay log, and semi-sync stays OFF for days. When the source's disk fails, the newest transactions are only on the dead source. Fixes: two semi-sync replicas with `wait_for_replica_count = 1` (Concept 4), monitoring of `Rpl_semi_sync_source_status` and `Rpl_semi_sync_source_no_tx`, and a deliberate choice of `rpl_semi_sync_source_timeout` rather than the default.
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 1 | PostgreSQL waits forever instead of falling back |
+| Concept 4 | Waiting for one of two replicas |
+| [Session 1, Concept 2](/blogs/databases/replication/session-1-how-replication-works/concept-2-mysql-binlog-gtid) | The binlog, the relay log and the replica's threads |
+
+## Key takeaways
+
+1. Semi-sync makes a commit wait for one replica's relay-log write: 25 ms instead of 2.5 ms with 20 ms of delay.
+2. AFTER_SYNC (default) hides the row until the ACK; AFTER_COMMIT lets others see it first.
+3. The ACK means "received", not "applied": reads on the replica can still be stale.
+4. After `rpl_semi_sync_source_timeout` (10 s) without an ACK the source silently becomes asynchronous; it turns semi-sync back on when a replica reconnects.
+5. Monitor `Rpl_semi_sync_source_status` and `Rpl_semi_sync_source_no_tx`.
+
+## Check questions
+
+1. What exactly has happened on the replica when it sends the semi-sync ACK?
+2. Why is AFTER_SYNC safer than AFTER_COMMIT, using the 0-row vs 1-row observation?
+3. The first commit with the replica paused took 10.04 s and the next ones 0.09 s. Explain.
+4. Which commits are at risk if the source fails while `Rpl_semi_sync_source_status = OFF`, and how do you count them?
+5. How would you make MySQL stop accepting commits instead of falling back to async, and what is the cost?
+6. Semi-sync is on. Can a read on the replica right after a commit miss the row? Why?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-2-sync-vs-async/concept-2-mysql-semi-sync/answers">Worked answers to Q1–Q6</DeepDive>

@@ -1,0 +1,12 @@
+{
+  "title": "Session 2: Synchronous vs asynchronous",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-postgresql-synchronous-commit/index",
+    "concept-2-mysql-semi-sync/index",
+    "concept-3-mongodb-write-concern/index",
+    "concept-4-quorums/index",
+    "lab/index"
+  ]
+}

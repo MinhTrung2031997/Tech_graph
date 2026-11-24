@@ -1,0 +1,62 @@
+---
+title: "Answers: MongoDB write concern"
+description: "Worked answers to the Session 2 Concept 3 check questions."
+companion: "answers"
+tags: ["replication", "write-concern", "mongodb", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+  - "https://www.mongodb.com/docs/manual/core/replica-set-elections/"
+---
+
+<Tldr>
+The write concern decides when you are told, not whether the write happens. Majority is the line between "may be rolled back" and "survives any election".
+</Tldr>
+
+## Q1. Majority is the nearest secondary
+
+**Question:** why was `w: "majority"` 26.7 ms and not 55 ms on a set with secondaries 20 ms and 50 ms away?
+
+A majority of three voting members is two. The primary counts as one, so the write needs one more member, and whichever secondary confirms first completes the majority. The +20 ms secondary always answered first: 26.7 ms. Only `w: 3`, which needs every member, waited for the +50 ms one (55.3 ms).
+
+> **Common mistake:** assuming majority latency is the average of the secondaries' latencies. It is the latency of the k-th fastest member.
+
+## Q2. w: 3 faster than majority without delay
+
+**Question:** without network delay, `w: 3` (0.60 ms) was faster than `w: "majority"` (1.39 ms). Why?
+
+`w: "majority"` implies journaling on the acknowledging members when `writeConcernMajorityJournalDefault` is true (the default, from the documentation): each must flush its journal before confirming, about 1 ms here (compare `w: 1, j: true` at 1.20 ms). `w: 3` without `j: true` only needs the members to apply the write in memory. With 20–50 ms of network delay the difference disappears in the round trip.
+
+> **Common mistake:** concluding `w: 3` is "safer and faster". Without `j`, a member that crashes right after acknowledging can lose the write from its memory.
+
+## Q3. After WriteConcernFailed
+
+**Question:** after `WriteConcernFailed`, was the document written? Where, and what should the application do?
+
+Yes, on the primary: a read with readConcern `local` found `p-maj` right after the error, and after the secondaries returned the newly elected primary had it too. The error only says the primary could not confirm a majority within `wtimeout`. The outcome is unknown: the write may survive (as here) or be rolled back if the primary fails before replicating it. The application should treat it as unknown, not as failed: re-read by a unique business key (order number) before retrying, or make the operation idempotent.
+
+> **Common mistake:** catching the error and inserting again, creating a duplicate order.
+
+## Q4. Stepping down
+
+**Question:** why did the primary step down when both secondaries were paused, and why does MongoDB do that?
+
+A primary must be able to reach a majority of voting members. With both secondaries unreachable it saw only itself (1 of 3) and stepped down 9.6 s after the pause, close to the 10-second election timeout. The reason is to avoid two primaries: the two other members, if they could see each other but not the old primary, would elect a new primary; an old primary still accepting writes would then create two conflicting histories. After stepping down, it refused even `w: 1` writes (NotWritablePrimary).
+
+> **Common mistake:** expecting `w: 1` writes to continue during a network partition that isolates the primary. They stop within about ten seconds.
+
+## Q5. w: 1 in an order service
+
+**Question:** which writes in an order service would you allow with `w: 1`, and which never?
+
+`w: 1` is acceptable where losing the last few seconds after a failover is harmless or self-correcting: page-view and search events, product-view counters, cart heartbeats, recommendation impressions, cache documents. Never for orders, payments, refunds, stock reservations, or anything a customer is told is confirmed: those use `w: "majority"`, because writes acknowledged with `w: 1` can be rolled back by an election (Session 5).
+
+> **Common mistake:** lowering the write concern globally in the connection string to fix latency.
+
+## Q6. wtimeout: 0
+
+**Question:** with `wtimeout: 0` (the default) and a majority unavailable, what would the client have seen?
+
+`wtimeout: 0` means wait without limit. The insert would have blocked until a majority acknowledged it or until something else ended it: here, the primary stepping down after about 10 s ends pending majority waits with an error because the node is no longer primary (from the documentation, not measured here), and a client-side timeout (`maxTimeMS` or the driver's socket timeout) would end it earlier. Either way the outcome is unknown, as in Q3.
+
+> **Common mistake:** expecting the default write concern to fail fast when replicas are down. It waits.
