@@ -1,0 +1,266 @@
+---
+title: "Concept 4: Physical vs logical, measured"
+description: "The same writes on the same 100,000 orders cost very different amounts of replication traffic. A single-row INSERT: 272 bytes of PostgreSQL WAL, 338 bytes of MySQL binlog, 397 bytes of MongoDB oplog. An UPDATE of all 100,000 rows: 34 to 47 MB of WAL (39.9 MB with wal_compression = lz4), 8.2 MB of row-format binlog (343 bytes as a statement), 18.5 MB of oplog in 100,000 entries. Physical replication ships page changes including indexes; logical replication ships rows and leaves index work to the replica."
+type: "concept"
+tags: ["replication", "wal", "binlog", "oplog", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/runtime-config-wal.html#GUC-WAL-COMPRESSION"
+  - "https://dev.mysql.com/doc/refman/8.4/en/binary-log-transaction-compression.html"
+  - "https://www.mongodb.com/docs/manual/core/replica-set-oplog/"
+---
+
+<Tldr>
+**Physical** replication (PostgreSQL) ships what changed on disk: row versions, every index entry, page pruning, and full-page images after checkpoints. **Logical** replication (MySQL binlog, MongoDB oplog) ships the changed rows or documents; the replica does its own index and page work. On the same writes: a single-row INSERT cost **272 B** (WAL), **338 B** (binlog) and **397 B** (oplog); a 1,000-row INSERT **~240 KB**, **41 KB** and **217 KB**; an UPDATE of all 100,000 rows **34.0–46.8 MB** of WAL (**39.9 MB** with `wal_compression = lz4` instead of 45.5 MB), **8.2 MB** of binlog (**1.6 MB** MINIMAL, **343 B** statement) and **18.5 MB** of oplog in **100,000 entries**. Small writes cost about the same everywhere; bulk changes and checkpoints are where the engines differ.
+</Tldr>
+
+## The numbers
+
+All on the 100,000-row `orders` table (PostgreSQL: primary key plus `created_at` index; MySQL and MongoDB: the same two indexes), measured as the change in WAL LSN, binlog position, and the `bsonsize` of new oplog entries.
+
+| Write | PostgreSQL WAL | MySQL binlog (ROW, FULL) | MongoDB oplog |
+|---|---|---|---|
+| 1-row INSERT, warm | 272–296 B | 338 B | 397 B (retryable write) |
+| 1-row INSERT, first after a checkpoint | 8,760–16,680 B | 338 B | 397 B |
+| 1-row UPDATE, warm | 168–176 B | 381 B (315 B MINIMAL) | 334 B |
+| 1,000-row INSERT | 238–249 KB | 41.5 KB | 217 KB (2 applyOps entries) |
+| UPDATE of 100,000 rows | 34.0–34.7 MB warm, 45.5–46.8 MB after a checkpoint | 8.2 MB (1.6 MB MINIMAL, 1.5 MB zstd, 343 B STATEMENT) | 18.5 MB, 100,000 entries |
+| Local log not shipped | none: the WAL is the replication stream | InnoDB redo 10.1 MB for the UPDATE | WiredTiger journal (not measured) |
+
+| Term | Meaning |
+|---|---|
+| Physical | The replica applies byte-level page changes; it must be an identical copy |
+| Logical | The replica applies row or document changes through its own storage engine |
+| Write amplification | Bytes logged per byte of data changed: indexes, page images, before-images |
+| **✓ / ✗** | Shipped to the replica / not shipped |
+
+## PostgreSQL: the UPDATE of 100,000 rows
+
+<Flow
+  title="PostgreSQL: what one bulk UPDATE puts in the WAL"
+  height={300}
+  nodes={[
+    { id: 'stmt', label: 'UPDATE 100,000', sub: 'amount = amount + 1', x: 20, y: 20, w: 190 },
+    { id: 'heap', label: 'Heap pages', sub: 'new row versions', x: 20, y: 140, w: 190 },
+    { id: 'idx', label: '2 index pages', sub: 'entries per version', x: 300, y: 140, w: 190 },
+    { id: 'fpw', label: 'Full-page images', sub: 'first touch after CP', x: 300, y: 20, w: 190 },
+    { id: 'wal', label: 'WAL', sub: '34–47 MB', x: 300, y: 240, w: 190 },
+    { id: 'standby', label: 'Standby', sub: 'replays every page', x: 590, y: 240, w: 190 },
+  ]}
+  edges={[
+    { id: 'stmt-heap', from: 'stmt', to: 'heap' },
+    { id: 'heap-idx', from: 'heap', to: 'idx' },
+    { id: 'stmt-fpw', from: 'stmt', to: 'fpw' },
+    { id: 'idx-wal', from: 'idx', to: 'wal' },
+    { id: 'wal-standby', from: 'wal', to: 'standby', label: 'stream' },
+  ]}
+  cases={[
+    {
+      title: 'Right after a checkpoint',
+      path: 'heap versions ✓ + index entries ✓ + full-page images ✓ → WAL 46.8 MB ✓ → standby',
+      summary: 'Every page touched for the first time since the checkpoint is shipped whole.',
+      steps: [
+        {
+          title: 'Row versions and index entries',
+          note: 'Each updated row gets a new version. The pages were full, so most new versions landed on other pages and each needed an entry in both indexes (the heap grew to 30 MB over the bulk updates).',
+          code: 'CHECKPOINT;\nUPDATE orders SET amount = amount + 1;   -- 46,835,048 B of WAL',
+          active: ['stmt', 'heap', 'idx'],
+          edges: ['stmt-heap', 'heap-idx'],
+        },
+        {
+          title: 'Page images on top',
+          note: 'After the CHECKPOINT every page is cold: its first record carries the 8 KB page. 46.8 MB first time, 45.5 MB in two runs after VACUUM FULL.',
+          active: ['stmt', 'fpw', 'idx', 'wal', 'standby'],
+          edges: ['stmt-fpw', 'idx-wal', 'wal-standby'],
+          subs: { wal: '45.5–46.8 MB' },
+        },
+      ],
+    },
+    {
+      title: 'Warm pages',
+      path: 'heap versions ✓ + index entries ✓ + full-page images ✗ → WAL 34.0–34.7 MB ✓',
+      summary: 'Without page images, the WAL is still larger than the table itself.',
+      steps: [
+        {
+          title: 'Same UPDATE again',
+          note: 'Run twice more without a checkpoint in between: 34,036,232 and 34,699,272 bytes. No page images, but every row version and index entry is still logged.',
+          active: ['stmt', 'heap', 'idx', 'wal', 'standby'],
+          edges: ['stmt-heap', 'heap-idx', 'idx-wal', 'wal-standby'],
+          subs: { fpw: '✗ none', wal: '34.0–34.7 MB' },
+        },
+      ],
+    },
+    {
+      title: 'wal_compression = lz4',
+      path: 'full-page images compressed ✓ → WAL 39.9 MB instead of 45.5 MB',
+      summary: 'Compression shrinks page images, not row records.',
+      steps: [
+        {
+          title: 'Compress the page images',
+          note: 'SET wal_compression = lz4 (session level, superuser), after VACUUM FULL and CHECKPOINT: 39,862,672 and 39,862,720 bytes, against 45,521,656 and 45,529,696 without. 12% less, because only the page images are compressed.',
+          code: 'SET wal_compression = lz4;\nUPDATE orders SET amount = amount + 1;   -- 39.9 MB',
+          active: ['fpw', 'wal'],
+          subs: { fpw: 'lz4-compressed', wal: '39.9 MB' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: the same UPDATE
+
+<Flow
+  title="MySQL: what one bulk UPDATE puts in each log"
+  height={260}
+  nodes={[
+    { id: 'stmt', label: 'UPDATE 100,000', sub: 'amount = amount + 1', x: 20, y: 20, w: 190 },
+    { id: 'redo', label: 'InnoDB redo', sub: '10.1 MB, local only', x: 20, y: 170, w: 190 },
+    { id: 'binlog', label: 'Binary log', sub: 'format decides size', x: 300, y: 20, w: 190 },
+    { id: 'replica', label: 'Replica', sub: 'applies rows', x: 590, y: 20, w: 190 },
+    { id: 'rerun', label: 'Replica re-runs SQL', sub: 'statement format', x: 590, y: 170, w: 190 },
+  ]}
+  edges={[
+    { id: 'stmt-redo', from: 'stmt', to: 'redo' },
+    { id: 'stmt-binlog', from: 'stmt', to: 'binlog' },
+    { id: 'binlog-replica', from: 'binlog', to: 'replica', label: 'rows' },
+    { id: 'binlog-rerun', from: 'binlog', to: 'rerun' },
+  ]}
+  cases={[
+    {
+      title: 'Row format',
+      path: 'redo 10.1 MB ✗ not shipped → binlog FULL 8.2 MB / MINIMAL 1.6 MB / zstd 1.5 MB ✓ → replica applies 100,000 row events',
+      summary: 'The binlog carries the rows; the replica writes its own redo and index entries.',
+      steps: [
+        {
+          title: 'Two logs',
+          note: 'Innodb_os_log_written grew by 10,109,440 and 10,101,760 bytes in two runs; the binlog by 8,226,642. The redo log is the source\'s own recovery log and never leaves it.',
+          active: ['stmt', 'redo', 'binlog'],
+          edges: ['stmt-redo', 'stmt-binlog'],
+          subs: { binlog: 'FULL 8.2 MB' },
+        },
+        {
+          title: 'Ship rows',
+          note: 'FULL images: 8,226,644 B. MINIMAL: 1,607,320 B. FULL with binlog_transaction_compression = ON: 1,501,031 B. The replica applied the FULL version within 0.21–0.38 s of the source\'s commit in this idle lab.',
+          active: ['binlog', 'replica'],
+          edges: ['binlog-replica'],
+          subs: { replica: '✓ 100,000 row changes' },
+        },
+      ],
+    },
+    {
+      title: 'Statement format',
+      path: 'binlog 343 B ✓ → replica re-executes the UPDATE (0.14–0.15 s) ✓',
+      summary: 'Tiny log, full work on every replica.',
+      steps: [
+        {
+          title: 'Ship the SQL',
+          note: 'SET SESSION binlog_format = STATEMENT: 343 bytes of binlog; InnoDB still wrote 10.4 MB of redo on the source, and the replica scans and updates the 100,000 rows itself.',
+          active: ['stmt', 'binlog', 'rerun'],
+          edges: ['stmt-binlog', 'binlog-rerun'],
+          subs: { binlog: 'STATEMENT 343 B' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: the same update
+
+<Flow
+  title="MongoDB: what one updateMany puts in the oplog"
+  height={260}
+  nodes={[
+    { id: 'stmt', label: 'updateMany', sub: '$inc on 100,000 docs', x: 20, y: 20, w: 190 },
+    { id: 'oplog', label: 'Primary oplog', sub: '100,000 entries', x: 300, y: 20, w: 190 },
+    { id: 's2', label: 'Secondary 2', sub: 'pulls 18.5 MB', x: 590, y: 20, w: 190 },
+    { id: 's3', label: 'Secondary 3', sub: 'pulls 18.5 MB', x: 590, y: 170, w: 190 },
+    { id: 'tx', label: 'applyOps entry', sub: 'transaction', x: 300, y: 170, w: 190 },
+  ]}
+  edges={[
+    { id: 'stmt-oplog', from: 'stmt', to: 'oplog' },
+    { id: 'oplog-s2', from: 'oplog', to: 's2', label: 'pull' },
+    { id: 'oplog-s3', from: 'oplog', to: 's3' },
+    { id: 'stmt-tx', from: 'stmt', to: 'tx' },
+  ]}
+  cases={[
+    {
+      title: 'One entry per document',
+      path: 'updateMany → 100,000 entries × 185 B = 18.5 MB ✓ → each secondary fetches all of it ✓',
+      summary: 'Each secondary pulls its own copy of every entry.',
+      steps: [
+        {
+          title: 'The oplog grows by 18.5 MB',
+          note: 'updateMany with $inc on _id 1 to 100,000: exactly 100,000 op u entries of 185 bytes, each with the new amount (idempotent).',
+          active: ['stmt', 'oplog'],
+          edges: ['stmt-oplog'],
+        },
+        {
+          title: 'Every secondary fetches it',
+          note: 'Both secondaries pull from the primary (syncSourceHost rpa-mongo1), so the primary sends the 18.5 MB twice. Chained replication (a secondary syncing from another secondary) moves that load off the primary.',
+          active: ['oplog', 's2', 's3'],
+          edges: ['oplog-s2', 'oplog-s3'],
+        },
+      ],
+    },
+    {
+      title: 'Grouped writes',
+      path: 'transaction of 3 updates → 1 applyOps entry, 653 B ✓; insertMany 1,000 → 2 applyOps entries ✓',
+      summary: 'Transactions and batched inserts share entries; updateMany does not.',
+      steps: [
+        {
+          title: 'applyOps',
+          note: 'A 3-update transaction was one 653-byte entry; insertMany of 1,000 documents two entries of 108,649 bytes. updateMany outside a transaction stays one entry per document.',
+          active: ['stmt', 'tx'],
+          edges: ['stmt-tx'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Physical vs logical
+
+| | Physical (PostgreSQL streaming) | Logical (MySQL binlog, MongoDB oplog) |
+|---|---|---|
+| Unit shipped | Page changes | Rows / documents |
+| Index maintenance | Shipped (records for every index) | Done again on the replica |
+| Checkpoint effect | Full-page images: 8.7–16.7 KB for one INSERT | None |
+| Bulk UPDATE of 100,000 rows | 34–47 MB | 8.2 MB (binlog), 18.5 MB (oplog) |
+| Replica must match | Same major version and architecture, whole cluster | Can differ in version (within limits), indexes, even tables |
+| Replica CPU per change | Low: write the bytes into the page | Higher: find the row, update indexes |
+| Replica writable | No | MySQL: yes unless `super_read_only`; MongoDB: no |
+
+<Pitfall>
+Do not size the network link or the replica from the size of the data change. One UPDATE that changed a 2-byte number in 100,000 rows produced 34 to 47 MB of WAL, 8.2 MB of binlog and 18.5 MB of oplog per secondary. Measure the log volume of your real workload: `pg_stat_wal.wal_bytes` or LSN differences in PostgreSQL, binlog file growth in MySQL, and `getReplicationInfo()` usage over time in MongoDB.
+</Pitfall>
+
+## Real-world scenario: the nightly price update
+
+A seller-tools service recalculates promotional prices every night with one UPDATE across 8 million SKU rows. On PostgreSQL the job writes several GB of WAL in minutes, the standby in another availability zone falls behind by minutes, and the WAL archive grows by the same amount. Options measured in this concept: update only rows whose price actually changes (`WHERE price IS DISTINCT FROM new_price`), batch the job so checkpoints do not fall in the middle of fresh page images, enable `wal_compression`, and leave free space in pages (`fillfactor`) so new versions stay on the same page as HOT updates and skip index entries. On MySQL, `binlog_row_image = MINIMAL` shrank the same pattern 5×; on MongoDB, the job's 8 million oplog entries also eat into the oplog window.
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concepts 1–3 | How each engine produces these bytes |
+| [Indexing Session 6, Concept 1](/blogs/databases/indexing/session-6-engine-differences/concept-1-postgres-mvcc) | Why a PostgreSQL UPDATE writes a new row version and new index entries |
+| Session 3 | Replica lag: what happens when the replica cannot apply this volume as fast as it arrives |
+
+## Key takeaways
+
+1. Single-row writes cost a few hundred bytes in all three engines.
+2. PostgreSQL ships page changes: index entries and full-page images make bulk writes 34–47 MB for a 100,000-row UPDATE.
+3. MySQL ships rows from the binlog; its redo log stays local. Row image settings changed the bulk UPDATE from 8.2 MB to 1.6 MB; statement format to 343 bytes.
+4. MongoDB ships one idempotent entry per document: 100,000 entries, 18.5 MB per secondary.
+5. Physical replicas are exact copies; logical replicas redo index and page work themselves and can differ.
+
+## Check questions
+
+1. Why is the PostgreSQL WAL for the 100,000-row UPDATE larger than the table itself?
+2. `wal_compression = lz4` saved 12%. Why not more?
+3. Why did MySQL write 10.1 MB of redo but ship only 8.2 MB?
+4. MongoDB wrote 18.5 MB of oplog. How much leaves the primary with two secondaries, and how could you reduce the primary's share?
+5. Name one thing a logical replica can do that a physical standby cannot, and one cost it pays for it.
+6. For the nightly 8-million-row price update, give two changes that reduce replication volume in PostgreSQL.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-1-how-replication-works/concept-4-what-gets-shipped/answers">Worked answers to Q1–Q6</DeepDive>

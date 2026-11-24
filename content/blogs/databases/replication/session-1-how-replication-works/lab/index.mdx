@@ -1,0 +1,342 @@
+---
+title: "Lab and session quiz: How replication works"
+description: "Build a PostgreSQL primary with a streaming standby, a MySQL source with a GTID replica and a three-member MongoDB replica set in Docker, load 100,000 orders, then measure what each write ships: decode WAL records with pg_waldump, read binlog events and their sizes by format, read oplog entries, stop a standby behind a replication slot, and break a writable MySQL replica."
+type: "how-to"
+tags: ["replication", "wal", "binlog", "oplog", "postgresql", "mysql", "mongodb", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/app-pgbasebackup.html"
+  - "https://www.postgresql.org/docs/17/pgwaldump.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-gtids-howto.html"
+  - "https://www.mongodb.com/docs/manual/tutorial/deploy-replica-set/"
+---
+
+<Tldr>
+Every session of this course uses small replication clusters in Docker, created by one script with a name **prefix**. Readers use the prefix `rp`: containers `rp-pg1` and `rp-pg2`, `rp-my1` and `rp-my2`, `rp-mongo1` to `rp-mongo3`, on the network `rp-net`. The clusters need about 1.3 GB of memory together; start one engine at a time if memory is short. The numbers quoted below come from the same scripts run with another prefix on one laptop; your sizes in bytes should match closely, your times will not.
+</Tldr>
+
+## Setup script
+
+Save as `rp-setup.sh` and run `bash rp-setup.sh rp pg` (or `mysql`, `mongo`, `all`). It uses the official images `postgres:17-alpine`, `mysql:8.4` and `mongo:8.0`, with trust authentication and a root password of `lab`: a lab, not a production setup.
+
+```bash
+#!/bin/bash
+# Replication course lab: one set of small primary/replica clusters per prefix.
+# Usage: rp-setup.sh <prefix> [pg|mysql|mongo|all]   e.g. rp-setup.sh rp all
+#   PostgreSQL 17: <prefix>-pg1 primary -> <prefix>-pg2 streaming standby (physical slot "standby1")
+#   MySQL 8.4:     <prefix>-my1 source  -> <prefix>-my2 replica (GTID auto-position), root password "lab"
+#   MongoDB 8.0:   <prefix>-mongo1..3 replica set "<prefix>rs"
+set -e
+P=$1; WHAT=${2:-all}
+docker network create $P-net >/dev/null 2>&1 || true
+if [ $WHAT = pg ] || [ $WHAT = all ]; then
+  docker run -d --name $P-pg1 --network $P-net -e POSTGRES_HOST_AUTH_METHOD=trust postgres:17-alpine \
+    -c shared_buffers=64MB -c wal_level=replica -c max_wal_senders=10 -c max_replication_slots=10 >/dev/null
+  until docker exec $P-pg1 pg_isready -q 2>/dev/null; do sleep 1; done; sleep 2
+  until docker exec $P-pg1 pg_isready -q 2>/dev/null; do sleep 1; done
+  # Allow replication connections from the Docker network (lab only: trust).
+  docker exec $P-pg1 sh -c 'echo "host replication all all trust" >> /var/lib/postgresql/data/pg_hba.conf'
+  docker exec $P-pg1 psql -U postgres -qc "SELECT pg_reload_conf()" >/dev/null
+  # Standby: clone the primary with pg_basebackup (-R writes primary_conninfo + standby.signal), then start.
+  # The clone runs only on the first start, so `docker stop/start <prefix>-pg2` resumes streaming.
+  docker run -d --name $P-pg2 --network $P-net --user postgres --entrypoint sh postgres:17-alpine -c \
+    "{ [ -s /var/lib/postgresql/data/PG_VERSION ] || pg_basebackup -h $P-pg1 -U postgres -D /var/lib/postgresql/data -R -X stream -C -S standby1 -c fast; } \
+     && chmod 700 /var/lib/postgresql/data && exec postgres -c shared_buffers=64MB -c hot_standby=on" >/dev/null
+  for _ in $(seq 60); do docker exec $P-pg2 pg_isready -q 2>/dev/null && break; sleep 1; done
+  docker exec $P-pg2 pg_isready -q || { docker logs --tail 5 $P-pg2; exit 1; }
+  docker exec $P-pg1 psql -U postgres -Atc "SELECT application_name, state, sync_state FROM pg_stat_replication"
+fi
+if [ $WHAT = mysql ] || [ $WHAT = all ]; then
+  for i in 1 2; do
+    docker run -d --name $P-my$i --network $P-net -e MYSQL_ROOT_PASSWORD=lab mysql:8.4 \
+      --server-id=$i --gtid-mode=ON --enforce-gtid-consistency=ON --log-bin=binlog --binlog-format=ROW \
+      --innodb-buffer-pool-size=64M --performance-schema=ON >/dev/null
+  done
+  for i in 1 2; do until docker exec $P-my$i mysql -uroot -plab -e "SELECT 1" >/dev/null 2>&1; do sleep 2; done; done
+  docker exec $P-my2 mysql -uroot -plab -e "CHANGE REPLICATION SOURCE TO SOURCE_HOST='$P-my1', SOURCE_USER='root',
+    SOURCE_PASSWORD='lab', SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1; START REPLICA;" 2>/dev/null
+  sleep 3
+  docker exec $P-my2 mysql -uroot -plab -e "SHOW REPLICA STATUS\G" 2>/dev/null | grep -E 'Replica_(IO|SQL)_Running:'
+fi
+if [ $WHAT = mongo ] || [ $WHAT = all ]; then
+  for i in 1 2 3; do
+    docker run -d --name $P-mongo$i --network $P-net mongo:8.0 --replSet ${P}rs --bind_ip_all --wiredTigerCacheSizeGB 0.25 >/dev/null
+  done
+  sleep 5
+  docker exec $P-mongo1 mongosh --quiet --eval "rs.initiate({_id: '${P}rs', members: [
+    { _id: 0, host: '$P-mongo1:27017', priority: 2 }, { _id: 1, host: '$P-mongo2:27017' }, { _id: 2, host: '$P-mongo3:27017' }]})" >/dev/null
+  # priority 2 makes <prefix>-mongo1 the preferred primary: if another member wins the first election, mongo1 takes over.
+  until docker exec $P-mongo1 mongosh --quiet --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -q true; do sleep 1; done
+  docker exec $P-mongo1 mongosh --quiet --eval 'rs.status().members.map(m => m.name + " " + m.stateStr).join(", ")'
+fi
+```
+
+Expected output: `walreceiver|streaming|async` for PostgreSQL, `Replica_IO_Running: Yes` and `Replica_SQL_Running: Yes` for MySQL, `rp-mongo1:27017 PRIMARY, rp-mongo2:27017 SECONDARY, rp-mongo3:27017 SECONDARY` for MongoDB.
+
+Remove everything with `bash rp-teardown.sh rp`:
+
+```bash
+#!/bin/bash
+# Remove every container of one prefix and its network. Usage: rp-teardown.sh <prefix>
+P=$1
+docker rm -f $(docker ps -aq --filter "name=^$P-") >/dev/null 2>&1; docker network rm $P-net >/dev/null 2>&1; echo "removed $P"
+```
+
+Shortcuts used in the exercises:
+
+```bash
+alias rpg1='docker exec -it rp-pg1 psql -U postgres'      # PostgreSQL primary
+alias rpg2='docker exec -it rp-pg2 psql -U postgres'      # PostgreSQL standby
+alias rmy1='docker exec -it rp-my1 mysql -uroot -plab'    # MySQL source
+alias rmy2='docker exec -it rp-my2 mysql -uroot -plab'    # MySQL replica
+alias rmg1='docker exec -it rp-mongo1 mongosh --quiet'    # MongoDB primary
+alias rmg2='docker exec -it rp-mongo2 mongosh --quiet'    # MongoDB secondary
+```
+
+## Data: 100,000 orders
+
+The same `orders` rows in every engine, run on the primary only; the replicas receive them. Formulas are those of the Partitioning and sharding course (seller, marketplace and status from md5), with rows 631.584 s apart so they span 2024–2025.
+
+PostgreSQL, `docker exec -i rp-pg1 psql -U postgres < pg-rp-seed.sql`:
+
+```sql
+-- Replication course table: 100,000 marketplace orders over 2024-2025 (same formulas as the
+-- Partitioning course seed, rows 631.584 s apart). Run on the PRIMARY; the standby receives it.
+DROP TABLE IF EXISTS orders;
+CREATE TABLE orders (
+  id          bigint        PRIMARY KEY,
+  seller_id   integer       NOT NULL,
+  marketplace text          NOT NULL,
+  status      text          NOT NULL,
+  amount      numeric(12,2) NOT NULL,
+  created_at  timestamptz   NOT NULL
+);
+INSERT INTO orders
+SELECT g,
+       ('x' || substr(md5('s' || g), 1, 8))::bit(32)::bigint % 5000 + 1,
+       CASE WHEN ('x' || substr(md5('m' || g), 1, 8))::bit(32)::bigint % 10 < 5 THEN 'shopee'
+            WHEN ('x' || substr(md5('m' || g), 1, 8))::bit(32)::bigint % 10 < 8 THEN 'tiktok'
+            ELSE 'lazada' END,
+       CASE WHEN ('x' || substr(md5('t' || g), 1, 8))::bit(32)::bigint % 20 < 2 THEN 'cancelled'
+            WHEN ('x' || substr(md5('t' || g), 1, 8))::bit(32)::bigint % 20 = 2 THEN 'returned'
+            ELSE 'delivered' END,
+       (g * 7907) % 50000 / 100.0 + 1,
+       timestamptz '2024-01-01 00:00:00+00' + ((g - 1) * 631584 / 1000) * interval '1 second'
+FROM generate_series(1::bigint, 100000) AS g;
+CREATE INDEX orders_created_at_idx ON orders (created_at);
+VACUUM ANALYZE orders;
+```
+
+MySQL, `docker exec -i rp-my1 mysql -uroot -plab < mysql-rp-seed.sql` (creates database `shop`):
+
+```sql
+-- Replication course table: 100,000 marketplace orders over 2024-2025 (same formulas as the PostgreSQL seed).
+-- Run on the SOURCE (rp-my1); the replica receives it through the binary log.
+CREATE DATABASE IF NOT EXISTS shop;
+USE shop;
+DROP TABLE IF EXISTS orders;
+CREATE TABLE orders (
+  id          BIGINT        NOT NULL PRIMARY KEY,
+  seller_id   INT           NOT NULL,
+  marketplace VARCHAR(8)    NOT NULL,
+  status      VARCHAR(10)   NOT NULL,
+  amount      DECIMAL(12,2) NOT NULL,
+  created_at  DATETIME      NOT NULL,
+  KEY orders_created_at_idx (created_at)
+) ENGINE = InnoDB;
+SET SESSION cte_max_recursion_depth = 1000;
+INSERT INTO orders
+WITH RECURSIVE a(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM a WHERE n < 99),
+               b(m) AS (SELECT 0 UNION ALL SELECT m + 1 FROM b WHERE m < 999),
+               s(g) AS (SELECT a.n * 1000 + b.m + 1 FROM a CROSS JOIN b)
+SELECT g,
+       CONV(SUBSTR(MD5(CONCAT('s', g)), 1, 8), 16, 10) % 5000 + 1,
+       CASE WHEN CONV(SUBSTR(MD5(CONCAT('m', g)), 1, 8), 16, 10) % 10 < 5 THEN 'shopee'
+            WHEN CONV(SUBSTR(MD5(CONCAT('m', g)), 1, 8), 16, 10) % 10 < 8 THEN 'tiktok'
+            ELSE 'lazada' END,
+       CASE WHEN CONV(SUBSTR(MD5(CONCAT('t', g)), 1, 8), 16, 10) % 20 < 2 THEN 'cancelled'
+            WHEN CONV(SUBSTR(MD5(CONCAT('t', g)), 1, 8), 16, 10) % 20 = 2 THEN 'returned'
+            ELSE 'delivered' END,
+       (g * 7907) % 50000 / 100 + 1,
+       TIMESTAMP '2024-01-01 00:00:00' + INTERVAL ((g - 1) * 631584 DIV 1000) SECOND
+FROM s ORDER BY g;
+ANALYZE TABLE orders;
+```
+
+MongoDB, `docker cp mongo-rp-seed.js rp-mongo1:/tmp/ && docker exec rp-mongo1 mongosh --quiet shop /tmp/mongo-rp-seed.js`:
+
+```js
+// Replication course collection: 100,000 marketplace orders over 2024-2025 (same formulas as the SQL seeds).
+// Run against the PRIMARY: mongosh --quiet shop mongo-rp-seed.js
+const md5n = s => parseInt(require('crypto').createHash('md5').update(s).digest('hex').slice(0, 8), 16);
+const t0 = new Date('2024-01-01T00:00:00Z').getTime();
+db.orders.drop();
+let batch = [];
+for (let g = 1; g <= 100000; g++) {
+  const m = md5n('m' + g) % 10, t = md5n('t' + g) % 20;
+  batch.push({
+    _id: g,
+    seller_id: md5n('s' + g) % 5000 + 1,
+    marketplace: m < 5 ? 'shopee' : m < 8 ? 'tiktok' : 'lazada',
+    status: t < 2 ? 'cancelled' : t === 2 ? 'returned' : 'delivered',
+    amount: Decimal128(((g * 7907) % 50000 / 100 + 1).toFixed(2)),
+    created_at: new Date(t0 + Math.floor((g - 1) * 631584 / 1000) * 1000)
+  });
+  if (batch.length === 10000) { db.orders.insertMany(batch); batch = []; }
+}
+db.orders.createIndex({ created_at: 1 });
+printjson({ orders: db.orders.countDocuments() });
+```
+
+Check that the replicas have the rows: `rpg2 -c "SELECT count(*), pg_is_in_recovery() FROM orders"` returns `100000 | t`; `rmy2 -e "SELECT count(*) FROM shop.orders"` returns 100000; on `rmg2`, `db.getMongo().setReadPref('secondary'); db.getSiblingDB('shop').orders.countDocuments()` returns 100000.
+
+## Helper: network delay
+
+Sessions 2 and 3 add delay between nodes. This script joins a throw-away Alpine container to a node's network namespace and uses Linux `netem` to delay everything that node sends. It needs internet access once to install `iproute2`. Save as `delay.sh`:
+
+```bash
+#!/bin/sh
+# Add or remove an outgoing network delay on one container (Linux netem through a throw-away sidecar that joins
+# the container's network namespace). Usage: delay.sh <container> <ms|off>
+C=$1; D=$2
+if [ "$D" = off ]; then CMD="tc qdisc del dev eth0 root 2>/dev/null; true"
+else CMD="tc qdisc replace dev eth0 root netem delay ${D}ms"; fi
+docker run --rm --net container:$C --cap-add NET_ADMIN alpine:3.20 sh -c "apk add -q iproute2 >/dev/null 2>&1 && $CMD && tc qdisc show dev eth0"
+```
+
+`sh delay.sh rp-pg2 20` delays the standby's replies by 20 ms; `sh delay.sh rp-pg2 off` removes it.
+
+## Exercise 1: PostgreSQL WAL records (Concept 1)
+
+Measure the WAL of one INSERT in one psql session, with `\gset` saving the LSN before and after:
+
+```sql
+-- rpg1
+SELECT pg_current_wal_insert_lsn() AS a \gset
+INSERT INTO orders VALUES (3000001, 42, 'shopee', 'delivered', 99.90, now());
+SELECT pg_current_wal_insert_lsn() AS b \gset
+SELECT :'a' AS start_lsn, :'b' AS end_lsn, pg_wal_lsn_diff(:'b', :'a') AS bytes;   -- 272 to 296 in the lab
+```
+
+Decode the records between the two LSNs (replace them with yours):
+
+```bash
+docker exec rp-pg1 pg_waldump -p /var/lib/postgresql/data/pg_wal -s 0/B1CB1C8 -e 0/B1CB2D8
+```
+
+Lab output: `Heap INSERT` 103 B, `Btree INSERT_LEAF` 64 B twice, `Transaction COMMIT` 34 B. Now run `CHECKPOINT;` and the same measurement with another id: 8,760–16,680 bytes in the lab, and `pg_waldump` shows `FPW` at the end of each block reference.
+
+Watch the four positions while the standby is idle, then stop the standby and write:
+
+```sql
+-- rpg1
+SELECT application_name, state, sent_lsn, write_lsn, flush_lsn, replay_lsn, sync_state FROM pg_stat_replication;
+```
+
+```bash
+docker stop rp-pg2
+docker exec rp-pg1 psql -U postgres -c "UPDATE orders SET amount = amount + 1"   # run it 3 times
+docker exec rp-pg1 psql -U postgres -c "SELECT active, wal_status, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots"
+docker start rp-pg2
+docker exec rp-pg1 psql -U postgres -c "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) FROM pg_stat_replication"   # 0 once caught up
+```
+
+Lab: `f | reserved | 96 MB` while stopped; caught up within 0.5 s of `docker start`. Finally, try a write on the standby: `rpg2 -c "INSERT INTO orders VALUES (1, 1, 'x', 'x', 1, now())"` fails with `cannot execute INSERT in a read-only transaction`.
+
+## Exercise 2: MySQL binlog events (Concept 2)
+
+Binlog position before and after one INSERT:
+
+```sql
+-- rmy1
+SHOW BINARY LOG STATUS;              -- note File and Position
+INSERT INTO shop.orders VALUES (3000001, 42, 'shopee', 'delivered', 99.90, '2026-01-01 10:00:00');
+SHOW BINARY LOG STATUS;              -- Position grew by 338 in the lab
+SHOW BINLOG EVENTS IN 'binlog.000005' FROM 198;   -- your file and start position
+```
+
+Expected events: `Gtid`, `Query` (BEGIN), `Table_map`, `Write_rows`, `Xid`. Repeat the position measurement for the 100,000-row UPDATE in each format, one session each:
+
+```sql
+-- rmy1, three separate runs
+UPDATE shop.orders SET amount = amount + 1 WHERE id <= 100000;                                                    -- 8,226,644 B
+SET SESSION binlog_row_image = MINIMAL;     UPDATE shop.orders SET amount = amount + 1 WHERE id <= 100000;        -- 1,607,320 B
+SET SESSION binlog_format = STATEMENT;      UPDATE shop.orders SET amount = amount + 1 WHERE id <= 100000;        -- 343 B
+SET SESSION binlog_format = STATEMENT;      UPDATE shop.orders SET amount = amount + 1 ORDER BY created_at LIMIT 5; SHOW WARNINGS;   -- Note 1592
+```
+
+Break the replica with a write of its own, then protect it:
+
+```sql
+-- rmy2 (replica)
+INSERT INTO shop.orders VALUES (4000001, 7, 'lazada', 'delivered', 5.00, '2026-01-02 00:00:00');
+-- rmy1 (source)
+INSERT INTO shop.orders VALUES (4000001, 42, 'shopee', 'delivered', 99.90, '2026-01-02 00:00:00');
+-- rmy2
+SHOW REPLICA STATUS\G      -- Replica_SQL_Running: No, Last_SQL_Errno: 1062
+SELECT @@gtid_executed;    -- a second UUID: the replica's own (errant) transactions
+DELETE FROM shop.orders WHERE id = 4000001; START REPLICA SQL_THREAD;
+SET GLOBAL super_read_only = ON;
+INSERT INTO shop.orders VALUES (4000002, 7, 'lazada', 'delivered', 5.00, '2026-01-02 00:00:00');   -- ERROR 1290
+```
+
+## Exercise 3: MongoDB oplog entries (Concept 3)
+
+```js
+// rmg1
+const oplog = db.getSiblingDB('local').oplog.rs;
+const last = () => oplog.find().sort({ $natural: -1 }).limit(1).next().ts;
+const s = db.getSiblingDB('shop');
+let a = last();
+s.orders.updateMany({ _id: { $lte: 100000 } }, { $inc: { amount: Decimal128('1') } });
+const e = oplog.find({ ts: { $gt: a }, ns: 'shop.orders' }).toArray();
+print(e.length, e.reduce((n, d) => n + bsonsize(d), 0));   // 100000 18500000
+printjson(e[0]);                                            // op: 'u', diff: { u: { amount: … } }
+
+a = last();
+s.orders.insertMany(Array.from({ length: 1000 }, (_, k) => ({ _id: 2000000 + k, seller_id: 42, marketplace: 'shopee',
+  status: 'delivered', amount: Decimal128('10.00'), created_at: new Date() })));
+oplog.find({ ts: { $gt: a } }).toArray().map(d => [d.op, d.o.applyOps ? d.o.applyOps.length : 1, bsonsize(d)]);   // two applyOps of 500
+
+db.getSiblingDB('local').getReplicationInfo();   // logSizeMB about 29,000 (from free disk), usedMB, timeDiffHours
+```
+
+On the secondary, a write fails:
+
+```js
+// rmg2
+db.getSiblingDB('shop').orders.insertOne({ _id: 1 });   // MongoServerError: not primary (NotWritablePrimary, 10107)
+```
+
+## Exercise 4: fill in the comparison (Concept 4)
+
+Use the three methods above (LSN difference, binlog position, `bsonsize` of new oplog entries) for the same writes and fill in the table:
+
+| Write | WAL | binlog (ROW FULL) | oplog |
+|---|---|---|---|
+| 1-row INSERT, warm | 272–296 B | 338 B | 397 B |
+| 1,000-row INSERT | 238–249 KB | 41,472 B | 217,298 B |
+| UPDATE of 100,000 rows | 34.0–46.8 MB | 8,226,644 B | 18,500,000 B |
+
+For PostgreSQL also try `SET wal_compression = lz4;` before the UPDATE after a `CHECKPOINT` (lab: 39.9 MB instead of 45.5 MB).
+
+## Reset
+
+```bash
+bash rp-teardown.sh rp     # removes all rp-* containers and rp-net
+```
+
+Each later session starts from `rp-setup.sh` and the seeds above.
+
+## Session quiz
+
+1. A single-row INSERT wrote 272 bytes of WAL, 338 bytes of binlog and 397 bytes of oplog. What does each of the three contain that the others do not?
+2. Why did the same PostgreSQL INSERT write up to 16,680 bytes right after a checkpoint, and why does a logical log not have that effect?
+3. Which PostgreSQL process produces each of `sent_lsn`, `write_lsn`, `flush_lsn` and `replay_lsn`?
+4. What did the replication slot do while the standby was stopped, and how can a slot take the primary down?
+5. Why does MySQL write both a redo log and a binlog at commit, and which one does a replica read?
+6. Give one advantage and two risks of `binlog_format = STATEMENT` for a 100,000-row UPDATE.
+7. Why is an `$inc` stored in the oplog as the resulting value, and what does `updateMany` on 100,000 documents put in the oplog?
+8. A MySQL replica stopped with error 1062. How could that happen in a correctly configured source/replica pair, and what setting prevents it?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-1-how-replication-works/lab/answers">Answers to the session quiz</DeepDive>

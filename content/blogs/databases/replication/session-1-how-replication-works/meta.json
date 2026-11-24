@@ -1,0 +1,12 @@
+{
+  "title": "Session 1: How replication works",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-postgresql-wal-streaming/index",
+    "concept-2-mysql-binlog-gtid/index",
+    "concept-3-mongodb-oplog/index",
+    "concept-4-what-gets-shipped/index",
+    "lab/index"
+  ]
+}
