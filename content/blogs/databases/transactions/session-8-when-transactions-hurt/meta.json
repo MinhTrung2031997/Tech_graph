@@ -1,0 +1,13 @@
+{
+  "title": "Session 8: When transactions hurt",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-idle-in-transaction/index",
+    "concept-2-long-transactions-cleanup/index",
+    "concept-3-big-transactions/index",
+    "concept-4-distributed-transactions/index",
+    "concept-5-design-checklist/index",
+    "lab/index"
+  ]
+}

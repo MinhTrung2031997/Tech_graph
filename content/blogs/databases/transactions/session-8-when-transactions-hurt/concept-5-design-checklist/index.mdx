@@ -1,0 +1,289 @@
+---
+title: "Concept 5: A transaction-design checklist"
+description: "The whole course as six questions to ask of every transaction: what must be atomic, which isolation level, how conflicts are controlled, how failures are retried, how long it can live, and whether it crosses a system boundary. Each question with the engine-specific settings, the measurement from this course that motivates it, and a worked checkout example."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "checklist", "design"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-model.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-production-consideration/"
+---
+
+<Tldr>
+Every transaction should survive six questions. **Scope:** what exactly must be all-or-nothing, and nothing more. **Isolation:** which anomalies would break it (Sessions 2–3), and which level or lock prevents them. **Concurrency control:** atomic statement, row lock or version check, chosen by contention (Session 7: thousands of optimistic retries on one hot row, a handful across 1,000 rows). **Retries:** which errors are retried, with the whole transaction re-run (Session 7: a MySQL 1205 that was not rolled back committed half a transfer). **Duration:** how long it can live, with timeouts that enforce it (this session: one idle transaction queued an unrelated SELECT; one old snapshot grew a table 3.5×). **Boundaries:** no network call to another system inside it; use an outbox (this session: dual writes lost 62 events per 1,000). The flows below walk a checkout through the list in each engine.
+</Tldr>
+
+## The checklist
+
+| # | Question | Good answer | Course reference |
+|---|---|---|---|
+| 1 | **Scope:** which changes must commit together? | The smallest set that keeps an invariant (order + stock + payment record), nothing else | Session 1 |
+| 2 | **Isolation:** which anomaly would break it? | Named anomaly → level or lock that prevents it; default level only if none applies | Sessions 2–3 |
+| 3 | **Concurrency control:** how are conflicting writers handled? | Atomic guarded statement first; `FOR UPDATE` on hot rows; version check for low contention or long think time | Sessions 5, 7 |
+| 4 | **Retries:** what happens on 40001 / 40P01 / 1213 / 1205 / TransientTransactionError? | Whole-transaction retry with cap and jitter; explicit ROLLBACK; idempotency key for client retries | Sessions 6, 7 |
+| 5 | **Duration:** how long can it live, and what enforces that? | Milliseconds; no user or network waits inside; timeouts on the role; bulk work in batches | Sessions 4, 8 |
+| 6 | **Boundaries:** does it touch another system? | No: events via an outbox or CDC, consumers idempotent | Session 8 |
+| + | **Indexes:** do its statements find rows by index? | Every WHERE in a locking statement uses an index, or it locks far more rows than it changes | Session 5, Indexing course |
+| + | **Monitoring:** how would you see it go wrong? | Retry counts, lock waits, oldest transaction age, history list / dead tuples, outbox lag | Sessions 4, 8 |
+
+| Term | Meaning |
+|---|---|
+| Invariant | A rule the data must always satisfy (stock ≥ 0, debits = credits, one active subscription per user) |
+| Scope creep | Work added to a transaction that does not need its atomicity (logging, emails, reads for display) |
+| Safety net | A database-side limit that bounds damage when application code misbehaves (timeouts) |
+| **✓ Ship / ✗ Redesign** | The transaction passes every question, or one answer forces a change |
+
+## The checklist in each engine
+
+<Flow
+  title="PostgreSQL: reviewing a checkout transaction"
+  height={350}
+  nodes={[
+    { id: 'scope', label: '1 Scope', sub: 'order + stock + payment', x: 20, y: 20, w: 210 },
+    { id: 'iso', label: '2 Isolation', sub: '', x: 295, y: 20, w: 210 },
+    { id: 'conc', label: '3 Concurrency', sub: '', x: 570, y: 20, w: 210 },
+    { id: 'retry', label: '4 Retries', sub: '', x: 570, y: 150, w: 210 },
+    { id: 'dur', label: '5 Duration', sub: '', x: 295, y: 150, w: 210 },
+    { id: 'bound', label: '6 Boundaries', sub: '', x: 20, y: 150, w: 210 },
+    { id: 'ok', label: '✓ Ship', sub: '', x: 120, y: 280, w: 200 },
+    { id: 'bad', label: '✗ Redesign', sub: '', x: 450, y: 280, w: 200 },
+  ]}
+  edges={[
+    { id: 'scope-iso', from: 'scope', to: 'iso' },
+    { id: 'iso-conc', from: 'iso', to: 'conc' },
+    { id: 'conc-retry', from: 'conc', to: 'retry' },
+    { id: 'retry-dur', from: 'retry', to: 'dur' },
+    { id: 'dur-bound', from: 'dur', to: 'bound' },
+    { id: 'bound-ok', from: 'bound', to: 'ok' },
+    { id: 'dur-bad', from: 'dur', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: '✓ A checkout that passes',
+      path: 'scope: 3 writes → READ COMMITTED + guarded UPDATE → no lost update → retry 40001/40P01 → ms, timeouts on the role → outbox row → ✓',
+      summary: 'Default isolation is enough because the one invariant (stock ≥ 0) is enforced inside a single statement.',
+      steps: [
+        {
+          title: '1–2: scope and isolation',
+          note: 'The invariant is "never sell stock that is not there". It lives in one row, so a guarded UPDATE enforces it under READ COMMITTED; no SERIALIZABLE needed. Write skew (Session 2) would need a check across rows.',
+          code: "BEGIN;\nUPDATE inventory SET stock = stock - $2 WHERE sku = $1 AND stock >= $2;   -- 0 rows → ROLLBACK, sold out\nINSERT INTO orders …;\nINSERT INTO payments (idem_key, …) VALUES ($key, …);   -- UNIQUE: retry-safe\nINSERT INTO outbox (event_id, payload) VALUES (…);\nCOMMIT;",
+          active: ['scope', 'iso'],
+          edges: ['scope-iso'],
+          subs: { iso: 'READ COMMITTED' },
+        },
+        {
+          title: '3–4: concurrency and retries',
+          note: 'The guarded UPDATE serialises buyers of one SKU on its row lock (Session 7 Concept 1: 0 lost of 400). Updating several SKUs? Sort them by sku first, so two carts cannot deadlock (Session 6). Retry 40001/40P01 around the whole function; the idempotency key makes client retries safe.',
+          active: ['iso', 'conc', 'retry'],
+          edges: ['iso-conc', 'conc-retry'],
+          subs: { conc: 'guarded UPDATE', retry: '40001, 40P01' },
+        },
+        {
+          title: '✓ 5–6: duration and boundaries',
+          note: 'The payment provider is called before (authorise) or after (capture via the outbox), never between BEGIN and COMMIT. The application role has idle_in_transaction_session_timeout and transaction_timeout (Concept 1) as a safety net.',
+          code: "ALTER ROLE app SET idle_in_transaction_session_timeout = '10s';\nALTER ROLE app SET transaction_timeout = '30s';",
+          active: ['retry', 'dur', 'bound', 'ok'],
+          edges: ['retry-dur', 'dur-bound', 'bound-ok'],
+          subs: { dur: 'ms + role timeouts', bound: 'outbox' },
+        },
+      ],
+    },
+    {
+      title: '✗ A checkout with an HTTP call inside',
+      path: 'BEGIN → lock stock row → call payment API (2–10 s) → COMMIT → ✗ duration and boundaries fail',
+      summary: 'Every buyer of a popular SKU waits for someone else\'s payment API call.',
+      steps: [
+        {
+          title: '✗ Duration',
+          note: 'The stock row stays locked during the API call: buyers of that SKU queue behind it, and a hung call leaves an idle transaction (Concept 1). If the API times out after charging, the transaction rolls back but the money moved: a boundary failure (Concept 4).',
+          active: ['dur', 'bad'],
+          edges: ['dur-bad'],
+          subs: { bad: 'move the call out' },
+        },
+      ],
+    },
+  ]}
+/>
+
+<Flow
+  title="MySQL: the same review"
+  height={350}
+  nodes={[
+    { id: 'scope', label: '1 Scope', sub: 'order + stock + payment', x: 20, y: 20, w: 210 },
+    { id: 'iso', label: '2 Isolation', sub: 'REPEATABLE READ', x: 295, y: 20, w: 210 },
+    { id: 'conc', label: '3 Concurrency', sub: '', x: 570, y: 20, w: 210 },
+    { id: 'retry', label: '4 Retries', sub: '', x: 570, y: 150, w: 210 },
+    { id: 'dur', label: '5 Duration', sub: '', x: 295, y: 150, w: 210 },
+    { id: 'bound', label: '6 Boundaries', sub: '', x: 20, y: 150, w: 210 },
+    { id: 'ok', label: '✓ Ship', sub: '', x: 120, y: 280, w: 200 },
+    { id: 'bad', label: '✗ Redesign', sub: '', x: 580, y: 280, w: 200 },
+  ]}
+  edges={[
+    { id: 'scope-iso', from: 'scope', to: 'iso' },
+    { id: 'iso-conc', from: 'iso', to: 'conc' },
+    { id: 'conc-retry', from: 'conc', to: 'retry' },
+    { id: 'retry-dur', from: 'retry', to: 'dur' },
+    { id: 'dur-bound', from: 'dur', to: 'bound' },
+    { id: 'bound-ok', from: 'bound', to: 'ok' },
+    { id: 'retry-bad', from: 'retry', to: 'bad', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'MySQL-specific answers',
+      path: 'RR consistent reads ≠ locking reads → guarded UPDATE / FOR UPDATE → retry 1213, ROLLBACK on 1205 → wait_timeout per job → outbox → ✓',
+      summary: 'Same design; three InnoDB details change the answers.',
+      steps: [
+        {
+          title: '2: know which reads are snapshots',
+          note: 'Under REPEATABLE READ a plain SELECT reads the snapshot, UPDATE and FOR UPDATE read the latest version (Session 7 Concept 1). Check-then-insert based on a plain SELECT never sees concurrent inserts: 800 charges for 200 requests in the lab. Use unique keys and guarded writes.',
+          active: ['scope', 'iso'],
+          edges: ['scope-iso'],
+        },
+        {
+          title: '3: gap locks on secondary indexes',
+          note: 'Locking reads through a secondary index take next-key locks under RR. The queue workers in Session 7 deadlocked 2,594–3,017 times under RR and 0 times under READ COMMITTED. Choose RC for connections that do queue-style or range-locking work.',
+          active: ['iso', 'conc'],
+          edges: ['iso-conc'],
+          subs: { conc: 'RC for queue workers' },
+        },
+        {
+          title: '4: 1205 is not 1213',
+          note: '1213 (deadlock) rolled back the transaction; 1205 (lock wait timeout) only the statement. Always ROLLBACK in the handler, or set innodb_rollback_on_timeout = ON.',
+          active: ['conc', 'retry'],
+          edges: ['conc-retry'],
+          subs: { retry: '1213; 1205 + ROLLBACK' },
+        },
+        {
+          title: '✓ 5–6: duration and boundaries',
+          note: 'No idle-transaction timeout exists: monitor innodb_trx for old transactions on sleeping connections, keep the history list flat, set lock_wait_timeout low for DDL. Outbox as in PostgreSQL, or a binlog-based CDC tool.',
+          active: ['retry', 'dur', 'bound', 'ok'],
+          edges: ['retry-dur', 'dur-bound', 'bound-ok'],
+        },
+        {
+          title: '✗ SERIALIZABLE as a fix-all',
+          note: 'Switching the whole application to SERIALIZABLE turns plain SELECTs into shared locks, and the retries explode: the Session 7 transfers produced 53–71 deadlocks. Fix the specific anomaly with a locking read or a constraint instead.',
+          active: ['iso', 'retry', 'bad'],
+          edges: ['retry-bad'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Flow
+  title="MongoDB: the same review"
+  height={350}
+  nodes={[
+    { id: 'scope', label: '1 Scope', sub: 'one document?', x: 20, y: 20, w: 210 },
+    { id: 'iso', label: '2 Isolation', sub: 'snapshot', x: 295, y: 20, w: 210 },
+    { id: 'conc', label: '3 Concurrency', sub: '', x: 570, y: 20, w: 210 },
+    { id: 'retry', label: '4 Retries', sub: '', x: 570, y: 150, w: 210 },
+    { id: 'dur', label: '5 Duration', sub: '< 60 s', x: 295, y: 150, w: 210 },
+    { id: 'bound', label: '6 Boundaries', sub: '', x: 20, y: 150, w: 210 },
+    { id: 'ok', label: '✓ Ship', sub: '', x: 120, y: 280, w: 200 },
+    { id: 'bad', label: '✗ Redesign', sub: '', x: 450, y: 280, w: 200 },
+  ]}
+  edges={[
+    { id: 'scope-iso', from: 'scope', to: 'iso' },
+    { id: 'iso-conc', from: 'iso', to: 'conc' },
+    { id: 'conc-retry', from: 'conc', to: 'retry' },
+    { id: 'retry-dur', from: 'retry', to: 'dur' },
+    { id: 'dur-bound', from: 'dur', to: 'bound' },
+    { id: 'bound-ok', from: 'bound', to: 'ok' },
+    { id: 'dur-bad', from: 'dur', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'MongoDB-specific answers',
+      path: 'can the invariant live in one document? → if not, transaction (snapshot) → conflicts abort, not wait → withTransaction → < 60 s → change stream → ✓',
+      summary: 'The first question is different: a single-document update is atomic without a transaction.',
+      steps: [
+        {
+          title: '1: model the invariant into one document',
+          note: 'An order with its lines embedded, a stock document updated with a guarded $inc: single-document operations are atomic and need no transaction (the $inc withdrawal was the fastest pattern in Session 7). Use multi-document transactions when the invariant truly spans documents.',
+          code: "db.inventory.updateOne({ _id: sku, stock: { $gte: qty } }, { $inc: { stock: -qty } })",
+          active: ['scope', 'iso'],
+          edges: ['scope-iso'],
+        },
+        {
+          title: '3–4: conflicts abort',
+          note: 'Transactions do not queue behind each other: a conflicting write gets WriteConflict (TransientTransactionError) and withTransaction re-runs the callback (188–396 re-runs on hot documents in Session 7). Keep the callback free of side effects; use a unique index for idempotency.',
+          active: ['iso', 'conc', 'retry'],
+          edges: ['iso-conc', 'conc-retry'],
+          subs: { conc: 'conflict = abort', retry: 'withTransaction' },
+        },
+        {
+          title: '✓ 5–6: duration and boundaries',
+          note: 'Transactions are aborted after 60 s (Concept 1) and snapshots older than 300 s are refused (Concept 2), so design for seconds. Events go out through a change stream with a stored resume token (Concept 4).',
+          active: ['retry', 'dur', 'bound', 'ok'],
+          edges: ['retry-dur', 'dur-bound', 'bound-ok'],
+        },
+        {
+          title: '✗ A bulk job in one transaction',
+          note: 'A 100,000-document transaction worked in the lab (Concept 3), but bigger ones hit the 60 s limit or the cache limit, and pin history for everyone meanwhile. Batch without a transaction when each document is correct on its own.',
+          active: ['dur', 'bad'],
+          edges: ['dur-bad'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Safety nets per engine
+
+| Setting | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| Idle inside a transaction | `idle_in_transaction_session_timeout` | (none) `wait_timeout` per session | `transactionLifetimeLimitSeconds` (60 s) |
+| Whole transaction | `transaction_timeout` (17+) | (none) | `transactionLifetimeLimitSeconds` |
+| One statement | `statement_timeout` | `max_execution_time` (SELECT only) | `maxTimeMS` |
+| Waiting for a lock | `lock_timeout` | `innodb_lock_wait_timeout`, `lock_wait_timeout` (metadata) | `maxTransactionLockRequestTimeoutMillis` |
+| Oldest snapshot | Monitor `backend_xmin` age, slots, prepared xacts | Monitor history list length | `minSnapshotHistoryWindowInSeconds` (300 s) |
+
+Set them per **role** or per **connection** for the application, looser for humans and batch jobs, and alert when they fire: each firing is a transaction that broke rule 5.
+
+## Worked example: reviewing four transactions
+
+| Transaction | Finding | Change |
+|---|---|---|
+| "Transfer between accounts" | Read balance, check, two UPDATEs in request order | Guarded debit (`WHERE balance >= amt`), update in id order, retry 40P01/1213 |
+| "Generate monthly statements" | One transaction over 2M accounts, 40 minutes | Batches of 5,000 by id; statements idempotent per (account, month) |
+| "Sign up user" | INSERT user, then call email API, then COMMIT | Commit, then outbox row → relay sends the email |
+| "Reserve a seat" | `SELECT … WHERE seat_id = ? AND status = 'free'` then UPDATE | One guarded UPDATE, or `FOR UPDATE`; unique (event, seat) for bookings |
+
+<Pitfall>
+The checklist is about each transaction **as written in the code**, including what the framework adds. Transaction-per-request middleware, ORM lazy loading after the transaction began, `@Transactional` on a method that calls another service, and connection pools that do not roll back on return all change the answers to questions 1, 5 and 6 without appearing in the SQL. Read the generated statements (`log_statement`, the general log, the profiler) for a real request.
+</Pitfall>
+
+## Real-world scenario: the transaction review in code review
+
+A team adds four lines to its pull-request template for any change that opens a transaction:
+
+| Line | Reviewer checks |
+|---|---|
+| Invariant | Which rule this transaction protects, in one sentence |
+| Conflict handling | Atomic statement, lock, or version; why |
+| Retry | Which errors, where the loop is, why it is safe to repeat |
+| Outside calls | None inside; how events leave (outbox) |
+
+Production incidents caused by transactions (deadlock storms, idle sessions, lost updates) dropped mostly because the questions are asked before the code ships, not after.
+
+## Key takeaways
+
+1. Six questions: scope, isolation, concurrency control, retries, duration, boundaries; plus indexes and monitoring.
+2. Prefer one guarded atomic statement; it answers questions 2 and 3 at once.
+3. Retries re-run the whole transaction and need idempotency; MySQL 1205 needs an explicit ROLLBACK.
+4. Keep transactions short and enforce it with database-side timeouts; batch bulk work.
+5. Never call another system inside a transaction; use an outbox or CDC with idempotent consumers.
+
+## Check questions
+
+1. Apply the six questions to "reserve a seat": write the transaction and justify each answer.
+2. When is READ COMMITTED enough for a transaction that protects an invariant, and when is it not?
+3. Which safety-net settings would you put on the application role in PostgreSQL, and what does each catch?
+4. Why do MongoDB designs ask "can it be one document?" before "which transaction settings?"
+5. A colleague proposes switching the whole MySQL application to SERIALIZABLE to fix a write-skew bug. What do you answer?
+6. Name three things a framework can add to a transaction without appearing in your SQL.
+7. Which four metrics would you put on a dashboard to see transaction problems early?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-8-when-transactions-hurt/concept-5-design-checklist/answers">Worked answers to Q1–Q7</DeepDive>

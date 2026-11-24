@@ -7,6 +7,7 @@
     "session-4-mvcc-internals",
     "session-5-locks-and-indexes",
     "session-6-deadlocks",
-    "session-7-application-patterns"
+    "session-7-application-patterns",
+    "session-8-when-transactions-hurt"
   ]
 }

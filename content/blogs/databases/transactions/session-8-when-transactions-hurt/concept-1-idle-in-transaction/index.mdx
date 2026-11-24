@@ -1,0 +1,301 @@
+---
+title: "Concept 1: Idle in transaction"
+description: "A transaction that did one UPDATE and then waited for the application blocked an UPDATE of the same row, an ALTER TABLE, and through the lock queue a plain SELECT of a different row, in PostgreSQL and in MySQL. How to see it (pg_stat_activity, innodb_trx, $currentOp) and how each engine ends it: idle_in_transaction_session_timeout and transaction_timeout, MySQL's wait_timeout, MongoDB's 60-second transaction lifetime (the waiting write finished after ≈ 80 s)."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "idle-in-transaction", "lock-queue", "timeouts"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-IDLE-IN-TRANSACTION-SESSION-TIMEOUT"
+  - "https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-TRANSACTION-TIMEOUT"
+  - "https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-ACTIVITY-VIEW"
+  - "https://dev.mysql.com/doc/refman/8.4/en/information-schema-innodb-trx-table.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/metadata-locking.html"
+  - "https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.transactionLifetimeLimitSeconds"
+---
+
+<Tldr>
+The most damaging transaction is often one that does **nothing**: it ran an UPDATE, then the application went off to call an API, wait for a user, or crashed without closing the connection. Its locks stay held. In the lab one such session (A) in PostgreSQL blocked an **UPDATE of the same row** (B), an **`ALTER TABLE`** (C), and, because C was queued, a **plain SELECT of a different row** (D): `pg_blocking_pids` showed the chain A → B, A → C, C → D. MySQL showed the same queue as `Waiting for table metadata lock` on both the ALTER and the SELECT. Timeouts are the fix: with `idle_in_transaction_session_timeout = '5s'` PostgreSQL terminated A after 5 s and B, C and D all completed at **5.01 s**; `transaction_timeout` (PostgreSQL 17) ended a busy transaction after **2.00 s**; MySQL has no idle-transaction timeout, but `wait_timeout = 5` closed A's connection and released the queue at **5.03 s**. MongoDB aborts any transaction older than `transactionLifetimeLimitSeconds` (60 s): a plain write waiting on A's document finished after **≈ 80 s**, and A's commit got `NoSuchTransaction`.
+</Tldr>
+
+## What an idle transaction holds
+
+| Held by an idle transaction | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| Row locks from its writes | ✓ until COMMIT/ROLLBACK | ✓ | ✓ (document write intents) |
+| Table-level lock (blocks DDL) | ✓ RowExclusiveLock (any statement takes one) | ✓ shared metadata lock | ✓ intent locks (DDL waits) |
+| An old snapshot (blocks cleanup) | Only if REPEATABLE READ, or a statement is running; a transaction **that wrote** holds its xid (Concept 2) | ✓ its read view, if it read under RR | ✓ its snapshot |
+| A connection | ✓ | ✓ | ✓ session |
+
+| Term | Meaning |
+|---|---|
+| Idle in transaction | A session inside `BEGIN … COMMIT` that is not running a statement, waiting for the client |
+| Lock queue | A waiting lock request also blocks later requests that conflict with **it**, even if they are compatible with the current holder |
+| `idle_in_transaction_session_timeout` | PostgreSQL: terminate a session idle inside a transaction for longer than this |
+| `transaction_timeout` | PostgreSQL 17+: terminate a session whose transaction (active or idle) has lasted longer than this |
+| `wait_timeout` | MySQL: close a connection idle (between statements) for longer than this, rolling back its transaction |
+| **✓ Released / ✗ Waiting** | The blocked statements completed, or are still queued |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: one idle transaction, three victims"
+  height={330}
+  nodes={[
+    { id: 'a', label: 'A: idle in transaction', sub: 'UPDATE id 21, then nothing', x: 20, y: 20, w: 260 },
+    { id: 'b', label: 'B: UPDATE id 21', sub: '', x: 20, y: 150, w: 260 },
+    { id: 'c', label: 'C: ALTER TABLE', sub: 'needs AccessExclusive', x: 360, y: 20, w: 200 },
+    { id: 'd', label: 'D: SELECT id 50', sub: 'needs AccessShare', x: 360, y: 150, w: 200 },
+    { id: 'wait', label: '✗ Waiting', sub: 'wait_event Lock', x: 620, y: 20, w: 160 },
+    { id: 'ok', label: '✓ Released', sub: '', x: 620, y: 150, w: 160 },
+    { id: 'kill', label: 'Timeout', sub: 'A terminated', x: 20, y: 270, w: 260 },
+  ]}
+  edges={[
+    { id: 'a-c', from: 'a', to: 'c', label: 'blocks' },
+    { id: 'a-b', from: 'a', to: 'b' },
+    { id: 'c-d', from: 'c', to: 'd', label: 'queue' },
+    { id: 'c-wait', from: 'c', to: 'wait' },
+    { id: 'd-ok', from: 'd', to: 'ok' },
+    { id: 'kill-a', from: 'kill', to: 'b', quiet: true },
+  ]}
+  cases={[
+    {
+      title: '✗ The queue forms',
+      path: 'A holds row 21 + RowExclusiveLock → B waits (transactionid) → C waits (relation) → D waits behind C → ✗',
+      summary: 'pg_stat_activity 1 s later: A idle in transaction, B, C, D all wait_event_type Lock.',
+      steps: [
+        {
+          title: 't0: A updates and goes idle',
+          note: 'state = idle in transaction, wait_event ClientRead: PostgreSQL is waiting for the application, not for anything inside the database.',
+          code: "BEGIN;\nUPDATE accounts SET balance = balance WHERE id = 21;\n-- application now calls an API, waits for a user, or hangs",
+          active: ['a'],
+        },
+        {
+          title: 't0 + 0.0 s: B waits for the row',
+          note: 'B wants the same row: wait_event transactionid, pg_blocking_pids(B) = A.',
+          active: ['a', 'b'],
+          edges: ['a-b'],
+        },
+        {
+          title: 't0 + 0.2 s: C waits for the table',
+          note: 'ALTER TABLE needs AccessExclusiveLock, which conflicts with A\'s RowExclusiveLock (and B\'s): wait_event relation, blocked by A and B.',
+          code: 'ALTER TABLE accounts ADD COLUMN note text;',
+          active: ['a', 'c', 'wait'],
+          edges: ['a-c', 'c-wait'],
+        },
+        {
+          title: '✗ t0 + 0.4 s: D waits behind C',
+          note: 'D only reads another row, and AccessShareLock is compatible with A. But it conflicts with C\'s queued AccessExclusive request, so it queues behind C: pg_blocking_pids(D) = C. Every new query on accounts now piles up behind an idle session.',
+          code: "SELECT pid, state, wait_event_type, wait_event, pg_blocking_pids(pid)\nFROM pg_stat_activity WHERE datname = current_database();",
+          active: ['c', 'd', 'wait'],
+          edges: ['c-d', 'c-wait'],
+        },
+      ],
+    },
+    {
+      title: '✓ idle_in_transaction_session_timeout',
+      path: 'A idle 5 s → server terminates A, rolls back → B, C, D complete at 5.01 s',
+      summary: 'The setting can be per session, per role, per database or server-wide.',
+      steps: [
+        {
+          title: '✓ A is terminated',
+          note: 'After 5 s idle inside the transaction the server ends A\'s session: "FATAL: terminating connection due to idle-in-transaction timeout". Its transaction rolls back and every lock is released.',
+          code: "SET idle_in_transaction_session_timeout = '5s';   -- or ALTER ROLE app SET …",
+          active: ['kill', 'a', 'b'],
+          edges: ['kill-a'],
+        },
+        {
+          title: '✓ The queue drains',
+          note: 'B, C and D all completed at 5.01 s. A\'s client finds out on its next statement: its connection is gone.',
+          active: ['b', 'c', 'd', 'ok'],
+          edges: ['d-ok'],
+        },
+      ],
+    },
+    {
+      title: 'transaction_timeout (PostgreSQL 17)',
+      path: 'transaction running longer than 2 s, active or idle → session terminated after 2.00 s',
+      summary: 'Covers what the idle timeout misses: a transaction that keeps running statements for an hour.',
+      steps: [
+        {
+          title: '✓ A cap on the whole transaction',
+          note: 'Measured: BEGIN; SELECT pg_sleep(5) with transaction_timeout = 2s → "terminating connection due to transaction timeout" after 2.00 s. statement_timeout limits one statement; transaction_timeout limits the sum.',
+          code: "SET transaction_timeout = '2s';\nBEGIN; SELECT pg_sleep(5);   -- terminated after 2 s",
+          active: ['kill', 'a'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL
+
+<Flow
+  title="MySQL: an idle transaction and the metadata-lock queue"
+  height={330}
+  nodes={[
+    { id: 'a', label: 'A: Sleep, trx RUNNING', sub: 'UPDATE id 21, then nothing', x: 20, y: 20, w: 260 },
+    { id: 'b', label: 'B: UPDATE id 21', sub: 'row lock wait', x: 20, y: 150, w: 260 },
+    { id: 'c', label: 'C: ALTER TABLE', sub: 'exclusive MDL', x: 360, y: 20, w: 200 },
+    { id: 'd', label: 'D: SELECT id 50', sub: 'shared MDL', x: 360, y: 150, w: 200 },
+    { id: 'wait', label: '✗ Waiting', sub: 'metadata lock', x: 620, y: 20, w: 160 },
+    { id: 'ok', label: '✓ Released', sub: '', x: 620, y: 150, w: 160 },
+    { id: 'kill', label: 'wait_timeout', sub: 'A disconnected', x: 20, y: 270, w: 260 },
+  ]}
+  edges={[
+    { id: 'a-c', from: 'a', to: 'c', label: 'blocks' },
+    { id: 'a-b', from: 'a', to: 'b' },
+    { id: 'c-d', from: 'c', to: 'd', label: 'queue' },
+    { id: 'c-wait', from: 'c', to: 'wait' },
+    { id: 'd-ok', from: 'd', to: 'ok' },
+    { id: 'kill-a', from: 'kill', to: 'b', quiet: true },
+  ]}
+  cases={[
+    {
+      title: '✗ The queue forms',
+      path: 'A idle (Sleep) holding row 21 and a shared MDL → B: 1205 after 3 s → C and D: Waiting for table metadata lock',
+      summary: 'processlist shows A as Sleep: nothing in it says "this connection is blocking everyone".',
+      steps: [
+        {
+          title: 'A looks harmless in processlist',
+          note: 'processlist: command Sleep, state empty. Only information_schema.innodb_trx shows its transaction: trx_state RUNNING, started 2 s ago, trx_query NULL.',
+          code: "SELECT trx_mysql_thread_id, trx_state, trx_started, trx_query FROM information_schema.innodb_trx;",
+          active: ['a'],
+        },
+        {
+          title: '✗ B gives up, C and D queue',
+          note: 'B (innodb_lock_wait_timeout = 3) failed with 1205 after 3.01 s. C waits for an exclusive metadata lock; D, a read of another row, waits behind C: both show "Waiting for table metadata lock".',
+          active: ['a', 'b', 'c', 'd', 'wait'],
+          edges: ['a-b', 'a-c', 'c-d', 'c-wait'],
+        },
+      ],
+    },
+    {
+      title: '✓ wait_timeout closes A',
+      path: 'A idle 5 s → server closes the connection → rollback → C and D complete at 5.03 s',
+      summary: 'MySQL has no idle-in-transaction timeout; wait_timeout (idle connection) is the closest tool.',
+      steps: [
+        {
+          title: '✓ The connection is closed',
+          note: 'With SET SESSION wait_timeout = 5, the idle connection was closed after 5 s and its transaction rolled back. A pool keeps connections open on purpose, so wait_timeout must be longer than the pool\'s idle time, or set per session for risky jobs. A\'s next statement failed: the connection was closed.',
+          code: 'SET SESSION wait_timeout = 5;   -- per connection; the global default is 28,800 s',
+          active: ['kill', 'a', 'b'],
+          edges: ['kill-a'],
+        },
+        {
+          title: '✓ The queue drains',
+          note: 'C (ALTER TABLE) and D (SELECT) completed at 5.03 s. For DDL itself, set lock_wait_timeout low (Indexing Session 8) so it gives up instead of heading the queue.',
+          active: ['c', 'd', 'ok'],
+          edges: ['d-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: the transaction lifetime limit"
+  height={300}
+  nodes={[
+    { id: 'a', label: 'A: open transaction', sub: 'updated _id 21', x: 20, y: 20, w: 240 },
+    { id: 'b', label: 'B: plain updateOne', sub: '_id 21', x: 20, y: 180, w: 240 },
+    { id: 'reaper', label: 'Lifetime limit', sub: '60 s', x: 330, y: 20, w: 200 },
+    { id: 'wait', label: '✗ B waiting', sub: '', x: 330, y: 180, w: 200 },
+    { id: 'ok', label: '✓ B completes', sub: 'after ≈ 80 s', x: 600, y: 100, w: 180 },
+  ]}
+  edges={[
+    { id: 'a-b', from: 'a', to: 'b' },
+    { id: 'b-wait', from: 'b', to: 'wait' },
+    { id: 'a-reaper', from: 'a', to: 'reaper' },
+    { id: 'reaper-ok', from: 'reaper', to: 'ok' },
+    { id: 'wait-ok', from: 'wait', to: 'ok', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Idle transaction, waiting write',
+      path: 'A updates _id 21 in a transaction and idles → B\'s plain update waits → server aborts A after its 60 s limit → ✓ B completes at ≈ 80 s → A\'s commit: NoSuchTransaction',
+      summary: 'Two runs: B completed at 80.5 s and 79.9 s.',
+      steps: [
+        {
+          title: 'A is visible as an inactive transaction',
+          note: '$currentOp with idleSessions: true showed A with active false, timeOpenMicros ≈ 3,000,000 and timeInactiveMicros ≈ 3,000,000 (open 3 s, idle 3 s), and an expiryTime 60 s after it started.',
+          code: "db.getSiblingDB('admin').aggregate([{ $currentOp: { idleSessions: true } },\n  { $match: { 'transaction.parameters.txnNumber': { $exists: true } } }])",
+          active: ['a'],
+        },
+        {
+          title: '✗ B waits',
+          note: 'A non-transactional write to a document modified by an open transaction waits (it is retried internally) until that transaction ends.',
+          active: ['a', 'b', 'wait'],
+          edges: ['a-b', 'b-wait'],
+        },
+        {
+          title: '✓ The server aborts A',
+          note: 'Transactions older than transactionLifetimeLimitSeconds (60 s) are aborted by a periodic background job; in the lab it ran about 20 s after the expiry, so B completed at ≈ 80 s. A\'s later commit failed: 251 NoSuchTransaction "Transaction with { txnNumber: 1 } has been aborted."',
+          active: ['a', 'reaper', 'ok'],
+          edges: ['a-reaper', 'reaper-ok', 'wait-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Finding idle transactions
+
+| Engine | Query | Look for |
+|---|---|---|
+| PostgreSQL | `SELECT pid, usename, application_name, state, now() - xact_start AS xact_age, now() - state_change AS idle_for, query FROM pg_stat_activity WHERE state LIKE 'idle in transaction%' ORDER BY xact_start` | `xact_age` of seconds or more; `query` is the **last** statement, a hint to the code path |
+| PostgreSQL | `SELECT pid, pg_blocking_pids(pid) FROM pg_stat_activity WHERE cardinality(pg_blocking_pids(pid)) > 0` | Who blocks whom |
+| MySQL | `SELECT t.trx_mysql_thread_id, t.trx_started, p.command, p.time FROM information_schema.innodb_trx t JOIN information_schema.processlist p ON p.id = t.trx_mysql_thread_id WHERE p.command = 'Sleep'` | Open transactions on sleeping connections |
+| MySQL | `SELECT * FROM sys.innodb_lock_waits` / `sys.schema_table_lock_waits` | Row waits / metadata lock waits with the blocker's id |
+| MongoDB | `$currentOp` with `idleSessions: true`, filter on `transaction` | `active: false` with a large `timeInactiveMicros` |
+
+<Pitfall>
+The usual sources are in the application, not the database: a request handler that opens a transaction and then calls an HTTP API; an ORM that begins a transaction on first query and commits at the end of the request; a test or console session left open; an exception path that never rolls back and returns the connection to a pool that does not reset it. Set `idle_in_transaction_session_timeout` (for the application role) as a safety net, but fix the code path the `query` column points to.
+</Pitfall>
+
+## Connection pools and transactions
+
+| Pool mode | One transaction holds | Risk |
+|---|---|---|
+| Session pooling (default in most app pools) | One server connection for the client's session | Idle-in-transaction connections reduce the pool for everyone |
+| Transaction pooling (PgBouncer `pool_mode = transaction`) | A server connection only while a transaction is open | Session state (SET, prepared statements, session advisory locks, Session 7) does not survive between transactions; an idle open transaction pins a server connection |
+| Statement pooling | A server connection per statement | Multi-statement transactions are not allowed |
+
+## Real-world scenario: the migration that took the site down
+
+A deploy runs `ALTER TABLE orders ADD COLUMN …`, which should take milliseconds. Instead the site's order pages time out for six minutes. A support engineer had a psql session open since the morning with `BEGIN; SELECT * FROM orders WHERE id = …;` and gone to lunch.
+
+| Lesson | Setting / practice |
+|---|---|
+| The ALTER queued behind an idle transaction, and all reads queued behind the ALTER | `SET lock_timeout = '3s'` in migrations; retry later |
+| Nobody noticed the idle session | Alert on `idle in transaction` older than 1 minute |
+| Humans open transactions by hand | `idle_in_transaction_session_timeout` for human roles (e.g. 10 min), much lower for the application role |
+
+## Why this matters
+
+| Next concept | Why this concept matters |
+|---|---|
+| Concept 2: long transactions and cleanup | Idle transactions are the most common long transactions |
+| Concept 3: big transactions | A big transaction holds the same locks, for longer |
+| Concept 5: checklist | Timeouts belong on every application role |
+
+## Key takeaways
+
+1. An idle transaction keeps its locks: it blocked a same-row UPDATE, an ALTER TABLE and, through the lock queue, an unrelated SELECT.
+2. `pg_stat_activity` (state `idle in transaction`, `pg_blocking_pids`), `innodb_trx` joined with processlist, and `$currentOp` with `idleSessions` find it.
+3. PostgreSQL: `idle_in_transaction_session_timeout` and, from 17, `transaction_timeout` end it (5.01 s and 2.00 s in the lab).
+4. MySQL has no idle-transaction timeout; `wait_timeout` per session (5.03 s in the lab) and short `lock_wait_timeout` for DDL limit the damage.
+5. MongoDB caps transactions at 60 s (`transactionLifetimeLimitSeconds`), enforced by a periodic job: the waiting write finished after ≈ 80 s.
+
+## Check questions
+
+1. Why did D, a SELECT of a different row, wait, although it does not conflict with A?
+2. What does `state = 'idle in transaction'` with `wait_event = 'ClientRead'` tell you about where the problem is?
+3. What is the difference between `statement_timeout`, `idle_in_transaction_session_timeout` and `transaction_timeout`?
+4. Why does MySQL's processlist make the blocking session easy to miss, and which view shows it?
+5. Why is a low global `wait_timeout` a risky way to fix idle transactions in MySQL?
+6. In the MongoDB run the transaction's limit was 60 s, but the waiting write finished at ≈ 80 s. Why?
+7. List three application patterns that produce idle-in-transaction sessions, and the fix for each.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-8-when-transactions-hurt/concept-1-idle-in-transaction/answers">Worked answers to Q1–Q7</DeepDive>

@@ -1,0 +1,117 @@
+---
+title: "Answers: When transactions hurt session quiz"
+description: "Worked answers to the Session 8 quiz, the final quiz of the Transactions course."
+companion: "answers"
+tags: ["transactions", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-purge-configuration.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions/"
+---
+
+<Tldr>
+Transactions are cheap when they are small, short, local and retried; every incident in this session broke one of those four.
+</Tldr>
+
+## Q1. Preventing the outage
+
+**Question:** which single setting would have prevented the outage, and which code change would have prevented the idle transaction?
+
+The setting: `lock_timeout` on the DDL session (`SET lock_timeout = '3s'` before `ALTER TABLE`). The ALTER would have given up instead of heading the queue, and D's SELECT would never have waited; the migration retries later. `idle_in_transaction_session_timeout` on the application role limits how long A can block, but the queue still forms until it fires. The code change: whatever left A open (an HTTP call or a user wait inside the transaction, a missing ROLLBACK on an error path) must be moved out or fixed, with the transaction opened only around the database work.
+
+> **Common mistake:** killing D, the victim, instead of A or C.
+
+## Q2. Idle RC writer vs idle RC reader
+
+**Question:** why does an idle READ COMMITTED transaction that wrote one row hold back VACUUM, while one that only read does not?
+
+A READ COMMITTED reader holds a snapshot only while a statement runs, so when idle it has no `backend_xmin`. A writer has been assigned a transaction id and is still in progress; every snapshot taken since then lists that xid as running, so the global horizon cannot advance past it, and rows that died after it might still be visible to such snapshots. Measured: read-only idle, 0 tuples kept; after one UPDATE, 49,995 dead tuples "not yet removable".
+
+> **Common mistake:** checking only `backend_xmin` when looking for the horizon holder; check `backend_xid` too.
+
+## Q3. A 3-hour MySQL report
+
+**Question:** a nightly MySQL report runs 3 hours in one transaction. Name two effects on the rest of the server and a design that avoids them.
+
+Effects: its read view stops **purge** for the whole server, so the history list grows (5,020 instead of ≈ 200 in a few seconds in the lab; millions in 3 hours), undo tablespaces grow and every read of recently changed rows gets slower; the report itself slows down as it reconstructs old versions from undo (5.6 → 32 ms in the lab for one SUM). If it takes metadata locks on tables that a migration wants to ALTER, the migration and everything behind it queue (Concept 1). Design: run it on a replica dedicated to reporting, or in autocommit chunks (per day, per customer range), or export a snapshot once (backup tool, CDC into a warehouse).
+
+> **Common mistake:** "it only reads, so it can't hurt anyone".
+
+## Q4. Rollback cost
+
+**Question:** why is a failed big transaction cheap to roll back in PostgreSQL but expensive in InnoDB, and where does PostgreSQL pay instead?
+
+PostgreSQL writes new row versions and never overwrites the old ones, so rollback only marks the xid aborted (3 ms for 100,000 rows). InnoDB updates in place and must restore every row from its undo record (184 ms for one pass, 347 ms for four: proportional to the work). PostgreSQL pays later: the aborted versions are dead tuples that bloat the table and indexes until VACUUM removes them, and the WAL for the aborted work was written anyway (37.6 MB).
+
+> **Common mistake:** retrying a failing bulk job in a loop in PostgreSQL "because rollback is free", creating bloat on every attempt.
+
+## Q5. 2PC vs outbox
+
+**Question:** compare 2PC and the outbox: what does each guarantee, and what does each cost operationally?
+
+| | Two-phase commit | Outbox |
+|---|---|---|
+| Guarantee | Atomic commit across participants (all or none) | The event is published at least once if and only if the local transaction committed |
+| Consumers | Can rely on atomicity | Must be idempotent (duplicates: 377 of 1,377 deliveries in the lab) |
+| Requirements | Every participant supports XA; a durable coordinator | One local table and a relay (or CDC) |
+| Failure mode | In-doubt transactions holding locks and the cleanup horizon until resolved (the MySQL branch held row 40 after its client vanished) | Relay lag (events late, not lost) |
+| Defaults | PostgreSQL ships it disabled (`max_prepared_transactions = 0`) | Works everywhere |
+
+> **Common mistake:** choosing 2PC to avoid writing idempotent consumers, then running without monitoring for in-doubt transactions.
+
+## Q6. Transfer in PostgreSQL, using the whole course
+
+**Question:** design "transfer money between two accounts" for PostgreSQL using the whole course.
+
+```sql
+-- READ COMMITTED is enough: each invariant is enforced inside one statement or a constraint.
+BEGIN;
+INSERT INTO transfers (idem_key, from_id, to_id, amount) VALUES ($key, $from, $to, $amt)
+ON CONFLICT (idem_key) DO NOTHING RETURNING id;                 -- 0 rows → already done (Session 7)
+-- lock both accounts in id order to avoid deadlocks (Session 6)
+SELECT id FROM accounts WHERE id IN ($from, $to) ORDER BY id FOR UPDATE;
+UPDATE accounts SET balance = balance - $amt WHERE id = $from AND balance >= $amt;   -- 0 rows → ROLLBACK, insufficient funds
+UPDATE accounts SET balance = balance + $amt WHERE id = $to;
+INSERT INTO outbox (event_id, payload) VALUES ('transfer-' || $key, …);              -- Session 8
+COMMIT;
+```
+
+- **Isolation:** READ COMMITTED (Sessions 2–3): the overdraft check is the guarded UPDATE; the CHECK (balance >= 0) backs it up.
+- **Locks:** both rows locked in id order (Session 6); the guarded UPDATE also protects against lost updates (Session 7).
+- **Retries:** wrap the function; retry 40P01 and 40001 with jitter, at most N times (Session 7).
+- **Idempotency:** `transfers.idem_key` UNIQUE, inserted in the same transaction (Session 7).
+- **Duration:** milliseconds; role-level `idle_in_transaction_session_timeout`, `transaction_timeout`, `lock_timeout` (Session 8).
+- **Event:** outbox row; consumers dedupe by event id (Session 8).
+- **Indexes:** primary keys on accounts and the unique key on `idem_key`; nothing locks more rows than it needs (Session 5).
+
+> **Common mistake:** SERIALIZABLE plus no retry loop: correct in tests, errors in production.
+
+## Q7. The same transfer in MongoDB
+
+**Question:** the same transfer in MongoDB: which parts change, and why?
+
+- Two account documents must change together, so a **multi-document transaction** is needed (one-document modelling does not fit a transfer), run with **`withTransaction`**, which re-runs the callback on TransientTransactionError and retries the commit on UnknownTransactionCommitResult (Session 7).
+- **No lock ordering**: transactions do not wait for each other, they abort on WriteConflict, so ordering does not reduce conflicts (Session 7: 188–230 re-runs either way). Keep the transaction tiny instead.
+- The overdraft guard is a filter in the update: `updateOne({ _id: from, balance: { $gte: amt } }, { $inc: { balance: -amt } }, { session })`, and abort the transaction if `modifiedCount` is 0.
+- **Idempotency** through a `transfers` collection with a unique index on `idem_key`, inserted in the same transaction.
+- **Events** through a change stream on `transfers` with a stored resume token (Session 8) instead of an outbox table.
+- **Duration** is capped by the server at 60 s; snapshots at 300 s.
+
+> **Common mistake:** writing the debit and the credit as two separate single-document updates "because they are each atomic"; a crash between them loses money.
+
+## Q8. Three surprising measurements
+
+**Question:** pick three measurements from the course that surprised you, and say which design rule each one supports.
+
+One reasonable answer (yours may differ):
+
+| Measurement | Rule it supports |
+|---|---|
+| Read-then-write lost 314–350 of 400 withdrawals with no error (Session 7) | Keep the decision inside one guarded statement, or protect it with a lock or version |
+| One idle transaction made an unrelated SELECT wait behind an ALTER TABLE (Session 8) | Short transactions, timeouts on every role, `lock_timeout` for DDL |
+| One old snapshot grew a table from 439 to 1,545 pages over four update cycles (Session 8) | Monitor the oldest snapshot/xid; no long transactions on busy databases |
+| A MySQL 1205 committed half a transfer (Session 7) | Always ROLLBACK on error before retrying |
+| SKIP LOCKED queue under RR: 2,594–3,017 deadlocks; under RC: 0 (Session 7) | Choose the isolation level per workload, and index what locking statements search |
+
+> **Common mistake:** memorising settings without the failure they prevent; the measurement is what makes the rule stick.

@@ -1,0 +1,277 @@
+---
+title: "Concept 4: Distributed transactions: two-phase commit vs the outbox"
+description: "A transaction cannot span your database and a message broker. Dual writes lost 62 of 1,000 events (or invented 52) under a 5% crash rate. Two-phase commit is disabled by default in PostgreSQL, and a prepared MySQL XA branch kept its row lock after its client vanished. The outbox pattern lost nothing: 1,000 orders, 1,000 distinct events, delivered at least once (377 duplicates for idempotent consumers to absorb). MongoDB change streams resumed after a crash without gaps."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "two-phase-commit", "xa", "outbox", "change-streams"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-prepare-transaction.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/xa.html"
+  - "https://microservices.io/patterns/data/transactional-outbox.html"
+  - "https://www.mongodb.com/docs/manual/changeStreams/#resume-a-change-stream"
+---
+
+<Tldr>
+"Save the order **and** publish an `OrderCreated` event" touches two systems, and no local transaction covers both. In a simulation of 1,000 orders with a 5% chance of crashing between the two writes, **database first** lost **62** events (orders nobody heard about) and **publish first** produced **52** phantom events (for orders that never existed). **Two-phase commit** makes both systems prepare, then commit: PostgreSQL ships it **disabled** (`max_prepared_transactions = 0`: "prepared transactions are disabled"), and in MySQL a prepared XA branch survived its client's disconnect, **kept its row lock** (another update got 1205 after 2 s) until someone ran `XA COMMIT` by hand. The **outbox pattern** writes the event into an `outbox` table **in the same local transaction** as the order; a relay publishes it afterwards and marks it sent. With failures and relay crashes injected, all **1,000** events arrived, as **1,377** deliveries: at least once, never zero, so consumers must be idempotent (Session 7). In MongoDB, a **change stream** is a ready-made relay: after a simulated crash at event 400 it resumed from its token and delivered all 1,000 in order.
+</Tldr>
+
+## The problem
+
+| Approach | Failure between the two writes | Lab result (1,000 orders, 5% crash) |
+|---|---|---|
+| ✗ Commit to the database, then publish | Order exists, event never sent | **62 lost events** |
+| ✗ Publish, then commit | Event sent, order never stored | **52 phantom events** |
+| Two-phase commit (2PC / XA) | Both systems prepared; a coordinator must finish them | Needs every system to support it; in-doubt transactions hold locks |
+| ✓ Transactional outbox | Event row commits with the order; relay retries until sent | **0 lost**, 1,000 distinct events, 377 duplicate deliveries |
+| ✓ Change data capture (change streams, logical decoding, binlog readers) | The database log is the outbox | **0 lost**, resumed without gaps after a crash |
+
+| Term | Meaning |
+|---|---|
+| Dual write | Writing to two systems in sequence, with no transaction across them |
+| Two-phase commit | Phase 1: every participant prepares (durably promises it can commit); phase 2: the coordinator tells all to commit or roll back |
+| In-doubt (prepared) transaction | Prepared but not yet committed or rolled back: holds its locks indefinitely |
+| Outbox | A table written in the same transaction as the business change, holding the events to publish |
+| Relay | A process that reads unsent outbox rows, publishes them, and marks them sent |
+| At-least-once | Every event is delivered one or more times; duplicates are possible, losses are not |
+| **✓ Consistent / ✗ Lost or phantom** | Database and broker agree, or not |
+
+## PostgreSQL: 2PC is off; the outbox is a table
+
+<Flow
+  title="PostgreSQL: order + event"
+  height={330}
+  nodes={[
+    { id: 'app', label: 'Order service', sub: '', x: 20, y: 120, w: 190 },
+    { id: 'db', label: 'PostgreSQL', sub: 'orders + outbox', x: 280, y: 20, w: 220 },
+    { id: 'relay', label: 'Relay', sub: 'SKIP LOCKED', x: 280, y: 220, w: 220 },
+    { id: 'broker', label: 'Broker', sub: '', x: 580, y: 120, w: 200 },
+    { id: 'lost', label: '✗ Event lost', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'ok', label: '✓ Delivered', sub: 'at least once', x: 580, y: 240, w: 200 },
+  ]}
+  edges={[
+    { id: 'app-db', from: 'app', to: 'db' },
+    { id: 'app-broker', from: 'app', to: 'broker', quiet: true },
+    { id: 'db-lost', from: 'db', to: 'lost' },
+    { id: 'db-relay', from: 'db', to: 'relay' },
+    { id: 'relay-broker', from: 'relay', to: 'broker' },
+    { id: 'relay-ok', from: 'relay', to: 'ok' },
+  ]}
+  cases={[
+    {
+      title: '✗ Dual write',
+      path: 'INSERT order, COMMIT → process dies → publish never happens → ✗ 62 of 1,000 events lost',
+      summary: 'The reverse order (publish, then insert) produced 52 phantom events instead.',
+      steps: [
+        {
+          title: 'Commit, then publish',
+          code: "INSERT INTO orders_o VALUES (:id, 10.00);   -- autocommit\n-- crash here: 5% of the time in the simulation\nbroker.publish({ event_id: 'order-' + id })",
+          note: 'Each write is reliable on its own; nothing ties them together.',
+          active: ['app', 'db', 'broker'],
+          edges: ['app-db', 'app-broker'],
+        },
+        {
+          title: '✗ The gap loses events',
+          note: '1,000 orders, 938 events: 62 orders exist that no other service will ever hear about (no invoice, no shipment). Retrying the publish from the request handler does not help when the process itself died.',
+          active: ['db', 'lost'],
+          edges: ['db-lost'],
+          subs: { lost: '62 of 1,000' },
+        },
+      ],
+    },
+    {
+      title: '2PC: disabled by default',
+      path: 'PREPARE TRANSACTION → ERROR: prepared transactions are disabled (max_prepared_transactions = 0)',
+      summary: 'Enabling it needs a server restart, and every in-doubt transaction holds locks and the cleanup horizon.',
+      steps: [
+        {
+          title: 'PREPARE TRANSACTION refused',
+          note: 'PostgreSQL supports the participant side of 2PC, but max_prepared_transactions is 0 by default. A forgotten prepared transaction would hold its locks and stop VACUUM (Concept 2) until someone resolves it: pg_prepared_xacts lists them.',
+          code: "BEGIN;\nUPDATE accounts SET balance = balance WHERE id = 40;\nPREPARE TRANSACTION 'pay-1';\n-- ERROR:  prepared transactions are disabled\n-- HINT:  Set \"max_prepared_transactions\" to a nonzero value.",
+          active: ['app', 'db'],
+          edges: ['app-db'],
+        },
+      ],
+    },
+    {
+      title: '✓ Outbox',
+      path: 'INSERT order + INSERT outbox in one transaction → relay: FOR UPDATE SKIP LOCKED, publish, mark sent → ✓ 1,000 of 1,000',
+      summary: '74 publish failures and 31 relay crashes injected: 0 lost, 1,377 deliveries of 1,000 distinct events.',
+      steps: [
+        {
+          title: '✓ One local transaction',
+          code: "BEGIN;\nINSERT INTO orders_o VALUES (:id, 10.00);\nINSERT INTO outbox (event_id, payload) VALUES ('order-' || :id, :payload);\nCOMMIT;",
+          note: 'The order and its event commit together or not at all: there is no gap to crash in.',
+          active: ['app', 'db'],
+          edges: ['app-db'],
+        },
+        {
+          title: 'The relay publishes',
+          code: "BEGIN;\nSELECT id, event_id, payload FROM outbox WHERE sent_at IS NULL ORDER BY id\nLIMIT 100 FOR UPDATE SKIP LOCKED;\n-- publish each row; on broker error stop and retry later\nUPDATE outbox SET sent_at = now() WHERE id = ANY(:sent);\nCOMMIT;",
+          note: 'Several relays can run in parallel thanks to SKIP LOCKED (Session 7). A partial index on unsent rows keeps the scan small.',
+          active: ['db', 'relay', 'broker'],
+          edges: ['db-relay', 'relay-broker'],
+        },
+        {
+          title: '✓ At least once',
+          note: 'A relay that crashed after publishing but before marking rolled back its batch, so those events were published again: 377 duplicates. No event was lost. Consumers deduplicate by event_id (an idempotency key, Session 7 Concept 5); smaller batches or per-row marking reduce the duplicates.',
+          active: ['relay', 'ok'],
+          edges: ['relay-ok'],
+          subs: { ok: '1,000 events, 1,377 sends' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: XA transactions
+
+MySQL supports two-phase commit through `XA` statements. The danger is the in-doubt state.
+
+<Flow
+  title="MySQL: a prepared XA branch without its coordinator"
+  height={300}
+  nodes={[
+    { id: 'coord', label: 'Coordinator', sub: 'client A', x: 20, y: 20, w: 200 },
+    { id: 'xa', label: "XA 'pay-1'", sub: 'PREPARED', x: 300, y: 110, w: 220 },
+    { id: 'other', label: 'Other session', sub: 'UPDATE id 40', x: 20, y: 200, w: 200 },
+    { id: 'wait', label: '✗ 1205', sub: 'lock still held', x: 600, y: 200, w: 180 },
+    { id: 'ok', label: '✓ XA COMMIT', sub: 'by an operator', x: 600, y: 20, w: 180 },
+  ]}
+  edges={[
+    { id: 'coord-xa', from: 'coord', to: 'xa' },
+    { id: 'other-xa', from: 'other', to: 'xa' },
+    { id: 'xa-wait', from: 'xa', to: 'wait' },
+    { id: 'xa-ok', from: 'xa', to: 'ok' },
+  ]}
+  cases={[
+    {
+      title: 'In-doubt branch',
+      path: 'XA START … XA PREPARE → client disconnects → branch survives, row 40 locked → ✗ 1205 for others → ✓ XA COMMIT from another session',
+      summary: 'innodb_trx showed the transaction RUNNING with thread id 0: owned by no connection.',
+      steps: [
+        {
+          title: 'Phase 1: prepare',
+          code: "XA START 'pay-1';\nUPDATE accounts SET balance = balance - 10 WHERE id = 40;\nXA END 'pay-1';\nXA PREPARE 'pay-1';",
+          note: 'After XA PREPARE the branch is durable: it survives a disconnect and even a server restart, waiting for the coordinator\'s decision.',
+          active: ['coord', 'xa'],
+          edges: ['coord-xa'],
+        },
+        {
+          title: '✗ The coordinator disappears',
+          note: 'Client A disconnected. XA RECOVER still listed pay-1; information_schema.innodb_trx showed it RUNNING, trx_mysql_thread_id 0, 1 row locked. Another session\'s UPDATE of id 40 failed with 1205 after 2,005 ms (lock wait timeout 2 s).',
+          code: 'XA RECOVER;   -- formatID 1, data pay-1',
+          active: ['other', 'xa', 'wait'],
+          edges: ['other-xa', 'xa-wait'],
+        },
+        {
+          title: '✓ Phase 2 by hand',
+          note: 'Any session can finish it: XA COMMIT \'pay-1\' applied the debit (balance 990.00) and released the lock. In production a transaction manager must do this after every crash, for every participant, consistently.',
+          code: "XA COMMIT 'pay-1';   -- or XA ROLLBACK 'pay-1'",
+          active: ['xa', 'ok'],
+          edges: ['xa-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: change streams as the relay
+
+MongoDB's multi-document transactions are local to one replica set (or cluster). For "write and publish", a **change stream** reads the oplog: every committed change, in order, with a **resume token** to continue after a restart.
+
+<Flow
+  title="MongoDB: change stream relay with resume"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'Order service', sub: 'insertOne', x: 20, y: 110, w: 190 },
+    { id: 'oplog', label: 'Oplog', sub: 'committed changes', x: 280, y: 110, w: 200 },
+    { id: 'r1', label: 'Relay run 1', sub: 'crashes at 400', x: 560, y: 20, w: 220 },
+    { id: 'r2', label: 'Relay run 2', sub: 'resumeAfter token', x: 560, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'app-oplog', from: 'app', to: 'oplog' },
+    { id: 'oplog-r1', from: 'oplog', to: 'r1' },
+    { id: 'oplog-r2', from: 'oplog', to: 'r2' },
+  ]}
+  cases={[
+    {
+      title: 'Crash and resume',
+      path: '1,000 inserts → relay reads 400, saves token, crashes → relay resumes after token → ✓ 1,000 received, 1,000 distinct, in order',
+      summary: 'The database log is the outbox: nothing extra to write in the transaction.',
+      steps: [
+        {
+          title: 'Only committed changes appear',
+          note: 'The order service just writes its document (or a transaction). Aborted transactions never reach the oplog, so no phantom events are possible.',
+          code: "await orders.insertOne({ _id: 17, amount: 10 });",
+          active: ['app', 'oplog'],
+          edges: ['app-oplog'],
+        },
+        {
+          title: 'Relay run 1 stops at 400',
+          note: 'Each event carries _id, the resume token. Store the token after publishing each event (or batch), ideally in the same place as the publish confirmation.',
+          code: "for await (const ev of orders.watch()) { publish(ev); token = ev._id; }",
+          active: ['oplog', 'r1'],
+          edges: ['oplog-r1'],
+        },
+        {
+          title: '✓ Run 2 resumes without gaps',
+          note: 'watch([], { resumeAfter: token }) delivered events 401–1000: 1,000 received, 1,000 distinct, in order. If the token was saved before publishing, a crash in between re-delivers one event: still at least once. The token must still be in the oplog window (oplog size).',
+          code: "orders.watch([], { resumeAfter: token })",
+          active: ['oplog', 'r2'],
+          edges: ['oplog-r2'],
+          subs: { r2: '1,000 total, in order' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Choosing
+
+| Need | Choose |
+|---|---|
+| Publish events for a database change | Outbox table + relay, or CDC (change streams, PostgreSQL logical decoding with Debezium, MySQL binlog readers) |
+| Update two databases you own, atomically | Avoid it: one owner per piece of data; otherwise a saga (steps with compensating actions) |
+| A legacy XA-capable stack (JTA + two databases) | 2PC can work; monitor `pg_prepared_xacts` / `XA RECOVER` and alert on old entries |
+| Consumers | Always idempotent by event id: every option above is at least once |
+
+<Pitfall>
+The outbox only moves the problem if the relay is careless: marking rows sent **before** publishing turns at-least-once into at-most-once (lost events on a crash), and publishing from inside a long-open transaction holds row locks and the cleanup horizon (Concepts 1–2). Publish, then mark, in short transactions, and delete or archive sent rows in batches (Concept 3).
+</Pitfall>
+
+## Real-world scenario: the missing invoices
+
+An order service inserts orders and then calls the billing service over HTTP. Each month a few dozen paid orders have no invoice; they all coincide with deploys and pod restarts.
+
+| Step | Change |
+|---|---|
+| 1 | Write `OrderPaid` to an outbox table in the order's transaction |
+| 2 | A relay (or Debezium on the WAL) publishes to the queue billing consumes |
+| 3 | Billing stores processed event ids under a unique key (Session 7) and ignores duplicates |
+| 4 | Alert on the age of the oldest unsent outbox row |
+
+## Why this matters
+
+| Next concept | Why this concept matters |
+|---|---|
+| Concept 5: checklist | "Never span a transaction across systems" is the last rule of transaction design |
+
+## Key takeaways
+
+1. A local transaction cannot include a broker or another service; dual writes lost 62 or invented 52 events per 1,000 with a 5% crash rate.
+2. Two-phase commit is disabled by default in PostgreSQL; in MySQL an in-doubt XA branch outlived its client and kept its lock until resolved by hand.
+3. The outbox writes the event in the same transaction as the change; a relay delivers it at least once: 0 lost, 377 duplicates with injected crashes.
+4. Change data capture (MongoDB change streams, logical decoding, binlog readers) uses the database log as the outbox; resume tokens gave 1,000 of 1,000 events in order.
+5. At-least-once delivery requires idempotent consumers keyed by event id.
+
+## Check questions
+
+1. Why does wrapping "INSERT order; publish event" in `BEGIN … COMMIT` not make it atomic?
+2. Explain the two failure modes of dual writes and their effects in the simulation.
+3. What does a participant promise at `PREPARE`, and why does an in-doubt transaction hurt the database?
+4. Why does the outbox deliver at least once rather than exactly once, and where did the 377 duplicates come from?
+5. Why must the relay publish before marking a row sent, and not the other way round?
+6. How does a MongoDB change stream play the role of the outbox, and what does the resume token guarantee?
+7. Design the consumer side so that duplicate events have no effect.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-8-when-transactions-hurt/concept-4-distributed-transactions/answers">Worked answers to Q1–Q7</DeepDive>

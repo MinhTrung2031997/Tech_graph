@@ -1,0 +1,88 @@
+---
+title: "Answers: Big transactions"
+description: "Worked answers to the Session 8 Concept 3 check questions."
+companion: "answers"
+tags: ["transactions", "batching", "rollback", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-explain.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-undo-logs.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-production-consideration/"
+---
+
+<Tldr>
+A transaction's size sets how long its locks, undo and snapshot live, how much a replica receives at once, and how much work a rollback undoes. Batches keep all of them small.
+</Tldr>
+
+## Q1. 1.5 s everywhere
+
+**Question:** why did the single-row update of job 50 wait about 1.5 s in every engine?
+
+The bulk transaction had updated job 50 along with every other job and held its row lock until it ended. The experiment kept the transaction open for 1.5 s after the UPDATE before rolling back (PostgreSQL, MySQL) or committing (MongoDB), so the single-row writer waited 1,508 / 1,686 / 1,600 ms. The wait has nothing to do with the cost of the update itself (0.2–0.4 s): it is the lifetime of the transaction. In a real job that is the whole runtime plus anything the application does before COMMIT.
+
+> **Common mistake:** measuring only the bulk statement's duration and concluding "it only takes 0.4 s".
+
+## Q2. Free rollback in PostgreSQL
+
+**Question:** why is PostgreSQL's ROLLBACK of a 100,000-row update almost free, and where does the cost go?
+
+PostgreSQL never overwrites rows: the UPDATE wrote 100,000 new tuple versions stamped with its transaction id. ROLLBACK only records "this xid aborted" in the commit log (3 ms); visibility checks then treat those versions as never committed. They remain in the table and its indexes as dead tuples until HOT pruning or VACUUM removes them, so the cost moves to cleanup and to temporary bloat (Concept 2).
+
+> **Common mistake:** "rollback is free, so failed bulk jobs are harmless". They leave as much garbage as a committed run.
+
+## Q3. InnoDB rollback grows with the work
+
+**Question:** why did InnoDB's rollback take longer after four passes than after one?
+
+InnoDB updates rows in place and writes the previous version to the undo log. Rolling back means applying every undo record in reverse order to restore the clustered and secondary index records: four passes over 100,000 rows produced four times the undo records, and rollback took 347 ms instead of 184 ms. It is roughly proportional to the work already done, often about as slow as the forward work, which is why killing a multi-hour InnoDB transaction can take hours to roll back (and continues after a crash, during recovery).
+
+> **Common mistake:** killing a long transaction in panic and expecting the locks to go away immediately.
+
+## Q4. MongoDB and the oplog
+
+**Question:** how did MongoDB write the 100,000-document transaction to the oplog, and what changed when each document grew by 200 bytes?
+
+Nothing was written to the oplog until commit. With a small change (`locked_by`) the whole transaction fitted in **one** `applyOps` entry with 100,000 operations. With a 200-byte string added to every document the operations no longer fitted in one 16 MB BSON document, so the transaction was split into **two** entries: 50,839 operations (15.9 MB, `partialTxn: true`) and 49,161 operations (15.4 MB), the last one committing the transaction. Secondaries apply it only after the final entry.
+
+> **Common mistake:** assuming a multi-document transaction is limited to 16 MB in total; since 4.2 it is split across entries, but the cache and the 60-second lifetime still limit it.
+
+## Q5. Replica lag
+
+**Question:** why do replicas fall behind more with one big transaction than with the same work in batches?
+
+A replica can only make a transaction visible after it has received and applied all of it. For MySQL the binlog event group is written at commit, so the replica starts applying a 10-minute transaction only after it committed on the primary, then needs about as long again: lag spikes to 10+ minutes. PostgreSQL streams WAL as it is produced, but a 37.6 MB burst still has to be replayed, and replay of other changes queues behind it; long queries on a hot standby can also conflict with replaying the cleanup. MongoDB secondaries apply the oplog entries after commit. With batches each unit is small, replicas apply them continuously, and lag stays at the level of one batch. (The lab's single-node containers did not measure lag.)
+
+> **Common mistake:** watching only the primary's duration of a bulk job.
+
+## Q6. Batched cleanup in PostgreSQL
+
+**Question:** write a batched version of "delete sessions that expired" for PostgreSQL that is safe to rerun.
+
+```sql
+-- Run repeatedly (from a script or a scheduled job) until it deletes 0 rows.
+-- Each run is its own short transaction; rerunning after a failure just continues.
+WITH doomed AS (
+  SELECT id FROM sessions
+  WHERE expires_at < now()
+  ORDER BY id
+  LIMIT 5000
+  FOR UPDATE SKIP LOCKED          -- never wait for rows a user is touching right now
+)
+DELETE FROM sessions s USING doomed d WHERE s.id = d.id;
+```
+
+An index on `expires_at` keeps each batch cheap. Pause briefly between batches if replicas lag. For very large volumes, partition by day and `DROP` old partitions instead.
+
+> **Common mistake:** `DELETE … WHERE id IN (SELECT id … LIMIT 5000)` inside one script-level transaction around the whole loop.
+
+## Q7. Atomic switch for 1M prices
+
+**Question:** a migration must make 1M new prices visible at once. How do you avoid one huge transaction?
+
+Compute in batches into a place readers do not use yet, then switch with one tiny transaction:
+- Add a column `new_price`, fill it in batches (each its own transaction), then in one transaction swap the meaning (e.g. update a `price_version` setting the application reads, or rename columns, which is a quick metadata change, using `lock_timeout`).
+- Or write a new `prices_v2` table in batches and switch a view or the application's pointer to it.
+
+Readers see either all old prices or all new ones, and no transaction holds 1M row locks.
+
+> **Common mistake:** "it must be atomic, so it must be one UPDATE". Atomic visibility only needs an atomic switch.

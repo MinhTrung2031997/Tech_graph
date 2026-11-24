@@ -1,0 +1,70 @@
+---
+title: "Answers: Long transactions stop cleanup"
+description: "Worked answers to the Session 8 Concept 2 check questions."
+companion: "answers"
+tags: ["transactions", "mvcc", "vacuum", "purge", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-purge-configuration.html"
+---
+
+<Tldr>
+Cleanup can only remove what no transaction can see. The oldest snapshot (or running writer) sets that limit for everyone.
+</Tldr>
+
+## Q1. 0 removed, 5 XIDs old
+
+**Question:** why did VACUUM remove 0 tuples while A was open, and what does "removable cutoff … 5 XIDs old" mean?
+
+A's REPEATABLE READ snapshot was taken before B's five updates. For A, the **old** versions are the visible ones, so every version B replaced is still needed: VACUUM may only remove tuples that died before the oldest snapshot in the database. The **removable cutoff** is that oldest xmin; "5 XIDs old" means it lagged 5 transaction ids (B's five UPDATEs) behind the newest when VACUUM finished. Everything those 5 transactions made dead is "dead but not yet removable": 50,000 tuples.
+
+> **Common mistake:** concluding autovacuum is misconfigured. It ran; it was not allowed to remove anything.
+
+## Q2. Stable vs 3.5× growth
+
+**Question:** why did the table keep its size without the old snapshot, but grow 3.5× with it?
+
+Without the snapshot, dead versions were pruned or vacuumed after each cycle, and the next cycle's new versions were written into that freed space: 439 pages throughout. With the snapshot, nothing could be freed, so each cycle of 5 × 10,000 new versions needed new pages: 442 → 809 → 1,177 → 1,545 pages, with `n_dead_tup` rising by 50,000 per cycle and the primary key index growing too (111 → 242 pages, since non-HOT versions need index entries).
+
+> **Common mistake:** expecting the table to shrink again after the long transaction ends. VACUUM makes the space reusable but keeps the file size.
+
+## Q3. Read-only vs one write under READ COMMITTED
+
+**Question:** an idle READ COMMITTED transaction that only read held nothing back; one that wrote one row held back 49,995 dead tuples. Explain.
+
+In READ COMMITTED a snapshot lives only for the duration of a statement; between statements the backend has no `backend_xmin` (measured: NULL). A read-only transaction therefore pins nothing while idle. A transaction that **wrote** has been assigned a transaction id (`backend_xid` 2353520) and is still running. Any other snapshot taken now must treat that xid as in progress, so the horizon cannot move past it, and tuples that died after it (49,995 of B's updates) cannot be removed.
+
+> **Common mistake:** "READ COMMITTED transactions can't cause bloat". Idle writers can.
+
+## Q4. The old reader slows down
+
+**Question:** why did A's own `SUM` get slower in both PostgreSQL and MySQL?
+
+The data A wants is old, and the engines store the new version in the main place. PostgreSQL: the table now holds 6 versions per row spread over 442 pages instead of 74; the scan reads them all and checks visibility for each (74 → 442 buffers). InnoDB: the clustered index holds only the newest version; for each row A follows the undo chain back to the version its read view may see, through up to 5 older versions per row (5.6 → 32 ms).
+
+> **Common mistake:** assuming a long-running report is slow only because the data is big; the longer it runs against a busy table, the more old versions it has to reconstruct.
+
+## Q5. History list length
+
+**Question:** what does the InnoDB history list length count, and why did it not drop to ≈ 0 right after A committed?
+
+It counts **undo logs of committed transactions** (one per transaction that modified data) not yet purged: 5,000 single-row commits added ≈ 5,000; 20 full-table UPDATEs added 20, not 200,000 rows. After A committed, purge processed most of them within a second (5,020 → 1,421), but works in batches and does not chase a small remainder urgently: the list stayed at ≈ 1,421 for the next 8 s. The signal to watch is a list that keeps **growing** over minutes or hours.
+
+> **Common mistake:** reading the history list as a row count.
+
+## Q6. MongoDB's bounds
+
+**Question:** how does MongoDB bound the cost of old snapshots, and what error shows the bound?
+
+Two limits: transactions are aborted after `transactionLifetimeLimitSeconds` (60 s by default; Concept 1), and the server keeps history only for `minSnapshotHistoryWindowInSeconds` (300 s). A snapshot read with `atClusterTime` 400 s in the past failed with **239 SnapshotTooOld**, 120 s in the past succeeded. PostgreSQL and MySQL have no equivalent default: one forgotten snapshot can hold cleanup back for days unless you configure timeouts.
+
+> **Common mistake:** raising both limits to run long analytical queries in transactions; use a secondary or an analytics node with non-snapshot reads.
+
+## Q7. Non-application horizons in PostgreSQL
+
+**Question:** name three sources of an old horizon in PostgreSQL that are not application transactions.
+
+Any three of: a **replication slot** that is inactive or lagging (`pg_replication_slots.xmin` / `catalog_xmin`); a **prepared transaction** nobody committed (`pg_prepared_xacts`); a **standby with `hot_standby_feedback = on`** running long queries; **`pg_dump`** (one REPEATABLE READ transaction for the whole dump); a **logical decoding** consumer that stopped; an interactive **psql/IDE session** left in a transaction; `CREATE INDEX CONCURRENTLY` waiting on old snapshots (indirectly).
+
+> **Common mistake:** checking only `pg_stat_activity` and missing slots and prepared transactions.
