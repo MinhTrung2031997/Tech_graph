@@ -1,0 +1,187 @@
+---
+title: "Concept 2: Chunks and the balancer"
+description: "Sharding the existing 1M-order collection created one chunk on the primary shard, and with the default 128 MB chunk size the balancer left all 113 MiB there: 'balanced'. Setting chunkSize to 4 MB for that collection alone made the balancer move 13 ranges of about 35,400 documents in 16 s, 199–447 ms each, and stop when the shards differed by less than three chunk sizes: sh1 one chunk of 61.6 MiB, sh2 thirteen of 52.3 MiB. The balancer counts data, not chunks."
+type: "concept"
+tags: ["sharding", "mongodb", "chunks", "balancer"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-data-partitioning/"
+  - "https://www.mongodb.com/docs/manual/core/sharding-balancer-administration/"
+  - "https://www.mongodb.com/docs/manual/reference/command/configureCollectionBalancing/"
+  - "https://www.mongodb.com/docs/manual/reference/command/balancerCollectionStatus/"
+---
+
+<Tldr>
+`sh.shardCollection` on a collection that already holds data creates **one chunk**, `[MinKey, MaxKey)`, on the database's primary shard. The balancer (a thread on the config server primary) moves ranges only when shards differ by **three chunk sizes** of data. With the default **128 MB** chunk size, the 113 MiB `orders_s` stayed 100% on sh1 and `balancerCollectionStatus` said `balancerCompliant: true`. After `configureCollectionBalancing` set **chunkSize: 4** for this one collection, the first migration started about 10 s later, **13 migrations** ran in 16.2 s (199–447 ms each, ~35,400 documents / 4.2 MB per range), and the balancer stopped with sh1 holding **one chunk of 61.6 MiB** and sh2 **thirteen chunks of 52.3 MiB**: balanced by size, not by chunk count. `moveRange` by hand is limited by the same chunk size: moving 219,705 documents failed until the collection's chunk size was raised.
+</Tldr>
+
+## Terms
+
+| Term | Meaning |
+|---|---|
+| Chunk / range | A shard-key range owned by one shard; one document in `config.chunks` |
+| Chunk size | Target size of a range (default 128 MB; set per collection with `configureCollectionBalancing`, globally in `config.settings`) |
+| Balancer | Background thread on the config server primary; each round compares data per shard and schedules migrations |
+| Migration | Copying one range from a donor shard to a recipient, then switching ownership (Concept 3) |
+| Balanced | For a collection: the difference in data between the most and least loaded shard is below 3 × chunk size |
+| **✓ / ✗** | Migration scheduled / not scheduled |
+
+## Sharding an existing collection
+
+```js
+db.orders.aggregate([{ $out: 'orders_s' }]);     // 2.6 s, 1,000,000 documents
+db.orders_s.createIndex({ seller_id: 1 });         // required: the shard key needs an index
+sh.shardCollection('pt6.orders_s', { seller_id: 1 });   // 88 ms
+db.getSiblingDB('config').chunks.find({ uuid: <collection uuid> })
+// [ { min: { seller_id: MinKey }, max: { seller_id: MaxKey }, shard: 'sh1' } ]
+```
+
+Sharding is a metadata change: it took 88 ms because no data moved. `pt6`'s primary shard is sh1, so the single chunk is on sh1.
+
+<Flow
+  title="Balancer: default chunk size vs 4 MB for one collection"
+  height={290}
+  nodes={[
+    { id: 'bal', label: 'Balancer', sub: 'config server primary', x: 20, y: 20, w: 200 },
+    { id: 'chunks', label: 'config.chunks', sub: 'ranges and owners', x: 580, y: 20, w: 200 },
+    { id: 'sh1', label: 'sh1', sub: '1 chunk, 113 MiB', x: 160, y: 210, w: 200 },
+    { id: 'sh2', label: 'sh2', sub: '0 chunks', x: 440, y: 210, w: 200 },
+  ]}
+  edges={[
+    { id: 'bal-chunks', from: 'bal', to: 'chunks' },
+    { id: 'bal-sh1', from: 'bal', to: 'sh1' },
+    { id: 'sh1-sh2', from: 'sh1', to: 'sh2', label: 'ranges' },
+  ]}
+  cases={[
+    {
+      title: 'Default chunk size (128 MB)',
+      path: 'balancer: sh1 113 MiB − sh2 0 MiB < 3 × 128 MB → balanced → no migration ✗',
+      summary: 'A collection smaller than three chunk sizes is never spread, however lopsided it is.',
+      steps: [
+        {
+          title: 'One chunk on the primary shard',
+          note: 'shardCollection on a non-empty collection creates a single range [MinKey, MaxKey) on the primary shard. getShardDistribution: sh1 113.43 MiB, 1,000,000 docs, 1 chunk.',
+          code: "sh.shardCollection('pt6.orders_s', { seller_id: 1 })",
+          active: ['bal', 'chunks', 'sh1'],
+          edges: ['bal-chunks'],
+          subs: { chunks: '1 range on sh1' },
+        },
+        {
+          title: 'The balancer finds nothing to do',
+          note: 'balancerCollectionStatus before and 70 s later: chunkSize 128, balancerCompliant: true. Still 1 chunk on sh1, 0 on sh2.',
+          code: "db.adminCommand({ balancerCollectionStatus: 'pt6.orders_s' })",
+          active: ['bal', 'sh1', 'sh2'],
+          edges: ['bal-sh1'],
+          subs: { sh2: '✗ nothing moved', bal: 'compliant' },
+        },
+      ],
+    },
+    {
+      title: 'chunkSize: 4 for this collection',
+      path: 'threshold 3 × 4 MB → chunksImbalance → 13 migrations sh1 → sh2 ✓ → 61.6 vs 52.3 MiB → compliant',
+      summary: 'The balancer cuts 4 MB ranges off the big chunk and moves them until the shards are within 12 MB.',
+      steps: [
+        {
+          title: 'Lower the chunk size for one collection',
+          note: 'The setting is stored on the collection (config.collections) and changes nothing else in the cluster. balancerCollectionStatus immediately reported balancerCompliant: false, firstComplianceViolation: chunksImbalance.',
+          code: "db.adminCommand({ configureCollectionBalancing: 'pt6.orders_s', chunkSize: 4 })",
+          active: ['bal', 'chunks'],
+          edges: ['bal-chunks'],
+          subs: { bal: 'chunksImbalance' },
+        },
+        {
+          title: 'Ranges move, one at a time',
+          note: 'First migration started about 10 s later (the next balancer round). 13 migrations from 12:54:17.3 to 12:54:33.5: [MinKey, 178), [178, 355), … [2126, 2303), each about 35,400 documents and 4.2 MB, 199–447 ms from moveChunk.start to moveChunk.commit.',
+          active: ['bal', 'sh1', 'sh2'],
+          edges: ['bal-sh1', 'sh1-sh2'],
+          subs: { sh1: 'donor', sh2: '✓ +13 ranges' },
+        },
+        {
+          title: 'Balanced by data size',
+          note: 'Compliant at 26.2 s. sh1: 1 chunk, 61.6 MiB. sh2: 13 chunks, 52.25 MiB. The difference, 9.4 MiB, is below 3 × 4 MB, so the balancer stopped. The 1 vs 13 chunk counts do not matter.',
+          active: ['chunks', 'sh1', 'sh2'],
+          edges: ['bal-chunks', 'sh1-sh2'],
+          subs: { sh1: '1 chunk, 61.6 MiB', sh2: '13 chunks, 52.3 MiB', chunks: '14 ranges' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## The chunk list afterwards
+
+```js
+db.getSiblingDB('config').chunks.find({ uuid }, { min: 1, max: 1, shard: 1 }).sort({ min: 1 })
+// sh2 MinKey..178, sh2 178..355, sh2 355..532, … sh2 2126..2303, sh1 2303..MaxKey
+```
+
+Each moved range holds about 177 sellers (5000 sellers, 200 orders each, 118-byte documents). Since MongoDB 6.0.3 the balancer does not split chunks because they grew; it carves a range of about one chunk size off a larger chunk when it needs to move data. That is why sh1 kept one big `[2303, MaxKey)` chunk.
+
+## Counting during and after balancing
+
+| Count on `orders_s` right after balancing | Result |
+|---|---|
+| `countDocuments({})` | 1,000,000 |
+| `estimatedDocumentCount()` | **1,460,637** |
+| `count()` (deprecated) | **1,460,637** |
+| `getShardDistribution()` total docs | **1,460,637** |
+| `$collStats` on sh1: count / numOrphanDocs | 1,000,000 / 460,637 |
+
+The donor keeps the moved documents for a while as **orphans** (Concept 3). Metadata-based counts add them; `countDocuments` runs a query, which filters them out.
+
+## Moving a range by hand
+
+```js
+sh.disableBalancing('pt6.orders_s');     // per collection: config.collections noBalance: true
+db.adminCommand({ moveRange: 'pt6.orders_s', min: { seller_id: 2303 }, max: { seller_id: 3400 }, toShard: 'sh2' })
+```
+
+| Attempt | Result |
+|---|---|
+| chunkSize 4 MB | `Cannot move chunk: the maximum number of documents for a chunk is 71088, the maximum chunk size is 4194304, average document size is 118. Found 219705 documents in chunk` |
+| chunkSize raised to 64 MB, while another collection was migrating to sh1 | `Unable to start new balancer operation because this shard is currently receiving chunk [{ seller_id: 2501 }, { seller_id: MaxKey }) for namespace pt8.orders_by_seller from sh2` |
+| Retried a moment later | ok, 1,555 ms, 219,705 documents, 26.2 MB |
+
+The document limit is about 2 × chunk size ÷ average document size (2 × 4,194,304 ÷ 118 ≈ 71,089; the server reported 71,088). A shard takes part in **one migration at a time**, across all collections: the second error came from another collection's migration in the same cluster.
+
+<Pitfall>
+"The collection is sharded" does not mean "the data is spread". A collection sharded after it was loaded starts with every document on one shard, and if it is smaller than three chunk sizes (384 MB by default) it stays there, reported as balanced. Check `getShardDistribution()` after sharding. To spread a small collection, lower its chunk size with `configureCollectionBalancing`, shard it while empty with pre-created ranges, or use a hashed key, which creates ranges on every shard up front (Session 5).
+</Pitfall>
+
+## Real-world scenario: the shard that does everything
+
+A team shards `orders` on `seller_id` during a quiet week. Dashboards show 2 shards, but CPU on sh1 stays at 90% and sh2 idles. `getShardDistribution()` shows 100% of the data on sh1 with one chunk; the collection holds 300 MB, under the 384 MB threshold, so the balancer has never moved anything.
+
+| Fix | Effect |
+|---|---|
+| `configureCollectionBalancing` with a smaller `chunkSize` for that collection | The balancer moves ranges at once; nothing else in the cluster changes |
+| Plan for size: the 128 MB default suits collections of many GB | Small collections often do not need sharding at all |
+| Watch `balancerCollectionStatus` and `getShardDistribution()` after any sharding change | Detects "sharded but not spread" in minutes |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 1 | The ranges in `config.chunks` are what mongos routes by |
+| Concept 3 | What one migration costs and why orphans appear |
+| [Session 5, Concept 2](/blogs/databases/partitioning-sharding/session-5-choosing-a-shard-key/concept-2-monotonic-keys) | A key with few values or monotonic values limits how ranges can be split |
+| [Session 1, Concept 3](/blogs/databases/partitioning-sharding/session-1-why-split-data/concept-3-partitioning-sharding-replication) | Sharding vs partitioning: here the "partitions" move between servers |
+
+## Key takeaways
+
+1. Sharding a loaded collection creates one chunk on the primary shard; no data moves at that moment.
+2. The balancer moves ranges when shards differ by at least three chunk sizes of data; with the 128 MB default a 113 MiB collection is "balanced" on one shard.
+3. `configureCollectionBalancing` changes the chunk size for one collection; 4 MB produced 13 migrations in 16 s.
+4. Balance is measured in data size, not chunk count (1 chunk vs 13 chunks was balanced).
+5. A shard joins one migration at a time; `moveRange` is limited to 2 × chunk size of documents.
+
+## Check questions
+
+1. Why did sharding `orders_s` take 88 ms although it holds 113 MiB?
+2. The collection was 100% on sh1 and the balancer said it was compliant. Explain.
+3. After balancing, sh1 had 1 chunk and sh2 had 13. Why did the balancer stop?
+4. Why did `estimatedDocumentCount()` return 1,460,637 right after balancing?
+5. Where does the number 71,088 in the `moveRange` error come from, and how did the lab get past it?
+6. What does the "currently receiving chunk … for namespace pt8.orders_by_seller" error tell you about migrations in a cluster?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-6-mongodb-sharded-cluster/concept-2-chunks-and-balancer/answers">Worked answers to Q1–Q6</DeepDive>

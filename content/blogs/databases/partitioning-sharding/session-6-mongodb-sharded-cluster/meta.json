@@ -1,0 +1,13 @@
+{
+  "title": "Session 6: A live MongoDB sharded cluster",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-routing-a-query/index",
+    "concept-2-chunks-and-balancer/index",
+    "concept-3-cost-of-a-migration/index",
+    "concept-4-unsharded-collections/index",
+    "concept-5-resharding/index",
+    "lab/index"
+  ]
+}

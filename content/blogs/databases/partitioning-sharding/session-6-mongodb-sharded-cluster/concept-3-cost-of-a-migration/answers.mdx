@@ -1,0 +1,62 @@
+---
+title: "Answers: What a migration costs"
+description: "Worked answers to the Session 6 Concept 3 check questions."
+companion: "answers"
+tags: ["sharding", "mongodb", "migration", "orphans", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-balancer-administration/"
+  - "https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.orphanCleanupDelaySecs"
+---
+
+<Tldr>
+Copy while writable, pause writes briefly to switch, delete the old copy later. Each phase has its own visible cost.
+</Tldr>
+
+## Q1. Writes during the copy
+
+**Question:** why could the workload keep updating the range while it was being copied?
+
+The donor stays the owner until the commit. It serves every read and write for the range during the clone and keeps track of the documents changed meanwhile; the recipient fetches those changes after the initial copy, repeatedly, until little is left. Only then does the migration enter the critical section. That is why 323 updates during the 1,555 ms move all succeeded, at a median of 3.47 ms instead of 1.95 ms.
+
+> **Common mistake:** expecting a migration to lock the range for as long as the copy takes.
+
+## Q2. The 34 ms update
+
+**Question:** when exactly did the slowest update happen, and why there?
+
+At +1,517 ms, in the last 40 ms of the 1,555 ms move. That is the critical section: writes to the moving range wait while the donor sends the final changes and the config servers record sh2 as the owner. The wait is short because the copy phase already sent nearly everything.
+
+> **Common mistake:** attributing post-migration latency spikes to the copy. The copy slows things down a little; the pause is at the switch.
+
+## Q3. How mongos finds out
+
+**Question:** how does mongos learn that the range now lives on sh2?
+
+It is not told. mongos sends the next request for the range to sh1 with the routing version it cached. sh1 knows its version changed at the commit and rejects the request as stale; mongos then refreshes the collection's routing table from the config servers and retries on sh2. With many mongos instances, each one refreshes on its own first stale request.
+
+> **Common mistake:** restarting mongos or running `flushRouterConfig` after every migration. It is needed only in rare cases.
+
+## Q4. 41,040 keys for 22,209 orders
+
+**Question:** why did the June query examine 41,040 keys on sh1 to return 22,209 orders?
+
+sh1 still held every June order, including the 18,831 belonging to sellers whose ranges had just moved to sh2. Its `created_at` index contains entries for those orphans, so the index scan visited all 41,040; the `SHARDING_FILTER` stage then dropped the 18,831 that sh1 no longer owns. sh2 returned those 18,831 as their owner, and the total, 41,040, was correct. After cleanup, sh1's part of the same query examined only the keys it owned.
+
+> **Common mistake:** concluding from the correct result that orphans cost nothing.
+
+## Q5. Summing per-shard counts
+
+**Question:** a job reads each shard directly and sums the counts. What goes wrong right after a migration, and for how long by default?
+
+Every moved document exists on both shards until the donor's range deleter runs: seller 100 had 191 orders on sh2 and the same 191 as orphans on sh1, so a per-shard sum counts 382. Direct connections to a shard do not apply the sharding filter. The default delay is `orphanCleanupDelaySecs` = 900 s, plus the deletion time itself (seconds to tens of seconds per range in the lab).
+
+> **Common mistake:** assuming a direct read of a shard returns only the data it owns.
+
+## Q6. The 903 s delay
+
+**Question:** the range deleter started 903 s after the first migration. What controls that delay, and why does it exist?
+
+The server parameter `orphanCleanupDelaySecs` (900 by default; the lab did not change it, since it is server-wide). Queries that started before the migration, with the old routing table, may still read the donor's copy; deleting it at once could make them miss documents. Waiting 15 minutes lets such queries and cursors finish. The cost is that the donor's disk and indexes carry the orphans for that time.
+
+> **Common mistake:** lowering the delay to save disk without thinking about long-running queries on secondaries or cursors.

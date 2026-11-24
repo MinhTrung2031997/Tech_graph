@@ -1,0 +1,158 @@
+---
+title: "Concept 5: Changing the shard key"
+description: "refineCollectionShardKey only adds suffix fields: seller_id to seller_id + created_at took 110 ms after a 1.2 s index build and moved no data. reshardCollection rewrites the whole collection under a new key: 1M orders from seller_id (all on sh1) to hashed _id took 332.2 s, of which 301.5 s cloning (the 300 s minimum), 30 s applying and 0.53 s blocking writes; the result was 500,405 / 499,595 documents per shard. Updates kept running, median 2.34 ms, worst 543 ms at the switch."
+type: "concept"
+tags: ["sharding", "mongodb", "resharding", "shard-key"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-reshard-a-collection/"
+  - "https://www.mongodb.com/docs/manual/reference/command/reshardCollection/"
+  - "https://www.mongodb.com/docs/manual/reference/command/refineCollectionShardKey/"
+  - "https://www.mongodb.com/docs/manual/reference/command/unshardCollection/"
+---
+
+<Tldr>
+There are two ways to change a shard key. **`refineCollectionShardKey`** appends fields to the existing key: `{ seller_id: 1 }` → `{ seller_id: 1, created_at: 1 }` needed an index starting with the new key (1,211 ms to build), then took **110 ms** and moved nothing; the 15 chunk bounds just gained `created_at: MinKey`. It refuses anything that does not *extend* the key (reordering, removing a field). **`reshardCollection`** picks any new key and rewrites the collection: `orders_r` (1M orders, all on sh1 under `{ seller_id: 1 }`) to `{ _id: 'hashed' }` took **332.2 s**: 301.5 s cloning, 30.0 s applying the oplog, **0.53 s blocking writes**, 0.07 s committing. It ended at **500,405 / 499,595** documents per shard. A workload of reads and updates by `_id` ran throughout: update median 2.34 ms, worst **543 ms**, at the switch. Resharding needs room for a second full copy on the recipients while it runs.
+</Tldr>
+
+## Terms
+
+| Term | Meaning |
+|---|---|
+| Refine | Add suffix fields to the current shard key; metadata only, ranges keep their owners |
+| Reshard | Build a new copy of the collection under a new key on the recipient shards, then switch |
+| Coordinator | Runs on the config server primary and moves the operation through its states |
+| Cloning / applying | Recipients copy the documents / then apply oplog entries written since the clone started |
+| Blocking writes | Short final state: writes wait while the last oplog entries are applied, then the new collection replaces the old |
+| **✓ / ✗** | Allowed / refused or held |
+
+## Refining the key
+
+```js
+db.adminCommand({ refineCollectionShardKey: 'pt6.orders_s', key: { seller_id: 1, created_at: 1 } })
+// MongoServerError: … Please create an index that starts with the proposed shard key before refining the collection's shard key.
+db.orders_s.createIndex({ seller_id: 1, created_at: 1 })                    // 1,211 ms
+db.adminCommand({ refineCollectionShardKey: 'pt6.orders_s', key: { seller_id: 1, created_at: 1 } })   // ok, 110 ms
+// chunk bounds now: { seller_id: MinKey, created_at: MinKey } → { seller_id: 178, created_at: MinKey } …  (15 chunks, unchanged owners)
+db.adminCommand({ refineCollectionShardKey: 'pt6.orders_s', key: { created_at: 1, seller_id: 1 } })
+// refineCollectionShardKey shard key { created_at: 1, seller_id: 1 } does not extend the current shard key { seller_id: 1, created_at: 1 }
+db.adminCommand({ refineCollectionShardKey: 'pt6.orders_s', key: { seller_id: 1 } })
+// refineCollectionShardKey shard key { seller_id: 1 } does not extend the current shard key { seller_id: 1, created_at: 1 }
+```
+
+Refining fixes one specific problem: a key with too few distinct values. All orders of one seller share `seller_id`, so no range can ever be cut inside one seller, and a seller with millions of orders becomes one unsplittable (jumbo) chunk; with `created_at` appended, a range can be cut between two dates of the same seller. It cannot fix a key that targets the wrong queries.
+
+<Flow
+  title="reshardCollection orders_r: { seller_id } → { _id: 'hashed' }"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'Workload', sub: 'findOne + updateOne by _id', x: 20, y: 20, w: 220 },
+    { id: 'coord', label: 'Coordinator', sub: 'config server primary', x: 560, y: 20, w: 220 },
+    { id: 'sh1', label: 'sh1', sub: 'old: 1,000,000 docs', x: 20, y: 220, w: 220 },
+    { id: 'tmp', label: 'New collection', sub: 'hashed _id, on sh1 + sh2', x: 300, y: 220, w: 200 },
+    { id: 'sh2', label: 'sh2', sub: 'old: 0 docs', x: 560, y: 220, w: 220 },
+  ]}
+  edges={[
+    { id: 'app-sh1', from: 'app', to: 'sh1' },
+    { id: 'coord-sh2', from: 'coord', to: 'sh2' },
+    { id: 'sh1-tmp', from: 'sh1', to: 'tmp', label: 'clone' },
+    { id: 'sh2-tmp', from: 'sh2', to: 'tmp' },
+    { id: 'app-coord', from: 'app', to: 'coord' },
+  ]}
+  cases={[
+    {
+      title: 'Reshard 1M orders',
+      path: 'initializing → cloning 301.5 s ✓ writes → applying 30.0 s ✓ writes → blocking-writes 0.53 s ✗ → committing 0.07 s → new key',
+      summary: 'A full second copy, built online; the only write pause is the switch.',
+      steps: [
+        {
+          title: 'Start',
+          note: 'reshardCollection on orders_r (sharded on seller_id a minute earlier, one chunk on sh1). Coordinator states from the changelog: initializing and preparing-to-donate in 70 ms, cloning from 13:05:58.1.',
+          code: "db.adminCommand({ reshardCollection: 'pt6.orders_r', key: { _id: 'hashed' } })",
+          active: ['app', 'coord', 'sh2'],
+          edges: ['app-coord', 'coord-sh2'],
+          subs: { coord: 'cloning' },
+        },
+        {
+          title: 'Clone and apply',
+          note: 'Each recipient builds its part of a new collection under the new key, from the donor\'s documents and then its oplog. Cloning ended at 13:10:59.6 (301.5 s; the 300,000 ms minimum again), applying lasted 30.0 s. Meanwhile the workload ran 95,929 reads (median 0.33 ms) and 95,929 updates (median 2.34 ms, p99 9.19 ms) against the old collection on sh1.',
+          active: ['app', 'sh1', 'tmp', 'sh2'],
+          edges: ['app-sh1', 'sh1-tmp', 'sh2-tmp'],
+          subs: { sh1: '✓ serves all traffic', tmp: 'copy + oplog apply' },
+        },
+        {
+          title: 'Block writes, switch',
+          note: 'blocking-writes 0.53 s, committing 0.07 s. The worst update of the run took 542.6 ms. The old collection is dropped; the new one carries the name orders_r.',
+          active: ['app', 'coord', 'tmp'],
+          edges: ['app-coord'],
+          subs: { coord: '✗ writes held 0.53 s', tmp: 'becomes orders_r' },
+        },
+        {
+          title: 'Result',
+          note: 'getShardDistribution: sh2 500,405 documents (56.77 MiB), sh1 499,595 (56.68 MiB), one chunk each. Lookups by _id are now targeted to the one shard that owns the hash. Reads after: median 0.33 ms; updates: 2.47 ms.',
+          active: ['sh1', 'sh2', 'tmp'],
+          edges: ['sh1-tmp', 'sh2-tmp'],
+          subs: { sh1: '499,595 docs', sh2: '500,405 docs' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Measured
+
+| | `refineCollectionShardKey` | `reshardCollection` |
+|---|---|---|
+| New key | must start with the current key | any key |
+| Prerequisite | index starting with the new key (1,211 ms on 1M) | none: it created the `_id: 'hashed'` index and rebuilt the existing indexes on the new copy |
+| Duration on 1M orders | 110 ms | 332.2 s |
+| Data moved | none | the whole collection, into a new collection |
+| Extra disk while running | none | a full copy on the recipients |
+| Write pause | none observed | 0.53 s blocking writes; worst update 543 ms |
+| Spread afterwards | unchanged | 50.04% / 49.95% |
+
+`moveCollection` (Concept 4) and 8.0's `unshardCollection` use the same machinery: one collection rewritten under a new placement, with the same 300 s minimum. `unshardCollection` was not run in the lab.
+
+<Pitfall>
+Resharding is online, not free. For its duration the recipients hold a second copy of the collection and its indexes, the donors keep oplog that the recipients still need, and every write is applied twice. On a large collection that is hours of extra disk, I/O and oplog. Check free disk on every recipient for the full collection, make sure the oplog window covers the whole operation, and run it when write load is lowest. And choose the key carefully the first time (Session 5): `refineCollectionShardKey` can only add fields at the end.
+</Pitfall>
+
+## Real-world scenario: sharded by marketplace
+
+An order service sharded `orders` on `{ marketplace: 1 }` because every query filtered by it. With three values (Shopee, TikTok, Lazada), the collection can have at most three ranges: the Shopee range grows into a jumbo chunk the balancer cannot split, and its shard fills up.
+
+| Option | Effect |
+|---|---|
+| Refine to `{ marketplace: 1, seller_id: 1 }` | 110 ms-class metadata change after an index build; the Shopee range can now be split by seller and balanced |
+| Reshard to `{ seller_id: 1, created_at: 1 }` | Hours-class rewrite on real data; queries by marketplace become broadcasts |
+| Keep the key, add shards | Does nothing: the Shopee range still cannot be split |
+
+Refining keeps every query targeted that was targeted before and adds split points; it is the first thing to try when the key's first field is right but too coarse.
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 5, Concept 1](/blogs/databases/partitioning-sharding/session-5-choosing-a-shard-key/concept-1-what-a-shard-key-decides) | The decision that resharding undoes |
+| Concept 2 | Why a key with few values blocks the balancer |
+| Concept 4 | `moveCollection` is the same operation for an unsharded collection |
+| [Session 4, Concept 4](/blogs/databases/partitioning-sharding/session-4-partition-lifecycle/concept-4-converting-a-table) | The single-server equivalent: converting a table's partitioning |
+
+## Key takeaways
+
+1. `refineCollectionShardKey` appends fields to the key: metadata only (110 ms), needs a supporting index, never reorders or removes fields.
+2. `reshardCollection` rewrites the collection under any new key: 332.2 s for 1M orders, never under the 300 s minimum.
+3. Reads and writes continue during resharding; writes are held only at the end (0.53 s here).
+4. Resharding needs a second full copy's worth of disk on the recipients and enough oplog to cover the operation.
+5. `moveCollection` and `unshardCollection` (8.0) use the same machinery.
+
+## Check questions
+
+1. Why did the first `refineCollectionShardKey` fail, and what did it take to make it work?
+2. Why was refining to `{ created_at: 1, seller_id: 1 }` refused?
+3. The collection had 1M orders and resharding took 332 s. Where did the time go?
+4. When could writes not proceed during resharding, and for how long?
+5. Which problem does refining solve, and which one can it not solve?
+6. What must you check on the cluster before resharding a 2 TB collection?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-6-mongodb-sharded-cluster/concept-5-resharding/answers">Worked answers to Q1–Q6</DeepDive>

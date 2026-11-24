@@ -1,0 +1,76 @@
+---
+title: "Answers: Changing the shard key"
+description: "Worked answers to the Session 6 Concept 5 check questions."
+companion: "answers"
+tags: ["sharding", "mongodb", "resharding", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-reshard-a-collection/"
+  - "https://www.mongodb.com/docs/manual/reference/command/refineCollectionShardKey/"
+---
+
+<Tldr>
+Refine is a metadata change with strict limits; reshard is a full online rewrite with a fixed minimum duration.
+</Tldr>
+
+## Q1. The failed refine
+
+**Question:** why did the first `refineCollectionShardKey` fail, and what did it take to make it work?
+
+Every shard must be able to find documents by the new key, so the server checks for an index that **starts with** the proposed key: "Please create an index that starts with the proposed shard key before refining the collection's shard key." After `createIndex({ seller_id: 1, created_at: 1 })` (1,211 ms on 1M orders, built on both shards through mongos), the refine succeeded in 110 ms. No document moved; the 15 chunk bounds were extended with `created_at: MinKey`.
+
+> **Common mistake:** creating the index on one shard directly. Build it through mongos so every shard has it.
+
+## Q2. Reordering refused
+
+**Question:** why was refining to `{ created_at: 1, seller_id: 1 }` refused?
+
+Refining keeps every existing range valid by only appending fields: a range `[seller 178, seller 355)` stays the same set of documents when `created_at` is added after `seller_id`. Putting `created_at` first would change which documents each range holds, which means moving data, which is resharding. The server answers "does not extend the current shard key". Removing a field (`{ seller_id: 1 }` after the refine) is refused for the same reason.
+
+> **Common mistake:** using refine as a cheap reshard.
+
+## Q3. Where 332 seconds went
+
+**Question:** the collection had 1M orders and resharding took 332 s. Where did the time go?
+
+From the coordinator's state transitions in `config.changelog`:
+
+| State | Duration |
+|---|---|
+| initializing + preparing-to-donate | 0.07 s |
+| cloning | 301.5 s |
+| applying | 30.0 s |
+| blocking-writes | 0.53 s |
+| committing | 0.07 s |
+
+Cloning is held to at least `reshardingMinimumOperationDurationMillis` (300,000 ms by default), whatever the size; on 1M orders the copy itself needs a few seconds. Applying lasted 30 s. On a large collection, cloning would be set by the data volume instead of by the minimum.
+
+> **Common mistake:** benchmarking resharding on small data and expecting linear scaling down.
+
+## Q4. When writes stopped
+
+**Question:** when could writes not proceed during resharding, and for how long?
+
+Only in the blocking-writes state: 0.53 s, after which the coordinator committed in 0.07 s. During the 331 s of cloning and applying, the workload's updates ran at median 2.34 ms (p99 9.19 ms). The worst update, 542.6 ms, fell in the blocking window. Reads are not blocked.
+
+> **Common mistake:** scheduling a long maintenance window for the whole resharding. Plan for the extra load during it and a sub-second write pause at the end (the documented behaviour is that resharding aborts if the block exceeds `reshardingCriticalSectionTimeoutMillis`; `getParameter` on the lab's config server returned 5000 ms).
+
+## Q5. What refining can and cannot fix
+
+**Question:** which problem does refining solve, and which one can it not solve?
+
+It solves **too few distinct values** (and too many documents per value) in the current key: appending a field adds split points, so the balancer can cut a huge range for one seller or one marketplace into smaller ranges. It cannot fix a key whose **first field** is wrong: queries that do not filter on `seller_id` stay broadcast after refining, and a monotonically increasing first field still sends every insert to the last range.
+
+> **Common mistake:** refining a monotonic key like `{ created_at: 1 }` with `_id` and expecting inserts to spread.
+
+## Q6. Before resharding 2 TB
+
+**Question:** what must you check on the cluster before resharding a 2 TB collection?
+
+- **Disk:** the recipients will hold a full second copy plus indexes until the commit; the donors keep the old copy until then.
+- **Oplog window:** donors must retain the oplog written since cloning started, or recipients cannot catch up; size the oplog for the expected duration.
+- **Load:** cloning reads everything and every write is applied twice; schedule for low write load.
+- **Other operations:** no other resharding, `moveCollection` or heavy balancing on the same shards; index builds and other DDL on the collection should wait.
+- **The new key:** test that the common queries are targeted under it (Session 5), because the next change costs another full rewrite.
+
+> **Common mistake:** checking only that the command is "online".

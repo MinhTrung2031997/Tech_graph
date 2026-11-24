@@ -1,0 +1,85 @@
+---
+title: "Answers: A live MongoDB sharded cluster session quiz"
+description: "Worked answers to the Session 6 quiz, with the lab's measured values."
+companion: "answers"
+tags: ["sharding", "mongodb", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-balancer-administration/"
+  - "https://www.mongodb.com/docs/manual/reference/command/moveCollection/"
+  - "https://www.mongodb.com/docs/manual/core/sharding-reshard-a-collection/"
+---
+
+<Tldr>
+A sharded cluster routes by metadata, moves data in ranges, cleans up later, and rewrites whole collections to change keys. Each step has a measurable cost.
+</Tldr>
+
+## Q1. Sharded but not spread
+
+**Question:** you sharded a 300 MB collection on a good key and it is still 100% on one shard. Why, and what is the per-collection fix?
+
+Sharding a loaded collection creates one chunk on the primary shard. The balancer moves data only when shards differ by three chunk sizes, 384 MB with the 128 MB default, so a 300 MB collection is "balanced" where it is. In the lab the 113 MiB `orders_s` stayed 100% on sh1 with `balancerCompliant: true`. Fix for that collection alone: `configureCollectionBalancing` with a smaller `chunkSize` (4 MB moved 13 ranges in 16 s).
+
+> **Common mistake:** changing the cluster-wide chunk size in `config.settings`, which affects every collection.
+
+## Q2. What mongos needs
+
+**Question:** what does mongos need to route `find({ seller_id: 4321 })` to one shard, and where does that information live?
+
+The collection's shard key (`config.collections`) and the list of ranges with their owners (`config.chunks`), both on the config servers. mongos caches them as the routing table, finds the range containing 4321 (`[2303, MaxKey)`, sh1), and sends the query there only: `SINGLE_SHARD`, 212 documents. If a migration has changed the owner since, the shard rejects the stale version and mongos refreshes.
+
+> **Common mistake:** expecting the config servers to be on the path of every query.
+
+## Q3. A fast broadcast
+
+**Question:** a lookup by `_id` on a collection sharded by `seller_id` runs in 0.3 ms on a 2-shard cluster. Why is it still a scaling problem?
+
+Because it runs on every shard: the profiler counted 500 queries on sh1 **and** 500 on sh2 for 500 lookups, against 272 + 228 when `seller_id` was included. On two shards next to each other this costs microseconds. With N shards it is N queries per lookup; the slowest shard sets the latency, and adding shards adds no capacity for these queries.
+
+> **Common mistake:** judging a shard key on a two-shard test cluster by latency alone.
+
+## Q4. When writes are held during a migration
+
+**Question:** during a migration, when are writes to the moving range held, and for how long was that in the lab?
+
+Only in the critical section at the end, while the last changes are copied and the config servers record the new owner. Moving 219,705 documents took 1,555 ms; updates to the range kept running throughout (median 3.47 ms vs 1.95 ms before), and the slowest, 34 ms, came at +1,517 ms, at the switch.
+
+> **Common mistake:** pausing the application for migrations. They are designed to run under load.
+
+## Q5. Orphans
+
+**Question:** give two ways orphan documents can mislead you, and how long they stay by default.
+
+Any two of:
+- Metadata counts include them: `estimatedDocumentCount()` and `count()` returned 1,460,637 for 1,000,000 orders.
+- Direct reads of a shard include them: seller 100's 191 orders appeared on both sh1 and sh2.
+- Queries through mongos are correct but slower: sh1 examined 41,040 keys to return 22,209.
+- Disk on the donor does not drop after a rebalance until the range deleter runs.
+
+They stay `orphanCleanupDelaySecs`, 900 s by default, plus the deletion itself (about 30 s for 460,637 documents, 11–17 s for 219,705 in the lab).
+
+> **Common mistake:** "fixing" duplicates in a per-shard export by de-duplicating on `_id` instead of reading through mongos.
+
+## Q6. Five minutes vs five seconds
+
+**Question:** why did `moveCollection` of 1M documents take more than five minutes, while `movePrimary` took five seconds?
+
+`moveCollection` is built on resharding, which never finishes its cloning phase before `reshardingMinimumOperationDurationMillis` (300,000 ms): 301 s cloning, 30 s applying, 0.96 s blocking writes, 0.15 s committing, 332.7 s in all. It keeps the collection writable until the last second. `movePrimary` simply copies the untracked collections and switches, in 5.0–5.3 s, but rejects writes meanwhile.
+
+> **Common mistake:** concluding that `movePrimary` is the better tool because it is faster.
+
+## Q7. movePrimary and writes
+
+**Question:** what does `movePrimary` do to writes, and what must the application do about it?
+
+Writes to the database's untracked unsharded collections fail with code 319, "movePrimary is in progress for namespace …", for the whole copy: 8,626 failed updates in 4.9 s in the lab. Reads continue. The application must catch the error and retry with backoff (or the operation must run in a window where those collections take no writes); a loop without error handling died on the first failure.
+
+> **Common mistake:** assuming writes queue as they do in a migration's critical section.
+
+## Q8. Refine or reshard
+
+**Question:** when is `refineCollectionShardKey` enough, and when do you need `reshardCollection`?
+
+Refine when the current key's leading field is right but too coarse: appending a field (`seller_id` → `seller_id, created_at`) adds split points, keeps every targeted query targeted, and is metadata only (110 ms after a 1.2 s index build). Reshard when the leading field is wrong: queries do not filter on it, it is monotonic, or it has a few huge values you cannot route around. Resharding rewrites the collection: 332 s for 1M orders, with a second copy's worth of disk and a 0.53 s write block at the end.
+
+> **Common mistake:** reaching for `reshardCollection` first. Check whether a refine solves the actual problem.
