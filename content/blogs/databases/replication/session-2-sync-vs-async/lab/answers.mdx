@@ -1,0 +1,79 @@
+---
+title: "Answers: Synchronous vs asynchronous session quiz"
+description: "Worked answers to the Session 2 quiz, with the lab's measured values."
+companion: "answers"
+tags: ["replication", "synchronous-replication", "semi-sync", "write-concern", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html"
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+---
+
+<Tldr>
+Every synchronous option costs one round trip to the replica that must answer, and each engine does something different when no replica answers.
+</Tldr>
+
+## Q1. synchronous_commit levels
+
+**Question:** list PostgreSQL's `synchronous_commit` levels in order and what each one waits for. Which one makes a read on the standby see the row?
+
+`off` (nothing; the WAL is flushed shortly after), `local` (the primary's WAL flush), `remote_write` (+ the standby wrote the WAL), `on` (+ the standby flushed it), `remote_apply` (+ the standby replayed it). Only `remote_apply` guarantees that a query on that standby sees the row once COMMIT returns. The remote levels apply only when `synchronous_standby_names` names a standby; otherwise they behave like `local`.
+
+> **Common mistake:** expecting `on` to give read-your-writes on the standby.
+
+## Q2. 25 ms for what
+
+**Question:** with a 20 ms standby, `local` took 1.05 ms and `on` 26.2 ms. What does the extra 25 ms buy?
+
+That the commit is on the standby's disk before the client is told it succeeded. If the primary is then lost for good, the standby can be promoted without losing that commit. With `local`, a commit acknowledged a moment before the primary's loss may never have reached the standby.
+
+> **Common mistake:** paying the 25 ms for every write, including those whose loss would not matter.
+
+## Q3. A paused synchronous standby
+
+**Question:** the synchronous standby was paused. What happened to commits, did `statement_timeout` help, and what did a cancelled commit leave behind?
+
+Commits waited in `SyncRep` with no limit; one waited 122 s. `statement_timeout = 3s` did not end the wait. `pg_cancel_backend` ended it with a WARNING that the transaction "has already committed locally, but might not have been replicated to the standby", and the client still received `INSERT 0 1`: another session counted 0 rows during the wait and 1 after the cancel. A session with `synchronous_commit = local` committed in 0.05 s.
+
+> **Common mistake:** retrying a commit after a cancelled synchronous wait.
+
+## Q4. Semi-sync ACK and AFTER_SYNC
+
+**Question:** what does a MySQL semi-sync ACK confirm, and why is AFTER_SYNC the safer wait point?
+
+That a replica's I/O thread has written the transaction to its relay log, not that the replica applied it. With AFTER_SYNC the source waits for the ACK before the InnoDB commit, so no other session can read the row before a replica has it (0 rows seen during a 2-second wait). With AFTER_COMMIT the row was visible during the wait (1 row seen): after a crash and failover, users could have read a row that the new source does not have.
+
+> **Common mistake:** treating semi-sync as a fix for stale reads on replicas.
+
+## Q5. 10 s, then 0.09 s
+
+**Question:** why did the first commit with the MySQL replica paused take 10 s and the next one 0.09 s? What should you monitor?
+
+The first commit waited for an ACK until `rpl_semi_sync_source_timeout` (10,000 ms), then the source logged MY-011153 and turned semi-sync off. Later commits did not wait at all. Monitor `Rpl_semi_sync_source_status` (OFF means unprotected), `Rpl_semi_sync_source_no_tx` (commits without an ACK, 3 here) and `Rpl_semi_sync_source_clients`.
+
+> **Common mistake:** checking only that the plugin is enabled.
+
+## Q6. Majority vs w: 3
+
+**Question:** why was MongoDB's `w: "majority"` 26.7 ms and `w: 3` 55.3 ms on the same set?
+
+On three members the majority is two: the primary and whichever secondary confirms first, the +20 ms one. `w: 3` needs every member, so the +50 ms secondary sets the latency. With the near secondary paused, majority writes took 53.2 ms because the far one completed the majority.
+
+> **Common mistake:** using `w: 3` on a 3-member set "to be extra safe", making every member's outage a write outage.
+
+## Q7. WriteConcernFailed and the step-down
+
+**Question:** a `WriteConcernFailed` error came back. Was the document written? What else happened to the primary 9.6 s later, and why?
+
+Yes: the document was on the primary (read with readConcern `local`), and later on the newly elected primary too. The error only meant no majority confirmed it within `wtimeout` (2,017 ms). 9.6 s after both secondaries were paused, the primary stepped down to SECONDARY because it could no longer see a majority of voting members, and then refused `w: 1` writes with NotWritablePrimary (10107). Stepping down prevents two members from accepting writes as primary at the same time during a network partition.
+
+> **Common mistake:** treating `WriteConcernFailed` as a failed write and inserting again.
+
+## Q8. Any one of two
+
+**Question:** with replicas at 20 ms and 50 ms, what did "any one of two" cost when both were up and when the near one was down, and what does it not protect against?
+
+Both up: the near replica's round trip, 22.8–25.5 ms (PostgreSQL `ANY 1`), 26.3 ms (MySQL `count = 1`), 23.5–26.7 ms (MongoDB majority). Near one down: the far replica's round trip, 53.4, 55.5 and 53.2 ms, with no hang and no fallback to async. It does not protect against losing a whole zone if the replica that usually answers first is in the same zone as the primary: the surviving replica may lack the latest commits. For zone safety, the acknowledging replica must be in another zone.
+
+> **Common mistake:** counting replicas instead of failure domains.

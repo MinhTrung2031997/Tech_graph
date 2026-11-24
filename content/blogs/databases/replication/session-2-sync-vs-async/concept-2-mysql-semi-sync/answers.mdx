@@ -1,0 +1,62 @@
+---
+title: "Answers: MySQL semi-synchronous replication"
+description: "Worked answers to the Session 2 Concept 2 check questions."
+companion: "answers"
+tags: ["replication", "semi-sync", "mysql", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-semisync-monitoring.html"
+---
+
+<Tldr>
+Semi-sync means "a replica has received it", only while the status is ON, and only for readers who could not see the row earlier.
+</Tldr>
+
+## Q1. What the ACK means
+
+**Question:** what exactly has happened on the replica when it sends the semi-sync ACK?
+
+The replica's I/O thread has received the transaction's events and written them to its relay log (flushed, from the documentation). The applier has not necessarily executed them: the replica's tables may not contain the row yet. In the lab the ACK arrived 20 ms after sending because of the injected delay, regardless of how fast the replica applied.
+
+> **Common mistake:** describing semi-sync as "the replica committed it". It received it.
+
+## Q2. AFTER_SYNC vs AFTER_COMMIT
+
+**Question:** why is AFTER_SYNC safer than AFTER_COMMIT, using the 0-row vs 1-row observation?
+
+With AFTER_COMMIT, InnoDB commits first and then the session waits for the ACK; during the 2-second wait another session already counted 1 row. If the source failed then and the replica, which had not received the transaction, were promoted, the row would disappear after people had read it (a "phantom read" across failover). With AFTER_SYNC the engine commit happens after the ACK, so the other session counted 0 rows: no one can see a row that no replica has.
+
+> **Common mistake:** choosing AFTER_COMMIT for its slightly lower latency (25.98 vs 24.95 ms here, within noise). It buys nothing measurable and weakens the guarantee.
+
+## Q3. 10.04 s, then 0.09 s
+
+**Question:** the first commit with the replica paused took 10.04 s and the next ones 0.09 s. Explain.
+
+The first commit waited for an ACK until `rpl_semi_sync_source_timeout` (10,000 ms) expired. The source then logged MY-011153 and switched semi-sync off (`Rpl_semi_sync_source_status = OFF`). From then on commits did not wait at all, as in asynchronous replication. When the replica reconnected and caught up, the source switched semi-sync back on.
+
+> **Common mistake:** reading the timeout as "each commit waits at most 10 s". Only the first does; the rest are silently asynchronous.
+
+## Q4. Commits at risk while OFF
+
+**Question:** which commits are at risk if the source fails while `Rpl_semi_sync_source_status = OFF`, and how do you count them?
+
+Every commit made while the status was OFF that the replica had not received when the source failed. `Rpl_semi_sync_source_no_tx` counts commits not acknowledged by a replica (3 in the lab); comparing `gtid_executed` on the source with `Retrieved_Gtid_Set` on the replica shows exactly which ones the replica is missing.
+
+> **Common mistake:** checking that the plugin is enabled (`rpl_semi_sync_source_enabled = ON`) instead of that it is active (`Rpl_semi_sync_source_status = ON`).
+
+## Q5. Never fall back
+
+**Question:** how would you make MySQL stop accepting commits instead of falling back to async, and what is the cost?
+
+Set `rpl_semi_sync_source_timeout` to a very large value (the variable is in milliseconds), so commits wait until a replica acknowledges. The cost: when every semi-sync replica is down or unreachable, all commits hang, like PostgreSQL with a single synchronous standby. Use at least two replicas with `wait_for_replica_count = 1` so one outage does not stop writes.
+
+> **Common mistake:** raising the timeout with only one replica, then patching that replica during business hours.
+
+## Q6. Stale reads with semi-sync
+
+**Question:** semi-sync is on. Can a read on the replica right after a commit miss the row? Why?
+
+Yes. The ACK only confirms the relay-log write. The replica's applier threads may be behind (a large transaction ahead in the queue, a slow replica), so a query on the replica can run before the row is applied. For read-your-writes through a replica, wait for the GTID on the replica (`WAIT_FOR_EXECUTED_GTID_SET`, Session 3) or read from the source.
+
+> **Common mistake:** using semi-sync to "fix" stale reads on replicas. It addresses durability, not visibility.

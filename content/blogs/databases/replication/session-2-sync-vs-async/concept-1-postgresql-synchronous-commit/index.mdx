@@ -1,0 +1,198 @@
+---
+title: "Concept 1: PostgreSQL synchronous_commit"
+description: "With a synchronous standby 20 ms away, a single-row INSERT committed in 1.05 ms with synchronous_commit = local, 23.8 ms with remote_write, 26.2 ms with on and 26.0 ms with remote_apply; off took 0.008 ms. When the synchronous standby was paused, commits waited on SyncRep indefinitely: statement_timeout did not stop the wait, and cancelling it after 122 s printed a WARNING that the transaction had already committed locally, then reported success."
+type: "concept"
+tags: ["replication", "synchronous-replication", "postgresql", "durability", "latency"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT"
+  - "https://www.postgresql.org/docs/17/runtime-config-replication.html#GUC-SYNCHRONOUS-STANDBY-NAMES"
+  - "https://www.postgresql.org/docs/17/warm-standby.html#SYNCHRONOUS-REPLICATION"
+---
+
+<Tldr>
+PostgreSQL replication is asynchronous until you name a synchronous standby in `synchronous_standby_names`. Then `synchronous_commit` decides how far a commit waits: **local** (own WAL flushed), **remote_write** (standby wrote the WAL), **on** (standby flushed it), **remote_apply** (standby replayed it). With the standby's replies delayed 20 ms, a single-row INSERT took **1.05 ms** (local), **23.8 ms** (remote_write), **26.2 ms** (on) and **26.0 ms** (remote_apply); `off` took **0.008 ms** because it does not even wait for the local flush. Without network delay the levels were 1.1–2.1 ms. When the synchronous standby stopped responding, commits **waited forever** (`wait_event = SyncRep`): `statement_timeout = 3s` did not end the wait. Cancelling after 122 s printed *"canceling wait for synchronous replication due to user request … The transaction has already committed locally"* and the client saw `INSERT 0 1`. `synchronous_commit = local` in one session still committed in 0.05 s.
+</Tldr>
+
+## The levels
+
+| `synchronous_commit` | COMMIT returns after | Lab latency, standby +20 ms | Lab latency, no delay |
+|---|---|---|---|
+| `off` | WAL written to memory; flushed later by the WAL writer | 0.008 ms | 0.008 ms |
+| `local` | WAL flushed on the primary | 1.05 ms | 1.12 ms |
+| `remote_write` | + standby has written the WAL (not fsynced) | 23.8 ms | 2.06 ms |
+| `on` (default) | + standby has flushed the WAL | 26.2 ms | 1.41 ms |
+| `remote_apply` | + standby has replayed it: visible to queries there | 26.0 ms | 1.66 ms |
+
+Measured with `pgbench`, one client, a single-row INSERT per transaction, median of three 5-second runs; `synchronous_standby_names = 's1'` and `rpa-pg2` connected as `application_name = s1`. The delay is Linux `netem` on the standby's outgoing traffic (the lab's `delay.sh`). Without `synchronous_standby_names`, every level except `off` behaves like `local` (1.12–1.23 ms here).
+
+| Term | Meaning |
+|---|---|
+| Synchronous standby | A standby listed in `synchronous_standby_names`; `pg_stat_replication.sync_state = sync` |
+| SyncRep wait | A committing backend waits with `wait_event = SyncRep` until the standby reports the required LSN |
+| **✓ / ✗** | Step done before COMMIT returns / not waited for |
+
+## What a commit waits for
+
+<Flow
+  title="PostgreSQL: COMMIT with a synchronous standby 20 ms away"
+  height={350}
+  nodes={[
+    { id: 'client', label: 'Client', sub: 'COMMIT', x: 20, y: 20, w: 170 },
+    { id: 'backend', label: 'Backend', sub: 'waits per level', x: 20, y: 150, w: 170 },
+    { id: 'flush', label: 'Primary WAL flush', sub: 'fsync pg_wal', x: 20, y: 280, w: 170 },
+    { id: 'sender', label: 'walsender', sub: 'streams, gets replies', x: 310, y: 150, w: 180 },
+    { id: 'write', label: 'Standby write', sub: 'remote_write', x: 600, y: 280, w: 180 },
+    { id: 'sflush', label: 'Standby flush', sub: 'on', x: 600, y: 150, w: 180 },
+    { id: 'replay', label: 'Standby replay', sub: 'remote_apply', x: 600, y: 20, w: 180 },
+  ]}
+  edges={[
+    { id: 'client-backend', from: 'client', to: 'backend' },
+    { id: 'backend-flush', from: 'backend', to: 'flush' },
+    { id: 'backend-sender', from: 'backend', to: 'sender' },
+    { id: 'sender-write', from: 'sender', to: 'write' },
+    { id: 'write-sflush', from: 'write', to: 'sflush' },
+    { id: 'sflush-replay', from: 'sflush', to: 'replay' },
+  ]}
+  cases={[
+    {
+      title: 'local',
+      path: 'primary flush ✓ → COMMIT returns (1.05 ms); standby write ✗ flush ✗ replay ✗ not waited for',
+      summary: 'Durable on the primary only; the standby catches up afterwards.',
+      steps: [
+        {
+          title: 'Flush locally and return',
+          note: 'The backend flushes its WAL to the primary\'s disk and returns. The standby receives the same WAL a moment later, but if the primary\'s disk is lost before that, the commit is lost with it. off goes further and returns before the local flush (0.008 ms); a crash of the primary can lose the last few commits.',
+          code: "SET synchronous_commit = local;\nINSERT INTO t (v) VALUES (1);   -- 1.05 ms",
+          active: ['client', 'backend', 'flush'],
+          edges: ['client-backend', 'backend-flush'],
+          subs: { backend: '✓ returns after flush' },
+        },
+      ],
+    },
+    {
+      title: 'remote_write',
+      path: 'primary flush ✓ → standby write ✓ → COMMIT returns (23.8 ms); standby flush ✗ replay ✗',
+      summary: 'Survives the loss of the primary, not a simultaneous crash of both.',
+      steps: [
+        {
+          title: 'Wait for the standby\'s write',
+          note: 'The commit waits until the standby reports it has written the WAL to its operating system. One round trip to the standby: 23.8 ms with 20 ms of delay. If the standby\'s OS crashes at the same moment as the primary, the WAL in its page cache is gone.',
+          code: "SET synchronous_commit = remote_write;   -- 23.8 ms",
+          active: ['backend', 'flush', 'sender', 'write'],
+          edges: ['backend-flush', 'backend-sender', 'sender-write'],
+          subs: { write: '✓ written', sflush: '✗ not waited' },
+        },
+      ],
+    },
+    {
+      title: 'on',
+      path: 'primary flush ✓ → standby write ✓ → standby flush ✓ → COMMIT returns (26.2 ms); replay ✗',
+      summary: 'The default: on two disks before the client hears "COMMIT".',
+      steps: [
+        {
+          title: 'Wait for the standby\'s fsync',
+          note: 'The standby fsyncs the WAL, then replies. 26.2 ms median (runs 24.2, 26.2, 28.8). The row is durable on two servers, but a query on the standby may not see it yet: replay can still be behind.',
+          code: "SET synchronous_commit = on;   -- 26.2 ms",
+          active: ['backend', 'sender', 'write', 'sflush'],
+          edges: ['backend-sender', 'sender-write', 'write-sflush'],
+          subs: { sflush: '✓ flushed', replay: '✗ maybe not yet' },
+        },
+      ],
+    },
+    {
+      title: 'remote_apply',
+      path: 'primary flush ✓ → standby write ✓ → flush ✓ → replay ✓ → COMMIT returns (26.0 ms)',
+      summary: 'A read on the standby after the commit sees the row.',
+      steps: [
+        {
+          title: 'Wait for replay',
+          note: 'The standby replies after replaying the commit record. 26.0 ms median, within noise of on: with an idle standby, replay takes microseconds. Under replay lag (Session 3) this level waits for the lag too.',
+          code: "SET synchronous_commit = remote_apply;   -- 26.0 ms",
+          active: ['sender', 'write', 'sflush', 'replay'],
+          edges: ['sender-write', 'write-sflush', 'sflush-replay'],
+          subs: { replay: '✓ visible on standby' },
+        },
+      ],
+    },
+    {
+      title: 'The synchronous standby stops responding',
+      path: 'primary flush ✓ → standby ✗ paused → backend waits on SyncRep (no timeout) → cancel → WARNING, but committed',
+      summary: 'Commits hang until the standby returns or the wait is cancelled; a cancelled commit is still committed.',
+      steps: [
+        {
+          title: 'Commits hang',
+          note: 'docker pause rpa-pg2. A session with SET statement_timeout = \'3s\' ran an INSERT: pg_stat_activity showed wait_event_type IPC, wait_event SyncRep. Another session counted the row: 0. statement_timeout did not cancel the wait; it was still waiting at 122 s.',
+          code: "SET statement_timeout = '3s';\nINSERT INTO t (v) VALUES (42);   -- still waiting after 122 s",
+          active: ['client', 'backend', 'flush', 'sender', 'write'],
+          edges: ['client-backend', 'backend-flush', 'backend-sender'],
+          subs: { backend: '✗ SyncRep wait', write: '✗ paused' },
+        },
+        {
+          title: 'Cancel: committed anyway',
+          note: 'pg_cancel_backend(pid): the client received WARNING: canceling wait for synchronous replication due to user request, DETAIL: The transaction has already committed locally, but might not have been replicated to the standby. Then INSERT 0 1. The other session now counted 1 row. With the standby unpaused after 5 s instead, a waiting commit returned after 5.0 s.',
+          code: "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE wait_event = 'SyncRep';",
+          active: ['client', 'backend', 'flush'],
+          edges: ['client-backend'],
+          subs: { backend: 'committed locally ✓' },
+        },
+        {
+          title: 'Escape hatch per session',
+          note: 'With the standby still paused, a session with synchronous_commit = local committed in 0.05 s. To let all writes continue, an administrator clears synchronous_standby_names and reloads: replication becomes asynchronous.',
+          code: "SET synchronous_commit = local;   -- 0.05 s with the standby paused\nALTER SYSTEM SET synchronous_standby_names = ''; SELECT pg_reload_conf();",
+          active: ['backend', 'flush'],
+          edges: ['backend-flush'],
+          subs: { backend: '✓ local only' },
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+A synchronous standby that is down stops **all** commits that wait for it, and there is no built-in timeout: here a commit sat in `SyncRep` for 122 s and would have waited longer. Two consequences. First, one synchronous standby with no alternative makes the standby as critical as the primary: list two and wait for one (Concept 4). Second, a cancelled or timed-out wait does **not** roll back: the transaction is committed on the primary, the client is told so with a WARNING it probably logs nowhere, and the standby may not have it.
+</Pitfall>
+
+## Choosing per transaction
+
+`synchronous_commit` is a session and transaction setting, so one cluster can mix levels:
+
+```sql
+-- Payment confirmation: must survive the loss of the primary
+BEGIN; SET LOCAL synchronous_commit = on; … COMMIT;
+-- Click tracking, page views: lose a few on a crash, never wait
+BEGIN; SET LOCAL synchronous_commit = off; … COMMIT;
+```
+
+`off` is not "no durability": the WAL is still written and flushed within a short delay by the WAL writer (from the documentation: at most three times `wal_writer_delay`, 200 ms by default), and a crash cannot corrupt data, only lose the most recent commits.
+
+## Real-world scenario: checkout stalls during a standby reboot
+
+A team turns on synchronous replication for orders with `synchronous_standby_names = 'standby1'`. During routine OS patching the standby reboots; for four minutes every checkout hangs on COMMIT, the connection pool fills, and the shop goes down while the primary is perfectly healthy. Fixes: name two standbys with `ANY 1 (s1, s2)` so either can acknowledge (Concept 4); have the patching runbook clear `synchronous_standby_names` before taking the last synchronous standby down; and give the application its own timeout and alerting on `wait_event = 'SyncRep'`, knowing that a commit it gives up on may still have happened.
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Transactions Session 1, Concept 3](/blogs/databases/transactions/session-1-transaction-guarantees/concept-3-durability) | The same setting on a single server: `off` vs `on` and what a crash loses |
+| Concept 4 | Quorums: waiting for any one of several standbys |
+| Session 5 | What each level means when the primary fails and a standby is promoted |
+
+## Key takeaways
+
+1. Replication is asynchronous until `synchronous_standby_names` names a standby; then `synchronous_commit` picks the wait.
+2. Each remote level adds a round trip: about 24–26 ms with 20 ms of delay; `local` stayed near 1 ms, `off` 0.008 ms.
+3. `remote_apply` is the only level that makes the row visible on the standby when COMMIT returns.
+4. A non-responding synchronous standby blocks commits indefinitely; `statement_timeout` does not end the wait.
+5. A cancelled synchronous wait leaves the transaction committed on the primary.
+
+## Check questions
+
+1. Why was `remote_write` 23.8 ms but `local` 1.05 ms, and what does each one survive?
+2. When is `on` not enough for a read on the standby right after the commit?
+3. A commit hung for 122 s with `statement_timeout = 3s`. Why did the timeout not help?
+4. After the cancel, was the row committed? Who could see it, and where might it be missing?
+5. How do you keep accepting writes while the only synchronous standby is down for maintenance?
+6. Which transactions in a marketplace back end would you run with `synchronous_commit = off`, and why is that safe for them?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-2-sync-vs-async/concept-1-postgresql-synchronous-commit/answers">Worked answers to Q1–Q6</DeepDive>

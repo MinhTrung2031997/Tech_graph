@@ -1,0 +1,62 @@
+---
+title: "Answers: PostgreSQL synchronous_commit"
+description: "Worked answers to the Session 2 Concept 1 check questions."
+companion: "answers"
+tags: ["replication", "synchronous-replication", "postgresql", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT"
+  - "https://www.postgresql.org/docs/17/warm-standby.html#SYNCHRONOUS-REPLICATION"
+---
+
+<Tldr>
+Each level buys protection against one more failure with one more wait. The wait has no timeout, and giving up on it does not undo the commit.
+</Tldr>
+
+## Q1. remote_write vs local
+
+**Question:** why was `remote_write` 23.8 ms but `local` 1.05 ms, and what does each one survive?
+
+`local` waits only for the primary's own WAL flush: no network. `remote_write` also waits for the standby's reply saying it has written the WAL, one round trip with the standby's 20 ms delay. `local` survives a crash of the primary process or server as long as its disk survives; it does not survive losing the primary's disk or server for good, because the standby may not have the last commits yet. `remote_write` survives losing the primary entirely, but not a simultaneous operating-system crash of both machines, because the standby had not fsynced.
+
+> **Common mistake:** thinking `remote_write` is "almost as safe as on" for free. It costs the same round trip (23.8 vs 26.2 ms here); the saving is only the standby's fsync.
+
+## Q2. When `on` is not enough
+
+**Question:** when is `on` not enough for a read on the standby right after the commit?
+
+`on` waits until the standby has flushed the WAL, not until it has replayed it. If the application commits on the primary and immediately reads from the standby (read-your-writes through a replica), replay may still be behind and the row missing. Only `remote_apply` waits for replay (26.0 ms here, the same as `on` because replay was idle; under replay lag it waits longer).
+
+> **Common mistake:** using `on` and routing the next read to the standby, then filing a bug about "missing orders".
+
+## Q3. statement_timeout did not help
+
+**Question:** a commit hung for 122 s with `statement_timeout = 3s`. Why did the timeout not help?
+
+The transaction had already been committed locally when the wait began; the backend was waiting for the standby's acknowledgement, not executing the statement. PostgreSQL does not end that wait on `statement_timeout` (measured here). Only a cancel or terminate request, the standby returning, or a change of `synchronous_standby_names` ends it.
+
+> **Common mistake:** relying on database timeouts to protect the application from a dead synchronous standby. Monitor `wait_event = 'SyncRep'` and use application-side timeouts.
+
+## Q4. After the cancel
+
+**Question:** after the cancel, was the row committed? Who could see it, and where might it be missing?
+
+Yes. The WARNING said "The transaction has already committed locally, but might not have been replicated to the standby", and the client received `INSERT 0 1`. During the wait, another session on the primary counted 0 rows; after the cancel it counted 1. The standby was paused, so it did not have the row; if the primary had failed at that point and the standby had been promoted, the row would have been lost despite "synchronous" replication.
+
+> **Common mistake:** treating the WARNING as an error and retrying the INSERT, creating a duplicate.
+
+## Q5. Maintenance on the only synchronous standby
+
+**Question:** how do you keep accepting writes while the only synchronous standby is down for maintenance?
+
+Before stopping it, make replication asynchronous: `ALTER SYSTEM SET synchronous_standby_names = ''; SELECT pg_reload_conf();` and restore it afterwards. Or, better, run with two standbys and `ANY 1 (s1, s2)` so maintenance on one never blocks commits (Concept 4: 53 ms instead of 23 ms while the near standby was paused, but no hang). Individual sessions can also use `SET synchronous_commit = local` (0.05 s with the standby paused).
+
+> **Common mistake:** restarting the synchronous standby "quickly" during business hours. Every commit waits for the whole restart.
+
+## Q6. Where `off` is safe
+
+**Question:** which transactions in a marketplace back end would you run with `synchronous_commit = off`, and why is that safe for them?
+
+Writes whose loss after a crash is acceptable and that can be rebuilt or ignored: page-view and click events, search logs, recommendation impressions, cache tables, session heartbeats. `off` does not risk corruption: it only returns before the WAL flush, so a crash can lose the last commits (from the documentation, up to three times `wal_writer_delay`). Payments, orders, stock and refunds stay at `on`.
+
+> **Common mistake:** setting `synchronous_commit = off` for the whole database to speed up a batch job, then forgetting to switch it back.

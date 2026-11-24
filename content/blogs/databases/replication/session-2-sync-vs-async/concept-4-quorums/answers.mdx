@@ -1,0 +1,62 @@
+---
+title: "Answers: Waiting for one of several replicas"
+description: "Worked answers to the Session 2 Concept 4 check questions."
+companion: "answers"
+tags: ["replication", "quorum", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/runtime-config-replication.html#GUC-SYNCHRONOUS-STANDBY-NAMES"
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+---
+
+<Tldr>
+A quorum turns "the replica" into "any replica". The latency is the k-th fastest acknowledgement; the guarantee is only as good as where those replicas are.
+</Tldr>
+
+## Q1. Majority as any one of two
+
+**Question:** why did MongoDB's `w: "majority"` behave like "any one of two secondaries"?
+
+On a 3-member replica set the majority is 2, and the primary is one of the two. One secondary's confirmation completes it, whichever comes first: the near one normally (23.5–26.7 ms), the far one when the near one was paused (53.2 ms). On a 5-member set the majority is 3, so it would need two secondaries.
+
+> **Common mistake:** adding a fourth member "for safety" and making majority 3 of 4: commits now wait for two secondaries, and the set tolerates no more failures than with three.
+
+## Q2. No timeout in MySQL
+
+**Question:** with the near replica paused, why did MySQL not hit its 10-second timeout?
+
+`rpl_semi_sync_source_wait_for_replica_count = 1` needs one acknowledgement. The far replica was still connected as a semi-sync client and acknowledged every commit after its 50 ms delay (55.5 ms per commit). The timeout only starts to matter when no connected replica acknowledges; `Rpl_semi_sync_source_status` stayed ON and `no_tx` stayed 0.
+
+> **Common mistake:** running semi-sync with exactly one replica and `count = 1`, so the first replica problem turns replication asynchronous.
+
+## Q3. FIRST vs ANY
+
+**Question:** `FIRST 1 (s2, s1)` took 55.7 ms and `ANY 1 (s1, s2)` 22.8–25.5 ms. Explain, and say when FIRST is the right choice.
+
+`FIRST 1 (s2, s1)` makes the first healthy standby **in the list** synchronous: s2, the far one, with s1 as a potential replacement. Every commit waited for s2. `ANY 1 (s1, s2)` accepts whichever standby confirms first, so the near s1 set the latency. FIRST is right when one standby must hold every commit for a reason other than speed, for example because it is the failover target in another zone and promoting the near standby would not survive a zone loss.
+
+> **Common mistake:** writing `FIRST 1 (near, far)` and believing the far standby is "also synchronous". It is only a potential replacement.
+
+## Q4. Any one replica and a zone failure
+
+**Question:** what does a commit acknowledged by "any one" replica guarantee if the primary's whole zone fails?
+
+Nothing beyond what that one replica's location gives. If the fastest replica is in the primary's zone, most commits are acknowledged by it alone; when the zone fails, the replica in the other zone may lack the last commits, and promoting it loses them. "Any one" protects against the loss of the primary server, not of a zone, unless every acknowledging replica is outside the zone.
+
+> **Common mistake:** counting replicas instead of failure domains.
+
+## Q5. A payment service in two zones
+
+**Question:** which setting would you pick for a payment service with three nodes in two zones, and what does it cost per commit?
+
+Require an acknowledgement from the other zone. For example: primary and one standby in zone A, one standby in zone B, and in PostgreSQL `FIRST 1 (zone_b)` or `ANY 1` over zone-B standbys only; in MongoDB a tagged write concern that requires a member in another zone (from the documentation), or majority with members placed so that any majority spans both zones; in MySQL a semi-sync replica only in zone B. The cost is one cross-zone round trip on every commit, as the measurements show (the round trip is essentially the whole added latency), plus the risk that zone B being down blocks or degrades commits, so add a second replica in zone B.
+
+> **Common mistake:** accepting the default majority on a set where the majority can be formed inside one zone.
+
+## Q6. No quorum
+
+**Question:** fill in: when no quorum is possible, PostgreSQL …, MySQL …, MongoDB … .
+
+PostgreSQL **waits**: commits sit in `SyncRep` without a timeout until a standby returns or the configuration changes; a cancelled wait leaves the commit committed locally. MySQL **falls back**: the first commit waits `rpl_semi_sync_source_timeout` (10 s), then the source continues asynchronously and switches back when a replica reconnects. MongoDB **errors per write and steps down**: each majority write waits until its `wtimeout` and fails with `WriteConcernFailed` while the write stays on the primary, and a primary that cannot see a majority steps down (9.6 s here) and refuses all writes.
+
+> **Common mistake:** assuming "synchronous" means the same thing in all three engines.
