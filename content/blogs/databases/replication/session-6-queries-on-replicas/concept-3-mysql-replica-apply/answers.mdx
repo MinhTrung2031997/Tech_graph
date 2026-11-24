@@ -1,0 +1,54 @@
+---
+title: "Answers: Long reads and apply speed on a MySQL replica"
+description: "Worked answers to the Session 6 Concept 3 check questions."
+companion: "answers"
+tags: ["replication", "replica", "mysql", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-options-replica.html#sysvar_replica_parallel_workers"
+  - "https://dev.mysql.com/doc/refman/8.4/en/metadata-locking.html"
+---
+
+<Tldr>
+On a MySQL replica, readers and row changes coexist; DDL and a slow applier are what make it fall behind.
+</Tldr>
+
+## Q1. UPDATE yes, ALTER no
+
+**Question:** why did a 100,000-row UPDATE apply on the replica during a long SELECT, while a one-column ALTER did not?
+
+Applying row changes takes a **shared** metadata lock on the table (for writing) plus row locks; InnoDB's MVCC gives the SELECT its own read view, so the two do not conflict and the UPDATE was applied within 4 s with lag 0. An ALTER TABLE needs the metadata lock **exclusively** at least at its start and end, which conflicts with the SELECT's shared lock, so the applier waited until the SELECT finished.
+
+> **Common mistake:** assuming "instant" DDL (`ALGORITHM=INSTANT`) needs no lock. It does no copying, but it still needs the exclusive metadata lock briefly, and waits for it like any other DDL.
+
+## Q2. Unrelated inserts stopped too
+
+**Question:** inserts into `lab.ev` had nothing to do with `lab.orders`. Why did they stop as well?
+
+The replica commits transactions in source order (`replica_preserve_commit_order = 1`), and DDL is applied on its own, after everything before it and before anything after it. While the ALTER waited, no later transaction could be committed, whatever table it touched: the replica stayed at 4 rows of `lab.ev` while the source reached 10.
+
+> **Common mistake:** expecting parallel workers to route around a blocked DDL.
+
+## Q3. A slow single applier
+
+**Question:** why can one applier thread fall behind a source that is not even busy?
+
+The source runs 8 sessions in parallel, and their commits share each log flush (group commit). A single applier replays the same transactions one after another, each with its own commit and, with `sync_binlog = 1`, `innodb_flush_log_at_trx_commit = 1` and `log_replica_updates = 1`, its own log flushes. In the lab: 40,000 transactions written in 13–20 s, applied in a median 73.4 s by one worker, about 545 per second.
+
+> **Common mistake:** sizing the replica by the source's CPU use. Apply is limited by its serial commit path, not by CPU.
+
+## Q4. 8 workers vs 4
+
+**Question:** why were 8 workers not faster than 4 here?
+
+Parallel apply is limited by the hardware: the laptop's cores were shared by the source, the replica, the client container and other databases, and all workers still commit in order through the same log files. Beyond 4 workers they mostly waited for each other and for CPU (medians 28.3 s for 4, 35.7 s for 8, with a wide spread). On a dedicated server with fast storage more workers can help; measure before raising it.
+
+> **Common mistake:** setting `replica_parallel_workers` to the core count without testing.
+
+## Q5. A replica that falls behind at 02:00
+
+**Question:** a BI replica falls hours behind every night at 02:00. What do you check first?
+
+What the applier is doing: `SHOW PROCESSLIST` / `performance_schema.threads` for the applier's state ("Waiting for table metadata lock" points to DDL blocked by a BI query), and `performance_schema.metadata_locks` to find the session holding the lock. Then the source's 02:00 jobs: migrations (DDL) and large batch transactions, which the replica applies as one long event. Then `replication_applier_status_by_worker` for errors and per-worker activity.
+
+> **Common mistake:** adding more parallel workers, which does nothing for a metadata-lock wait or for a single huge transaction.

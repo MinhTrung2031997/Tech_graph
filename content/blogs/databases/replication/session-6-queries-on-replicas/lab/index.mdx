@@ -1,0 +1,294 @@
+---
+title: "Lab and session quiz: Queries on replicas"
+description: "Make a PostgreSQL standby cancel a report and then stop cancelling it at the price of bloat on the primary; block a MySQL replica's applier with a long SELECT and an ALTER TABLE, and time backlog apply with 1, 4 and 8 workers; run an aggregation and a snapshot read on a MongoDB secondary under write load."
+type: "how-to"
+tags: ["replication", "hot-standby", "replica", "secondary-reads", "lab", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/hot-standby.html#HOT-STANDBY-CONFLICT"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-options-replica.html#sysvar_replica_parallel_workers"
+  - "https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.minSnapshotHistoryWindowInSeconds"
+---
+
+<Tldr>
+Uses `rp-setup.sh` and `rp-teardown.sh` from the [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) with prefix `rp`, one engine at a time. Save the scripts below into the same folder and make them executable (`chmod +x *.sh`); they take the prefix from `P` (default `rp`) and use `python3` on the host for timings. Lab numbers come from the course machine, a laptop shared with other databases: expect different absolute times, similar ratios.
+</Tldr>
+
+## Exercise 1: hot standby conflicts (Concept 1)
+
+```bash
+bash rp-setup.sh rp pg
+```
+
+`pg-orders.sh`:
+
+```bash
+#!/bin/bash
+# After rp-setup.sh <prefix> pg: the 1,000,000-row orders table on the primary. Usage: P=rp ./pg-orders.sh
+P=${P:-rp}
+docker exec $P-pg1 psql -U postgres -qc "DROP TABLE IF EXISTS orders" \
+  -c "CREATE TABLE orders AS SELECT g AS id, (g % 5000) + 1 AS seller_id, md5(g::text) AS note, 'new'::text AS status FROM generate_series(1, 1000000) g" \
+  -c "ALTER TABLE orders ADD PRIMARY KEY (id)" -c "VACUUM ANALYZE orders"
+```
+
+`conflict.sh` (a 60 s report on the standby; UPDATE + VACUUM on the primary; replay lag every 5 s):
+
+```bash
+#!/bin/bash
+# conflict.sh <tag> [standby settings SQL]: a 60 s report on the standby holds a snapshot; the primary updates 100k rows
+# and vacuums them; record when the report ends and how far replay falls behind meanwhile.
+P=${P:-rp}
+TAG=$1; SET=$2
+docker exec $P-pg1 psql -U postgres -qc "CREATE TABLE IF NOT EXISTS tick (t timestamptz)"
+[ -n "$SET" ] && { docker exec $P-pg2 psql -U postgres -qc "ALTER SYSTEM SET $SET" -c "SELECT pg_reload_conf()" >/dev/null; sleep 1; }
+docker exec $P-pg2 psql -U postgres -Atc "SHOW max_standby_streaming_delay" -c "SHOW hot_standby_feedback" | tr '\n' ' '; echo
+# The report: a repeatable-read transaction that reads orders, sleeps 60 s, reads again.
+( S=$(date +%s.%N)
+  docker exec $P-pg2 psql -U postgres -At -c "BEGIN ISOLATION LEVEL REPEATABLE READ" -c "SELECT count(*) FROM orders WHERE status = 'new'" \
+    -c "SELECT pg_sleep(60)" -c "SELECT count(*) FROM orders WHERE status = 'new'" -c "COMMIT" > /tmp/report-$TAG.txt 2>&1
+  E=$(date +%s.%N); echo "report ended after $(python3 -c "print(round($E-$S,1))") s" >> /tmp/report-$TAG.txt ) &
+sleep 3
+S0=$(date +%s)
+docker exec $P-pg1 psql -U postgres -qc "UPDATE orders SET status = 'paid' WHERE id <= 100000" -c "VACUUM orders"
+echo "update+vacuum done at +$(( $(date +%s)-S0 ))s"
+for i in $(seq 1 70); do
+  docker exec $P-pg1 psql -U postgres -qc "INSERT INTO tick VALUES (now())"
+  L=$(docker exec $P-pg2 psql -U postgres -Atc "SELECT round(extract(epoch FROM now() - pg_last_xact_replay_timestamp()))::int || 's ' || pg_size_pretty(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()))")
+  [ $((i % 5)) -eq 1 ] && echo "+$(( $(date +%s)-S0 ))s replay lag $L"
+  jobs %1 >/dev/null 2>&1 || { echo "report finished at +$(( $(date +%s)-S0 ))s"; break; }
+  sleep 1
+done
+wait; cat /tmp/report-$TAG.txt
+```
+
+```bash
+./pg-orders.sh
+./conflict.sh default                                         # lab: cancelled after 33.5 s, lag up to 29 s
+docker exec rp-pg1 psql -U postgres -c "UPDATE orders SET status = 'new'" -c "VACUUM orders"
+./conflict.sh never "max_standby_streaming_delay = -1"        # lab: report finished, lag up to 58 s
+docker exec rp-pg1 psql -U postgres -c "UPDATE orders SET status = 'new'" -c "VACUUM orders"
+./conflict.sh five  "max_standby_streaming_delay = '5s'"      # lab: cancelled after 8.4 s
+```
+
+The lock conflict, with the 5 s setting still in place:
+
+```bash
+docker exec rp-pg2 psql -U postgres -c "SELECT count(*), pg_sleep(30) FROM orders" &
+sleep 2; docker exec rp-pg1 psql -U postgres -c "ALTER TABLE orders ADD COLUMN note2 text"; wait
+docker exec rp-pg2 psql -U postgres -c "SELECT confl_snapshot, confl_lock FROM pg_stat_database_conflicts WHERE datname = 'postgres'"
+docker exec rp-pg1 psql -U postgres -c "ALTER TABLE orders DROP COLUMN note2"
+```
+
+## Exercise 2: feedback and bloat (Concept 2)
+
+`bloat.sh` (recreates `orders`, holds a 75 s report on the standby, five rounds of UPDATE + VACUUM on the primary):
+
+```bash
+#!/bin/bash
+# bloat.sh <tag> "<standby setting 1>" "<standby setting 2>": recreate orders, hold a 75 s report on the standby, run
+# 5 rounds of (update 100k rows + VACUUM) on the primary, report dead tuples, table size and replay lag.
+P=${P:-rp}
+TAG=$1
+docker exec $P-pg1 psql -U postgres -qc "DROP TABLE IF EXISTS orders" -c "CREATE TABLE orders AS SELECT g AS id, (g % 5000) + 1 AS seller_id, md5(g::text) AS note, 'new'::text AS status FROM generate_series(1, 1000000) g" -c "ALTER TABLE orders ADD PRIMARY KEY (id)" -c "VACUUM ANALYZE orders"
+docker exec $P-pg2 psql -U postgres -qc "ALTER SYSTEM SET $2" -c "ALTER SYSTEM SET $3" -c "SELECT pg_reload_conf()" >/dev/null; sleep 3
+echo "$TAG: $(docker exec $P-pg2 psql -U postgres -Atc "SHOW hot_standby_feedback" -c "SHOW max_standby_streaming_delay" | tr '\n' ' ') size before $(docker exec $P-pg1 psql -U postgres -Atc "SELECT pg_size_pretty(pg_table_size('orders'))")"
+( docker exec $P-pg2 psql -U postgres -At -c "BEGIN ISOLATION LEVEL REPEATABLE READ" -c "SELECT count(*) FROM orders" -c "SELECT pg_sleep(75)" -c "COMMIT" > /tmp/rep-$TAG.txt 2>&1 ) &
+sleep 3
+echo "primary backend_xmin from standby: $(docker exec $P-pg1 psql -U postgres -Atc "SELECT backend_xmin FROM pg_stat_replication")"
+for r in 1 2 3 4 5; do
+  docker exec $P-pg1 psql -U postgres -qc "UPDATE orders SET status = 'r$r' WHERE id <= 100000"
+  V=$(docker exec $P-pg1 psql -U postgres -c "VACUUM (VERBOSE) orders" 2>&1 | grep -oE 'tuples: [0-9]+ removed, [0-9]+ remain, [0-9]+ are dead but not yet removable' | head -1)
+  echo "round $r: $V; size $(docker exec $P-pg1 psql -U postgres -Atc "SELECT pg_size_pretty(pg_table_size('orders'))"); replay lag $(docker exec $P-pg2 psql -U postgres -Atc "SELECT pg_size_pretty(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()))")"
+  sleep 5
+done
+wait; echo "report: $(tr '\n' ' ' < /tmp/rep-$TAG.txt)"
+sleep 2; echo "after report ended + VACUUM: $(docker exec $P-pg1 psql -U postgres -c "VACUUM (VERBOSE) orders" 2>&1 | grep -oE 'tuples: [0-9]+ removed[^;]*')  size $(docker exec $P-pg1 psql -U postgres -Atc "SELECT pg_size_pretty(pg_table_size('orders'))")"
+```
+
+```bash
+./bloat.sh feedback "hot_standby_feedback = on"  "max_standby_streaming_delay = '30s'"   # lab: 73 → 110 MB, 500,000 not removable
+./bloat.sh delay    "hot_standby_feedback = off" "max_standby_streaming_delay = -1"      # lab: 80 MB, replay 122 MB behind
+```
+
+While a feedback run is in progress, look for the standby's horizon on the primary:
+
+```bash
+docker exec rp-pg1 psql -U postgres -c "SELECT slot_name, xmin FROM pg_replication_slots" -c "SELECT backend_xmin FROM pg_stat_replication"
+```
+
+```bash
+bash rp-teardown.sh rp
+```
+
+## Exercise 3: the MySQL applier (Concept 3)
+
+```bash
+bash rp-setup.sh rp mysql
+```
+
+`my-orders.sh`:
+
+```bash
+#!/bin/bash
+# After rp-setup.sh <prefix> mysql: lab.orders (1,000,000 rows), lab.ev and a client container. Usage: P=rp ./my-orders.sh
+P=${P:-rp}
+docker run -d --name $P-myc --network $P-net --entrypoint sleep mysql:8.4 infinity >/dev/null
+docker exec $P-my1 mysql -uroot -plab -e "CREATE DATABASE lab;
+  CREATE TABLE lab.orders (id INT PRIMARY KEY, seller_id INT NOT NULL, note CHAR(32) NOT NULL, status VARCHAR(10) NOT NULL);
+  SET SESSION cte_max_recursion_depth = 1000000;
+  INSERT INTO lab.orders WITH RECURSIVE s(g) AS (SELECT 1 UNION ALL SELECT g + 1 FROM s WHERE g < 1000000)
+    SELECT g, g % 5000 + 1, MD5(g), 'new' FROM s;
+  CREATE TABLE lab.ev (id BIGINT AUTO_INCREMENT PRIMARY KEY, client INT NOT NULL)" 2>/dev/null
+```
+
+`ddl.sh` (a 30 s SELECT on the replica while the source adds a column):
+
+```bash
+#!/bin/bash
+# A 30 s SELECT on the replica while the source adds a column and keeps inserting into another table.
+# Usage: P=rp ./ddl.sh
+P=${P:-rp}
+m() { docker exec $1 mysql -uroot -plab -N -e "$2" 2>/dev/null; }
+lag() { docker exec $P-my2 mysql -uroot -plab -e "SHOW REPLICA STATUS\G" 2>/dev/null | awk '/Seconds_Behind_Source/ {print $2}'; }
+( m $P-my2 "SELECT COUNT(*), SLEEP(30) FROM lab.orders" >/dev/null; echo "replica SELECT finished" ) &
+sleep 2; m $P-my1 "ALTER TABLE lab.orders ADD COLUMN note2 VARCHAR(10)"; S0=$(date +%s)
+for i in 1 2 3 4 5 6 7 8; do sleep 4; m $P-my1 "INSERT INTO lab.ev (client) VALUES (2)"
+  echo "+$(( $(date +%s)-S0 ))s lag=$(lag) applier=$(m $P-my2 "SELECT GROUP_CONCAT(DISTINCT state) FROM information_schema.processlist WHERE user = 'system user' AND state LIKE 'Waiting for table%'") ev replica/source=$(m $P-my2 'SELECT COUNT(*) FROM lab.ev')/$(m $P-my1 'SELECT COUNT(*) FROM lab.ev')"
+done; wait
+m $P-my1 "ALTER TABLE lab.orders DROP COLUMN note2"
+```
+
+`apply.sh` (stop the applier, write 40,000 transactions from 8 clients, time the catch-up):
+
+```bash
+#!/bin/bash
+# apply.sh <workers>: stop the replica applier, write 8 x 5000 single-row transactions on the source from 8 clients,
+# then start the applier with <workers> parallel workers and time the catch-up.
+P=${P:-rp}
+W=$1
+m() { docker exec $1 mysql -uroot -plab -N -e "$2" 2>/dev/null; }
+m $P-my2 "STOP REPLICA SQL_THREAD; SET GLOBAL replica_parallel_workers = $W"
+m $P-my1 "TRUNCATE lab.ev"
+S=$(date +%s.%N)
+for c in 1 2 3 4 5 6 7 8; do
+  docker exec $P-myc sh -c "yes 'INSERT INTO lab.ev (client) VALUES ($c);' | head -n 5000 | mysql -h $P-my1 -uroot -plab 2>/dev/null" &
+done; wait; E=$(date +%s.%N)
+TOTAL=$(m $P-my1 "SELECT COUNT(*) FROM lab.ev")
+echo "workers=$W: source wrote $TOTAL rows in $(python3 -c "print(round($E-$S,1))") s"
+sleep 2
+S=$(date +%s.%N); m $P-my2 "START REPLICA SQL_THREAD"
+until [ "$(m $P-my2 "SELECT COUNT(*) FROM lab.ev")" = "$TOTAL" ]; do sleep 0.2; done; E=$(date +%s.%N)
+echo "workers=$W: replica applied the backlog in $(python3 -c "print(round($E-$S,1))") s"
+```
+
+```bash
+./my-orders.sh
+./ddl.sh                         # lab: applier "Waiting for table metadata lock", lag up to 25–26 s
+for w in 1 4 8; do ./apply.sh $w; done   # lab medians: 73.4 s, 28.3 s, 35.7 s (24.7 s in a later 4-worker run)
+bash rp-teardown.sh rp
+```
+
+Also try the row-change case from Concept 3: a long `SELECT COUNT(*), SLEEP(20) FROM lab.orders` on `rp-my2` while `UPDATE lab.orders SET status = 'paid' WHERE id <= 100000` runs on `rp-my1`; `Seconds_Behind_Source` stays 0.
+
+## Exercise 4: MongoDB secondary reads (Concept 4)
+
+```bash
+bash rp-setup.sh rp mongo
+docker run -d --name rp-client --network rp-net --entrypoint sleep mongo:8.0 infinity
+```
+
+The scripts: `mg-seed.js` (1,000,000 orders), `mg-writer.js` (random updates), `mg-agg.js` (the seller aggregation on the node it runs on, as a secondary read), `mg-snap.js` (a snapshot read with a pause), `mg-lag.sh` (lag of `rp-mongo2`).
+
+```js
+// mg-seed.js
+// 1,000,000 orders for the secondary-read tests.
+const d = db.getSiblingDB('lab'); d.orders.drop();
+for (let b = 0; b < 100; b++) {
+  d.orders.insertMany(Array.from({ length: 10000 }, (_, k) => { const g = b * 10000 + k + 1;
+    return { _id: g, seller_id: g % 5000 + 1, status: 'new', amount: (g * 7907) % 50000 / 100 + 1 }; }), { writeConcern: { w: 'majority' } });
+}
+print('orders:', d.orders.countDocuments());
+```
+
+```js
+// mg-writer.js
+// Update random orders for DUR ms with w:1 (set DUR before --file).
+const d = Mongo(URI).getDB('lab'); const end = Date.now() + DUR; let n = 0;
+while (Date.now() < end) { d.orders.updateOne({ _id: 1 + Math.floor(Math.random() * 1000000) }, { $inc: { amount: 1 }, $set: { status: 'paid' } }, { writeConcern: { w: 1 } }); n++; }
+print('updates:', n);
+```
+
+```js
+// mg-agg.js
+// Run the seller GMV aggregation on this node (a secondary) and print the time.
+db.getMongo().setReadPref('secondary');
+const s = Date.now();
+const r = db.getSiblingDB('lab').orders.aggregate([{ $group: { _id: '$seller_id', n: { $sum: 1 }, gmv: { $sum: '$amount' } } }, { $count: 'sellers' }]).toArray();
+print('agg ms:', Date.now() - s, 'sellers:', r[0].sellers);
+```
+
+```js
+// mg-snap.js
+// A snapshot read on this secondary: first batch, wait WAIT ms (writers run meanwhile), then read the rest.
+db.getMongo().setReadPref('secondary');
+const d = db.getSiblingDB('lab');
+const s = Date.now();
+try {
+  const c = d.orders.find({}, { amount: 1 }).readConcern('snapshot').batchSize(1000);
+  let n = 0, sum = 0; for (let i = 0; i < 1000; i++) { const x = c.next(); sum += x.amount; n++; }
+  sleep(WAIT);
+  while (c.hasNext()) { const x = c.next(); sum += x.amount; n++; }
+  print('snapshot read ok:', n, 'docs in', Date.now() - s, 'ms');
+} catch (e) { print('snapshot read failed after', Date.now() - s, 'ms:', e.codeName, String(e.message).slice(0, 160)); }
+```
+
+```bash
+#!/bin/bash
+# Print <P>-mongo2's lag behind the primary once a second for N seconds. Usage: P=rp ./mg-lag.sh 20
+P=${P:-rp}
+for i in $(seq 1 $1); do
+  docker exec $P-mongo1 mongosh --quiet --eval "const s = rs.status(); const p = s.members.find(m => m.stateStr === 'PRIMARY');
+    const m2 = s.members.find(m => m.name.startsWith('$P-mongo2')); print(((p.optimeDate - m2.optimeDate) / 1000).toFixed(1))"
+  sleep 1
+done
+```
+
+```bash
+docker cp mg-seed.js rp-mongo1:/tmp/ && docker exec rp-mongo1 mongosh --quiet /tmp/mg-seed.js
+docker cp mg-agg.js rp-mongo2:/tmp/ && docker cp mg-snap.js rp-mongo2:/tmp/ && docker cp mg-writer.js rp-client:/tmp/
+URI="mongodb://rp-mongo1:27017,rp-mongo2:27017,rp-mongo3:27017/?replicaSet=rprs"
+
+# idle secondary (lab: 151–182 ms)
+for i in 1 2 3; do docker exec rp-mongo2 mongosh --quiet /tmp/mg-agg.js; done
+
+# under write load (lab: 418–577 ms, lag 0–2 s)
+for c in 1 2 3 4 5 6 7 8; do docker exec rp-client mongosh --quiet --nodb --eval "const URI='$URI', DUR=30000;" --file /tmp/mg-writer.js & done
+sleep 3; for i in 1 2 3 4 5; do docker exec rp-mongo2 mongosh --quiet /tmp/mg-agg.js; done; ./mg-lag.sh 10; wait
+
+# snapshot read with a 15 s pause: default window, then a 5 s window (lab: ok in 28 s, then SnapshotTooOld)
+for c in 1 2 3 4; do docker exec rp-client mongosh --quiet --nodb --eval "const URI='$URI', DUR=25000;" --file /tmp/mg-writer.js & done
+docker exec rp-mongo2 mongosh --quiet --eval "const WAIT=15000;" --file /tmp/mg-snap.js; wait
+docker exec rp-mongo2 mongosh --quiet --eval 'db.adminCommand({ setParameter: 1, minSnapshotHistoryWindowInSeconds: 5 })'
+for c in 1 2 3 4; do docker exec rp-client mongosh --quiet --nodb --eval "const URI='$URI', DUR=25000;" --file /tmp/mg-writer.js & done
+docker exec rp-mongo2 mongosh --quiet --eval "const WAIT=15000;" --file /tmp/mg-snap.js; wait
+```
+
+## Reset
+
+```bash
+bash rp-teardown.sh rp
+docker rm -f rp-client rp-myc 2>/dev/null
+```
+
+## Session quiz
+
+1. Why must a PostgreSQL standby either pause replay or cancel a query when the primary vacuums rows the query still needs?
+2. With `max_standby_streaming_delay = 30s` the report was cancelled after 33.5 s; with -1 it finished. What did each choice cost?
+3. What does `hot_standby_feedback = on` change, and how big was its cost on the primary in the lab?
+4. Why did the primary's table stay at 110 MB after the report ended and VACUUM removed the dead rows?
+5. On a MySQL replica, why did a long SELECT not delay a 100,000-row UPDATE, but stop an ALTER TABLE and every transaction after it?
+6. A single applier thread took a median 73.4 s for a backlog the source wrote in 13–20 s. Why, and what helped?
+7. Why does a MongoDB secondary neither cancel long reads nor pause replication, and what did a long aggregation still cost?
+8. Why did a snapshot read on a secondary fail with SnapshotTooOld when the history window was 5 s, and what is the trade-off in raising the window?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-6-queries-on-replicas/lab/answers">Answers to the session quiz</DeepDive>

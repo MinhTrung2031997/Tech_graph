@@ -1,0 +1,160 @@
+---
+title: "Concept 3: Long reads and apply speed on a MySQL replica"
+description: "On a MySQL replica a 20-second SELECT did not delay the source's row changes at all (Seconds_Behind_Source stayed 0). A 30-second SELECT did block an ALTER TABLE from the source: the applier waited for the table metadata lock and everything behind it, including inserts into other tables, stopped; lag grew to 25 s. Applying a 40,000-transaction backlog from 8 clients took a median 73.4 s with 1 worker, 28.3 s with 4 (the 8.4 default) and 35.7 s with 8 on this laptop."
+type: "concept"
+tags: ["replication", "replica", "parallel-apply", "metadata-lock", "mysql"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-options-replica.html#sysvar_replica_parallel_workers"
+  - "https://dev.mysql.com/doc/refman/8.4/en/metadata-locking.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-threads-monitor-main.html"
+---
+
+<Tldr>
+An InnoDB replica serves reads from MVCC snapshots, so long queries do not block **row** changes coming from the source: during a 20-second SELECT, 100,000 updated rows arrived and `Seconds_Behind_Source` stayed **0**. There are no cancellations like PostgreSQL's. **DDL** is different: an `ALTER TABLE` from the source needs an exclusive metadata lock on the replica, so it waited for a 30-second SELECT, the applier showed **"Waiting for table metadata lock"**, and **everything behind it stopped**, including inserts into an unrelated table: lag climbed to **25 s** and caught up only when the SELECT ended. Apply speed is the other limit. Eight clients wrote 40,000 single-row transactions on the source in about 13–20 s; a replica with **1 worker** needed a median **73.4 s** to apply them, with **4 workers** (the default in 8.4) **28.3 s**, with 8 **35.7 s**.
+</Tldr>
+
+## The setup
+
+`rpc-my1` → `rpc-my2`, GTID, row-based binlog, `replica_parallel_type = LOGICAL_CLOCK`, `replica_preserve_commit_order = 1`, and on both servers `sync_binlog = 1`, `innodb_flush_log_at_trx_commit = 1`, `log_replica_updates = 1`. Table `lab.orders`, 1,000,000 rows; table `lab.ev` for single-row inserts.
+
+| Term | Meaning |
+|---|---|
+| Applier (SQL thread) | Reads the relay log and applies the source's transactions on the replica |
+| `replica_parallel_workers` | Number of worker threads applying transactions in parallel (default 4 in MySQL 8.4) |
+| Metadata lock (MDL) | Table-level lock every statement holds; DDL needs it exclusively |
+| `Seconds_Behind_Source` | How old the transaction being applied is; 0 when the applier is idle |
+| **✓ / ✗** | Applied / waiting |
+
+## MySQL InnoDB
+
+<Flow
+  title="MySQL: a long SELECT on the replica meets the applier"
+  height={340}
+  nodes={[
+    { id: 'src', label: 'Source', sub: 'UPDATE, then ALTER', x: 20, y: 20, w: 200 },
+    { id: 'relay', label: 'Relay log', sub: 'events in order', x: 300, y: 20, w: 200 },
+    { id: 'app', label: 'Applier', sub: '4 workers', x: 580, y: 20, w: 200 },
+    { id: 'sel', label: 'SELECT on replica', sub: 'runs 20–30 s', x: 580, y: 270, w: 200 },
+    { id: 'mdl', label: 'MDL lab.orders', sub: 'shared by the SELECT', x: 300, y: 270, w: 200 },
+  ]}
+  edges={[
+    { id: 'src-relay', from: 'src', to: 'relay' },
+    { id: 'relay-app', from: 'relay', to: 'app' },
+    { id: 'app-mdl', from: 'app', to: 'mdl' },
+    { id: 'sel-mdl', from: 'sel', to: 'mdl' },
+  ]}
+  cases={[
+    {
+      title: 'Row changes during a long SELECT',
+      path: 'SELECT holds a snapshot ✓ → 100,000-row UPDATE arrives → applier ✓ applies it → lag 0 ✓',
+      summary: 'MVCC lets the reader and the applier pass each other.',
+      steps: [
+        {
+          title: 'The SELECT reads its snapshot',
+          code: "SELECT COUNT(*), SLEEP(20) FROM lab.orders WHERE status = 'new';",
+          note: 'It holds a shared metadata lock on lab.orders and an InnoDB read view.',
+          active: ['sel', 'mdl'],
+          edges: ['sel-mdl'],
+        },
+        {
+          title: 'The UPDATE is applied anyway',
+          note: "UPDATE lab.orders SET status = 'paid' WHERE id <= 100000 on the source. On the replica, 4 s later: 100,000 paid rows, Seconds_Behind_Source = 0. Row changes need only a shared metadata lock, compatible with the SELECT's.",
+          active: ['src', 'relay', 'app', 'mdl'],
+          edges: ['src-relay', 'relay-app', 'app-mdl'],
+          subs: { app: '✓ applied, lag 0' },
+        },
+      ],
+    },
+    {
+      title: 'DDL during a long SELECT',
+      path: 'SELECT holds shared MDL ✓ → ALTER TABLE arrives → applier ✗ waits for exclusive MDL → later events ✗ wait → lag 25 s ✗ → SELECT ends → ✓ catch-up',
+      summary: 'One DDL event turns a read into a replication stop.',
+      steps: [
+        {
+          title: 'ALTER TABLE reaches the applier',
+          note: 'ALTER TABLE lab.orders ADD COLUMN note2 VARCHAR(10) needs the metadata lock exclusively. The SELECT (SLEEP(30)) still holds it shared. The applier thread: "Waiting for table metadata lock".',
+          active: ['src', 'relay', 'app', 'mdl', 'sel'],
+          edges: ['src-relay', 'relay-app', 'app-mdl', 'sel-mdl'],
+          subs: { app: '✗ waits for metadata lock' },
+        },
+        {
+          title: 'Everything behind it waits',
+          note: 'One insert per 4 s into lab.ev, a different table: the replica stayed at 4 rows while the source went to 10. Seconds_Behind_Source 4, 8, 13, 17, 21, 25. DDL is applied as a barrier; parallel workers do not get around it.',
+          active: ['relay', 'app'],
+          edges: ['relay-app'],
+          subs: { relay: 'ev inserts queued', app: '✗ lag 25 s' },
+        },
+        {
+          title: 'The SELECT ends',
+          note: 'After 30 s the shared lock is released, the ALTER is applied, the queued inserts follow: 11 of 11 rows, lag 0.',
+          active: ['sel', 'mdl', 'app'],
+          edges: ['sel-mdl', 'app-mdl'],
+          subs: { app: '✓ lag 0' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Measured: applying a backlog
+
+The applier was stopped (`STOP REPLICA SQL_THREAD`), 8 clients each wrote 5,000 single-row autocommit inserts on the source, then the applier was started with a given number of workers and timed until the replica had all 40,000 rows. Three rounds; this laptop also ran other databases, so the spread is large.
+
+| `replica_parallel_workers` | Apply time, 3 rounds | Median | Rate (median) |
+|---|---|---|---|
+| 1 | 55.5, 73.4, 92.4 s | 73.4 s | 545 txn/s |
+| 4 (default) | 28.3, 46.5, 28.2 s | 28.3 s | 1,413 txn/s |
+| 8 | 35.7, 21.7, 44.3 s | 35.7 s | 1,120 txn/s |
+
+The source wrote the same 40,000 transactions in 12.5–20.3 s (about 2,000–3,200 per second). A single-threaded replica could not keep up with 8 writers: it would fall behind steadily under that load. Four workers more than doubled the apply rate; eight were no better on a laptop whose cores were shared with the source, the client and other containers.
+
+Parallel apply works here because MySQL 8.4 tracks which transactions touch different rows (write sets) and lets those run on different workers, while `replica_preserve_commit_order = 1` still commits them in source order.
+
+<Pitfall>
+`Seconds_Behind_Source` reads 0 whenever the applier has caught up with what the replica has **received**, even if the newest transactions have not arrived yet because the network link is slow or stalled; it only becomes NULL when the replication threads stop. It also jumps from 0 to large values when a big transaction arrives (both from the documentation). For an honest lag figure compare GTID sets (`gtid_executed` on both sides) or use a heartbeat table written on the source every second (Session 3). And an online DDL that runs for 20 minutes on the source runs for about 20 minutes again on the replica, as one blocking event, after it has finished on the source (from the documentation).
+</Pitfall>
+
+## Real-world scenario: the nightly migration and the BI replica
+
+A BI tool runs 10-minute queries on a MySQL replica. The team runs `ALTER TABLE orders ADD COLUMN …` on the source at 02:00, which finishes instantly there.
+
+| What happens on the replica | Why |
+|---|---|
+| The ALTER waits for the BI query holding `orders` | Exclusive metadata lock vs the query's shared lock |
+| All replication stops, for all tables | The applier applies DDL as a barrier |
+| New BI queries on `orders` also wait | They queue behind the pending exclusive lock (the same lock queue as on a single server) |
+| Application reads routed to the replica see data up to 10 minutes old | Lag grows for the whole duration |
+
+| Fix | Effect |
+|---|---|
+| `max_execution_time` (or a kill script) for BI sessions during migration windows | Bounds the wait |
+| A separate replica for BI, excluded from read routing | The stall hits only BI |
+| Check `performance_schema.metadata_locks` on replicas before DDL | Know who will block the applier |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 1 | PostgreSQL's answer to the same conflict: cancel the query or pause replay |
+| [Partitioning and sharding Session 4, Concept 2](/blogs/databases/partitioning-sharding/session-4-partition-lifecycle/concept-2-detach-without-blocking) | The same metadata-lock queue on a single server |
+| [Session 5, Concept 4](/blogs/databases/replication/session-5-failover/concept-4-promoting-mysql) | A replica that is behind at failover time loses those transactions |
+| [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) | The source/replica setup |
+
+## Key takeaways
+
+1. Long SELECTs on an InnoDB replica do not block row changes from the source: lag stayed 0.
+2. DDL from the source waits for the metadata lock held by replica queries, and stops replication of every table behind it.
+3. A single applier thread applied about 545 transactions per second, well below what 8 clients wrote on the source.
+4. Four parallel workers (the 8.4 default) more than doubled the apply rate; more workers did not help on a small machine.
+5. `Seconds_Behind_Source` is a rough indicator; use GTID comparison or a heartbeat for real lag.
+
+## Check questions
+
+1. Why did a 100,000-row UPDATE apply on the replica during a long SELECT, while a one-column ALTER did not?
+2. Inserts into `lab.ev` had nothing to do with `lab.orders`. Why did they stop as well?
+3. Why can one applier thread fall behind a source that is not even busy?
+4. Why were 8 workers not faster than 4 here?
+5. A BI replica falls hours behind every night at 02:00. What do you check first?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-6-queries-on-replicas/concept-3-mysql-replica-apply/answers">Worked answers to Q1–Q5</DeepDive>

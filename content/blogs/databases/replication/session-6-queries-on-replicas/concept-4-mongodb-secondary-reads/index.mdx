@@ -1,0 +1,177 @@
+---
+title: "Concept 4: Reads on MongoDB secondaries"
+description: "A seller-GMV aggregation over 1,000,000 orders on a MongoDB secondary took 151–182 ms idle and 418–577 ms while 8 writers ran about 6,300–7,000 updates per second on the primary. Replication lag stayed 0–2 s with and without the aggregation: MongoDB never cancels a secondary read and never pauses replication for it. The limit is history: a snapshot read that outlived minSnapshotHistoryWindowInSeconds (lowered to 5 s for the test) failed with SnapshotTooOld; with the default 300 s the same 28-second read succeeded."
+type: "concept"
+tags: ["replication", "secondary-reads", "read-preference", "snapshot", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/read-preference/"
+  - "https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.minSnapshotHistoryWindowInSeconds"
+  - "https://www.mongodb.com/docs/manual/reference/read-concern-snapshot/"
+  - "https://www.mongodb.com/docs/manual/core/replica-set-members/#hidden-members"
+---
+
+<Tldr>
+MongoDB secondaries apply the oplog in batches and serve reads from a storage-engine snapshot, so a long read and replication do not wait for each other: replication lag stayed **0–2 s** whether or not a seller aggregation was running on the secondary, and nothing was cancelled. The read itself pays for sharing the node: the aggregation over 1,000,000 orders took **151–182 ms** on an idle secondary and **418–577 ms** while 8 writers updated about 6,300–7,000 orders per second on the primary (all on one laptop, so part of that is shared CPU). The real limit is **history**: a read with `readConcern: "snapshot"` must finish within `minSnapshotHistoryWindowInSeconds`. With the default **300 s** a 28-second snapshot read succeeded; with the window lowered to **5 s** the same read failed after 15 s with **SnapshotTooOld**. Reads without snapshot read concern have no such limit, but they are not a single point in time either.
+</Tldr>
+
+## The setup
+
+Replica set `rpcrs` (3 members). Collection `lab.orders`, 1,000,000 documents (`seller_id`, `status`, `amount`). The reads run on `rpc-mongo2`, a secondary, with read preference `secondary`. Writers run in a separate container: 8 processes, each updating random orders with `w: 1` for 30 s.
+
+```js
+// the report: GMV per seller
+db.orders.aggregate([{ $group: { _id: '$seller_id', n: { $sum: 1 }, gmv: { $sum: '$amount' } } }, { $count: 'sellers' }])
+```
+
+| Term | Meaning |
+|---|---|
+| Read preference | Which member a read goes to: `primary`, `primaryPreferred`, `secondary`, `secondaryPreferred`, `nearest` |
+| Oplog batch application | A secondary fetches oplog entries and applies them in parallel batches; readers see the state at a batch boundary |
+| `readConcern: "snapshot"` | All batches of a cursor read the same point in time |
+| `minSnapshotHistoryWindowInSeconds` | How long WiredTiger keeps old versions for snapshot reads (default 300) |
+| Hidden member | A member that receives the oplog but is invisible to clients' read preference; used for analytics or backups |
+| **✓ / ✗** | Runs / fails or slows down |
+
+## MongoDB
+
+<Flow
+  title="MongoDB: a report on a secondary under write load"
+  height={340}
+  nodes={[
+    { id: 'w', label: '8 writers', sub: 'w:1 updates', x: 20, y: 20, w: 200 },
+    { id: 'p', label: 'mongo1', sub: 'primary', x: 300, y: 20, w: 200 },
+    { id: 's', label: 'mongo2', sub: 'secondary', x: 580, y: 20, w: 200 },
+    { id: 'rpt', label: 'Report', sub: 'readPreference secondary', x: 580, y: 270, w: 200 },
+    { id: 'hist', label: 'Snapshot history', sub: 'kept 300 s by default', x: 300, y: 270, w: 200 },
+  ]}
+  edges={[
+    { id: 'w-p', from: 'w', to: 'p' },
+    { id: 'p-s', from: 'p', to: 's' },
+    { id: 'rpt-s', from: 'rpt', to: 's' },
+    { id: 's-hist', from: 's', to: 'hist' },
+  ]}
+  cases={[
+    {
+      title: 'Aggregation during heavy writes',
+      path: 'writers → primary ✓ → oplog applied on mongo2 ✓ (lag 0–2 s) → report on mongo2 ✓ but 3× slower',
+      summary: 'No conflicts, only competition for the machine.',
+      steps: [
+        {
+          title: 'Idle secondary',
+          note: 'Three runs: 182, 151, 152 ms.',
+          active: ['rpt', 's'],
+          edges: ['rpt-s'],
+          subs: { rpt: '✓ 151–182 ms' },
+        },
+        {
+          title: 'Writers on the primary',
+          note: '8 processes, 211,900 updates in 30 s. mongo2\'s lag behind the primary, sampled every second from rs.status(): 0–2 s (optime dates have 1 s resolution).',
+          active: ['w', 'p', 's'],
+          edges: ['w-p', 'p-s'],
+          subs: { s: '✓ lag 0–2 s' },
+        },
+        {
+          title: 'Both at once',
+          note: 'The aggregation ran 5 times while the writers continued: 426, 577, 512, 418, 488 ms. Lag stayed 0–2 s; writers managed 189,332 updates in 30 s.',
+          active: ['w', 'p', 's', 'rpt'],
+          edges: ['w-p', 'p-s', 'rpt-s'],
+          subs: { rpt: '✗ 418–577 ms', s: '✓ lag 0–2 s' },
+        },
+      ],
+    },
+    {
+      title: 'A long snapshot read',
+      path: 'snapshot cursor opens ✓ → 15 s pause while writers run → getMore needs old versions → kept ✓ (300 s window) / evicted ✗ SnapshotTooOld (5 s window)',
+      summary: 'Snapshot reads are bounded by how much history the secondary keeps.',
+      steps: [
+        {
+          title: 'Open the cursor, read 1,000 documents, pause',
+          code: "const c = db.orders.find({}, { amount: 1 }).readConcern('snapshot').batchSize(1000);\n// read the first batch, then sleep(15000) while 4 writers update orders",
+          active: ['rpt', 's', 'hist'],
+          edges: ['rpt-s', 's-hist'],
+        },
+        {
+          title: 'Default window: 300 s',
+          note: 'The rest of the cursor read the same point in time: 1,000,000 documents in 28,082 ms.',
+          active: ['s', 'hist', 'rpt'],
+          edges: ['s-hist', 'rpt-s'],
+          subs: { hist: '✓ versions kept', rpt: '✓ 28 s read' },
+        },
+        {
+          title: 'Window lowered to 5 s',
+          note: 'setParameter minSnapshotHistoryWindowInSeconds: 5 on mongo2. The getMore after the pause: SnapshotTooOld "Read timestamp Timestamp(1795537812, 736) is older than the oldest available timestamp." after 15,042 ms.',
+          code: 'db.adminCommand({ setParameter: 1, minSnapshotHistoryWindowInSeconds: 5 })',
+          active: ['s', 'hist', 'rpt'],
+          edges: ['s-hist', 'rpt-s'],
+          subs: { hist: '✗ history gone', rpt: '✗ SnapshotTooOld' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Measured
+
+| Secondary workload | Aggregation over 1M orders | Secondary lag (sampled each second) |
+|---|---|---|
+| idle | 151–182 ms | 0 |
+| 8 writers on the primary, no report | — | 0–2 s |
+| 8 writers + report looping on the secondary | 418–577 ms | 0–2 s |
+
+| Snapshot read on the secondary (1M documents, 15 s pause, 4 writers) | Result |
+|---|---|
+| `minSnapshotHistoryWindowInSeconds = 300` (default) | ✓ 1,000,000 documents in 28,082 ms |
+| `minSnapshotHistoryWindowInSeconds = 5` | ✗ SnapshotTooOld after 15,042 ms |
+
+Compared with the other engines on the same kind of test:
+
+| | PostgreSQL standby | MySQL replica | MongoDB secondary |
+|---|---|---|---|
+| Long read vs replicated row changes | conflict: pause replay or cancel the query (Concept 1) | no conflict | no conflict |
+| Long read vs replicated DDL | lock conflict, cancel after the delay | applier waits, replication stops (Concept 3) | DDL is replicated as an oplog entry; collection drops kill cursors (Partitioning and sharding Session 4) |
+| Limit on a single long read | `max_standby_streaming_delay` or feedback bloat | none from replication | snapshot reads: `minSnapshotHistoryWindowInSeconds` |
+
+<Pitfall>
+Without `readConcern: "snapshot"`, a long query on a secondary (or a primary) is **not** a point-in-time read. Its cursor yields between batches and can see documents that changed after it started; a report summing balances while transfers run can count money twice or not at all (from the documentation on read isolation). Raising `minSnapshotHistoryWindowInSeconds` to make long snapshot reads possible keeps more old versions in the WiredTiger cache on **every** member, which increases cache pressure under heavy writes. For hour-long analytics, use a hidden member or an analytics node with its own tag, and accept that its reports are as of "now-ish".
+</Pitfall>
+
+## Real-world scenario: seller dashboards on secondaries
+
+A marketplace serves seller dashboards from secondaries (`readPreference: secondaryPreferred`) to keep load off the primary, and runs a nightly GMV export on the same secondaries.
+
+| Observation | From this concept |
+|---|---|
+| Dashboards slow down during flash-sale traffic, though nothing is "blocked" | The secondaries apply the primary's write load too; reads share the machine (aggregation 3× slower under writes) |
+| The export never gets cancelled, unlike on the old PostgreSQL setup | Secondaries do not cancel reads for replication |
+| The export's totals do not match the primary's at any single moment | It reads without snapshot read concern over minutes |
+| Switching the export to `readConcern: "snapshot"` would make it fail once it runs past 5 minutes | `SnapshotTooOld` when a read outlives the 300 s history window |
+
+A fix: a **hidden** fourth member (priority 0, `hidden: true`) for exports, so dashboards and the export no longer compete, and exports split per seller range, each a short snapshot read.
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 1 | PostgreSQL cancels or pauses where MongoDB does neither |
+| Concept 3 | MySQL's replica: no conflicts for rows, a full stop for DDL |
+| [Session 5, Concept 1](/blogs/databases/replication/session-5-failover/concept-1-mongodb-elections) | Writes wait for an election; reads with a secondary read preference do not need the primary at all (from the documentation) |
+| [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) | The replica set setup |
+
+## Key takeaways
+
+1. A MongoDB secondary neither cancels long reads nor pauses replication for them: lag stayed 0–2 s with an aggregation running.
+2. Reads on a secondary share the node with oplog application: the aggregation took 3× longer under write load here.
+3. Snapshot reads must finish within `minSnapshotHistoryWindowInSeconds` (300 s by default); past it they fail with SnapshotTooOld.
+4. Reads without snapshot read concern have no time limit but are not a consistent point in time.
+5. For heavy analytics, use a hidden or tagged member so it does not slow the members serving the application.
+
+## Check questions
+
+1. Why does a MongoDB secondary not need PostgreSQL's choice between pausing replay and cancelling the query?
+2. Lag did not change, but the aggregation was 3× slower under write load. What was it competing with?
+3. Why did the same snapshot read succeed with a 300 s window and fail with a 5 s window?
+4. A 20-minute export must be consistent to one point in time. How do you run it on MongoDB?
+5. When would you use a hidden member instead of `readPreference: secondary`?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-6-queries-on-replicas/concept-4-mongodb-secondary-reads/answers">Worked answers to Q1–Q5</DeepDive>
