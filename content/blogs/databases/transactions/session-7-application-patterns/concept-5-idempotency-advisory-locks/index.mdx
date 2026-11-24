@@ -1,0 +1,281 @@
+---
+title: "Concept 5: Idempotency keys and advisory locks"
+description: "Clients retry, queues redeliver, users double-click: the same request arrives several times. A unique idempotency key written in the same transaction as the effect makes it happen once: 200 payment requests delivered 4 times each charged 696 times in PostgreSQL and 800 in MySQL with check-then-insert, and exactly 200 with a unique key. When there is no row to lock, advisory locks (pg_advisory_xact_lock, GET_LOCK) or a counter document serialise the critical section: 54 distinct invoice numbers out of 400 without one, 400 with one."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "idempotency", "unique-constraint", "advisory-locks"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT"
+  - "https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/locking-functions.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/insert-on-duplicate.html"
+  - "https://www.mongodb.com/docs/manual/core/index-unique/"
+---
+
+<Tldr>
+Networks time out after the server has done the work, so clients **retry**; queues deliver **at least once**; users **double-click**. A handler that is not idempotent charges twice. The fix: the client sends an **idempotency key**, and the server records it under a **unique constraint in the same transaction as the effect**. In the lab, 200 payment requests each arrived **4 times concurrently**. Check-then-insert ("have I seen this key?") charged **696** times in PostgreSQL and **800** in MySQL; with a unique key and `ON CONFLICT DO NOTHING` / `INSERT IGNORE` / a unique index, exactly **200** charges and the balance was right in all three engines. Some critical sections have **no row to lock** ("next invoice number = max + 1"): 8 workers × 50 produced only **54** distinct numbers in PostgreSQL, **61** in MySQL and **120** in MongoDB. A transaction-level **advisory lock** (`pg_advisory_xact_lock`), MySQL's **`GET_LOCK`**, or MongoDB's **atomic counter** gave 400 distinct numbers.
+</Tldr>
+
+## Idempotency: the same request, once
+
+| Term | Meaning |
+|---|---|
+| Idempotent operation | Running it twice has the same effect as running it once |
+| Idempotency key | A unique id the client generates per logical request (a UUID) and resends unchanged on every retry |
+| Check-then-insert | `SELECT` the key; if absent, `INSERT` it and do the work. Two concurrent copies both see "absent" |
+| Unique-key claim | `INSERT` the key under a unique constraint; only one copy can succeed, the others get a conflict |
+| Advisory lock | A lock on an application-chosen number or name, not on any row; the database only enforces mutual exclusion |
+| **✓ Once / ✗ Repeated** | The effect happened once per key, or once per delivery |
+
+### The measurements
+
+200 requests to withdraw 1.00 from account 2, each delivered by 4 concurrent workers (a client retry storm). Correct result: 200 payments, balance 800.00.
+
+| Variant | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| ✗ Check-then-insert, then debit, in one transaction | **696** payments, balance 304.00 | **800** payments, balance 200.00 | 200 payments, 800.00, 48–64 transaction retries (see below) |
+| ✗ Check-then-insert, no shared write | | | **457** payments |
+| ✓ Unique key claim, then debit if inserted | 200, 800.00 (`ON CONFLICT DO NOTHING RETURNING`) | 200, 800.00 (`INSERT IGNORE`) | 200, 800.00 (unique index; 600 duplicate-key errors) |
+
+MySQL charged **every** copy: under REPEATABLE READ each transaction's check is a consistent read of its own snapshot, and none of the snapshots contained the others' inserts. MongoDB's first variant came out right only by accident: the four copies also updated the **same account document**, so three of them hit a write conflict, were retried, and on retry saw the payment. Without that shared write (second row), 257 duplicates appeared.
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: four deliveries of payment req-7"
+  height={300}
+  nodes={[
+    { id: 'c1', label: 'Delivery 1', sub: 'key req-7', x: 20, y: 20, w: 180 },
+    { id: 'c2', label: 'Deliveries 2–4', sub: 'key req-7', x: 20, y: 200, w: 180 },
+    { id: 'pay', label: 'payments', sub: 'UNIQUE (idem_key)', x: 290, y: 20, w: 210 },
+    { id: 'acc', label: 'accounts id = 2', sub: 'balance', x: 290, y: 200, w: 210 },
+    { id: 'ok', label: '✓ Charged once', sub: '', x: 600, y: 20, w: 180 },
+    { id: 'dup', label: '✗ Charged 4 times', sub: '', x: 600, y: 200, w: 180 },
+  ]}
+  edges={[
+    { id: 'c1-pay', from: 'c1', to: 'pay' },
+    { id: 'c2-pay', from: 'c2', to: 'pay' },
+    { id: 'pay-acc', from: 'pay', to: 'acc' },
+    { id: 'pay-ok', from: 'pay', to: 'ok' },
+    { id: 'acc-dup', from: 'acc', to: 'dup' },
+  ]}
+  cases={[
+    {
+      title: '✗ Check-then-insert',
+      path: 'all copies SELECT req-7 → none found → all INSERT and debit → ✗ charged up to 4 times',
+      summary: '800 deliveries of 200 requests: 696 payments, balance 304.00.',
+      steps: [
+        {
+          title: 'Each copy checks first',
+          note: 'Under READ COMMITTED a SELECT sees only committed rows. Copies that run before the first one commits all find nothing.',
+          code: "BEGIN;\nSELECT 1 FROM payments WHERE idem_key = 'req-7';   -- 0 rows (all copies)",
+          active: ['c1', 'c2', 'pay'],
+          edges: ['c1-pay', 'c2-pay'],
+        },
+        {
+          title: '✗ Each copy inserts and debits',
+          note: 'Without a unique constraint nothing stops the second INSERT. Each debit is an atomic UPDATE, so none is lost: they are all applied, which is the problem.',
+          code: "INSERT INTO payments (idem_key, account_id, amount) VALUES ('req-7', 2, 1.00);\nUPDATE accounts SET balance = balance - 1 WHERE id = 2;\nCOMMIT;",
+          active: ['pay', 'acc', 'dup'],
+          edges: ['pay-acc', 'acc-dup'],
+          subs: { pay: 'req-7 × 4', dup: '696 for 200 requests' },
+        },
+      ],
+    },
+    {
+      title: '✓ Unique key claim',
+      path: 'copy 1 inserts req-7 → copies 2–4 block on the unique key, then get 0 rows → only copy 1 debits → ✓',
+      summary: '200 payments, balance 800.00.',
+      steps: [
+        {
+          title: '✓ The insert is the check',
+          note: 'The unique index makes concurrent inserts of the same key wait for the first transaction; when it commits, the others resolve to DO NOTHING and RETURNING gives 0 rows.',
+          code: "BEGIN;\nINSERT INTO payments (idem_key, account_id, amount) VALUES ('req-7', 2, 1.00)\nON CONFLICT (idem_key) DO NOTHING RETURNING id;\n-- 1 row: do the work; 0 rows: already done, return the stored result\nUPDATE accounts SET balance = balance - 1 WHERE id = 2;   -- only if 1 row\nCOMMIT;",
+          active: ['c1', 'c2', 'pay', 'acc', 'ok'],
+          edges: ['c1-pay', 'c2-pay', 'pay-acc', 'pay-ok'],
+          subs: { pay: 'req-7 × 1', ok: '200 for 200 requests' },
+        },
+        {
+          title: 'Same transaction, or it is not safe',
+          note: 'The key and the effect must commit together. If the key is inserted in its own transaction and the debit fails, the retry sees the key and skips the charge; if the key is inserted after the debit commits, a crash in between charges twice.',
+          active: ['pay', 'acc'],
+          edges: ['pay-acc'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL
+
+<Flow
+  title="MySQL: four deliveries of payment req-7"
+  height={300}
+  nodes={[
+    { id: 'c1', label: 'Delivery 1', sub: 'key req-7', x: 20, y: 20, w: 180 },
+    { id: 'c2', label: 'Deliveries 2–4', sub: 'key req-7', x: 20, y: 200, w: 180 },
+    { id: 'pay', label: 'payments', sub: 'UNIQUE payments_idem', x: 290, y: 20, w: 210 },
+    { id: 'acc', label: 'accounts id = 2', sub: 'balance', x: 290, y: 200, w: 210 },
+    { id: 'ok', label: '✓ Charged once', sub: '', x: 600, y: 20, w: 180 },
+    { id: 'dup', label: '✗ Charged 4 times', sub: '', x: 600, y: 200, w: 180 },
+  ]}
+  edges={[
+    { id: 'c1-pay', from: 'c1', to: 'pay' },
+    { id: 'c2-pay', from: 'c2', to: 'pay' },
+    { id: 'pay-acc', from: 'pay', to: 'acc' },
+    { id: 'pay-ok', from: 'pay', to: 'ok' },
+    { id: 'acc-dup', from: 'acc', to: 'dup' },
+  ]}
+  cases={[
+    {
+      title: '✗ Check-then-insert',
+      path: 'each copy\'s SELECT reads its own snapshot → none sees the others → ✗ all 4 charged',
+      summary: '800 payments for 200 requests: balance 200.00.',
+      steps: [
+        {
+          title: '✗ Consistent reads never see the others',
+          note: 'Under REPEATABLE READ the plain SELECT is answered from the transaction\'s read view. Concurrent inserts are invisible until the reader starts a new transaction, so every copy concluded "new request".',
+          code: "START TRANSACTION;\nSELECT 1 FROM payments WHERE idem_key = 'req-7';   -- empty in every copy\nINSERT INTO payments …; UPDATE accounts SET balance = balance - 1 WHERE id = 2;\nCOMMIT;",
+          active: ['c1', 'c2', 'pay', 'acc', 'dup'],
+          edges: ['c1-pay', 'c2-pay', 'pay-acc', 'acc-dup'],
+          subs: { dup: '800 for 200 requests' },
+        },
+      ],
+    },
+    {
+      title: '✓ Unique key claim',
+      path: 'INSERT IGNORE → affectedRows 1 for one copy, 0 for the rest → ✓ one debit',
+      summary: '200 payments, balance 800.00, no deadlocks in this run.',
+      steps: [
+        {
+          title: '✓ affectedRows decides',
+          note: 'INSERT IGNORE turns the duplicate-key error into a warning with affectedRows 0. It also hides other errors (bad values become warnings), so many teams prefer a plain INSERT and catching error 1062, or ON DUPLICATE KEY UPDATE id = id.',
+          code: "INSERT IGNORE INTO payments (idem_key, account_id, amount) VALUES ('req-7', 2, 1.00);\n-- affectedRows = 1 → debit; 0 → already processed",
+          active: ['c1', 'c2', 'pay', 'acc', 'ok'],
+          edges: ['c1-pay', 'c2-pay', 'pay-acc', 'pay-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: four deliveries of payment req-7"
+  height={300}
+  nodes={[
+    { id: 'c1', label: 'Delivery 1', sub: 'key req-7', x: 20, y: 20, w: 180 },
+    { id: 'c2', label: 'Deliveries 2–4', sub: 'key req-7', x: 20, y: 200, w: 180 },
+    { id: 'pay', label: 'payments', sub: 'unique idem_key', x: 290, y: 20, w: 210 },
+    { id: 'acc', label: 'accounts _id: 2', sub: 'balance', x: 290, y: 200, w: 210 },
+    { id: 'ok', label: '✓ Charged once', sub: '', x: 600, y: 20, w: 180 },
+    { id: 'dup', label: '✗ Repeated', sub: '', x: 600, y: 200, w: 180 },
+  ]}
+  edges={[
+    { id: 'c1-pay', from: 'c1', to: 'pay' },
+    { id: 'c2-pay', from: 'c2', to: 'pay' },
+    { id: 'pay-acc', from: 'pay', to: 'acc' },
+    { id: 'pay-ok', from: 'pay', to: 'ok' },
+    { id: 'pay-dup', from: 'pay', to: 'dup' },
+  ]}
+  cases={[
+    {
+      title: '✗ Check-then-insert without a shared write',
+      path: 'findOne req-7 → null in every transaction → insertOne → ✗ duplicates',
+      summary: 'Payments only: 457 documents for 200 keys.',
+      steps: [
+        {
+          title: '✗ Snapshot reads, no conflict',
+          note: 'Each transaction reads its own snapshot and inserts a new document. Inserts of different documents never conflict, so nothing aborts.',
+          code: "if (await payments.findOne({ idem_key: key }, { session }) === null)\n  await payments.insertOne({ idem_key: key, … }, { session });",
+          active: ['c1', 'c2', 'pay', 'dup'],
+          edges: ['c1-pay', 'c2-pay', 'pay-dup'],
+          subs: { dup: '457 for 200 keys' },
+        },
+        {
+          title: 'Saved by accident when the debit is included',
+          note: 'With the debit of the same account document in each transaction, three of four copies hit WriteConflict, were retried by withTransaction, and on retry saw the committed payment: 200 payments, 800.00. Correct only because every request touched one hot document.',
+          active: ['pay', 'acc'],
+          edges: ['pay-acc'],
+        },
+      ],
+    },
+    {
+      title: '✓ Unique index',
+      path: 'insertOne under a unique index → one copy commits, others get E11000 → withTransaction aborts them → ✓',
+      summary: '200 payments, 800.00; 600 duplicate-key errors caught as "already processed".',
+      steps: [
+        {
+          title: '✓ The index enforces once',
+          code: "await payments.createIndex({ idem_key: 1 }, { unique: true });\n// in the transaction callback:\nawait payments.insertOne({ idem_key: key, account_id: 2, amount: 1 }, { session });\nawait accounts.updateOne({ _id: 2 }, { $inc: { balance: -1 } }, { session });",
+          note: 'A duplicate key (E11000) is not a transient error: withTransaction aborts and rethrows it, and the handler answers "already processed". 31 transient retries happened first, while the winning copy was still uncommitted.',
+          active: ['c1', 'c2', 'pay', 'acc', 'ok'],
+          edges: ['c1-pay', 'c2-pay', 'pay-acc', 'pay-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Advisory locks: when there is no row to lock
+
+"Invoice number = highest existing number + 1" has nothing to lock: the row does not exist yet, and `max()` reads many rows. 8 workers × 50 invoices:
+
+| Variant | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| ✗ `max(number) + 1`, no lock | 400 invoices, **54** distinct numbers | 400 invoices, **61** distinct | 400 invoices, **120** distinct |
+| ✓ Serialised | `pg_advisory_xact_lock(42)` first: 400 distinct, ≈ 0.47 s (vs 0.12 s) | `GET_LOCK('invoice', 10)` … `RELEASE_LOCK`: 400 distinct, ≈ 1.2 s (vs 0.2 s) | Counter document, `findOneAndUpdate` + `$inc`: 400 distinct, ≈ 0.34 s |
+
+| Lock | Scope (measured) | Released |
+|---|---|---|
+| `pg_advisory_lock(42)` | Session: after A's `COMMIT`, B's `pg_try_advisory_lock(42)` still returned false; pg_locks showed `advisory`, ExclusiveLock, granted | `pg_advisory_unlock` or disconnect |
+| `pg_advisory_xact_lock(43)` | Transaction: B got false during A's transaction, true right after A's `COMMIT` | End of transaction, automatically |
+| MySQL `GET_LOCK('nightly-report', 0)` | Session: survived C's `COMMIT` (D got 0); D got 1 as soon as C disconnected | `RELEASE_LOCK` or disconnect |
+| MongoDB | No advisory locks | Use a lock document with a unique `_id` and an expiry (a lease), or an atomic counter |
+
+Advisory locks only work if **every** code path takes them; the database does not connect lock 42 with the invoices table. For numbering, a sequence or a counter row plus a unique constraint on `number` is usually the better design; advisory locks suit "only one instance may run this job" and "serialise work on customer 1234" (`pg_advisory_xact_lock(1234)`).
+
+<Pitfall>
+Session-level advisory locks (`pg_advisory_lock`, `GET_LOCK`) and connection poolers do not mix. With PgBouncer in transaction mode or any pool that hands a connection to another request after `COMMIT`, the lock stays on the pooled connection: the next request that happens to get it already "holds" the lock, and the request that took it cannot release it. Use the transaction-level form (`pg_advisory_xact_lock`) in pooled applications; MySQL has no transaction-level `GET_LOCK`, so release it in a `finally` on the same connection.
+</Pitfall>
+
+## Real-world scenario: the payment API behind a mobile app
+
+Mobile clients time out after 10 s and retry; the payment provider sometimes answers in 12 s. Support sees customers charged twice.
+
+| Step | Design |
+|---|---|
+| Client | Generates `Idempotency-Key: <uuid>` per checkout and resends it on retries |
+| Server, transaction 1 | `INSERT INTO idempotency (key, request_hash, status) VALUES (…, 'started') ON CONFLICT DO NOTHING`; 0 rows → return the stored response (or "in progress") |
+| Provider call | Outside the database transaction, passing the same key to the provider (most payment APIs accept one) |
+| Server, transaction 2 | Store the provider result and the response body under the key |
+| Retention | Keep keys for at least the client's retry window (24 h is common); delete older ones in batches |
+
+## Why this matters for application patterns
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 8: outbox pattern | Events published at least once need idempotent consumers keyed the same way |
+| Concept 4: job queues | A job that runs twice (lease expired) must be harmless |
+| Session 5: locks and indexes | The unique index is what serialises the duplicates |
+
+## Key takeaways
+
+1. Retries and redeliveries are normal; without idempotency 200 requests became 696–800 charges.
+2. Check-then-insert does not work under concurrency, and in MySQL REPEATABLE READ it never sees concurrent inserts.
+3. Insert the idempotency key under a unique constraint in the same transaction as the effect; the row count (or E11000) tells you whether to act.
+4. MongoDB's check-then-insert looked correct only because of an unrelated hot document; use a unique index.
+5. Advisory locks serialise work with no row to lock; prefer the transaction-level form, especially behind a connection pool.
+
+## Check questions
+
+1. Why did check-then-insert produce 696 charges in PostgreSQL but 800 in MySQL?
+2. Why must the idempotency key and the debit be in the same transaction? Describe what goes wrong in each of the two wrong orders.
+3. What happens to the second copy's `INSERT … ON CONFLICT DO NOTHING` while the first copy is still uncommitted?
+4. Why was MongoDB's check-then-insert correct when it included the debit, and why is that not a design you can rely on?
+5. What is the drawback of `INSERT IGNORE`, and what would you use instead?
+6. Why do 8 workers computing `max(number) + 1` produce duplicate numbers, and what are three ways to fix it?
+7. Why is `pg_advisory_lock` dangerous behind PgBouncer in transaction mode, and what do you use instead?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-7-application-patterns/concept-5-idempotency-advisory-locks/answers">Worked answers to Q1–Q7</DeepDive>

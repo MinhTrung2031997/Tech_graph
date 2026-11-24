@@ -1,0 +1,329 @@
+---
+title: "Concept 3: Retry loops"
+description: "Serialization failures, deadlocks and write conflicts are not bugs: they are the database asking you to try again. Which errors are retryable in each engine (40001, 40P01, 1213, TransientTransactionError), what a correct retry loop looks like, and what it cost: 562–602 serialization failures for 800 transfers under SERIALIZABLE, deadlocks that cost 1 s each in PostgreSQL, and a MySQL lock-wait timeout that committed half a transfer."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "retries", "serializable", "deadlock", "write-conflict"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/mvcc-serialization-failure-handling.html"
+  - "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-deadlocks-handling.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-parameters.html#sysvar_innodb_rollback_on_timeout"
+  - "https://www.mongodb.com/docs/manual/core/transactions-in-applications/"
+---
+
+<Tldr>
+Stronger isolation and concurrent transactions mean some attempts will be **refused**: PostgreSQL `40001` (serialization failure) and `40P01` (deadlock), MySQL `1213` (deadlock), MongoDB errors labelled `TransientTransactionError`. In each case the database has **rolled back the whole transaction**, and the right reaction is to run it again from the start. In the lab, 8 workers × 100 transfers between 20 accounts needed **562–602 retries** under PostgreSQL SERIALIZABLE, **53–71** deadlock retries under MySQL SERIALIZABLE and **188–230** in MongoDB; with a retry loop every run ended with the money conserved (20,000.00). Two traps: PostgreSQL detects a deadlock only after **`deadlock_timeout` (1 s)**, so 3–6 deadlocks made the run **10–20× slower** than locking rows in a consistent order; and MySQL's **lock wait timeout (1205) rolls back only the statement**: in the lab the transaction carried on and committed **half a transfer**.
+</Tldr>
+
+## Which errors to retry
+
+| Engine | Error | Meaning | Rolled back | Retry |
+|---|---|---|---|---|
+| PostgreSQL | `40001` serialization_failure: "could not serialize access due to read/write dependencies among transactions" (SERIALIZABLE) or "… due to concurrent update" (REPEATABLE READ) | Your transaction could not be ordered with a concurrent one | Whole transaction | ✓ whole transaction |
+| PostgreSQL | `40P01` deadlock_detected | You were chosen as the victim of a lock cycle | Whole transaction | ✓ whole transaction |
+| MySQL | `1213` ER_LOCK_DEADLOCK (SQLSTATE 40001): "Deadlock found when trying to get lock; try restarting transaction" | Deadlock victim | Whole transaction | ✓ whole transaction |
+| MySQL | `1205` ER_LOCK_WAIT_TIMEOUT: "Lock wait timeout exceeded; try restarting transaction" | Waited `innodb_lock_wait_timeout` | **Only the statement** (default) | ⚠ roll back yourself, then retry |
+| MongoDB | label `TransientTransactionError` (e.g. 112 WriteConflict) | Conflict or transient failure inside a transaction | Whole transaction | ✓ whole transaction |
+| MongoDB | label `UnknownTransactionCommitResult` | The commit may or may not have applied | Unknown | ✓ retry **commit** only (it is idempotent) |
+
+| Term | Meaning |
+|---|---|
+| Retryable error | The database refused this attempt for a concurrency reason; the same transaction may succeed if run again |
+| Retry loop | Run the whole transaction (reads included) again, with a cap and a backoff |
+| Backoff with jitter | Wait a short, random, growing time before retrying, so the same transactions do not collide again in lockstep |
+| `deadlock_timeout` | PostgreSQL waits this long (1 s default) before checking for a deadlock |
+| **✓ Commit / ✗ Retryable / ✗ Fatal** | The attempt committed; refused, run again; or a real error, give up |
+
+## The measurements
+
+8 workers × 100 transfers of 1.00 between random pairs of the first 20 accounts. Every run ended with the 20 balances summing to 20,000.00. Two runs each.
+
+| Variant | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| READ COMMITTED (MySQL: RR), update `from` then `to` | 3–6 × `40P01`, ≈ 3.5–5.4 s | 5–6 × `1213`, ≈ 0.7–0.8 s | 220–230 transient retries, ≈ 0.5 s |
+| Same, rows updated in id order | 0 errors, ≈ 0.26–0.30 s | 0 errors, ≈ 0.7 s | 188–195 transient retries, ≈ 0.4–0.5 s |
+| SERIALIZABLE, read balance, check, update both | **562–602 × `40001`** + 4–6 × `40P01`, ≈ 4.5–6.5 s | **53–71 × `1213`**, ≈ 0.7–0.9 s | (transactions are snapshot isolation) |
+
+Why the differences:
+
+- **PostgreSQL deadlocks are slow.** A waiting transaction checks for a cycle only after `deadlock_timeout` (1 s): the captured deadlock took **1,000 ms** to report. 3–6 of them cost 3–5 s of an otherwise 0.3 s run. MySQL detected its deadlock after **1 ms**.
+- **MySQL SERIALIZABLE turns plain SELECTs into shared locks.** Two transfers read (S lock) the same account, then both try to update it (X lock): a deadlock, 53–71 of them.
+- **MongoDB conflicts are not deadlocks.** A transactional write to a document another open transaction modified fails at once with `WriteConflict` (≈ 4 ms), whatever the order. Ordering the writes did not reduce them (188–195 vs 220–230).
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: a transfer with a retry loop"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'transfer(5 → 6)', x: 20, y: 120, w: 180 },
+    { id: 'txn', label: 'Attempt', sub: 'BEGIN … COMMIT', x: 290, y: 120, w: 200 },
+    { id: 'ok', label: '✓ Committed', sub: '', x: 590, y: 20, w: 190 },
+    { id: 'retry', label: '✗ 40001 / 40P01', sub: 'retryable', x: 590, y: 120, w: 190 },
+    { id: 'fatal', label: '✗ Other error', sub: 'give up', x: 590, y: 220, w: 190 },
+  ]}
+  edges={[
+    { id: 'app-txn', from: 'app', to: 'txn' },
+    { id: 'txn-ok', from: 'txn', to: 'ok' },
+    { id: 'txn-retry', from: 'txn', to: 'retry' },
+    { id: 'txn-fatal', from: 'txn', to: 'fatal' },
+  ]}
+  cases={[
+    {
+      title: 'Serialization failure',
+      path: 'SERIALIZABLE: read balance → update both → COMMIT ✗ 40001 → back off → run again → ✓',
+      summary: '562–602 failures for 800 transfers on 20 hot accounts; all succeeded on retry.',
+      steps: [
+        {
+          title: 'The attempt',
+          note: 'The whole transaction, reads included, is the unit of retry: the balance check must be re-done on fresh data.',
+          code: "BEGIN ISOLATION LEVEL SERIALIZABLE;\nSELECT balance FROM accounts WHERE id = 5;          -- check ≥ 1\nUPDATE accounts SET balance = balance - 1 WHERE id = 5;\nUPDATE accounts SET balance = balance + 1 WHERE id = 6;\nCOMMIT;",
+          active: ['app', 'txn'],
+          edges: ['app-txn'],
+        },
+        {
+          title: '✗ Refused at commit',
+          note: 'SSI found a dangerous pattern of read/write dependencies with a concurrent transfer. The error can come at any statement or at COMMIT.',
+          code: 'ERROR:  could not serialize access due to read/write dependencies among transactions\nDETAIL:  Reason code: Canceled on identification as a pivot, during commit attempt.\nHINT:  The transaction might succeed if retried.',
+          active: ['txn', 'retry'],
+          edges: ['txn-retry'],
+        },
+        {
+          title: '✓ Retried',
+          note: 'ROLLBACK, wait a few random milliseconds, run the same function again. The next attempt sees the other transfer\'s result and commits.',
+          active: ['app', 'txn', 'ok'],
+          edges: ['app-txn', 'txn-ok'],
+        },
+      ],
+    },
+    {
+      title: 'Deadlock (opposite order)',
+      path: 'T1 locks 7, T2 locks 8 → each waits for the other → after deadlock_timeout 1 s ✗ 40P01 for one → retry',
+      summary: 'Correct, but each deadlock costs ≈ 1 s. Locking in id order removed them all.',
+      steps: [
+        {
+          title: '✗ Detected after 1 s',
+          note: 'The victim gets 40P01 "deadlock detected" 1,000 ms after it started waiting. Retrying fixes correctness, not the delay: in the lab 3–6 deadlocks turned a 0.3 s run into 3.5–5.4 s.',
+          code: 'ERROR:  deadlock detected',
+          active: ['txn', 'retry'],
+          edges: ['txn-retry'],
+        },
+        {
+          title: '✓ Prevent instead',
+          note: 'Update the two accounts in id order (smaller id first): no cycle can form. 0 deadlocks, ≈ 0.3 s. Session 6 covers deadlocks in depth.',
+          code: 'UPDATE … WHERE id = least(:from, :to); UPDATE … WHERE id = greatest(:from, :to);',
+          active: ['app', 'txn', 'ok'],
+          edges: ['app-txn', 'txn-ok'],
+        },
+      ],
+    },
+    {
+      title: 'Non-retryable error',
+      path: 'CHECK violation / unique violation / syntax error → ✗ give up and report',
+      summary: 'Retrying a 23514 or 23505 gives the same answer every time.',
+      steps: [
+        {
+          title: '✗ Not a concurrency problem',
+          note: 'Retry only 40001 and 40P01 (and, if you use them, 55P03 lock_not_available from NOWAIT/lock_timeout). A CHECK violation (23514) or a duplicate key (23505) will fail again.',
+          active: ['txn', 'fatal'],
+          edges: ['txn-fatal'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL
+
+<Flow
+  title="MySQL: deadlocks vs lock wait timeouts"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'transfer(12 → 11)', x: 20, y: 120, w: 180 },
+    { id: 'txn', label: 'Attempt', sub: 'START … COMMIT', x: 290, y: 120, w: 200 },
+    { id: 'ok', label: '✓ Committed', sub: '', x: 590, y: 20, w: 190 },
+    { id: 'retry', label: '✗ 1213 deadlock', sub: 'txn rolled back', x: 590, y: 120, w: 190 },
+    { id: 'half', label: '✗ 1205 timeout', sub: 'statement only', x: 590, y: 220, w: 190 },
+  ]}
+  edges={[
+    { id: 'app-txn', from: 'app', to: 'txn' },
+    { id: 'txn-ok', from: 'txn', to: 'ok' },
+    { id: 'txn-retry', from: 'txn', to: 'retry' },
+    { id: 'txn-half', from: 'txn', to: 'half' },
+  ]}
+  cases={[
+    {
+      title: 'Deadlock 1213',
+      path: 'lock cycle → detected in ≈ 1 ms → ✗ 1213, whole transaction rolled back → retry → ✓',
+      summary: 'Immediate detection (innodb_deadlock_detect = ON): 5–6 deadlocks cost almost nothing.',
+      steps: [
+        {
+          title: '✗ Victim rolled back',
+          note: 'InnoDB checks the wait-for graph when a lock wait starts and rolls back the smaller transaction at once: "Deadlock found when trying to get lock; try restarting transaction" (SQLSTATE 40001), 1 ms after the second waiter arrived.',
+          active: ['app', 'txn', 'retry'],
+          edges: ['app-txn', 'txn-retry'],
+        },
+        {
+          title: '✓ Run it again',
+          note: 'The whole transaction is gone; run it from START TRANSACTION. Under SERIALIZABLE, where plain SELECTs take shared locks, the same workload produced 53–71 deadlocks.',
+          active: ['app', 'txn', 'ok'],
+          edges: ['app-txn', 'txn-ok'],
+        },
+      ],
+    },
+    {
+      title: 'Lock wait timeout 1205',
+      path: 'debit 12 ✓ → credit 11 waits 1 s → ✗ 1205 (only this statement undone) → app COMMITs → half a transfer',
+      summary: 'Measured: account 12 lost 5.00, account 11 got nothing, and the commit succeeded.',
+      steps: [
+        {
+          title: 'The second statement times out',
+          note: 'Another session held account 11. With innodb_lock_wait_timeout = 1 the credit failed after 1,010 ms: "Lock wait timeout exceeded; try restarting transaction".',
+          code: "START TRANSACTION;\nUPDATE accounts SET balance = balance - 5 WHERE id = 12;   -- OK\nUPDATE accounts SET balance = balance + 5 WHERE id = 11;   -- ERROR 1205 after 1,010 ms",
+          active: ['app', 'txn', 'half'],
+          edges: ['app-txn', 'txn-half'],
+        },
+        {
+          title: '✗ The transaction is still open',
+          note: 'innodb_rollback_on_timeout is OFF by default: only the failed statement was undone. information_schema.innodb_trx still showed the transaction RUNNING with 1 row modified. An application that catches the error and commits (or a pool that commits on release) persists the debit: in the lab 12 ended at 995.00, 11 at 1000.00.',
+          code: '-- handler for 1205 must do this, then retry from the start:\nROLLBACK;',
+          active: ['txn', 'half'],
+          edges: ['txn-half'],
+          subs: { half: '12: 995.00, 11: 1000.00' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: withTransaction retries"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'withTransaction(cb)', x: 20, y: 120, w: 180 },
+    { id: 'txn', label: 'Callback', sub: 'two updateOne', x: 290, y: 120, w: 200 },
+    { id: 'ok', label: '✓ Committed', sub: '', x: 590, y: 20, w: 190 },
+    { id: 'retry', label: '✗ Transient', sub: 'rerun callback', x: 590, y: 120, w: 190 },
+    { id: 'unk', label: '✗ Unknown commit', sub: 'retry commit', x: 590, y: 220, w: 190 },
+  ]}
+  edges={[
+    { id: 'app-txn', from: 'app', to: 'txn' },
+    { id: 'txn-ok', from: 'txn', to: 'ok' },
+    { id: 'txn-retry', from: 'txn', to: 'retry' },
+    { id: 'txn-unk', from: 'txn', to: 'unk' },
+  ]}
+  cases={[
+    {
+      title: 'WriteConflict',
+      path: 'another open transaction modified the document → ✗ WriteConflict (TransientTransactionError) in ≈ 4 ms → callback re-run → ✓',
+      summary: '188–230 re-runs for 800 transfers, in id order or not.',
+      steps: [
+        {
+          title: '✗ Conflict, labelled transient',
+          note: 'Code 112 WriteConflict, errorLabels ["TransientTransactionError"]: "Write conflict during plan execution and yielding is disabled. … Please retry your operation or multi-document transaction."',
+          active: ['app', 'txn', 'retry'],
+          edges: ['app-txn', 'txn-retry'],
+        },
+        {
+          title: '✓ The driver retries for you',
+          note: 'session.withTransaction(cb) aborts, then re-runs cb while the error carries TransientTransactionError, for up to 120 s. Keep the callback free of side effects (no emails, no HTTP calls): it may run many times.',
+          code: "await session.withTransaction(async () => {\n  await accounts.updateOne({ _id: from }, { $inc: { balance: -1 } }, { session });\n  await accounts.updateOne({ _id: to }, { $inc: { balance: 1 } }, { session });\n});",
+          active: ['app', 'txn', 'ok'],
+          edges: ['app-txn', 'txn-ok'],
+        },
+      ],
+    },
+    {
+      title: 'Unknown commit result',
+      path: 'commit sent, connection drops → ✗ UnknownTransactionCommitResult → retry commitTransaction only',
+      summary: 'Retrying the commit is safe: committing an already-committed transaction succeeds without applying it twice.',
+      steps: [
+        {
+          title: 'Retry the commit, not the work',
+          note: 'withTransaction also retries commitTransaction when the error carries UnknownTransactionCommitResult. A hand-written loop must distinguish the two labels: re-running the callback after a commit that did apply would apply it twice.',
+          active: ['txn', 'unk'],
+          edges: ['txn-unk'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## A correct retry loop
+
+```js
+// Retry the whole transaction on retryable errors, with a cap and jittered backoff.
+async function inTransaction(work, { maxAttempts = 10 } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+      const result = await work(client);          // all reads and writes happen in here
+      await client.query('COMMIT');
+      return result;
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      const retryable = e.code === '40001' || e.code === '40P01';   // MySQL: errno 1213 (and 1205 after ROLLBACK)
+      if (!retryable || attempt >= maxAttempts) throw e;
+      await sleep(Math.random() * 5 * attempt);   // jittered backoff
+    } finally {
+      client.release();
+    }
+  }
+}
+```
+
+| Rule | Why |
+|---|---|
+| Retry the **whole** transaction, reads included | The decision was based on data that changed |
+| No side effects inside the retried function | An email or HTTP call would be repeated on every attempt (outbox, Session 8) |
+| Cap attempts, add jittered backoff | Unbounded retries amplify overload; lockstep retries collide again |
+| Always `ROLLBACK` on error, explicitly | MySQL 1205 leaves the transaction open |
+| Log the retry count | A rising count is the first sign of a hot row or a missing index (Session 5) |
+
+<Pitfall>
+Many frameworks retry nothing by default. Ecto's `Repo.transaction`, Spring's `@Transactional` and ActiveRecord's `transaction` all raise the 40001/1213 error to your code. And many HTTP clients will happily retry the **whole request** at a higher level, which re-runs non-idempotent work outside any transaction: make the endpoint idempotent first (Concept 5).
+</Pitfall>
+
+## Real-world scenario: moving to SERIALIZABLE
+
+A team switches a PostgreSQL service to SERIALIZABLE to fix a write-skew bug (Session 2). Within an hour the error rate rises: `could not serialize access` on 5% of checkout requests during peak.
+
+| Step | Action |
+|---|---|
+| 1 | Wrap each transaction in a retry helper like the one above; errors drop to ≈ 0 |
+| 2 | Watch the retry count per endpoint: hot rows show up as high counts |
+| 3 | Keep transactions short and read only what the decision needs (fewer dependencies) |
+| 4 | Declare read-only transactions `READ ONLY`; SSI tracks them more cheaply |
+| 5 | Where the conflict is a single row, use an atomic statement (Concept 1) instead |
+
+## Why this matters for application patterns
+
+| Later concept | Why this concept matters |
+|---|---|
+| Concept 4: job queues | Queue workers hit deadlocks and conflicts; the loop must handle them |
+| Concept 5: idempotency keys | Retries at the HTTP level need idempotent endpoints |
+| Session 8: when transactions hurt | Retries of big transactions multiply their cost |
+
+## Key takeaways
+
+1. `40001`, `40P01`, `1213` and `TransientTransactionError` mean "run the whole transaction again"; they are normal under concurrency.
+2. With a retry loop, 800 transfers stayed correct even with 562–602 serialization failures.
+3. PostgreSQL deadlocks cost `deadlock_timeout` (1 s) each; prevent them with a consistent lock order rather than retrying them.
+4. MySQL `1205` undoes only the statement: always `ROLLBACK` before retrying, or you may commit half a transaction.
+5. In MongoDB use `withTransaction`; keep the callback side-effect free, and retry only the commit on `UnknownTransactionCommitResult`.
+
+## Check questions
+
+1. Which errors would you retry in each engine, and what has the database already undone in each case?
+2. Why did 3–6 deadlocks make the PostgreSQL run 10–20× slower, while 5–6 deadlocks barely affected MySQL?
+3. In the 1205 experiment, why did account 12 lose 5.00? Write the handler that prevents it.
+4. Why must the balance check be inside the retried function rather than before it?
+5. Why did ordering the updates by id remove deadlocks in PostgreSQL and MySQL but not reduce MongoDB's retries?
+6. What is the difference between `TransientTransactionError` and `UnknownTransactionCommitResult`, and what do you retry for each?
+7. Why does MySQL SERIALIZABLE produce deadlocks for the read-check-update transfer?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-7-application-patterns/concept-3-retry-loops/answers">Worked answers to Q1–Q7</DeepDive>

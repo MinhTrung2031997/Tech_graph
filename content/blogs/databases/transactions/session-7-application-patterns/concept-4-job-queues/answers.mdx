@@ -1,0 +1,76 @@
+---
+title: "Answers: Job queues with SKIP LOCKED"
+description: "Worked answers to the Session 7 Concept 4 check questions."
+companion: "answers"
+tags: ["transactions", "skip-locked", "job-queue", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html#isolevel_read-committed"
+---
+
+<Tldr>
+A queue claim must be exclusive (a lock or an atomic update), must not make workers wait for each other (SKIP LOCKED), and must be cheap to find (an index on the queued jobs).
+</Tldr>
+
+## Q1. Five runs per job
+
+**Question:** why did the no-lock variant run each job ≈ 5 times in PostgreSQL?
+
+All workers run the same "oldest queued job" query. A plain SELECT takes no lock and nothing changes until the first worker's UPDATE, 2 ms later. During those 2 ms most of the 8 workers read the same id and process it. 10,588 runs for 2,000 jobs: ≈ 5.3 per job. The UPDATE to `done` succeeds for each of them because it does not check the status.
+
+> **Common mistake:** "the UPDATE will fail for the second worker". It will not unless its WHERE clause includes `status = 'queued'` and the code checks the row count, which turns it into an atomic claim.
+
+## Q2. FOR UPDATE: correct but serial
+
+**Question:** with plain `FOR UPDATE`, why does no job run twice, and why is it almost as slow as one worker?
+
+The first worker locks the oldest queued row until it commits. Every other worker's query targets the same row and **waits** for that lock. When the lock is released, PostgreSQL re-checks the row (READ COMMITTED), finds it is no longer queued, skips it and returns the next row to one waiter (0 empty claims in the lab). So a job is never handed out twice, but at any moment almost all workers are waiting behind one row: ≈ 7.8–10.1 s, close to the 2,000 × ≈ 4 ms of a single worker.
+
+> **Common mistake:** adding workers to a `FOR UPDATE` queue to make it faster.
+
+## Q3. SKIP LOCKED
+
+**Question:** what does `SKIP LOCKED` do differently, and why can it return no row while queued jobs remain?
+
+Rows that another transaction has locked are treated as not there: the scan moves on to the next matching row instead of waiting. Eight workers get eight different jobs at once (≈ 1.9–2.1 s). When the remaining queued jobs are all locked by other workers at that instant (typically near the end, or when there are fewer jobs than workers), the query finds nothing unlocked and returns an empty result: 8–17 times per run in PostgreSQL, 23–40 in MySQL.
+
+> **Common mistake:** treating an empty result as "queue drained" and stopping the worker.
+
+## Q4. The MySQL deadlock
+
+**Question:** explain the MySQL deadlock in the report: which index, which locks, and why READ COMMITTED removes it.
+
+Index: `jobs_status_id (status, id)`. Under REPEATABLE READ, the claim's scan takes next-key locks: the record plus the **gap** before it. The UPDATE changes `status` from `queued` to `done`, so InnoDB deletes the `('queued', id)` entry and inserts `('done', id)`, which requires an **insert intention** lock in the gap where `('done', id)` goes. The report showed two UPDATEs (ids 91989 and 91990) each **holding** "X locks gap before rec" and each **waiting** for "X locks gap before rec insert intention" on the same record: a cycle. READ COMMITTED does not take gap locks for scans, so only the claimed records are locked: 0 deadlocks, ≈ 1.6 s.
+
+> **Common mistake:** treating these deadlocks as random noise and only adding retries; 2,594–3,017 retries for 2,000 jobs doubles the work.
+
+## Q5. The claim index
+
+**Question:** which index would you create for the claim query in each engine, and what did it change?
+
+| Engine | Index | Before → after |
+|---|---|---|
+| PostgreSQL | `CREATE INDEX jobs_queued_idx ON jobs (id) WHERE status = 'queued'` | 1,177 buffers / 7.6 ms (90,000 rows filtered) → 5 buffers / 0.06 ms |
+| MySQL | `ADD INDEX jobs_status_id (status, id)` (no partial indexes) | 90,001 rows / 9.4 ms → covering lookup / 0.1 ms |
+| MongoDB | `{ status: 1, _id: 1 }` (or a partial index on queued) | 90,001 keys / 44 ms → 1 key |
+
+The partial index stays tiny because finished jobs leave it.
+
+> **Common mistake:** an index on `status` alone in PostgreSQL: it still has to sort or walk the queued entries in a different order from `ORDER BY id`. Include the ordering column.
+
+## Q6. A 3-minute job
+
+**Question:** a job takes 3 minutes. Why should it not hold its row lock for the whole time, and what do you do instead?
+
+Holding the lock means holding the **transaction** open for 3 minutes: it keeps an old snapshot that stops VACUUM / purge from cleaning up (Session 8), holds connections, and any other statement touching that row waits for minutes. Instead claim and commit quickly (`UPDATE … SET status = 'running', locked_by = ?, locked_at = now() WHERE id = (SELECT … FOR UPDATE SKIP LOCKED) RETURNING id`), do the work outside a transaction, then mark the job done. A periodic sweeper re-queues `running` jobs whose `locked_at` is too old (the worker died).
+
+> **Common mistake:** a lease shorter than the longest job, so healthy jobs get re-queued and run twice; size it generously and make handlers idempotent.
+
+## Q7. MongoDB without SKIP LOCKED
+
+**Question:** why does MongoDB not need SKIP LOCKED for the same queue?
+
+The claim is a single atomic operation: `findOneAndUpdate({ status: 'queued' }, { $set: { status: 'running' } }, { sort: { _id: 1 } })` matches and modifies one document. Two workers racing for the same document produce a write conflict inside the server; the loser re-runs its query and gets the next queued job. Nothing is locked while the job runs, because the status field itself is the claim. That is the "claim, commit, work" style, so it needs a `locked_at` lease for crash recovery.
+
+> **Common mistake:** wrapping the claim and the work in a multi-document transaction "to be safe", which adds conflicts and a 60-second lifetime limit.

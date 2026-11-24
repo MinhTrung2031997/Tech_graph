@@ -1,0 +1,316 @@
+---
+title: "Concept 2: Optimistic vs pessimistic locking"
+description: "When a change cannot be one statement, either lock the row before reading it (SELECT … FOR UPDATE) or check a version column when writing (compare-and-set). Measured under three levels of contention: on one hot row optimistic locking needed 2,790–5,190 retries for 800 withdrawals; spread over 1,000 rows it needed 0–5 and was as fast or faster. MongoDB transactions behave optimistically even when you write first."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "optimistic-locking", "pessimistic-locking", "select-for-update"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-production-consideration/#in-progress-transactions-and-write-conflicts"
+  - "https://hexdocs.pm/ecto/Ecto.Changeset.html#optimistic_lock/3"
+---
+
+<Tldr>
+Some changes need a decision in the application between the read and the write (check a limit, call a pricing rule, update several fields). Two ways keep that safe. **Pessimistic:** `SELECT … FOR UPDATE` locks the row before reading, so other writers **wait**. **Optimistic:** read freely, then `UPDATE … SET version = version + 1 WHERE id = ? AND version = :seen`; 0 rows means someone else won, so **retry**. Both ended at the correct balance in every run. The difference is contention: 8 workers × 100 withdrawals on **one** row cost the optimistic version **2,790–3,875 retries** in PostgreSQL and **5,095–5,190** in MySQL (2–3× slower than locking); spread over **1,000** rows it needed **0–5 retries** and was as fast or faster. MongoDB has no `FOR UPDATE`: a transaction that writes a document first is still **optimistic underneath**, aborting with `WriteConflict` (325–396 retries on the hot row) instead of waiting.
+</Tldr>
+
+## Two ways to protect a decision
+
+| | Pessimistic | Optimistic |
+|---|---|---|
+| Idea | Lock first, then read and write | Read, then write only if nothing changed |
+| SQL | `BEGIN; SELECT … FOR UPDATE; UPDATE …; COMMIT` | `UPDATE … SET …, version = version + 1 WHERE id = ? AND version = ?` |
+| MongoDB | No row locks to request; a transaction that writes first aborts conflicting writers | `updateOne({ _id, version }, { $set: …, $inc: { version: 1 } })` |
+| On conflict | The second writer **waits** | The second writer gets **0 rows** and retries |
+| Holds | A row lock for the whole transaction | Nothing between read and write |
+| Good for | Hot rows, expensive work that must not be repeated | Low contention, long "think time" (a form open for minutes) |
+
+| Term | Meaning |
+|---|---|
+| `SELECT … FOR UPDATE` | A locking read: takes an exclusive row lock until the transaction ends |
+| Version column | An integer incremented on every write; the write checks it still has the value that was read |
+| Compare-and-set (CAS) | Write only if the current value equals the expected one |
+| Contention | How often concurrent transactions touch the same row |
+| **✓ Committed / ✗ Version mismatch** | The write applied, or found a newer version and must retry |
+
+## The measurements
+
+8 workers, each making withdrawals of 1.00. Every run ended at the correct total.
+
+**One hot row** (8 × 50 withdrawals from account 1, two runs):
+
+| Engine | Pessimistic | Optimistic | Optimistic retries |
+|---|---|---|---|
+| PostgreSQL | ≈ 0.44–0.45 s | ≈ 1.25–1.36 s | 1,379–1,422 |
+| MySQL | ≈ 0.68–1.05 s | ≈ 0.72–1.07 s | 2,522–2,672 |
+| MongoDB | ≈ 0.53–0.63 s (transaction) | ≈ 0.45–0.68 s | 996–1,389 |
+
+**Contention falling** (8 × 100 withdrawals from a random account among the first K, two runs):
+
+| K accounts | PostgreSQL pess / opt (retries) | MySQL pess / opt (retries) | MongoDB txn / opt (retries) |
+|---|---|---|---|
+| 1 | 0.9–1.3 s / 3.7–4.0 s (2,790–3,875) | 1.4–1.5 s / 2.3–2.8 s (5,095–5,190) | 1.4 s (325–396) / 1.1 s (2,030–2,977) |
+| 10 | 0.24–0.34 s / 0.58–1.13 s (409–519) | 0.55 s / 0.34–0.56 s (406–482) | 0.27–0.42 s (115–118) / 0.24–0.38 s (162–169) |
+| 1,000 | 0.20–0.31 s / 0.16–0.29 s (4–5) | 0.32–0.38 s / 0.26–0.39 s (0–2) | 0.23–0.32 s (3) / 0.20–0.29 s (1) |
+
+Timings are approximate (other experiments shared the machine); the retry counts are the stable signal. On one row, optimistic workers mostly re-read and lose again: each success cost ≈ 3.5–6.5 attempts.
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: pessimistic vs optimistic on one account"
+  height={300}
+  nodes={[
+    { id: 't1', label: 'T1', sub: 'withdraw 1.00', x: 20, y: 20, w: 180 },
+    { id: 't2', label: 'T2', sub: 'withdraw 1.00', x: 20, y: 200, w: 180 },
+    { id: 'row', label: 'accounts id = 1', sub: 'balance 1000, v1', x: 290, y: 110, w: 220 },
+    { id: 'ok', label: '✓ Committed', sub: '', x: 600, y: 20, w: 180 },
+    { id: 'miss', label: '✗ Version mismatch', sub: '0 rows → retry', x: 600, y: 200, w: 180 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row' },
+    { id: 't2-row', from: 't2', to: 'row' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-miss', from: 'row', to: 'miss' },
+  ]}
+  cases={[
+    {
+      title: 'Pessimistic: FOR UPDATE',
+      path: 'T1 locks the row → T2 waits on FOR UPDATE → T1 commits → T2 reads 999 → ✓ both committed',
+      summary: 'No retries; the cost is waiting. 8 × 50 on one row: ≈ 0.45 s.',
+      steps: [
+        {
+          title: 't1: T1 locks before reading',
+          note: 'FOR UPDATE takes the row lock as part of the read, so the value T1 sees cannot change before T1 writes.',
+          code: 'BEGIN;\nSELECT balance FROM accounts WHERE id = 1 FOR UPDATE;   -- 1000.00\n-- application logic here\nUPDATE accounts SET balance = 999.00 WHERE id = 1;\nCOMMIT;',
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+          subs: { row: '1000 → 999, locked by T1' },
+        },
+        {
+          title: 't2: T2 waits on its locking read',
+          note: 'T2\'s SELECT … FOR UPDATE blocks until T1 commits, then returns the new committed value 999.00 (READ COMMITTED re-reads the locked row).',
+          active: ['t2', 'row'],
+          edges: ['t2-row'],
+        },
+        {
+          title: '✓ t3: both withdrawals applied',
+          note: 'T2 writes 998.00 and commits. The application code is the same as read-then-write; only the lock was added.',
+          active: ['t1', 't2', 'row', 'ok'],
+          edges: ['row-ok'],
+          subs: { row: 'balance 998, unlocked', ok: '998.00' },
+        },
+      ],
+    },
+    {
+      title: 'Optimistic: version check',
+      path: 'both read v1 → T1 writes WHERE version = 1 ✓ (v2) → T2 writes WHERE version = 1 ✗ 0 rows → T2 re-reads v2 and retries',
+      summary: '8 × 50 on one row: 1,379–1,422 retries, ≈ 1.3 s; over 1,000 rows: 4–5 retries.',
+      steps: [
+        {
+          title: 't1: both read without locks',
+          note: 'Each worker reads balance and version. Nothing is locked, so nothing waits.',
+          code: 'SELECT balance, version FROM accounts WHERE id = 1;   -- 1000.00, 1 (both)',
+          active: ['t1', 't2', 'row'],
+          edges: ['t1-row', 't2-row'],
+        },
+        {
+          title: '✓ t2: T1\'s write matches the version',
+          note: 'The WHERE clause includes the version T1 read. It still matches, so the row is updated and the version moves to 2.',
+          code: 'UPDATE accounts SET balance = 999.00, version = version + 1\nWHERE id = 1 AND version = 1;   -- UPDATE 1',
+          active: ['t1', 'row', 'ok'],
+          edges: ['t1-row', 'row-ok'],
+          subs: { row: 'balance 999, v2', ok: 'T1' },
+        },
+        {
+          title: '✗ t3: T2 finds version 2',
+          note: 'T2 waits for T1\'s row lock (if T1 is still uncommitted), re-checks WHERE on the new version: version = 1 is false, UPDATE 0. T2 re-reads (999.00, v2) and tries again. Nothing is lost; the cost is the retry.',
+          code: 'UPDATE accounts SET balance = 999.00, version = version + 1\nWHERE id = 1 AND version = 1;   -- UPDATE 0 → retry',
+          active: ['t2', 'row', 'miss'],
+          edges: ['t2-row', 'row-miss'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL
+
+<Flow
+  title="MySQL: pessimistic vs optimistic on one account"
+  height={300}
+  nodes={[
+    { id: 't1', label: 'T1', sub: 'withdraw 1.00', x: 20, y: 20, w: 180 },
+    { id: 't2', label: 'T2', sub: 'withdraw 1.00', x: 20, y: 200, w: 180 },
+    { id: 'row', label: 'accounts id = 1', sub: 'record in PRIMARY', x: 290, y: 110, w: 220 },
+    { id: 'ok', label: '✓ Committed', sub: '', x: 600, y: 20, w: 180 },
+    { id: 'miss', label: '✗ Version mismatch', sub: 'affectedRows 0', x: 600, y: 200, w: 180 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row' },
+    { id: 't2-row', from: 't2', to: 'row' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-miss', from: 'row', to: 'miss' },
+  ]}
+  cases={[
+    {
+      title: 'Pessimistic: FOR UPDATE',
+      path: 'T1 SELECT … FOR UPDATE (X record lock) → T2 waits → T1 COMMIT → T2 reads the latest version → ✓',
+      summary: 'A locking read ignores the REPEATABLE READ snapshot: T2 gets 999.00, not 1000.00.',
+      steps: [
+        {
+          title: 't1: X lock on the clustered record',
+          note: 'performance_schema.data_locks shows a RECORD lock, LOCK_MODE X,REC_NOT_GAP on PRIMARY for id 1 (an equality match on a unique index needs no gap lock).',
+          code: 'START TRANSACTION;\nSELECT balance FROM accounts WHERE id = 1 FOR UPDATE;\nUPDATE accounts SET balance = ? WHERE id = 1;\nCOMMIT;',
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+          subs: { row: 'X lock (T1)' },
+        },
+        {
+          title: '✓ t2: T2 waits, then reads the latest version',
+          note: 'Up to innodb_lock_wait_timeout (50 s by default). After T1\'s commit, the locking read returns the newest committed balance even under REPEATABLE READ.',
+          active: ['t2', 'row', 'ok'],
+          edges: ['t2-row', 'row-ok'],
+          subs: { ok: '998.00' },
+        },
+      ],
+    },
+    {
+      title: 'Optimistic: version check',
+      path: 'both read version 1 → T1 UPDATE … AND version = 1 ✓ → T2 ✗ affectedRows 0 → retry',
+      summary: '8 × 50 on one row: 2,522–2,672 retries; over 1,000 rows: 0–2.',
+      steps: [
+        {
+          title: '✓ t1: the first writer wins',
+          note: 'The UPDATE is a locking read of the latest version, so its version check is reliable even under REPEATABLE READ.',
+          code: 'UPDATE accounts SET balance = ?, version = version + 1 WHERE id = 1 AND version = ?;',
+          active: ['t1', 'row', 'ok'],
+          edges: ['t1-row', 'row-ok'],
+        },
+        {
+          title: '✗ t2: the second writer sees version 2',
+          note: 'affectedRows 0. Important under REPEATABLE READ: if the retry re-reads inside the same transaction, a plain SELECT returns the old snapshot (version 1) again, and the loop never succeeds. Retry in a new transaction (autocommit here), or re-read with a locking read.',
+          active: ['t2', 'row', 'miss'],
+          edges: ['t2-row', 'row-miss'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: version check vs transaction"
+  height={300}
+  nodes={[
+    { id: 't1', label: 'Client 1', sub: 'withdraw 1.00', x: 20, y: 20, w: 180 },
+    { id: 't2', label: 'Client 2', sub: 'withdraw 1.00', x: 20, y: 200, w: 180 },
+    { id: 'doc', label: 'accounts _id: 1', sub: 'balance, version', x: 290, y: 110, w: 220 },
+    { id: 'ok', label: '✓ Committed', sub: '', x: 600, y: 20, w: 180 },
+    { id: 'miss', label: '✗ Conflict', sub: 'retry', x: 600, y: 200, w: 180 },
+  ]}
+  edges={[
+    { id: 't1-doc', from: 't1', to: 'doc' },
+    { id: 't2-doc', from: 't2', to: 'doc' },
+    { id: 'doc-ok', from: 'doc', to: 'ok' },
+    { id: 'doc-miss', from: 'doc', to: 'miss' },
+  ]}
+  cases={[
+    {
+      title: 'Optimistic: version in the filter',
+      path: 'both findOne (v1) → client 1 updateOne({ _id, version: 1 }) ✓ → client 2 ✗ modifiedCount 0 → retry',
+      summary: '8 × 50 on one document: 996–1,389 retries; over 1,000 documents: 1.',
+      steps: [
+        {
+          title: '✓ t1: the filter includes the version',
+          note: 'The update matches only if the version is still the one read; $inc moves it on.',
+          code: "await accounts.updateOne({ _id: 1, version: d.version },\n  { $set: { balance: newBalance }, $inc: { version: 1 } });",
+          active: ['t1', 'doc', 'ok'],
+          edges: ['t1-doc', 'doc-ok'],
+        },
+        {
+          title: '✗ t2: no match, retry',
+          note: 'matchedCount 0: the document changed. Re-read and try again.',
+          active: ['t2', 'doc', 'miss'],
+          edges: ['t2-doc', 'doc-miss'],
+        },
+      ],
+    },
+    {
+      title: 'Transaction that writes first',
+      path: 'client 1 writes the doc in a transaction → client 2\'s write in its transaction → ✗ WriteConflict (TransientTransactionError) after ≈ 4 ms → withTransaction retries',
+      summary: 'No FOR UPDATE exists; a write is the closest thing, and it aborts the other side instead of blocking it: 325–396 retries on one document.',
+      steps: [
+        {
+          title: 't1: client 1 "locks" by writing',
+          note: 'A common emulation of FOR UPDATE: inside the transaction, write a field (lockedAt) with findOneAndUpdate before reading the balance.',
+          code: "await session.withTransaction(async () => {\n  const d = await accounts.findOneAndUpdate({ _id: 1 }, { $set: { lockedAt: new Date() } },\n    { session, returnDocument: 'after' });\n  await accounts.updateOne({ _id: 1 }, { $set: { balance: … } }, { session });\n});",
+          active: ['t1', 'doc', 'ok'],
+          edges: ['t1-doc', 'doc-ok'],
+        },
+        {
+          title: '✗ t2: client 2 aborts instead of waiting',
+          note: 'Writes inside transactions wait at most maxTransactionLockRequestTimeoutMillis (5 ms here) and a document already modified by another open transaction gives WriteConflict, labelled TransientTransactionError. withTransaction re-runs the whole callback. Correct result, but the work is redone, like optimistic locking.',
+          code: "MongoServerError: WriteConflict … Please retry your operation or multi-document transaction.",
+          active: ['t2', 'doc', 'miss'],
+          edges: ['t2-doc', 'doc-miss'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Choosing
+
+| Situation | Choose | Why |
+|---|---|---|
+| One counter or balance everyone updates | Atomic statement (Concept 1); if impossible, pessimistic | Optimistic retries explode: 2,790–5,190 per 800 writes |
+| Rows rarely touched by two writers at once | Optimistic | No locks held, 0–5 retries, no lock waits to tune |
+| A user edits a record in a form for minutes | Optimistic (version in the form) | Never hold a database lock across user think time |
+| Expensive or external work between read and write (a payment API call) | Pessimistic, or restructure (Concept 5) | A retry would repeat the expensive work |
+| MongoDB | Version field, or an atomic `findOneAndUpdate` | Transactions abort on conflict; they do not queue |
+
+<Pitfall>
+An optimistic retry loop that re-reads **inside the same REPEATABLE READ transaction** never sees the new version: in InnoDB the plain SELECT keeps returning the snapshot, so the version check fails forever (in PostgreSQL REPEATABLE READ the UPDATE raises 40001 instead). Start a new transaction for each attempt, and cap the number of attempts.
+</Pitfall>
+
+## Real-world scenario: the order editing screen
+
+Two support agents open the same order, change the address and the discount, and press Save a minute apart. With plain `UPDATE orders SET … WHERE id = ?`, the second save silently overwrites the first agent's changes. Holding `FOR UPDATE` while the form is open would lock the row for minutes.
+
+| Step | Implementation |
+|---|---|
+| Load | Return the order with its `version` (hidden form field or ETag) |
+| Save | `UPDATE orders SET …, version = version + 1 WHERE id = ? AND version = ?` |
+| 0 rows | Show "this order was changed by someone else", reload, let the agent re-apply |
+| HTTP | `If-Match: "<version>"` → `412 Precondition Failed` on mismatch |
+
+## Why this matters for application patterns
+
+| Later concept | Why this concept matters |
+|---|---|
+| Concept 3: retry loops | Optimistic locking only works with a correct retry loop |
+| Concept 4: job queues | Claiming jobs with `FOR UPDATE` is pessimistic locking with a twist (SKIP LOCKED) |
+| Session 6 (deadlocks) | Pessimistic locks on several rows can deadlock; optimistic ones cannot |
+
+## Key takeaways
+
+1. Pessimistic (`FOR UPDATE`) makes conflicting writers wait; optimistic (version check) makes them retry.
+2. Both were correct in every run; contention decides the cost: thousands of retries on one row, 0–5 over 1,000 rows.
+3. A locking read or an UPDATE always sees the latest version in InnoDB, so version checks work there; re-reading with a plain SELECT in the same RR transaction does not.
+4. MongoDB transactions behave optimistically: a conflicting write aborts with `WriteConflict` (TransientTransactionError), it does not wait.
+5. Never hold a database lock across user think time; use a version for long edits.
+
+## Check questions
+
+1. What does `SELECT … FOR UPDATE` add compared with a plain SELECT followed by UPDATE?
+2. Why did optimistic locking need thousands of retries on one row but only 0–5 across 1,000 rows?
+3. Write the optimistic withdrawal for MySQL and say how the application detects a conflict.
+4. Why can an optimistic retry loop never succeed if it re-reads with a plain SELECT inside the same InnoDB REPEATABLE READ transaction?
+5. Why is "write the document first inside a transaction" not a true pessimistic lock in MongoDB?
+6. Two agents edit the same order in a form for several minutes. Which approach do you use and how does the second agent find out?
+7. When would you prefer pessimistic locking even with low contention?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-7-application-patterns/concept-2-optimistic-vs-pessimistic/answers">Worked answers to Q1–Q7</DeepDive>

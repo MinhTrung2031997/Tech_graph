@@ -1,0 +1,199 @@
+---
+title: "Lab and session quiz: Application patterns"
+description: "Reproduce lost updates with pgbench and two terminals, compare atomic updates, FOR UPDATE and version checks, watch pgbench retry serialization failures, commit half a transfer after a MySQL lock-wait timeout, drain a job queue with and without SKIP LOCKED, and make a payment endpoint idempotent."
+type: "how-to"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "lab", "skip-locked", "idempotency"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pgbench.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-in-applications/"
+---
+
+<Tldr>
+Uses the containers and the `bank` database from the [Session 1 lab](/blogs/databases/transactions/session-1-transaction-guarantees/lab) (accounts, inventory, jobs). PostgreSQL exercises use **pgbench** inside the `idx-pg` container for real concurrency; MySQL and MongoDB exercises use **two terminals** (A and B) and a deliberate interleaving. Write down your prediction before each run. Reset what you change: `UPDATE accounts SET balance = 1000.00, version = 1 WHERE id <= 20;` and `UPDATE jobs SET status = 'queued', locked_by = NULL WHERE id > 90000;` (MongoDB: the same with `updateMany`).
+</Tldr>
+
+## Setup
+
+```bash
+# Shell helpers for this lab (database "bank").
+pg()  { docker exec -i idx-pg psql -U postgres -d bank "$@"; }
+my()  { docker exec -i idx-mysql mysql -uroot -plab bank "$@"; }
+mg()  { docker exec -i tx-mongo mongosh --quiet bank "$@"; }
+pgb() { docker exec -w /tmp/l7 idx-pg pgbench -U postgres -n "$@" bank; }
+docker exec idx-pg mkdir -p /tmp/l7
+
+# Queue indexes (Concept 4).
+pg -c "CREATE INDEX IF NOT EXISTS jobs_queued_idx ON jobs (id) WHERE status = 'queued'"
+my -e "ALTER TABLE jobs ADD INDEX jobs_status_id (status, id)"
+mg --eval 'db.jobs.createIndex({ status: 1, _id: 1 })'
+```
+
+Write pgbench scripts into the container with a heredoc, for example:
+
+```bash
+docker exec -i idx-pg sh -c 'cat > /tmp/l7/rtw.sql' <<'EOF'
+SELECT balance FROM accounts WHERE id = 1 \gset
+UPDATE accounts SET balance = :balance - 1 WHERE id = 1;
+EOF
+```
+
+## Exercise 1: lost updates (Concept 1)
+
+**PostgreSQL with pgbench.** Create `rtw.sql` (above) and `atomic.sql`:
+
+```sql
+UPDATE accounts SET balance = balance - 1 WHERE id = 1 AND balance >= 1;
+```
+
+```bash
+pg -c "UPDATE accounts SET balance = 1000.00 WHERE id = 1"; pgb -c 8 -t 50 -f rtw.sql
+pg -Atc "SELECT balance FROM accounts WHERE id = 1"      # predict first
+pg -c "UPDATE accounts SET balance = 1000.00 WHERE id = 1"; pgb -c 8 -t 50 -f atomic.sql
+pg -Atc "SELECT balance FROM accounts WHERE id = 1"
+```
+
+Reference run: 400 transactions, 0 failed in both; read-then-write ended at **950.00**, atomic at **600.00**.
+
+**MySQL, two terminals** (`docker exec -it idx-mysql mysql -uroot -plab bank`). Run the steps in order:
+
+| Step | Terminal A | Terminal B |
+|---|---|---|
+| 1 | `START TRANSACTION; SELECT balance FROM accounts WHERE id = 1;` | |
+| 2 | | `START TRANSACTION; SELECT balance FROM accounts WHERE id = 1;` |
+| 3 | `UPDATE accounts SET balance = 999.00 WHERE id = 1; COMMIT;` | |
+| 4 | | `UPDATE accounts SET balance = 999.00 WHERE id = 1; COMMIT;` |
+| 5 | `SELECT balance FROM accounts WHERE id = 1;` | |
+
+Then repeat with `UPDATE accounts SET balance = balance - 1 WHERE id = 1` in steps 3 and 4.
+
+**MongoDB, two terminals.** Same interleaving with `db.accounts.findOne({ _id: 1 })` and `db.accounts.updateOne({ _id: 1 }, { $set: { balance: NumberDecimal("999.00") } })`, then with `{ $inc: { balance: NumberDecimal("-1") } }`.
+
+## Exercise 2: optimistic vs pessimistic (Concept 2)
+
+**Pessimistic in PostgreSQL**, two terminals (`docker exec -it idx-pg psql -U postgres -d bank`):
+
+| Step | Terminal A | Terminal B |
+|---|---|---|
+| 1 | `BEGIN; SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;` | |
+| 2 | | `BEGIN; SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;` (predict: returns or waits?) |
+| 3 | `UPDATE accounts SET balance = balance - 1 WHERE id = 1; COMMIT;` | (what does B's SELECT return now?) |
+| 4 | | `COMMIT;` |
+
+**The REPEATABLE READ retry trap in MySQL:**
+
+| Step | Terminal A | Terminal B |
+|---|---|---|
+| 1 | `UPDATE accounts SET version = 1 WHERE id = 1;` | |
+| 2 | `START TRANSACTION; SELECT version FROM accounts WHERE id = 1;` | |
+| 3 | | `UPDATE accounts SET version = version + 1 WHERE id = 1;` |
+| 4 | `UPDATE accounts SET version = version + 1 WHERE id = 1 AND version = 1;` (rows affected?) | |
+| 5 | `SELECT version FROM accounts WHERE id = 1;` then `SELECT version FROM accounts WHERE id = 1 FOR UPDATE;` | |
+
+Reference: step 4 affected **0** rows; the plain re-read returned **1**, the locking read **2**. In PostgreSQL REPEATABLE READ step 4 fails instead with `40001 could not serialize access due to concurrent update`.
+
+## Exercise 3: retries (Concept 3)
+
+**pgbench retries serialization failures for you** (PostgreSQL 15+). `transfer.sql`:
+
+```sql
+\set a random(1, 20)
+\set b random(1, 20)
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT balance FROM accounts WHERE id = :a;
+UPDATE accounts SET balance = balance - 1 WHERE id = :a;
+UPDATE accounts SET balance = balance + 1 WHERE id = :b;
+COMMIT;
+```
+
+```bash
+pg -c "UPDATE accounts SET balance = 1000.00 WHERE id <= 20"
+pgb -c 8 -t 100 -f transfer.sql                     # no retries
+pgb -c 8 -t 100 --max-tries=50 -f transfer.sql      # with retries
+pg -Atc "SELECT sum(balance) FROM accounts WHERE id <= 20"
+```
+
+Reference: without retries **385 of 800** transactions failed; with `--max-tries=50`, 800/800 succeeded, **367** needed a retry, **868** retries in total; the sum stayed 20,000.00.
+
+**Half a transfer in MySQL:**
+
+| Step | Terminal A | Terminal B |
+|---|---|---|
+| 1 | `START TRANSACTION; UPDATE accounts SET balance = balance WHERE id = 11;` | |
+| 2 | | `SET SESSION innodb_lock_wait_timeout = 1; START TRANSACTION;` |
+| 3 | | `UPDATE accounts SET balance = balance - 5 WHERE id = 12;` |
+| 4 | | `UPDATE accounts SET balance = balance + 5 WHERE id = 11;` (error after 1 s) |
+| 5 | | `SELECT trx_state, trx_rows_modified FROM information_schema.innodb_trx WHERE trx_mysql_thread_id = CONNECTION_ID(); COMMIT;` |
+| 6 | `ROLLBACK; SELECT id, balance FROM accounts WHERE id IN (11, 12);` | |
+
+Reference: `ERROR 1205 … Lock wait timeout exceeded` after 1,010 ms; the transaction was still RUNNING with 1 modified row; after COMMIT account 12 had **995.00** and 11 **1000.00**.
+
+**MongoDB WriteConflict:** in terminal A run `s = db.getMongo().startSession(); s.startTransaction(); s.getDatabase("bank").accounts.updateOne({ _id: 9 }, { $inc: { version: 1 } })`; in terminal B the same with its own session. Note the error code, `codeName` and `errorLabels`, then `s.abortTransaction()` in both.
+
+## Exercise 4: a job queue (Concept 4)
+
+```bash
+docker exec -i idx-pg sh -c 'cat > /tmp/l7/skip.sql' <<'EOF'
+BEGIN;
+SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED \gset
+\sleep 2 ms
+UPDATE jobs SET status = 'done' WHERE id = :id;
+COMMIT;
+EOF
+docker exec idx-pg sh -c "sed 's/ SKIP LOCKED//' /tmp/l7/skip.sql > /tmp/l7/forupdate.sql"
+for f in forupdate skip; do
+  pg -c "UPDATE jobs SET status = 'queued' WHERE id > 90000"
+  pgb -c 8 -t 250 -f $f.sql | grep -E "latency average|^tps"
+done
+```
+
+Reference: `FOR UPDATE` ≈ **273 tps** (latency ≈ 29 ms: the workers queue on one row); `SKIP LOCKED` ≈ **1,676 tps** (≈ 4.8 ms); 2,000 jobs done each time.
+
+**MySQL gap locks.** Look at the locks of one claim under both isolation levels:
+
+```sql
+START TRANSACTION;
+SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED;
+SELECT index_name, lock_mode, lock_data FROM performance_schema.data_locks
+WHERE object_schema = 'bank' AND lock_type = 'RECORD';
+ROLLBACK;
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;   -- then repeat the four statements
+```
+
+Reference: under REPEATABLE READ the `jobs_status_id` entry `('queued', 90001)` is locked with mode **`X`** (record + gap); under READ COMMITTED with **`X,REC_NOT_GAP`**. The PRIMARY record is `X,REC_NOT_GAP` in both.
+
+**MongoDB:** claim twice from two terminals with `db.jobs.findOneAndUpdate({ status: "queued" }, { $set: { status: "running" } }, { sort: { _id: 1 } })` and compare the `_id`s.
+
+## Exercise 5: idempotency and advisory locks (Concept 5)
+
+```sql
+-- PostgreSQL
+CREATE TABLE payments (id bigserial PRIMARY KEY, idem_key text NOT NULL UNIQUE,
+                       account_id int NOT NULL, amount numeric(12,2) NOT NULL);
+```
+
+| Step | Terminal A | Terminal B |
+|---|---|---|
+| 1 | `BEGIN; INSERT INTO payments (idem_key, account_id, amount) VALUES ('req-7', 2, 1) ON CONFLICT (idem_key) DO NOTHING RETURNING id;` | |
+| 2 | | Same statement in its own `BEGIN` (predict: 1 row, 0 rows, or wait?) |
+| 3 | `COMMIT;` | (what does B get now?) |
+
+Then in MySQL, REPEATABLE READ, without a unique key: A `START TRANSACTION; SELECT … WHERE idem_key = 'req-8'`; B the same; both insert; both commit. Count the rows.
+
+**Advisory locks:** in two psql terminals run `SELECT pg_try_advisory_lock(42);`, then in A `BEGIN; COMMIT;` and try again in B. Repeat with `BEGIN; SELECT pg_advisory_xact_lock(43);` in A. In MySQL: `SELECT GET_LOCK('nightly-report', 0);` in both, then disconnect A.
+
+Reference: the session lock survived A's COMMIT (B: false); the transaction lock was free right after COMMIT (B: true); `GET_LOCK` returned 1, then 0, then 1 after A disconnected.
+
+## Session quiz
+
+1. In Exercise 1, MySQL lost exactly 350 of 400 withdrawals in both runs. What does that say about how the workers interleaved?
+2. Rewrite this ORM code as a safe single statement in PostgreSQL, MySQL and MongoDB: load product, `if stock >= qty then stock -= qty`, save.
+3. On one hot row, optimistic locking needed thousands of retries. Give two designs that avoid both the retries and a single hot row.
+4. In Exercise 3, why did 385 of 800 transactions fail without `--max-tries`, and why was the sum still 20,000.00 even then?
+5. Your MySQL service logs show occasional `1205` errors and accounting differences. What is the likely link, and what are two fixes?
+6. Why was the `FOR UPDATE` queue ≈ 6× slower than `SKIP LOCKED` in pgbench, even though no job was processed twice in either?
+7. A webhook from a payment provider may arrive several times. Design the table and the handler so that the order is marked paid exactly once.
+8. Which pattern from this session would you use for each: (a) a like counter, (b) an admin editing a product for 10 minutes, (c) one nightly billing run across 4 app servers, (d) sending order-confirmation emails from a table?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-7-application-patterns/lab/answers">Answers to the session quiz</DeepDive>

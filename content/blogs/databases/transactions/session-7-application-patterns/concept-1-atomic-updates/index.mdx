@@ -1,0 +1,298 @@
+---
+title: "Concept 1: Read-then-write vs one atomic statement"
+description: "The most common concurrency bug in application code: read a value, compute in the application, write the result back. 8 workers × 50 withdrawals of 1.00 lost 347 of 400 in PostgreSQL, 350 in MySQL and 314 in MongoDB. The same work as one atomic UPDATE or $inc lost none. Why the engines get it right when the arithmetic stays inside the statement."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "lost-update", "atomic-update", "concurrency"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html#XACT-READ-COMMITTED"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-consistent-read.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html"
+  - "https://www.mongodb.com/docs/manual/core/write-operations-atomicity/"
+  - "https://www.mongodb.com/docs/manual/reference/operator/update/inc/"
+---
+
+<Tldr>
+Application code loves the shape **read → compute → write**: load the account, subtract in the application, save the new balance. Under concurrency it silently loses work: two workers read 1000.00, both write 999.00, one withdrawal disappears. In the lab, **8 workers × 50 withdrawals** of 1.00 from one account ended at **947.00** in PostgreSQL (347 of 400 withdrawals lost), **950.00** in MySQL (350 lost) and **914.00** in MongoDB (314 lost), with no error anywhere. The fix needs no locks in application code: put the arithmetic **inside one statement** (`SET balance = balance - 1`, `$inc`). Each engine then applies it to the **latest** committed version of the row: all three ended at exactly **600.00**. Add the business rule to the same statement (`WHERE balance >= 1`) and the row count tells you whether the withdrawal happened.
+</Tldr>
+
+## The experiment
+
+Account 1 starts at 1000.00. 8 workers each make 50 withdrawals of 1.00, so the correct final balance is **600.00**. Each statement is its own transaction (autocommit), as in most ORM code paths.
+
+| Pattern | Statements per withdrawal | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|---|
+| ✗ Read-then-write | `SELECT balance` → compute → `UPDATE … SET balance = :new` | 947.00–949.00: **347–349 lost** | 950.00: **350 lost** | 914.00–926.00: **314–326 lost** |
+| ✓ Atomic | `UPDATE … SET balance = balance - 1 WHERE … AND balance >= 1` / `$inc` | 600.00, ≈ 0.24–0.27 s | 600.00, ≈ 0.6–1.0 s | 600.00, ≈ 0.12 s |
+
+Two runs each; timings are approximate (other experiments shared the machine). The read-then-write runs were not slower: they were **fast and wrong**, and nothing in any log said so.
+
+| Term | Meaning |
+|---|---|
+| Lost update | Two transactions read the same value, both write a value computed from it; the second write erases the first |
+| Read-then-write | Read a value in one statement, compute in the application, write the result in another |
+| Atomic update | The read, the computation and the write happen in one statement on one row or document |
+| Conditional update | An atomic update whose `WHERE` (or filter) also checks the business rule (`balance >= 1`); the affected-row count says whether it applied |
+| **✓ Correct / ✗ Lost** | Final balance 600.00, or higher because withdrawals vanished |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: two withdrawals from account 1"
+  height={230}
+  nodes={[
+    { id: 't1', label: 'T1 (worker 1)', sub: 'withdraw 1.00', x: 20, y: 20, w: 200 },
+    { id: 't2', label: 'T2 (worker 2)', sub: 'withdraw 1.00', x: 20, y: 150, w: 200 },
+    { id: 'row', label: 'accounts id = 1', sub: 'balance 1000.00', x: 300, y: 85, w: 220 },
+    { id: 'ok', label: '✓ Both applied', sub: '998.00', x: 600, y: 20, w: 180 },
+    { id: 'lost', label: '✗ One lost', sub: '999.00', x: 600, y: 150, w: 180 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row' },
+    { id: 't2-row', from: 't2', to: 'row' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-lost', from: 'row', to: 'lost' },
+  ]}
+  cases={[
+    {
+      title: '✗ Read-then-write',
+      path: 'T1 reads 1000.00 → T2 reads 1000.00 → T1 writes 999.00 → T2 writes 999.00 → ✗ one withdrawal lost',
+      summary: '8 workers × 50: final 947.00–949.00, 347–349 of 400 withdrawals lost, no error.',
+      steps: [
+        {
+          title: 't1: both workers read',
+          note: 'Each worker runs SELECT balance. Under READ COMMITTED each statement sees the latest committed value: both see 1000.00. Reads take no row lock.',
+          code: 'SELECT balance FROM accounts WHERE id = 1;   -- 1000.00 (both workers)',
+          active: ['t1', 't2', 'row'],
+          edges: ['t1-row', 't2-row'],
+        },
+        {
+          title: 't2: T1 writes its computed value',
+          note: 'The application computes 1000.00 − 1 and sends the result as a constant. The database has no idea it came from a read.',
+          code: "UPDATE accounts SET balance = 999.00 WHERE id = 1;   -- T1",
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+          subs: { row: 'balance 999.00 (T1)' },
+        },
+        {
+          title: '✗ t3: T2 overwrites it with the same value',
+          note: 'T2 also writes 999.00. Both UPDATEs succeed, the balance went down by 1.00 for 2.00 of withdrawals. In the lab 8 workers interleaved like this most of the time: 347 of 400 withdrawals vanished.',
+          code: "UPDATE accounts SET balance = 999.00 WHERE id = 1;   -- T2, also 999.00",
+          active: ['t2', 'row', 'lost'],
+          edges: ['t2-row', 'row-lost'],
+          subs: { row: 'balance 999.00 (T2)' },
+        },
+      ],
+    },
+    {
+      title: '✓ Atomic UPDATE',
+      path: 'T1 updates (row lock) → T2 waits → T1 commits → T2 re-reads the new version → ✓ 998.00',
+      summary: '8 workers × 50: final exactly 600.00 in ≈ 0.25 s.',
+      steps: [
+        {
+          title: 't1: T1 updates and locks the row',
+          note: 'balance = balance − 1 is evaluated on the row version T1 is updating. The UPDATE takes a row lock until T1 commits.',
+          code: 'UPDATE accounts SET balance = balance - 1 WHERE id = 1 AND balance >= 1;',
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+          subs: { row: 'balance 999.00 (T1, locked)' },
+        },
+        {
+          title: 't2: T2 waits for the row lock',
+          note: 'T2 runs the same statement, finds the row locked by T1 and waits. It does not compute anything from a stale value.',
+          active: ['t2', 'row'],
+          edges: ['t2-row'],
+        },
+        {
+          title: '✓ t3: T2 re-checks the newest version',
+          note: 'When T1 commits, READ COMMITTED re-evaluates T2\'s WHERE clause on the new row version (999.00 ≥ 1: still true) and applies balance − 1 to it: 998.00. This re-check is called EvalPlanQual.',
+          active: ['t2', 'row', 'ok'],
+          edges: ['t2-row', 'row-ok'],
+          subs: { row: 'balance 998.00' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL
+
+InnoDB has a twist: a plain `SELECT` is a **consistent read** from the transaction's snapshot, but `UPDATE` is a **locking read** that always works on the latest committed version. That is why the atomic form works even under REPEATABLE READ.
+
+<Flow
+  title="MySQL: two withdrawals from account 1"
+  height={230}
+  nodes={[
+    { id: 't1', label: 'T1 (worker 1)', sub: 'withdraw 1.00', x: 20, y: 20, w: 200 },
+    { id: 't2', label: 'T2 (worker 2)', sub: 'withdraw 1.00', x: 20, y: 150, w: 200 },
+    { id: 'row', label: 'accounts id = 1', sub: 'clustered index record', x: 300, y: 85, w: 220 },
+    { id: 'ok', label: '✓ Both applied', sub: '998.00', x: 600, y: 20, w: 180 },
+    { id: 'lost', label: '✗ One lost', sub: '999.00', x: 600, y: 150, w: 180 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row' },
+    { id: 't2-row', from: 't2', to: 'row' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-lost', from: 'row', to: 'lost' },
+  ]}
+  cases={[
+    {
+      title: '✗ Read-then-write',
+      path: 'both SELECT 1000.00 (consistent reads, no lock) → both UPDATE … = 999.00 → ✗ one lost',
+      summary: '8 workers × 50: final 950.00 in both runs, 350 of 400 lost.',
+      steps: [
+        {
+          title: 't1: two consistent reads',
+          note: 'A plain SELECT reads a snapshot and takes no lock. Both workers see 1000.00.',
+          code: 'SELECT balance FROM accounts WHERE id = 1;   -- 1000.00 (both)',
+          active: ['t1', 't2', 'row'],
+          edges: ['t1-row', 't2-row'],
+        },
+        {
+          title: '✗ t2: both write 999.00',
+          note: 'T1 writes 999.00; T2 waits briefly for T1\'s row lock (autocommit makes it short), then also writes 999.00. Only 50 of the 400 withdrawals survived in the lab: the 8 workers moved in near lockstep.',
+          code: 'UPDATE accounts SET balance = 999.00 WHERE id = 1;   -- T1, then T2',
+          active: ['t1', 't2', 'row', 'lost'],
+          edges: ['t1-row', 't2-row', 'row-lost'],
+          subs: { row: 'balance 999.00' },
+        },
+      ],
+    },
+    {
+      title: '✓ Atomic UPDATE',
+      path: 'UPDATE is a locking read: T2 waits for T1\'s X lock, then reads the latest version → ✓ 998.00',
+      summary: '8 workers × 50: final 600.00.',
+      steps: [
+        {
+          title: 't1: T1 locks the record',
+          note: 'The UPDATE takes an exclusive record lock on the clustered index entry for id 1 and computes balance − 1 from the current version.',
+          code: 'UPDATE accounts SET balance = balance - 1 WHERE id = 1 AND balance >= 1;',
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+          subs: { row: '999.00, X lock (T1)' },
+        },
+        {
+          title: '✓ t2: T2 reads the latest committed version',
+          note: 'T2 waits for the lock. After T1 commits, the UPDATE reads the newest committed version (a locking read never uses the snapshot), checks balance >= 1 and writes 998.00.',
+          active: ['t2', 'row', 'ok'],
+          edges: ['t2-row', 'row-ok'],
+          subs: { row: '998.00' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+A single-document update is atomic in MongoDB: the filter is matched and the update applied to one version of the document. Two concurrent updates of the same document cause a write conflict inside the storage engine, which the server retries automatically for single-document writes outside a transaction.
+
+<Flow
+  title="MongoDB: two withdrawals from account 1"
+  height={230}
+  nodes={[
+    { id: 't1', label: 'Client 1', sub: 'withdraw 1.00', x: 20, y: 20, w: 200 },
+    { id: 't2', label: 'Client 2', sub: 'withdraw 1.00', x: 20, y: 150, w: 200 },
+    { id: 'doc', label: 'accounts _id: 1', sub: 'balance 1000.00', x: 300, y: 85, w: 220 },
+    { id: 'ok', label: '✓ Both applied', sub: '998.00', x: 600, y: 20, w: 180 },
+    { id: 'lost', label: '✗ One lost', sub: '999.00', x: 600, y: 150, w: 180 },
+  ]}
+  edges={[
+    { id: 't1-doc', from: 't1', to: 'doc' },
+    { id: 't2-doc', from: 't2', to: 'doc' },
+    { id: 'doc-ok', from: 'doc', to: 'ok' },
+    { id: 'doc-lost', from: 'doc', to: 'lost' },
+  ]}
+  cases={[
+    {
+      title: '✗ findOne then $set',
+      path: 'both findOne → 1000.00 → both $set 999.00 → ✗ one lost',
+      summary: '8 clients × 50: final 914.00–926.00, 314–326 of 400 lost.',
+      steps: [
+        {
+          title: 't1: both clients read the document',
+          code: 'const d = await accounts.findOne({ _id: 1 });   // balance 1000.00',
+          note: 'Two reads of the same committed document.',
+          active: ['t1', 't2', 'doc'],
+          edges: ['t1-doc', 't2-doc'],
+        },
+        {
+          title: '✗ t2: both $set the computed value',
+          note: '$set with a constant computed in the client: the second write replaces the first. The server sees two valid, unrelated updates.',
+          code: 'await accounts.updateOne({ _id: 1 }, { $set: { balance: 999.00 } });',
+          active: ['t1', 't2', 'doc', 'lost'],
+          edges: ['t1-doc', 't2-doc', 'doc-lost'],
+          subs: { doc: 'balance 999.00' },
+        },
+      ],
+    },
+    {
+      title: '✓ $inc with a guard',
+      path: 'filter balance ≥ 1 and $inc −1 in one operation → conflict retried by the server → ✓ 998.00',
+      summary: '8 clients × 50: final 600.00 in ≈ 0.12 s, the fastest of the three engines here.',
+      steps: [
+        {
+          title: '✓ One operation per withdrawal',
+          note: 'The filter (balance ≥ 1) and $inc apply to the same document version. If two updates collide, WiredTiger reports a write conflict and the server retries the operation on the new version. modifiedCount 0 means the guard failed (not enough money).',
+          code: 'await accounts.updateOne({ _id: 1, balance: { $gte: 1 } }, { $inc: { balance: -1 } });',
+          active: ['t1', 't2', 'doc', 'ok'],
+          edges: ['t1-doc', 't2-doc', 'doc-ok'],
+          subs: { doc: 'balance 998.00' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## The guard belongs in the statement
+
+| Need | ✗ Read-then-write | ✓ Atomic, guarded |
+|---|---|---|
+| Withdraw if enough money | `SELECT balance`, `if balance >= amount`, `UPDATE … SET balance = :new` | `UPDATE accounts SET balance = balance - :amt WHERE id = :id AND balance >= :amt` → 1 row = done, 0 = refused |
+| Sell one unit if in stock | `SELECT stock`, `if stock > 0`, `UPDATE … SET stock = :new` | `UPDATE inventory SET stock = stock - 1 WHERE sku = :sku AND stock > 0` |
+| Count a page view | `views = views + 1` in the ORM entity | `UPDATE … SET views = views + 1` / `$inc` |
+| Several fields from one decision | Read-then-write in a transaction, plus a lock or a version check | Concept 2 |
+
+The `CHECK (balance >= 0)` constraint in the lab schema is a second line of defence: a buggy update that would go negative fails instead of silently corrupting data. It does not catch lost updates: 947.00 is a perfectly valid balance.
+
+<Pitfall>
+ORMs make read-then-write the default. `account = Repo.get(Account, 1)`, `account.balance - 1`, `Repo.update(changeset)` (Ecto), `account.balance -= 1; account.save` (ActiveRecord) or `entity.setBalance(…)` (JPA) all send `SET balance = <constant>`. Wrapping it in a transaction does not help under READ COMMITTED (PostgreSQL's default): the read still takes no lock. Use the ORM's atomic form (`Repo.update_all(… inc: [balance: -1])`, `update_counters`, `UPDATE … SET x = x - 1`), a version column, or a row lock (Concept 2).
+</Pitfall>
+
+## Real-world scenario: the flash sale
+
+A shop sells 100 units of a product at 10:00. The checkout service reads `stock`, checks `stock > 0`, and writes `stock - 1`. With hundreds of concurrent checkouts, many read the same stock value: the shop sells far more than 100 units, and stock still looks positive.
+
+| Fix | Effect |
+|---|---|
+| `UPDATE inventory SET stock = stock - 1 WHERE sku = ? AND stock > 0` | Exactly 100 succeed; the rest get 0 rows and see "sold out" |
+| `CHECK (stock >= 0)` | Any other code path that would oversell fails loudly |
+| One hot row for a very popular SKU | Every checkout queues on its row lock (Session 5); split stock into a few bucket rows if throughput matters |
+
+## Why this matters for application patterns
+
+| Later concept | Why this concept matters |
+|---|---|
+| Concept 2: optimistic vs pessimistic | When one statement cannot express the change, you need a version check or a lock |
+| Concept 4: job queues | Claiming a job is the same problem: read "queued", write "running" |
+| Concept 5: idempotency keys | The same request applied twice is the mirror image of a lost update |
+
+## Key takeaways
+
+1. Read → compute in the application → write loses updates under concurrency: 314–350 of 400 withdrawals in the lab, with no error.
+2. Arithmetic inside one statement (`balance = balance - 1`, `$inc`) is applied to the latest version by all three engines: exactly 600.00.
+3. Put the business rule in the same statement (`WHERE balance >= 1`) and use the affected-row count as the answer.
+4. InnoDB's UPDATE is a locking read of the latest version, unlike its plain SELECT; PostgreSQL re-checks the WHERE clause on the new version (EvalPlanQual).
+5. ORMs default to read-then-write; look for their atomic update form.
+
+## Check questions
+
+1. Why did read-then-write lose updates in all three engines without any error?
+2. In PostgreSQL READ COMMITTED, what happens to the second `UPDATE … SET balance = balance - 1` while the first is uncommitted, and after it commits?
+3. Under InnoDB REPEATABLE READ, a transaction reads balance 1000.00 with a plain SELECT, then runs `UPDATE … SET balance = balance - 1`. Which version does the UPDATE use, and why?
+4. Rewrite "sell one unit if in stock" as a single statement for each engine and say how the application knows whether it sold.
+5. Does wrapping the read-then-write in `BEGIN … COMMIT` fix the lost update in PostgreSQL's default isolation level? Why?
+6. What does `CHECK (balance >= 0)` protect against, and what does it not protect against?
+7. An Ecto service does `Repo.get`, changes `balance`, `Repo.update`. Name two ways to make it safe.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-7-application-patterns/concept-1-atomic-updates/answers">Worked answers to Q1–Q7</DeepDive>
