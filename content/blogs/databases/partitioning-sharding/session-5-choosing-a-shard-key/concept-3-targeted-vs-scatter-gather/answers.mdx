@@ -1,0 +1,65 @@
+---
+title: "Answers: Targeted queries vs scatter-gather"
+description: "Worked answers to the Session 5 Concept 3 check questions."
+companion: "answers"
+tags: ["sharding", "query-routing", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharded-cluster-query-router/"
+  - "https://docs.citusdata.com/en/stable/develop/reference_processing.html"
+---
+
+<Tldr>
+The router knows only the shard key. Anything else in the filter is useful to the shards, not to the routing.
+</Tldr>
+
+## Q1. Which keys targeted seller queries
+
+**Question:** which of the five MongoDB keys made both "seller 42" and "seller 42 + March" targeted, and why did hashed `_id` target neither?
+
+`{ seller_id: 1 }` and `{ seller_id: 1, created_at: 1 }`. For the compound key, an equality on the first field limits the possible ranges to those for seller 42, which sat on one shard. Hashed `_id` targets only filters on `_id`; seller 42's orders have random order ids, so they are spread over both shards.
+
+> **Common mistake:** thinking a compound key needs all its fields in the filter to be targeted. A prefix of the key is enough; a filter that skips the first field is not.
+
+## Q2. sh1 asked for nothing
+
+**Question:** why was sh1 asked about March 2025 on `o_range` although it holds none of those orders?
+
+mongos routes only by the shard key (`_id` here). The filter is on `created_at`, so mongos cannot rule out any shard and asks both. That March orders sit on sh2 is a consequence of ids growing with time, which mongos does not know. sh1 examined 0 keys but still paid the round trip.
+
+> **Common mistake:** assuming correlated fields help routing. Only the key itself does.
+
+## Q3. 1.3× vs 15×
+
+**Question:** why did the gap between targeted and scatter-gather differ so much between MongoDB (1.3×) and Citus (15×)?
+
+The fan-out factor differs: MongoDB had 2 shards, so scatter-gather meant 2 shard queries instead of 1; Citus had 32 shards, so it meant 32 shard queries (each with its own connection work and planning on the worker) instead of 1. The per-task overhead was also inflated by the Citus containers running under amd64 emulation, so the exact ratio is specific to this lab; the direction is not.
+
+> **Common mistake:** concluding "MongoDB handles scatter-gather better". Give MongoDB 32 shards and its fan-out cost grows the same way.
+
+## Q4. The index on id
+
+**Question:** the order-id lookup on `c_by_seller` went from 74 tps to 651 tps after one index. What did the index change, and what did it not change?
+
+Without an index on `id`, each of the 32 shards scanned its whole table to find one row (50–94 ms per lookup). The index turned each shard's work into an index probe. It did not change the routing: the query still goes to all 32 shards, which is why it stayed about 14× below the 9,349 tps of the table distributed by `id`.
+
+> **Common mistake:** fixing a fan-out query with indexes alone. Indexes make each shard's part cheap; only the key makes the query skip shards.
+
+## Q5. lazada + seller 42
+
+**Question:** on `o_mkt`, "lazada + seller 42" was targeted but "seller 42" was not. Why?
+
+`o_mkt` is keyed on `marketplace`. With `marketplace: 'lazada'` in the filter, mongos knows the single range (on sh1). "seller 42" alone says nothing about marketplace, and seller 42 sells on all three, so both shards are asked.
+
+> **Common mistake:** counting a query as targeted because it "usually" includes the key. Every query shape that omits it fans out.
+
+## Q6. Targeting order lookups on a seller key
+
+**Question:** name two ways to make a lookup by order id targeted on a collection sharded by seller.
+
+1. Make the caller send the seller id too (e.g. encode it in the order number or include it in the API), so the filter contains the key.
+2. Keep a small lookup collection `order_id → seller_id`, sharded by order id: one targeted read to find the seller, one targeted read for the order.
+
+A third option is to accept the fan-out if lookups by id are rare.
+
+> **Common mistake:** adding a secondary index on `_id` and calling it done (it exists already); the lookup is still sent to every shard.

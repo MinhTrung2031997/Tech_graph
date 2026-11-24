@@ -1,0 +1,248 @@
+---
+title: "Concept 1: What a shard key decides"
+description: "The shard key decides where every row lives, which shard takes each write and which queries can stay on one shard. Its cardinality caps how far data can spread: sharding 1M orders by marketplace (3 values) left MongoDB with 3 ranges, 2 of them unsplittable jumbo ranges, and an 80/20 split; Citus put shopee and tiktok in the same hash shard, so 2 of 32 shards held all the data. seller_id (5,000 values) spread evenly in both."
+type: "concept"
+tags: ["sharding", "shard-key", "mongodb", "citus", "cardinality"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-choose-a-shard-key/"
+  - "https://www.mongodb.com/docs/manual/core/sharding-data-partitioning/"
+  - "https://www.mongodb.com/docs/manual/core/sharding-balancer-administration/"
+  - "https://docs.citusdata.com/en/stable/sharding/data_modeling.html"
+  - "https://docs.citusdata.com/en/stable/develop/api_udf.html"
+---
+
+<Tldr>
+A **shard key** (MongoDB) or **distribution column** (Citus) is the field the cluster uses to decide which shard owns a row. It decides three things at once: **where the data sits**, **where each write goes** and **which queries can be answered by one shard**. You cannot spread data more finely than the key's distinct values. Sharding 1,000,000 orders by `marketplace` (3 values) gave MongoDB **3 ranges, 2 of them marked jumbo**, and a split of **800,496 vs 199,504 documents (90 MB vs 22 MB)** that the balancer can never fix. Citus hashed `shopee` and `tiktok` into the **same shard**, so **2 of 32 shards** held all the rows (59 MB on one worker, 15 MB on the other). With `seller_id` (5,000 values) both systems spread the same data evenly.
+</Tldr>
+
+## The setup
+
+The lab clusters from the [Session 5 lab](/blogs/databases/partitioning-sharding/session-5-choosing-a-shard-key/lab): MongoDB with two shards (`sh1`, `sh2`) behind a `mongos` router, and Citus with a coordinator and two workers (`w1`, `w2`). Each holds the same 1,000,000 `orders` (2024–2025, 5,000 sellers, `marketplace` shopee 50% / tiktok 30% / lazada 20%). The MongoDB copies were sharded while empty, then loaded in id order; each collection's range size was set to 4 MB so 113 MB of data is enough for the balancer to act:
+
+```js
+sh.shardCollection('pt5.o_mkt', { marketplace: 1 })
+db.adminCommand({ configureCollectionBalancing: 'pt5.o_mkt', chunkSize: 4 })   // MB, this collection only
+```
+
+| Term | Meaning |
+|---|---|
+| Shard key / distribution column | The field (or fields) whose value decides which shard owns a row |
+| Range (chunk) | MongoDB: a contiguous interval of shard-key values, owned by one shard, listed in `config.chunks` |
+| Hash shard | Citus: a range of hash values of the distribution column (32 by default), placed on one worker |
+| Cardinality | How many distinct values the key has: 3 for `marketplace`, 5,000 for `seller_id`, 1,000,000 for `id` |
+| Jumbo range | A range bigger than the range size that cannot be split, because every row in it has the same key value |
+| Balancer | MongoDB background process that moves ranges until shards hold similar amounts of data (difference under 3 × range size) |
+| **✓ / ✗** | The shard receives / does not receive the rows |
+
+## MongoDB: three values, three ranges
+
+<Flow
+  title="MongoDB: where orders land with shard key marketplace vs seller_id"
+  height={340}
+  nodes={[
+    { id: 'ins', label: 'insertMany', sub: '1,000,000 orders', x: 20, y: 20, w: 180 },
+    { id: 'mongos', label: 'mongos', sub: 'routing table', x: 300, y: 20, w: 200 },
+    { id: 'cfg', label: 'Config server', sub: 'config.chunks', x: 580, y: 20, w: 200 },
+    { id: 'r1', label: 'Range A', sub: 'MinKey → "shopee"', x: 20, y: 150, w: 200 },
+    { id: 'r2', label: 'Range B', sub: '"shopee" → "tiktok"', x: 300, y: 150, w: 200 },
+    { id: 'r3', label: 'Range C', sub: '"tiktok" → MaxKey', x: 580, y: 150, w: 200 },
+    { id: 'sh1', label: 'Shard sh1', sub: '', x: 20, y: 280, w: 200 },
+    { id: 'sh2', label: 'Shard sh2', sub: '', x: 580, y: 280, w: 200 },
+  ]}
+  edges={[
+    { id: 'ins-mongos', from: 'ins', to: 'mongos' },
+    { id: 'mongos-cfg', from: 'mongos', to: 'cfg', quiet: true },
+    { id: 'mongos-r1', from: 'mongos', to: 'r1', quiet: true },
+    { id: 'mongos-r2', from: 'mongos', to: 'r2', quiet: true },
+    { id: 'mongos-r3', from: 'mongos', to: 'r3', quiet: true },
+    { id: 'r1-sh1', from: 'r1', to: 'sh1', quiet: true },
+    { id: 'r2-sh2', from: 'r2', to: 'sh2', quiet: true },
+    { id: 'r3-sh2', from: 'r3', to: 'sh2', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Key { marketplace: 1 }',
+      path: 'mongos → 3 ranges only → lazada range ✓ moved to sh1 → shopee and tiktok ranges ✗ jumbo, stuck on sh2',
+      summary: 'Three distinct values can never become more than three ranges.',
+      subs: { r1: 'lazada: 199,504 docs', r2: 'shopee: 501,221 docs', r3: 'tiktok: 299,275 docs', sh1: 'waiting', sh2: 'primary shard of pt5' },
+      steps: [
+        {
+          title: 'Every insert starts on one shard',
+          note: 'An empty collection sharded on a ranged key starts as one range (MinKey → MaxKey) on the database\'s primary shard, sh2. All 1M inserts went there. MongoDB 8.0 does not split ranges while you insert; the balancer splits when it migrates.',
+          code: "sh.shardCollection('pt5.o_mkt', { marketplace: 1 })\n// config.chunks: 1 range on sh2",
+          active: ['ins', 'mongos', 'cfg', 'sh2'],
+          edges: ['ins-mongos', 'mongos-cfg'],
+        },
+        {
+          title: 'The balancer can only cut between values',
+          note: 'A range boundary must be a shard-key value, so the only possible cut points are "shopee" and "tiktok". The balancer moved the lazada range to sh1 six seconds into the load, while it held only 36,871 documents (1 migration); every later lazada insert went straight to sh1.',
+          active: ['mongos', 'r1', 'sh1'],
+          edges: ['mongos-r1', 'r1-sh1'],
+          subs: { sh1: '✓ 199,504 docs, 22 MB' },
+        },
+        {
+          title: 'Two jumbo ranges stay where they are',
+          note: 'shopee (501,221 docs) and tiktok (299,275 docs) are each one key value, far above the 4 MB range size. config.changelog shows the balancer tried to move shopee twice and tiktok once; each attempt ended in moveChunk.error, and both ranges were flagged jumbo: true. Final: sh2 owns 800,496 docs (90 MB), sh1 199,504 (22 MB), and no amount of waiting changes that.',
+          code: "db.getSiblingDB('config').chunks.find({ uuid: <o_mkt uuid>, jumbo: true }).count()   // 2",
+          active: ['r2', 'r3', 'sh2'],
+          edges: ['mongos-r2', 'mongos-r3', 'r2-sh2', 'r3-sh2'],
+          subs: { r2: '✗ jumbo', r3: '✗ jumbo', sh2: '✗ 800,496 docs, 90 MB' },
+        },
+      ],
+    },
+    {
+      title: 'Key { seller_id: 1 }',
+      path: 'mongos → ranges cut between any of 5,000 sellers → sh1 ✓ 7 ranges, sh2 ✓ 1 range → even data',
+      summary: 'Enough distinct values: the balancer can cut wherever it needs.',
+      subs: { r1: 'MinKey → 525 (1 of 7)', r2: '2199 → 2376 (7 of 7)', r3: '2376 → MaxKey', sh1: 'waiting', sh2: 'primary shard of pt5' },
+      steps: [
+        {
+          title: 'Same start: one range on sh2',
+          note: 'All 1M inserts went into the single initial range on sh2, exactly as with marketplace.',
+          active: ['ins', 'mongos', 'cfg', 'sh2'],
+          edges: ['ins-mongos', 'mongos-cfg'],
+        },
+        {
+          title: 'Seven 4 MB pieces move to sh1',
+          note: 'The balancer cut 7 ranges of about 4 MB (35,464–36,023 docs each) at seller boundaries and moved them to sh1.',
+          active: ['mongos', 'r1', 'r2', 'sh1'],
+          edges: ['mongos-r1', 'mongos-r2', 'r1-sh1'],
+          subs: { sh1: '✓ 475,313 docs, 53 MB' },
+        },
+        {
+          title: 'Balanced',
+          note: 'sh2 kept the rest as one big range (sellers 2376 and up): 524,687 docs, 59 MB. The shards are within 3 × 4 MB of each other, which is what "balanced" means to the balancer, so it stops.',
+          active: ['r3', 'sh2'],
+          edges: ['mongos-r3', 'r3-sh2'],
+          subs: { sh2: '✓ 524,687 docs, 59 MB' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Citus: three values, 32 hash shards
+
+Citus hashes the distribution column and maps each hash range to one of 32 shards. With only three values, at most three shards can ever receive rows, and two values can land in the same shard.
+
+<Flow
+  title="Citus: where orders land with distribution column marketplace vs seller_id"
+  height={340}
+  nodes={[
+    { id: 'ins', label: 'INSERT … SELECT', sub: '1,000,000 orders', x: 20, y: 20, w: 180 },
+    { id: 'coord', label: 'Coordinator', sub: 'hash(column)', x: 300, y: 20, w: 200 },
+    { id: 'meta', label: 'pg_dist_shard', sub: '32 hash ranges', x: 580, y: 20, w: 200 },
+    { id: 's1', label: 'Shard 102122', sub: 'hash range A', x: 20, y: 150, w: 200 },
+    { id: 's2', label: 'Shard 102129', sub: 'hash range B', x: 300, y: 150, w: 200 },
+    { id: 's3', label: 'Other 30 shards', sub: '', x: 580, y: 150, w: 200 },
+    { id: 'w1', label: 'Worker w1', sub: '', x: 20, y: 280, w: 200 },
+    { id: 'w2', label: 'Worker w2', sub: '', x: 580, y: 280, w: 200 },
+  ]}
+  edges={[
+    { id: 'ins-coord', from: 'ins', to: 'coord' },
+    { id: 'coord-meta', from: 'coord', to: 'meta', quiet: true },
+    { id: 'coord-s1', from: 'coord', to: 's1', quiet: true },
+    { id: 'coord-s2', from: 'coord', to: 's2', quiet: true },
+    { id: 'coord-s3', from: 'coord', to: 's3', quiet: true },
+    { id: 's1-w1', from: 's1', to: 'w1', quiet: true },
+    { id: 's2-w2', from: 's2', to: 'w2', quiet: true },
+    { id: 's3-w2', from: 's3', to: 'w2', quiet: true },
+  ]}
+  cases={[
+    {
+      title: "create_distributed_table('c_mkt', 'marketplace')",
+      path: 'hash(marketplace) → lazada ✓ shard 102122 on w1 → shopee + tiktok ✓ both shard 102129 on w2 → 30 shards ✗ empty',
+      summary: 'Two of three values collided in one shard.',
+      subs: { s1: 'lazada: 199,504 rows', s2: 'shopee + tiktok: 800,496', s3: '✗ empty', w1: '15 MB', w2: '59 MB' },
+      steps: [
+        {
+          title: 'Hash the value, look up the shard',
+          note: 'The coordinator hashes each row\'s marketplace and finds the shard whose hash range contains it (get_shard_id_for_distribution_column shows the mapping).',
+          code: "SELECT marketplace, get_shard_id_for_distribution_column('c_mkt', marketplace) FROM … ;\n-- lazada 102122, shopee 102129, tiktok 102129",
+          active: ['ins', 'coord', 'meta'],
+          edges: ['ins-coord', 'coord-meta'],
+        },
+        {
+          title: 'Three values, two shards',
+          note: 'shopee and tiktok hash into the same range: shard 102129 on w2 holds 800,496 rows (59 MB); lazada\'s shard on w1 holds 199,504 (15 MB). The other 30 shards are empty. A hash spreads many values evenly; it cannot spread three.',
+          active: ['coord', 's1', 's2', 's3', 'w1', 'w2'],
+          edges: ['coord-s1', 'coord-s2', 's1-w1', 's2-w2'],
+        },
+      ],
+    },
+    {
+      title: "create_distributed_table('c_by_seller', 'seller_id')",
+      path: 'hash(seller_id) → about 156 sellers per shard → all 32 shards ✓ 4.8–6.2 MB → w1 and w2 ✓ 16 shards each',
+      summary: '5,000 values fill every shard.',
+      subs: { s1: '≈156 sellers', s2: '≈156 sellers', s3: '≈156 sellers each', w1: '16 shards', w2: '16 shards' },
+      steps: [
+        {
+          title: 'Every shard gets sellers',
+          note: '5,000 seller ids hash into all 32 ranges. Shard sizes ranged from 4,840 kB to 6,192 kB (181 MB in total); the spread comes from each shard holding a different number of sellers.',
+          active: ['ins', 'coord', 'meta', 's1', 's2', 's3'],
+          edges: ['ins-coord', 'coord-meta', 'coord-s1', 'coord-s2', 'coord-s3'],
+        },
+        {
+          title: 'Placed evenly on the workers',
+          note: 'Citus places the 32 shards round-robin: 16 on each worker.',
+          active: ['s1', 's2', 's3', 'w1', 'w2'],
+          edges: ['s1-w1', 's2-w2', 's3-w2'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Measured
+
+| Key | System | Ranges / shards with data | Split between the two shards |
+|---|---|---|---|
+| `marketplace` (3 values) | MongoDB | 3 ranges, 2 jumbo | **800,496 / 199,504 docs** (90 / 22 MB) |
+| `marketplace` (3 values) | Citus | **2 of 32** shards | 59 MB / 15 MB |
+| `seller_id` (5,000 values) | MongoDB | 8 ranges after 7 migrations | 524,687 / 475,313 docs (59 / 53 MB) |
+| `seller_id` (5,000 values) | Citus | 32 of 32 | 16 shards per worker, 4.8–6.2 MB each |
+| `id` (1,000,000 values) | Citus | 32 of 32 | 5.5–5.8 MB each |
+
+The three properties to check for any candidate key:
+
+| Property | Question | Bad here |
+|---|---|---|
+| **Cardinality** | How many distinct values? It caps how many pieces the data can be cut into | `marketplace`: 3 |
+| **Frequency** | Does one value hold a large share of rows? That value's rows can never be split | A seller with 20% of orders (Concept 4) |
+| **Monotonicity** | Do new values always go up (ids, timestamps)? With ranges, every insert hits the last range | Ranged `_id`, `created_at` (Concept 2) |
+
+<Pitfall>
+A low-cardinality key looks fine on day one: three ranges on two shards is "balanced enough". It becomes a dead end when you add a third, fourth or tenth shard: with three values there are never more than three units to move, and the biggest value's share (here shopee, 50%) is the floor for one shard's load. Changing the key later means resharding the whole collection (Session 6) or redistributing the table.
+</Pitfall>
+
+## Real-world scenario: sharding by country or marketplace
+
+A team sharding a multi-country order table proposes `country` as the key because "every query filters on it". With Vietnam, Thailand and a handful of other markets, that key has single-digit cardinality and very uneven frequency: the largest market's rows can never leave one shard. Keep `country` as a **query filter**, and pick a key with many values that the main queries also filter on (a seller or shop id), or a compound key with `country` first and a high-cardinality field second.
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 1, partitioning vs sharding vs replication](/blogs/databases/partitioning-sharding/session-1-why-split-data/concept-3-partitioning-sharding-replication) | The partition key in a single database and the shard key across machines answer the same "which piece owns this row" question |
+| [Session 2, list partitioning](/blogs/databases/partitioning-sharding/session-2-partitioning-postgresql/concept-1-declarative-partitioning) | A list partition per marketplace is fine inside one server; as a shard key the same column cannot spread load |
+| Concept 3 | The key also decides which queries are routed to one shard |
+
+## Key takeaways
+
+1. The shard key decides data placement, write routing and query targeting at once.
+2. Data can be cut into at most as many pieces as the key has distinct values.
+3. `marketplace` (3 values): MongoDB ended with 2 jumbo ranges and an 80/20 split; Citus filled 2 of 32 shards.
+4. `seller_id` (5,000 values) spread evenly in both systems.
+5. Check cardinality, frequency and monotonicity before choosing.
+
+## Check questions
+
+1. Name the three things a shard key decides.
+2. Why did the MongoDB balancer move the lazada range but not the shopee range?
+3. What does `jumbo: true` on a range mean, and why can't waiting fix it?
+4. Citus has 32 shards. Why did only 2 receive rows with `marketplace`, and could it have been 3?
+5. Both collections started with all 1M documents on sh2. Why, and what did the balancer do differently for `seller_id`?
+6. Your cluster grows from 2 to 6 shards. What is the best possible split of the `marketplace`-keyed collection?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-5-choosing-a-shard-key/concept-1-what-a-shard-key-decides/answers">Worked answers to Q1–Q6</DeepDive>

@@ -5,6 +5,7 @@
     "session-2-partitioning-postgresql",
     "session-3-indexes-and-constraints",
     "session-4-partition-lifecycle",
+    "session-5-choosing-a-shard-key",
     "session-7-sharding-postgresql-mysql"
   ]
 }

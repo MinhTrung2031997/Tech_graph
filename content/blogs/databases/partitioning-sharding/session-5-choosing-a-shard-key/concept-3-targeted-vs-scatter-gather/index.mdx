@@ -1,0 +1,265 @@
+---
+title: "Concept 3: Targeted queries vs scatter-gather"
+description: "A query that filters on the shard key goes to one shard; any other query goes to all of them and the router merges the results. Measured on five MongoDB shard keys and two Citus distribution columns: the same seller+month query ran 5,228 vs 3,908 queries/s on MongoDB (1 shard vs 2) and 8,898 vs 576 transactions/s on Citus (1 task vs 32)."
+type: "concept"
+tags: ["sharding", "shard-key", "mongodb", "citus", "query-routing", "explain"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharded-cluster-query-router/"
+  - "https://www.mongodb.com/docs/manual/reference/explain-results/#sharded-collection"
+  - "https://docs.citusdata.com/en/stable/develop/reference_processing.html"
+  - "https://docs.citusdata.com/en/stable/performance/performance_tuning.html"
+---
+
+<Tldr>
+The router (MongoDB `mongos`, the Citus coordinator) can send a query to **one shard** only when the filter pins the shard key to one value (or a range, for ranged keys). Every other query is **scatter-gather**: sent to all shards, results merged by the router. On MongoDB `explain` says `SINGLE_SHARD` or `SHARD_MERGE`; on Citus `EXPLAIN` shows `Task Count: 1` or `Task Count: 32`. The same "seller 42 in March" query ran **5,228 vs 3,908 queries/s** on MongoDB (key `seller_id` vs hashed `_id`, two shards) and **8,898 vs 576 transactions/s** on Citus (distributed by `seller_id` vs `id`, 32 shards). The reverse holds too: a lookup by order id dropped from **9,349 to 651 tps** on the table distributed by seller. **Pick the key your most frequent queries filter on.**
+</Tldr>
+
+## The setup
+
+The five MongoDB copies from Concepts 1–2, each with the same secondary indexes (`{ seller_id: 1, created_at: 1 }` and `{ created_at: 1 }`) so that only routing differs, and two Citus tables with the same indexes:
+
+| Collection / table | Shard key / distribution column |
+|---|---|
+| `o_hashed` | `{ _id: 'hashed' }` |
+| `o_range` | `{ _id: 1 }` |
+| `o_seller` | `{ seller_id: 1 }` |
+| `o_mkt` | `{ marketplace: 1 }` |
+| `o_seller_time` | `{ seller_id: 1, created_at: 1 }` |
+| `c_by_id` (Citus) | `id` |
+| `c_by_seller` (Citus) | `seller_id` (primary key `(seller_id, id)`, plus an index on `id`) |
+
+| Term | Meaning |
+|---|---|
+| Targeted query | The router can compute the single shard that holds every possible match from the filter |
+| Scatter-gather | The router sends the query to every shard and merges the answers |
+| `SINGLE_SHARD` / `SHARD_MERGE` | MongoDB explain: top stage for a targeted / scatter-gather query |
+| Router query / `Task Count` | Citus: a query answered by one shard; Task Count is how many shard queries the coordinator runs |
+| **✓ Asked / ✗ Skipped** | The router sends the query to that shard / does not |
+
+## MongoDB: who gets asked
+
+<Flow
+  title="MongoDB: seller 42 in March 2025, by shard key"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'find()', sub: 'seller 42, March', x: 20, y: 20, w: 180 },
+    { id: 'mongos', label: 'mongos', sub: 'reads the filter', x: 300, y: 20, w: 200 },
+    { id: 'res', label: 'Result', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'sh1', label: 'Shard sh1', sub: '', x: 20, y: 200, w: 200 },
+    { id: 'sh2', label: 'Shard sh2', sub: '', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'q-mongos', from: 'q', to: 'mongos' },
+    { id: 'mongos-sh1', from: 'mongos', to: 'sh1', quiet: true },
+    { id: 'mongos-sh2', from: 'mongos', to: 'sh2', quiet: true },
+    { id: 'mongos-res', from: 'mongos', to: 'res' },
+  ]}
+  cases={[
+    {
+      title: 'Key { seller_id: 1 }: targeted',
+      path: 'mongos ✓ seller_id 42 falls in one range → sh1 ✓ asked → sh2 ✗ skipped → SINGLE_SHARD',
+      summary: 'The filter contains the shard key, so one shard answers.',
+      subs: { sh1: 'owns sellers 1 … 2375', sh2: 'owns 2376 … MaxKey', res: '4 docs' },
+      steps: [
+        {
+          title: 'Look up the range for seller 42',
+          note: 'The filter pins seller_id to 42; mongos finds the one range containing 42 in its cached routing table: it is on sh1.',
+          code: "db.o_seller.find({ seller_id: 42, created_at: { $gte: ISODate('2025-03-01'), $lt: ISODate('2025-04-01') } })\n  .explain('executionStats').queryPlanner.winningPlan.stage   // 'SINGLE_SHARD'",
+          active: ['q', 'mongos'],
+          edges: ['q-mongos'],
+        },
+        {
+          title: 'One shard answers',
+          note: 'sh1 examined 4 index keys and returned 4 documents. sh2 never saw the query.',
+          active: ['mongos', 'sh1', 'res'],
+          edges: ['mongos-sh1', 'mongos-res'],
+          subs: { sh1: '✓ 4 keys, 4 docs', sh2: '✗ not asked' },
+        },
+      ],
+    },
+    {
+      title: "Key { _id: 'hashed' }: scatter-gather",
+      path: 'mongos ✗ filter has no _id → sh1 ✓ asked → sh2 ✓ asked → SHARD_MERGE',
+      summary: 'Seller 42\'s orders are spread by order id, so both shards must look.',
+      subs: { sh1: 'hash ≥ 0', sh2: 'hash < 0', res: '4 docs' },
+      steps: [
+        {
+          title: 'No shard key in the filter',
+          note: 'mongos cannot tell where seller 42\'s orders are, so it sends the query to every shard that owns a range of o_hashed.',
+          active: ['q', 'mongos'],
+          edges: ['q-mongos'],
+        },
+        {
+          title: 'Both shards search, mongos merges',
+          note: 'sh1 found 2 and sh2 found 2 (2 index keys each); mongos merged them (SHARD_MERGE). Each shard did a full index search for a tiny answer.',
+          active: ['mongos', 'sh1', 'sh2', 'res'],
+          edges: ['mongos-sh1', 'mongos-sh2', 'mongos-res'],
+          subs: { sh1: '✓ 2 keys, 2 docs', sh2: '✓ 2 keys, 2 docs' },
+        },
+      ],
+    },
+    {
+      title: 'Key { _id: 1 } and the month query: asked for nothing',
+      path: 'mongos ✗ created_at is not the key → sh1 ✓ asked, finds 0 → sh2 ✓ asked, finds 42,408 → SHARD_MERGE',
+      summary: 'Even when the data happens to sit on one shard, only the key lets mongos know that.',
+      subs: { sh1: 'ids 1 … 497,602', sh2: 'ids 497,603 …', res: '42,408 docs' },
+      steps: [
+        {
+          title: 'March 2025 lives on sh2 only',
+          note: 'Ids grow with time and sh2 owns the high ids, so every March 2025 order is on sh2. But the filter is on created_at, not on _id.',
+          code: "db.o_range.find({ created_at: { $gte: ISODate('2025-03-01'), $lt: ISODate('2025-04-01') } })",
+          active: ['q', 'mongos'],
+          edges: ['q-mongos'],
+        },
+        {
+          title: 'sh1 is asked anyway',
+          note: 'Explain: sh1 examined 0 keys, sh2 42,408. sh1 paid a round trip and an index probe for nothing.',
+          active: ['mongos', 'sh1', 'sh2', 'res'],
+          edges: ['mongos-sh1', 'mongos-sh2', 'mongos-res'],
+          subs: { sh1: '✓ asked: 0 keys', sh2: '✓ 42,408 keys' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Citus: one task or 32
+
+<Flow
+  title="Citus: seller 42 in March 2025, distributed by seller_id vs id"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'SELECT', sub: 'seller 42, March', x: 20, y: 20, w: 180 },
+    { id: 'coord', label: 'Coordinator', sub: 'distributed planner', x: 300, y: 20, w: 200 },
+    { id: 'res', label: 'Result', sub: 'count, sum', x: 580, y: 20, w: 200 },
+    { id: 'w1', label: 'Worker w1', sub: '16 shards', x: 20, y: 200, w: 200 },
+    { id: 'w2', label: 'Worker w2', sub: '16 shards', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'q-coord', from: 'q', to: 'coord' },
+    { id: 'coord-w1', from: 'coord', to: 'w1', quiet: true },
+    { id: 'coord-w2', from: 'coord', to: 'w2', quiet: true },
+    { id: 'coord-res', from: 'coord', to: 'res' },
+  ]}
+  cases={[
+    {
+      title: 'c_by_seller: router query',
+      path: 'coordinator ✓ hash(42) → 1 shard on w2 ✓ → w1 ✗ → Task Count: 1',
+      summary: 'The whole query, aggregate included, runs on one shard.',
+      steps: [
+        {
+          title: 'Plan: one task',
+          note: 'seller_id = 42 hashes to one shard, so Citus sends the whole SQL (count and sum included) to that shard on w2.',
+          code: "EXPLAIN SELECT count(*), sum(amount) FROM c_by_seller\nWHERE seller_id = 42 AND created_at >= '2025-03-01' AND created_at < '2025-04-01';\n-- Custom Scan (Citus Adaptive)\n--   Task Count: 1\n--   Node: host=pt-citus-w2",
+          active: ['q', 'coord', 'w2'],
+          edges: ['q-coord', 'coord-w2'],
+          subs: { w2: '✓ 1 task', w1: '✗ not asked' },
+        },
+        {
+          title: 'Throughput',
+          note: 'pgbench, 4 clients, random seller, 10 s, 3 runs: 9,326 / 6,131 / 8,898 tps, median 8,898, latency 0.45 ms.',
+          active: ['coord', 'res'],
+          edges: ['coord-res'],
+        },
+      ],
+    },
+    {
+      title: 'c_by_id: multi-shard query',
+      path: 'coordinator ✗ seller_id is not the column → w1 ✓ 16 tasks → w2 ✓ 16 tasks → coordinator sums 32 partial results',
+      summary: 'Every shard is asked, and the coordinator combines the partial aggregates.',
+      steps: [
+        {
+          title: 'Plan: 32 tasks',
+          note: 'The filter says nothing about id, so the coordinator runs the query on all 32 shards; each returns a partial count and sum, and the coordinator adds them (an Aggregate node above the Custom Scan).',
+          code: "-- Aggregate\n--   ->  Custom Scan (Citus Adaptive)\n--         Task Count: 32",
+          active: ['q', 'coord', 'w1', 'w2'],
+          edges: ['q-coord', 'coord-w1', 'coord-w2'],
+          subs: { w1: '✓ 16 tasks', w2: '✓ 16 tasks' },
+        },
+        {
+          title: 'Throughput',
+          note: 'Same pgbench: 576 / 522 / 674 tps, median 576, latency 6.9 ms: about 15× fewer queries per second than the router query.',
+          active: ['coord', 'res'],
+          edges: ['coord-res'],
+        },
+      ],
+    },
+    {
+      title: 'Lookup by order id: the roles swap',
+      path: 'c_by_id ✓ Task Count 1 → c_by_seller ✗ Task Count 32 (index on id in every shard)',
+      summary: 'Whatever is not the distribution column becomes a fan-out.',
+      steps: [
+        {
+          title: 'id = :i on both tables',
+          note: 'pgbench, random id, 3 runs: c_by_id median 9,349 tps (0.43 ms); c_by_seller median 651 tps (6.1 ms) with an index on id in each shard. Before that index existed, each of the 32 shards scanned its whole table: 74 / 80 / 43 tps, 50–94 ms.',
+          code: "CREATE INDEX c_by_seller_id_idx ON c_by_seller (id);   -- created on all 32 shards",
+          active: ['q', 'coord', 'w1', 'w2', 'res'],
+          edges: ['q-coord', 'coord-w1', 'coord-w2', 'coord-res'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Measured: which queries are targeted
+
+MongoDB `explain('executionStats')` through `mongos` (1 = `SINGLE_SHARD`, 2 = `SHARD_MERGE` on both shards). Latency is the median of 5 runs and is 0–3 ms for every small query; the month query returns 42,408 documents and took 87–119 ms on every key.
+
+| Query | hashed `_id` | ranged `_id` | `seller_id` | `marketplace` | `{ seller_id, created_at }` |
+|---|---|---|---|---|---|
+| `_id: 777777` | **1** | **1** | 2 | 2 | 2 |
+| `seller_id: 42` | 2 | 2 | **1** | 2 | **1** |
+| March 2025 | 2 | 2 | 2 | 2 | 2 |
+| seller 42 + March | 2 | 2 | **1** | 2 | **1** |
+| lazada + seller 42 | 2 | 2 | **1** | **1** | **1** |
+
+Throughput of "seller 42 in March" with random sellers:
+
+| System | Targeted | Scatter-gather | Ratio |
+|---|---|---|---|
+| MongoDB, 2 shards: 4 clients × 1,500 queries, median of 5 rounds (includes client start-up) | 5,228 q/s (`o_seller`) | 3,908 q/s (`o_hashed`) | 1.3× |
+| Citus, 32 shards: pgbench 4 clients, median of 3 | 8,898 tps (`c_by_seller`) | 576 tps (`c_by_id`) | 15× |
+
+Why the gap differs: on MongoDB scatter-gather here means 2 shard queries instead of 1; on Citus it means 32 shard queries instead of 1. The cost of a fan-out grows with the number of shards, and adding shards makes targeted queries cheaper per shard but scatter-gather queries more expensive. (The Citus containers run under amd64 emulation on this Mac, which inflates per-task overhead; compare the ratio, not the absolute numbers, with other systems.)
+
+<Pitfall>
+"Our month report is a scatter-gather query, so it is slow" is usually the wrong conclusion. A report that reads a large share of the data is scatter-gather by nature and benefits from shards working in parallel (Concept 2 showed a 10,000-row range finishing faster on two shards). The queries to protect are the **small, frequent** ones (a seller's dashboard, an order lookup): those should hit one shard, because fanning them out multiplies their cost by the shard count while their result stays tiny.
+</Pitfall>
+
+## Real-world scenario: seller centre vs customer service
+
+A marketplace operations platform has two hot read paths: the seller centre ("my orders this month", by seller) and customer service ("look up order 123456789", by order id). Sharding by `seller_id` makes the first targeted and the second a fan-out. Common fixes:
+
+| Option | Effect |
+|---|---|
+| Put the seller id into the order number or the lookup request | Customer service sends `seller_id` + `id`: targeted |
+| A small lookup collection / table `order_id → seller_id`, sharded by order id | Two targeted queries instead of one fan-out |
+| Accept the fan-out for the rare path | Fine if order lookups are a small share of traffic |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 2, when pruning fails](/blogs/databases/partitioning-sharding/session-2-partitioning-postgresql/concept-3-when-pruning-fails) | The single-server version of the same rule: a lookup by `id` on a table partitioned by month opened all 24 partitions |
+| [Session 3, unique keys](/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-3-unique-keys) | Partition key in the primary key, distribution column in the primary key: the same constraint |
+| Concept 4 | A targeted key concentrates a hot seller on one shard |
+
+## Key takeaways
+
+1. A query is targeted only if its filter pins the shard key; otherwise every shard is asked.
+2. MongoDB explain shows `SINGLE_SHARD` or `SHARD_MERGE`; Citus shows `Task Count`.
+3. A shard with no matching data is still asked (0 keys examined) if the key is not in the filter.
+4. Fan-out cost grows with shard count: 1.3× on 2 MongoDB shards, 15× on 32 Citus shards.
+5. Choose the key your small, frequent queries filter on; let big reports fan out.
+
+## Check questions
+
+1. Which of the five MongoDB keys made both "seller 42" and "seller 42 + March" targeted, and why did hashed `_id` target neither?
+2. Why was sh1 asked about March 2025 on `o_range` although it holds none of those orders?
+3. Why did the gap between targeted and scatter-gather differ so much between MongoDB (1.3×) and Citus (15×)?
+4. The order-id lookup on `c_by_seller` went from 74 tps to 651 tps after one index. What did the index change, and what did it not change?
+5. On `o_mkt`, "lazada + seller 42" was targeted but "seller 42" was not. Why?
+6. Name two ways to make a lookup by order id targeted on a collection sharded by seller.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-5-choosing-a-shard-key/concept-3-targeted-vs-scatter-gather/answers">Worked answers to Q1–Q6</DeepDive>

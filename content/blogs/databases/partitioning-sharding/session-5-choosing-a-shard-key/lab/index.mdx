@@ -1,0 +1,382 @@
+---
+title: "Lab and session quiz: Choosing a shard key"
+description: "Build the sharding lab used by Sessions 5–8 (a MongoDB 8.0 sharded cluster with two shards and a Citus 13 cluster with two workers, 1M orders in each), then measure what each candidate shard key does: data spread, where new writes go, which queries are targeted, and what a hot seller does to one shard."
+type: "how-to"
+tags: ["sharding", "shard-key", "mongodb", "citus", "lab"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/tutorial/deploy-shard-cluster/"
+  - "https://www.mongodb.com/docs/manual/reference/command/configureCollectionBalancing/"
+  - "https://www.mongodb.com/docs/manual/reference/operator/aggregation/shardedDataDistribution/"
+  - "https://hub.docker.com/r/citusdata/citus"
+  - "https://docs.citusdata.com/en/stable/develop/api_udf.html"
+---
+
+<Tldr>
+This lab builds the environment Sessions 5–8 reuse: a **MongoDB 8.0 sharded cluster** (config server, two single-member shard replica sets `sh1` and `sh2`, a `mongos` router) and a **Citus 13.0 cluster on PostgreSQL 17** (coordinator plus two workers), all in Docker on one network, plus a database called **`parts`** in each holding **1,000,000 orders**. About 3 GB of RAM in total. Then four exercises, one per concept. Timings depend on your machine; the per-shard counts and plan shapes should match.
+</Tldr>
+
+## 1. Start the clusters
+
+Save as `cluster-setup.sh` and run it once. Ports on your machine: `mongos` on 27020, the Citus coordinator on 5434.
+
+```bash
+#!/bin/bash
+# Lab for Sessions 5-8: a MongoDB sharded cluster (config replica set + 2 single-member shard replica sets + mongos)
+# and a Citus cluster (coordinator + 2 workers), all on one Docker network.
+set -e
+docker network create pt-net >/dev/null 2>&1 || true
+# --- MongoDB sharded cluster ---
+docker run -d --name pt-cfg    --network pt-net mongo:8.0 --configsvr --replSet cfg --port 27017 --bind_ip_all --wiredTigerCacheSizeGB 0.25
+docker run -d --name pt-shard1 --network pt-net mongo:8.0 --shardsvr  --replSet sh1 --port 27017 --bind_ip_all --wiredTigerCacheSizeGB 0.5
+docker run -d --name pt-shard2 --network pt-net mongo:8.0 --shardsvr  --replSet sh2 --port 27017 --bind_ip_all --wiredTigerCacheSizeGB 0.5
+sleep 5
+docker exec pt-cfg    mongosh --quiet --eval 'rs.initiate({_id: "cfg", configsvr: true, members: [{ _id: 0, host: "pt-cfg:27017" }]})'
+docker exec pt-shard1 mongosh --quiet --eval 'rs.initiate({_id: "sh1", members: [{ _id: 0, host: "pt-shard1:27017" }]})'
+docker exec pt-shard2 mongosh --quiet --eval 'rs.initiate({_id: "sh2", members: [{ _id: 0, host: "pt-shard2:27017" }]})'
+sleep 10
+docker run -d --name pt-mongos --network pt-net -p 27020:27017 mongo:8.0 mongos --configdb cfg/pt-cfg:27017 --bind_ip_all --port 27017
+sleep 5
+docker exec pt-mongos mongosh --quiet --eval 'sh.addShard("sh1/pt-shard1:27017"); sh.addShard("sh2/pt-shard2:27017"); printjson(db.adminCommand({ listShards: 1 }).shards.map(s => s._id))'
+# --- Citus: coordinator + 2 workers (trust auth: lab only) ---
+for n in pt-citus pt-citus-w1 pt-citus-w2; do
+  P=""; [ $n = pt-citus ] && P="-p 5434:5432"
+  docker run -d --name $n --network pt-net $P -e POSTGRES_PASSWORD=lab -e POSTGRES_HOST_AUTH_METHOD=trust citusdata/citus:13.0
+done
+sleep 10
+docker exec pt-citus psql -U postgres -c "SELECT citus_set_coordinator_host('pt-citus', 5432)" \
+  -c "SELECT citus_add_node('pt-citus-w1', 5432)" -c "SELECT citus_add_node('pt-citus-w2', 5432)" \
+  -c "SELECT nodename, nodeport FROM pg_dist_node ORDER BY nodeid"
+```
+
+The last two commands should print `[ 'sh1', 'sh2' ]` and three nodes: `pt-citus`, `pt-citus-w1`, `pt-citus-w2`.
+
+<Pitfall>
+The `citusdata/citus:13.0` image is published for linux/amd64 only. On an Apple Silicon Mac Docker runs it under emulation (it prints a platform warning), which works but makes every Citus timing slower than native PostgreSQL. Compare Citus numbers with each other (router vs multi-shard), never with the `idx-pg` numbers from Sessions 1–4.
+</Pitfall>
+
+## 2. Create the `parts` database
+
+**MongoDB** creates `parts` on first write; the database's **primary shard** (where unsharded collections and freshly sharded empty collections start) is chosen by the cluster. In the lab runs it was `sh2`; yours may be `sh1`, which swaps the shard names in the results below.
+
+**Citus** does not propagate `CREATE DATABASE` to the workers (it prints a NOTICE saying so), and node membership is stored per database. So create the database and the extension on **every** node, then register the nodes inside that database on the coordinator:
+
+```bash
+for h in pt-citus pt-citus-w1 pt-citus-w2; do
+  docker exec $h psql -U postgres -qc "CREATE DATABASE parts"
+  docker exec $h psql -U postgres -d parts -qc "CREATE EXTENSION citus"
+done
+docker exec pt-citus psql -U postgres -d parts -qAt -c "SELECT citus_set_coordinator_host('pt-citus', 5432)" \
+  -c "SELECT citus_add_node('pt-citus-w1', 5432)" -c "SELECT citus_add_node('pt-citus-w2', 5432)"
+```
+
+Shortcuts used in Sessions 5–8:
+
+```bash
+alias pmongos='docker exec -it pt-mongos mongosh --quiet parts'
+alias pcitus='docker exec -it pt-citus psql -U postgres -d parts'
+```
+
+## 3. Load 1,000,000 orders
+
+Same columns and formulas as the 5M dataset of the [Session 1 lab](/blogs/databases/partitioning-sharding/session-1-why-split-data/lab), with one order every 63.2 s so that 1M rows still cover 2024–2025. 1M rows (about 113 MB in MongoDB, 181 MB as a Citus table with indexes) keep migrations and redistribution quick on a laptop. Both loads took about 22 s in the lab.
+
+### Citus
+
+Save as `citus-pt-seed-1m.sql`, then `docker exec -i pt-citus psql -U postgres -d parts < citus-pt-seed-1m.sql`. This creates a **plain local table** on the coordinator; the exercises distribute copies of it.
+
+```sql
+-- Partitioning course dataset: 1,000,000 marketplace orders (sharding labs) over two years (2024-01-01 .. 2025-12-31 UTC).
+-- id increases with created_at, like a real order table. seller, marketplace and status come from md5
+-- so they are independent of each other and of time.
+DROP TABLE IF EXISTS orders;
+CREATE TABLE orders (
+  id          bigint        PRIMARY KEY,
+  seller_id   integer       NOT NULL,               -- 1..5000, not indexed
+  marketplace text          NOT NULL,               -- shopee 50%, tiktok 30%, lazada 20%
+  status      text          NOT NULL,               -- delivered 85%, cancelled 10%, returned 5%
+  amount      numeric(12,2) NOT NULL,
+  created_at  timestamptz   NOT NULL
+);
+INSERT INTO orders
+SELECT g,
+       ('x' || substr(md5('s' || g), 1, 8))::bit(32)::bigint % 5000 + 1,
+       CASE WHEN ('x' || substr(md5('m' || g), 1, 8))::bit(32)::bigint % 10 < 5 THEN 'shopee'
+            WHEN ('x' || substr(md5('m' || g), 1, 8))::bit(32)::bigint % 10 < 8 THEN 'tiktok'
+            ELSE 'lazada' END,
+       CASE WHEN ('x' || substr(md5('t' || g), 1, 8))::bit(32)::bigint % 20 < 2 THEN 'cancelled'
+            WHEN ('x' || substr(md5('t' || g), 1, 8))::bit(32)::bigint % 20 = 2 THEN 'returned'
+            ELSE 'delivered' END,
+       (g * 7907) % 50000 / 100.0 + 1,
+       timestamptz '2024-01-01 00:00:00+00' + ((g - 1) * 631584 / 10000) * interval '1 second'
+FROM generate_series(1::bigint, 1000000) AS g;
+CREATE INDEX orders_created_at_idx ON orders (created_at);
+VACUUM ANALYZE orders;
+```
+
+### MongoDB
+
+Save as `mongo-pt-seed-1m.js`, then:
+
+```bash
+docker cp mongo-pt-seed-1m.js pt-mongos:/tmp/seed.js
+docker exec pt-mongos mongosh --quiet parts /tmp/seed.js     # prints { orders: 1000000 }
+```
+
+This creates an **unsharded** collection on the primary shard; the exercises shard copies of it.
+
+```js
+// Partitioning course dataset: 1,000,000 marketplace orders (sharding labs) over two years (2024-01-01 .. 2025-12-31 UTC).
+// Run with: mongosh --quiet <db> mongo-pt-seed.js   (same formulas as the SQL seeds; _id is the order id)
+const md5n = s => parseInt(require('crypto').createHash('md5').update(s).digest('hex').slice(0, 8), 16);
+const t0 = new Date('2024-01-01T00:00:00Z').getTime();
+db.orders.drop();
+let batch = [];
+for (let g = 1; g <= 1000000; g++) {
+  const m = md5n('m' + g) % 10, t = md5n('t' + g) % 20;
+  batch.push({
+    _id: g,
+    seller_id: md5n('s' + g) % 5000 + 1,
+    marketplace: m < 5 ? 'shopee' : m < 8 ? 'tiktok' : 'lazada',
+    status: t < 2 ? 'cancelled' : t === 2 ? 'returned' : 'delivered',
+    amount: Decimal128(((g * 7907) % 50000 / 100 + 1).toFixed(2)),
+    created_at: new Date(t0 + Math.floor((g - 1) * 631584 / 10000) * 1000)
+  });
+  if (batch.length === 10000) { db.orders.insertMany(batch, { ordered: false }); batch = []; }
+}
+db.orders.createIndex({ created_at: 1 });
+printjson({ orders: db.orders.countDocuments() });
+```
+
+## 4. Helpers for the MongoDB exercises
+
+Save as `helpers.js`, copy it into the router container (`docker cp helpers.js pt-mongos:/tmp/helpers.js`) and run `load('/tmp/helpers.js')` at the start of each `pmongos` session.
+
+```js
+// Helpers for Session 5 measurements on database parts (run through mongos).
+db = db.getSiblingDB('parts');
+// Per-shard document count of a collection (from $collStats, one doc per shard; includes orphans).
+globalThis.perShard = name => Object.fromEntries(db[name].aggregate([{ $collStats: { count: {} } }]).toArray().map(d => [d.shard, d.count]));
+// Copy orders (optionally transformed) into a target collection in batches, in _id order.
+globalThis.copyInto = (name, fn = d => d, filter = {}) => {
+  const t = Date.now(); let batch = [];
+  db.orders.find(filter).sort({ _id: 1 }).forEach(d => { batch.push(fn(d)); if (batch.length === 5000) { db[name].insertMany(batch, { ordered: false }); batch = []; } });
+  if (batch.length) db[name].insertMany(batch, { ordered: false });
+  return Date.now() - t;
+};
+// Ranges (chunks) per shard for a collection.
+globalThis.ranges = name => {
+  const uuid = db.getSiblingDB('config').collections.findOne({ _id: 'parts.' + name }).uuid;
+  return db.getSiblingDB('config').chunks.aggregate([{ $match: { uuid } }, { $group: { _id: '$shard', n: { $sum: 1 } } }, { $sort: { _id: 1 } }]).toArray();
+};
+// Owned and orphaned documents per shard (8.0 $shardedDataDistribution), for one collection.
+globalThis.dist = name => {
+  const r = db.getSiblingDB('admin').aggregate([{ $shardedDataDistribution: {} }, { $match: { ns: 'parts.' + name } }]).toArray()[0];
+  return r ? r.shards.map(s => `${s.shardName}: owned ${s.numOwnedDocuments}, orphans ${s.numOrphanedDocs}, ${Math.round(s.ownedSizeBytes / 1048576)} MB`) : null;
+};
+// Median of k timed runs of f, in ms.
+globalThis.med = (f, k = 5) => { const a = []; for (let i = 0; i < k; i++) { const t = Date.now(); f(); a.push(Date.now() - t); } a.sort((x, y) => x - y); return a[Math.floor(k / 2)]; };
+// Shards contacted and keys/docs examined per shard for a find.
+globalThis.route2 = (name, q) => {
+  const e = db[name].find(q).explain('executionStats');
+  const sh = e.executionStats.executionStages.shards || [];
+  return { stage: e.queryPlanner.winningPlan.stage, n: e.executionStats.nReturned,
+           shards: sh.map(s => `${s.shardName} keys ${s.totalKeysExamined} docs ${s.totalDocsExamined}`).join('; ') };
+};
+```
+
+Every exercise sets a **4 MB range size on its own collection** (`configureCollectionBalancing`), so the balancer acts on 113 MB of data. Never change the cluster-wide chunk size or stop the balancer for the whole cluster in a shared lab; `sh.disableBalancing(ns)` pauses it for one collection.
+
+## Exercise 1: a low-cardinality key (Concept 1)
+
+```js
+// MongoDB: shard copies on marketplace and on seller_id while empty, then load
+for (const [n, key] of [['o_mkt', { marketplace: 1 }], ['o_seller', { seller_id: 1 }]]) {
+  db[n].drop(); sh.shardCollection('parts.' + n, key);
+  db.adminCommand({ configureCollectionBalancing: 'parts.' + n, chunkSize: 4 });
+  print(n, copyInto(n), 'ms');
+}
+sleep(60000)                       // give the balancer a minute
+dist('o_mkt'); ranges('o_mkt')     // lab: sh2 800,496 owned (90 MB), sh1 199,504 (22 MB); 3 ranges
+db.getSiblingDB('config').chunks.find({ uuid: db.getSiblingDB('config').collections.findOne({ _id: 'parts.o_mkt' }).uuid },
+  { min: 1, max: 1, shard: 1, jumbo: 1, _id: 0 })                       // lab: shopee and tiktok ranges jumbo: true
+dist('o_seller'); ranges('o_seller')                                     // lab: 524,687 / 475,313 owned, 7 + 1 ranges
+```
+
+```sql
+-- Citus: distribute copies on marketplace and on seller_id
+CREATE TABLE c_mkt (LIKE orders);
+SELECT create_distributed_table('c_mkt', 'marketplace', colocate_with => 'none');
+INSERT INTO c_mkt SELECT * FROM orders;
+SELECT count(*) FILTER (WHERE shard_size > 100000) AS shards_with_data, count(*) AS shards
+FROM citus_shards WHERE table_name = 'c_mkt'::regclass;               -- lab: 2 of 32
+SELECT marketplace, get_shard_id_for_distribution_column('c_mkt', marketplace), count(*)
+FROM c_mkt GROUP BY 1;                                                  -- lab: shopee and tiktok share a shard
+
+CREATE TABLE c_by_seller (LIKE orders);
+ALTER TABLE c_by_seller ADD PRIMARY KEY (seller_id, id);
+SELECT create_distributed_table('c_by_seller', 'seller_id');
+INSERT INTO c_by_seller SELECT * FROM orders;
+CREATE INDEX ON c_by_seller (seller_id, created_at);
+CREATE INDEX ON c_by_seller (created_at);
+SELECT nodename, count(*), pg_size_pretty(min(shard_size)), pg_size_pretty(max(shard_size))
+FROM citus_shards WHERE table_name = 'c_by_seller'::regclass GROUP BY 1;  -- lab: 16 per worker, 4.8–6.2 MB
+```
+
+## Exercise 2: a monotonic key (Concept 2)
+
+```js
+for (const [n, key] of [['o_range', { _id: 1 }], ['o_hashed', { _id: 'hashed' }]]) {
+  db[n].drop(); sh.shardCollection('parts.' + n, key);
+  db.adminCommand({ configureCollectionBalancing: 'parts.' + n, chunkSize: 4 });
+  print(n, 'initial', JSON.stringify(ranges(n)));        // lab: o_range 1 range; o_hashed 1 per shard
+  print(n, copyInto(n), 'ms');
+}
+sleep(30000); dist('o_range'); dist('o_hashed')
+
+// The next 100,000 orders, with balancing paused for each collection
+for (const n of ['o_range', 'o_hashed']) {
+  sh.disableBalancing('parts.' + n);
+  const before = perShard(n);
+  copyInto(n, d => Object.assign(d, { _id: d._id + 1000000 }), { _id: { $lte: 100000 } });
+  const after = perShard(n);
+  printjson(Object.fromEntries(Object.keys(after).map(k => [k, after[k] - (before[k] || 0)])));
+  sh.enableBalancing('parts.' + n);
+}
+// lab: o_range { sh1: 0, sh2: 100000 }   o_hashed { sh1: 49903, sh2: 50097 }
+
+const q = { _id: { $gte: 500000, $lt: 510000 } };
+route2('o_range', q); route2('o_hashed', q)    // lab: SINGLE_SHARD vs SHARD_MERGE
+```
+
+```sql
+CREATE TABLE c_by_id (LIKE orders INCLUDING ALL);
+SELECT create_distributed_table('c_by_id', 'id');
+INSERT INTO c_by_id SELECT * FROM orders;
+CREATE INDEX ON c_by_id (seller_id, created_at);
+CREATE INDEX ON c_by_id (created_at);
+INSERT INTO c_by_id SELECT id + 1000000, seller_id, marketplace, status, amount, created_at + interval '2 years'
+FROM orders WHERE id <= 100000;
+SELECT s.nodename, sum(r.result::bigint) AS new_rows
+FROM run_command_on_shards('c_by_id', $$SELECT count(*) FROM %s WHERE id > 1000000$$) r
+JOIN citus_shards s USING (shardid) GROUP BY 1;                        -- lab: 50,063 / 49,937
+EXPLAIN (COSTS OFF) SELECT count(*) FROM c_by_id WHERE id >= 500000 AND id < 510000;   -- Task Count: 32
+EXPLAIN (COSTS OFF) SELECT count(*) FROM c_by_id WHERE id IN (500000, 500001);        -- Task Count: 2
+```
+
+## Exercise 3: targeted vs scatter-gather (Concept 3)
+
+Create `o_seller_time` the same way as in Exercise 1 with key `{ seller_id: 1, created_at: 1 }`, give every copy the same two secondary indexes, then fill the routing table:
+
+```js
+for (const n of ['o_hashed', 'o_range', 'o_seller', 'o_mkt', 'o_seller_time']) {
+  db[n].createIndex({ seller_id: 1, created_at: 1 }); db[n].createIndex({ created_at: 1 });
+}
+const M = { $gte: ISODate('2025-03-01'), $lt: ISODate('2025-04-01') };
+const Q = { id: { _id: 777777 }, seller: { seller_id: 42 }, month: { created_at: M },
+            'seller+month': { seller_id: 42, created_at: M }, 'lazada+seller': { marketplace: 'lazada', seller_id: 42 } };
+for (const n of ['o_hashed', 'o_range', 'o_seller', 'o_mkt', 'o_seller_time'])
+  for (const [k, q] of Object.entries(Q)) { const r = route2(n, q); print(n, k, r.stage, r.n, r.shards); }
+```
+
+Throughput with concurrent clients, from your shell (4 clients × 1,500 random seller+month queries; run each collection 5 times and take the median):
+
+```bash
+for c in o_seller o_hashed; do
+  s=$(python3 -c 'import time; print(time.time())')
+  for i in 1 2 3 4; do
+    docker exec pt-mongos mongosh --quiet parts --eval "for (let k = 0; k < 1500; k++) { const s = 1 + Math.floor(Math.random() * 5000);
+      db.$c.find({ seller_id: s, created_at: { \$gte: ISODate('2025-03-01'), \$lt: ISODate('2025-04-01') } }).toArray(); }" &
+  done; wait
+  python3 -c "import time; print('$c', round(6000 / (time.time() - $s)), 'queries/s')"
+done
+# lab medians: o_seller 5,228   o_hashed 3,908
+```
+
+Citus with pgbench (inside the coordinator container):
+
+```bash
+for t in c_by_seller c_by_id; do
+  printf '\\set s random(1, 5000)\nSELECT count(*), sum(amount) FROM %s WHERE seller_id = :s AND created_at >= '"'"'2025-03-01'"'"' AND created_at < '"'"'2025-04-01'"'"';\n' $t > q-$t.sql
+  docker cp q-$t.sql pt-citus:/tmp/q-$t.sql
+  docker exec pt-citus pgbench -U postgres -n -c 4 -j 2 -T 10 -f /tmp/q-$t.sql parts | grep -E '^tps|latency average'
+done
+# lab medians of 3: c_by_seller 8,898 tps (0.45 ms), c_by_id 576 tps (6.9 ms)
+```
+
+Repeat with `SELECT * FROM <table> WHERE id = :i` (`\set i random(1, 1000000)`): `c_by_id` is now the router query. Run `c_by_seller` once without and once with `CREATE INDEX c_by_seller_id_idx ON c_by_seller (id)` (lab: 74 → 651 tps, vs 9,349 tps on `c_by_id`).
+
+## Exercise 4: a hot seller (Concept 4)
+
+```js
+const hot = d => { if (d._id % 5 === 0) d.seller_id = 1; return d; };     // seller 1: 200,153 orders
+for (const [n, key] of [['o_hot_s', { seller_id: 1 }], ['o_hot_st', { seller_id: 1, created_at: 1 }]]) {
+  db[n].drop(); sh.shardCollection('parts.' + n, key);
+  db.adminCommand({ configureCollectionBalancing: 'parts.' + n, chunkSize: 4 });
+  print(n, copyInto(n, hot), 'ms');
+}
+sleep(90000); dist('o_hot_s'); dist('o_hot_st')
+
+// Try to move seller 1's whole range in o_hot_s (split at seller 1 first)
+db.adminCommand({ split: 'parts.o_hot_s', middle: { seller_id: 1 } })
+db.adminCommand({ moveRange: 'parts.o_hot_s', min: { seller_id: 1 }, max: { seller_id: 2 }, toShard: 'sh2' })
+// lab: Cannot move chunk: the maximum number of documents for a chunk is 71088 … Found 200153 documents
+//      (use the shard that does NOT hold seller 1 as toShard)
+
+// 50,000 new orders for seller 1
+const t0 = new Date('2026-01-01T00:00:00Z').getTime();
+const mk = i => ({ _id: 2000000 + i, seller_id: 1, marketplace: 'shopee', status: 'delivered',
+                   amount: NumberDecimal('100.00'), created_at: new Date(t0 + i * 1000) });
+for (const n of ['o_hot_s', 'o_hot_st', 'o_hashed']) {
+  sh.disableBalancing('parts.' + n);
+  const before = perShard(n); let b = [];
+  for (let i = 1; i <= 50000; i++) { b.push(mk(i)); if (b.length === 5000) { db[n].insertMany(b); b = []; } }
+  const after = perShard(n);
+  print(n, JSON.stringify(Object.fromEntries(Object.keys(after).map(k => [k, after[k] - (before[k] || 0)]))));
+  sh.enableBalancing('parts.' + n);
+}
+// lab: o_hot_s and o_hot_st all 50,000 on one shard; o_hashed 25,088 / 24,912
+```
+
+To move one time slice of seller 1 in `o_hot_st`, read its boundaries from `config.chunks` and pass them to `moveRange` (lab: 35,543 documents in 320 ms). If it fails with `ExceededTimeLimit … orphans cleanup routine didn't clear yet`, the target shard still holds orphan copies from the load; wait about 15 minutes, until `dist('o_hot_st')` shows 0 orphans.
+
+```sql
+CREATE TABLE c_hot (LIKE orders);
+ALTER TABLE c_hot ADD PRIMARY KEY (seller_id, id);
+SELECT create_distributed_table('c_hot', 'seller_id');
+INSERT INTO c_hot SELECT id, CASE WHEN id % 5 = 0 THEN 1 ELSE seller_id END, marketplace, status, amount, created_at FROM orders;
+SELECT get_shard_id_for_distribution_column('c_hot', 1);
+SELECT shardid, nodename, pg_size_pretty(shard_size) FROM citus_shards
+WHERE table_name = 'c_hot'::regclass ORDER BY shard_size DESC LIMIT 3;     -- lab: 24 MB, then 3.5 MB
+SELECT isolate_tenant_to_new_shard('c_hot', 1);                            -- fails: colocated with c_by_seller
+SELECT isolate_tenant_to_new_shard('c_hot', 1, 'CASCADE', shard_transfer_mode => 'block_writes');
+-- move the returned shard to the other worker (use the node names citus_shards shows)
+SELECT citus_move_shard_placement(<shard id>, 'pt-citus-w2', 5432, 'pt-citus-w1', 5432, shard_transfer_mode => 'block_writes');
+SELECT nodename, count(*), pg_size_pretty(sum(shard_size)) FROM citus_shards
+WHERE table_name = 'c_hot'::regclass GROUP BY 1;
+```
+
+## Clean up
+
+Sessions 6–8 start from `orders` alone in `parts`.
+
+```js
+['o_mkt', 'o_seller', 'o_range', 'o_hashed', 'o_seller_time', 'o_hot_s', 'o_hot_st'].forEach(n => db[n].drop())
+```
+
+```sql
+DROP TABLE IF EXISTS c_mkt, c_by_id, c_by_seller, c_hot;
+```
+
+## Session quiz
+
+1. Name the three properties to check for a candidate shard key, and the Concept that measured each.
+2. Sharding by `marketplace` left 800,496 documents on one shard. Why can neither the balancer nor more shards fix it?
+3. With ranged `_id`, 100,000 new orders went 100,000 / 0. Why does the balancer not prevent that, and what did hashing change?
+4. What is the read-side cost of a hashed key, measured in this session?
+5. A query filters on `seller_id` and `created_at`. On which of the five MongoDB keys is it targeted, and what does explain show on the others?
+6. Why was the Citus fan-out penalty (15×) so much larger than MongoDB's (1.3×) in this lab?
+7. Seller 1 owns 20% of the orders. Which designs spread its new writes, which spread only its stored data, and which spread neither?
+8. For a seller-centre application on Shopee, TikTok and Lazada orders, which key would you choose, and what would you do about the few giant sellers?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-5-choosing-a-shard-key/lab/answers">Answers to the session quiz</DeepDive>

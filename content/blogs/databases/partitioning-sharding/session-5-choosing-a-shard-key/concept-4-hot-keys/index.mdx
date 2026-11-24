@@ -1,0 +1,285 @@
+---
+title: "Concept 4: Hot keys, and a checklist for choosing"
+description: "When one seller owns 20% of the orders, a seller-based shard key puts all of that seller on one shard. MongoDB refused to move the seller's 200,153 documents (maximum 71,088 per range), Citus kept them in one 24 MB shard (median 3.4 MB), and all 50,000 new orders for that seller went to one shard in both. A compound key with time splits the seller's stored data but not its new writes; only a key that does not start with the seller spreads those."
+type: "concept"
+tags: ["sharding", "shard-key", "mongodb", "citus", "hot-key", "tenant-isolation"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-choose-a-shard-key/"
+  - "https://www.mongodb.com/docs/manual/core/sharding-data-partitioning/#jumbo-chunks"
+  - "https://www.mongodb.com/docs/manual/reference/command/moveRange/"
+  - "https://docs.citusdata.com/en/stable/develop/api_udf.html#isolate-tenant-to-new-shard"
+  - "https://docs.citusdata.com/en/stable/develop/api_udf.html#citus-move-shard-placement"
+---
+
+<Tldr>
+**Frequency** is the second property of a shard key: how many rows share one value. All rows with the same key value live in the same range or shard, so the biggest value sets a floor on one shard's data and write load. With one seller owning **20% of the orders (200,153 of 1,000,000)**: MongoDB refused to move that seller's range (**"the maximum number of documents for a chunk is 71088 … Found 200153 documents"**); Citus put it in one shard of **24 MB** against a median of **3.4 MB**; and all **50,000 new orders** for the seller went to **one shard** in both systems. A compound key `{ seller_id, created_at }` let MongoDB cut the seller's **stored** orders into 6 time slices that can move, but new orders still all hit the latest slice. A hashed `_id` spread them **25,088 / 24,912**, at the cost of fanning out every seller query (Concept 3).
+</Tldr>
+
+## The setup
+
+Copies of the 1M orders where every fifth order belongs to seller 1, the way one brand's flagship store can dominate a marketplace account:
+
+```js
+const hot = d => { if (d._id % 5 === 0) d.seller_id = 1; return d; };   // seller 1: 200,153 orders
+sh.shardCollection('pt5.o_hot_s',  { seller_id: 1 })
+sh.shardCollection('pt5.o_hot_st', { seller_id: 1, created_at: 1 })
+```
+
+```sql
+CREATE TABLE c_hot (LIKE orders);
+ALTER TABLE c_hot ADD PRIMARY KEY (seller_id, id);
+SELECT create_distributed_table('c_hot', 'seller_id');
+INSERT INTO c_hot SELECT id, CASE WHEN id % 5 = 0 THEN 1 ELSE seller_id END, marketplace, status, amount, created_at FROM orders;
+```
+
+Then 50,000 new orders for seller 1 (ids from 2,000,001, timestamps from 2026-01-01) are inserted and counted per shard.
+
+| Term | Meaning |
+|---|---|
+| Frequency | Share of rows with the same key value; here seller 1 has 20% |
+| Hot key | A key value that receives a large share of reads or writes |
+| Compound shard key | Several fields; ranges can be cut between values of the second field when the first is equal |
+| Tenant isolation | Citus: `isolate_tenant_to_new_shard` gives one distribution value its own shard |
+| **✓ / ✗** | The shard receives / does not receive the rows |
+
+## MongoDB: three keys, one hot seller
+
+<Flow
+  title="MongoDB: where seller 1's orders live and where its new orders go"
+  height={340}
+  nodes={[
+    { id: 'ins', label: 'insertMany', sub: '50,000 seller-1 orders', x: 20, y: 20, w: 200 },
+    { id: 'mongos', label: 'mongos', sub: 'routing table', x: 300, y: 20, w: 200 },
+    { id: 'bal', label: 'moveRange', sub: 'by hand or balancer', x: 580, y: 20, w: 200 },
+    { id: 'rs1', label: 'Seller 1 ranges', sub: '', x: 20, y: 150, w: 200 },
+    { id: 'rest', label: 'Other ranges', sub: '', x: 580, y: 150, w: 200 },
+    { id: 'sh1', label: 'Shard sh1', sub: '', x: 20, y: 280, w: 200 },
+    { id: 'sh2', label: 'Shard sh2', sub: '', x: 580, y: 280, w: 200 },
+  ]}
+  edges={[
+    { id: 'ins-mongos', from: 'ins', to: 'mongos' },
+    { id: 'mongos-rs1', from: 'mongos', to: 'rs1', quiet: true },
+    { id: 'mongos-rest', from: 'mongos', to: 'rest', quiet: true },
+    { id: 'rs1-sh1', from: 'rs1', to: 'sh1', quiet: true },
+    { id: 'rest-sh2', from: 'rest', to: 'sh2', quiet: true },
+    { id: 'bal-rs1', from: 'bal', to: 'rs1', quiet: true },
+    { id: 'rs1-sh2', from: 'rs1', to: 'sh2', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Key { seller_id: 1 }',
+      path: 'seller 1 = one range on sh1 → moveRange ✗ too many documents → 50,000 new orders → sh1 ✓ all, sh2 ✗ none',
+      summary: 'One value is one range, however large it grows.',
+      subs: { rs1: '[1, 2): 200,153 docs', rest: 'sellers 2 …', sh1: '524,641 owned', sh2: '525,359 owned' },
+      steps: [
+        {
+          title: 'The balancer works around it',
+          note: 'Overall data stayed balanced (sh1 524,641 / sh2 525,359 owned after the test) because the balancer moved other sellers instead. But all 200,153 of seller 1\'s orders are in one range on sh1.',
+          active: ['mongos', 'rs1', 'rest', 'sh1', 'sh2'],
+          edges: ['mongos-rs1', 'mongos-rest', 'rs1-sh1', 'rest-sh2'],
+        },
+        {
+          title: 'The range cannot move',
+          note: 'After splitting at seller_id 1, moving [1, 2) to sh2 failed: a range may hold at most 2 × chunk size / average document size documents.',
+          code: "db.adminCommand({ moveRange: 'pt5.o_hot_s', min: { seller_id: 1 }, max: { seller_id: 2 }, toShard: 'sh2' })\n// Cannot move chunk: the maximum number of documents for a chunk is 71088, the maximum chunk size\n// is 4194304, average document size is 118. Found 200153 documents in chunk\n// ns: pt5.o_hot_s { seller_id: 1 } -> { seller_id: 2 }",
+          active: ['bal', 'rs1', 'sh2'],
+          edges: ['bal-rs1', 'rs1-sh2'],
+          subs: { rs1: '✗ too big to move', sh2: '✗ not moved' },
+        },
+        {
+          title: 'New orders: one shard',
+          note: '50,000 new orders for seller 1: sh1 +50,000, sh2 +0.',
+          active: ['ins', 'mongos', 'rs1', 'sh1'],
+          edges: ['ins-mongos', 'mongos-rs1', 'rs1-sh1'],
+          subs: { sh1: '✓ +50,000', sh2: '✗ +0' },
+        },
+      ],
+    },
+    {
+      title: 'Key { seller_id: 1, created_at: 1 }',
+      path: 'seller 1 cut into 6 time slices → old slices ✓ can move → new orders all > latest boundary → sh1 ✓ all, sh2 ✗ none',
+      summary: 'Time splits the seller\'s history, not its present.',
+      subs: { rs1: '6 slices of ≈4 months', rest: 'sellers 2 …', sh1: '514,895 owned', sh2: '535,105 owned' },
+      steps: [
+        {
+          title: 'Seller 1 becomes six ranges',
+          note: 'With created_at in the key, the balancer could cut seller 1 between timestamps: 6 ranges, e.g. seller 1 from 2024-05-09 to 2024-09-16, each about 4 MB.',
+          code: "// config.chunks for o_hot_st (first rows)\n// { seller_id: 1, created_at: 2024-05-09T19:26:45Z } -> { seller_id: 1, created_at: 2024-09-16T14:07:12Z }  sh1",
+          active: ['mongos', 'rs1', 'rest', 'sh1', 'sh2'],
+          edges: ['mongos-rs1', 'mongos-rest', 'rs1-sh1', 'rest-sh2'],
+        },
+        {
+          title: 'A slice can move',
+          note: 'Moving one 4-month slice of seller 1 to sh2 copied 35,543 documents (4.2 MB) in 320 ms. The first two attempts failed with ExceededTimeLimit: sh2 still held orphan copies of that range from the original load, and a shard will not receive a range again until its orphans are deleted (about 15 minutes after the earlier migration here; Session 6 covers range deletion).',
+          code: "db.adminCommand({ moveRange: 'pt5.o_hot_st',\n  min: { seller_id: 1, created_at: ISODate('2024-05-09T19:26:45Z') },\n  max: { seller_id: 1, created_at: ISODate('2024-09-16T14:07:12Z') }, toShard: 'sh2' })",
+          active: ['bal', 'rs1', 'sh2'],
+          edges: ['bal-rs1', 'rs1-sh2'],
+          subs: { rs1: '✓ slice movable' },
+        },
+        {
+          title: 'New orders: still one shard',
+          note: 'New orders have the newest created_at, so they all fall into seller 1\'s last slice: sh1 +50,000, sh2 +0. The compound key spreads what the seller has stored, not what it writes now.',
+          active: ['ins', 'mongos', 'rs1', 'sh1'],
+          edges: ['ins-mongos', 'mongos-rs1', 'rs1-sh1'],
+          subs: { sh1: '✓ +50,000', sh2: '✗ +0' },
+        },
+      ],
+    },
+    {
+      title: "Key { _id: 'hashed' }",
+      path: 'hash(order id) ignores the seller → sh1 ✓ 25,088 → sh2 ✓ 24,912',
+      summary: 'Writes spread; every seller query becomes scatter-gather.',
+      subs: { rs1: 'n/a: no seller ranges', rest: 'hash ranges', sh1: 'hash ≥ 0', sh2: 'hash < 0' },
+      steps: [
+        {
+          title: 'New orders: both shards',
+          note: 'The same 50,000 orders on o_hashed: sh1 +25,088, sh2 +24,912. The price is Concept 3: every query for seller 1 asks both shards.',
+          active: ['ins', 'mongos', 'rest', 'sh1', 'sh2'],
+          edges: ['ins-mongos', 'mongos-rest', 'rest-sh2'],
+          subs: { sh1: '✓ +25,088', sh2: '✓ +24,912' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Citus: isolate the tenant, then place it
+
+Citus hashes `seller_id`, so seller 1 shares a hash range with about 155 other sellers until it is isolated.
+
+<Flow
+  title="Citus: seller 1 in c_hot, before and after tenant isolation"
+  height={340}
+  nodes={[
+    { id: 'ins', label: 'INSERT', sub: '50,000 seller-1 rows', x: 20, y: 20, w: 200 },
+    { id: 'coord', label: 'Coordinator', sub: 'hash(seller_id)', x: 300, y: 20, w: 200 },
+    { id: 'fn', label: 'Citus UDFs', sub: 'isolate, move', x: 580, y: 20, w: 200 },
+    { id: 'shot', label: 'Seller 1 shard', sub: '', x: 20, y: 150, w: 200 },
+    { id: 'sother', label: 'Other shards', sub: '', x: 580, y: 150, w: 200 },
+    { id: 'w1', label: 'Worker w1', sub: '', x: 20, y: 280, w: 200 },
+    { id: 'w2', label: 'Worker w2', sub: '', x: 580, y: 280, w: 200 },
+  ]}
+  edges={[
+    { id: 'ins-coord', from: 'ins', to: 'coord' },
+    { id: 'coord-shot', from: 'coord', to: 'shot', quiet: true },
+    { id: 'coord-sother', from: 'coord', to: 'sother', quiet: true },
+    { id: 'fn-shot', from: 'fn', to: 'shot', quiet: true },
+    { id: 'shot-w1', from: 'shot', to: 'w1', quiet: true },
+    { id: 'shot-w2', from: 'shot', to: 'w2', quiet: true },
+    { id: 'sother-w2', from: 'sother', to: 'w2', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Before: seller 1 inside a shared shard',
+      path: 'hash(1) → shard 102073 ✓ 24 MB on w2 → 31 other shards ✓ ≈3.4 MB each',
+      summary: 'One shard is seven times the median.',
+      subs: { shot: '102073: 24 MB', sother: '31 shards, median 3.4 MB', w1: '16 shards, 53 MB', w2: '16 shards, 73 MB' },
+      steps: [
+        {
+          title: 'Shard sizes',
+          note: 'citus_shards: shard 102073 (seller 1 plus the sellers that share its hash range) is 24 MB; the next largest is 3,536 kB and the median 3.4 MB. w2, which holds it, has 73 MB against w1\'s 53 MB.',
+          code: "SELECT get_shard_id_for_distribution_column('c_hot', 1);   -- 102073\nSELECT shardid, nodename, pg_size_pretty(shard_size) FROM citus_shards\nWHERE table_name = 'c_hot'::regclass ORDER BY shard_size DESC LIMIT 3;",
+          active: ['coord', 'shot', 'sother', 'w2'],
+          edges: ['coord-shot', 'coord-sother', 'shot-w2', 'sother-w2'],
+        },
+      ],
+    },
+    {
+      title: 'Isolate seller 1, move it, write to it',
+      path: 'isolate_tenant_to_new_shard ✓ 21 MB shard for one hash value → move to w1 ✓ 1.24 s → 50,000 new rows → w1 ✓ all, w2 ✗ none',
+      summary: 'A tenant becomes a unit you can place, never one you can split.',
+      subs: { shot: '102073: 24 MB', sother: '31 shards, median 3.4 MB', w1: '16 shards, 53 MB', w2: '16 shards, 73 MB' },
+      steps: [
+        {
+          title: 'Colocated tables split together',
+          note: 'c_hot is colocated with c_by_seller (same column type and shard count), so isolating without CASCADE fails. With CASCADE (0.93 s) both tables got three shards for the old range: below seller 1, seller 1 alone, above it. Each table now has 34 shards.',
+          code: "SELECT isolate_tenant_to_new_shard('c_hot', 1);\n-- ERROR: cannot isolate tenant because \"c_hot\" has colocated tables\nSELECT isolate_tenant_to_new_shard('c_hot', 1, 'CASCADE', shard_transfer_mode => 'block_writes');\n-- 102108",
+          active: ['fn', 'shot'],
+          edges: ['fn-shot'],
+          subs: { shot: '102108: 21 MB, 1 hash value' },
+        },
+        {
+          title: 'Place it on its own',
+          note: 'citus_move_shard_placement moved shard 102108 (and its colocated c_by_seller shard) to w1 in 1.24 s. w1 now has 74 MB, w2 49 MB: the hot tenant moved, but the imbalance just changed sides; you would now move ordinary shards the other way.',
+          code: "SELECT citus_move_shard_placement(102108, 'pt-citus-w2', 5432, 'pt-citus-w1', 5432,\n                                  shard_transfer_mode => 'block_writes');",
+          active: ['fn', 'shot', 'w1'],
+          edges: ['fn-shot', 'shot-w1'],
+          subs: { shot: '102108: 21 MB on w1', w1: '17 shards, 74 MB', w2: '17 shards, 49 MB' },
+        },
+        {
+          title: 'New orders: one worker',
+          note: '50,000 new rows for seller 1, counted per worker with run_command_on_shards: w1 +50,000, w2 +0. One distribution value is one shard, whatever you do with that shard.',
+          active: ['ins', 'coord', 'shot', 'w1'],
+          edges: ['ins-coord', 'coord-shot', 'shot-w1'],
+          subs: { w1: '✓ +50,000', w2: '✗ +0' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Measured
+
+| | `{ seller_id }` (MongoDB) | `{ seller_id, created_at }` (MongoDB) | hashed `_id` (MongoDB) | `seller_id` (Citus) |
+|---|---|---|---|---|
+| Where seller 1's 200,153 stored orders live | 1 range on sh1 | 6 ranges | both shards | 1 shard, 24 MB (median 3.4 MB) |
+| Can that data be moved in pieces? | **No**: moveRange refused (max 71,088 docs) | Yes: one slice, 35,543 docs, moved in 320 ms | not needed | Only as one shard (isolate, then move: 0.93 s + 1.24 s) |
+| 50,000 new seller-1 orders | sh1 +50,000 / sh2 0 | sh1 +50,000 / sh2 0 | 25,088 / 24,912 | w1 +50,000 / w2 0 |
+| Seller 1's queries | targeted | targeted | scatter-gather | targeted |
+
+<Pitfall>
+A compound key with a timestamp second (`{ seller_id: 1, created_at: 1 }`) is the standard answer to "one tenant is too big", and it does fix **storage**: the big seller's history can be cut and spread. It does not fix **write load**: the newest orders of a seller always sort into that seller's last range. If one seller's write rate is more than one shard can take, the key must put something before the seller (a hash of the order id, or a bucket number such as `id % 8`) and seller queries must then ask several shards.
+</Pitfall>
+
+## A checklist for choosing a key
+
+| Check | How to test it on your data | Warning sign |
+|---|---|---|
+| **Cardinality** | `count(DISTINCT key)` | Fewer distinct values than shards you will ever want (Concept 1) |
+| **Frequency** | Top 10 values by `count(*)` and their share | One value above (1 / number of shards) of rows or writes |
+| **Monotonicity** | Is the key a sequence, timestamp or ObjectId? | Ranged sharding on it: every insert hits one shard (Concept 2) |
+| **Query targeting** | List the 5 most frequent queries; does each filter on the key? | A frequent small query that does not (Concept 3) |
+| **Write spread** | Where does the next 1% of inserts go? | All to one range / one shard |
+| **Uniqueness needs** | Must something be unique across all shards? | A unique value that is not the key (Session 3's rule applies again) |
+
+For `orders` in a marketplace business the measurements point to:
+
+| Option | Seller queries | Order lookups | New-write spread | Hot seller |
+|---|---|---|---|---|
+| `seller_id` (Citus) / `{ seller_id, created_at }` (MongoDB) | **targeted** | fan-out unless seller is known | even across sellers | stuck on one shard |
+| hashed order id | fan-out | **targeted** | **even** | spread |
+| `marketplace`, `created_at` | — | — | uneven / one shard | — (rejected in Concepts 1–2) |
+
+Most seller-facing platforms choose the seller as the key and handle the few giant sellers separately (isolation, or a bucket added to their key). Sessions 6–8 build on this: moving data between shards, sharding with Citus in practice, and what breaks when one operation needs two shards.
+
+## Real-world scenario: the flagship store
+
+A brand's official store accounts for a fifth of all orders on a marketplace account. On a mega-sale day its order rate triples. With a seller key, one shard takes that whole burst while the others idle, and its range or shard cannot be split to share the load. Two practical paths, both measured above in their basic form: give the store its own shard and the strongest machine (Citus tenant isolation, or a MongoDB zone for that seller), or key the store's orders by `{ seller_id, bucket }` with a small bucket number so its writes spread over several ranges.
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 3, unique keys](/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-3-unique-keys) | Changing the key to fight hot spots also changes which unique constraints the database can enforce |
+| [Session 1, when not to split](/blogs/databases/partitioning-sharding/session-1-why-split-data/concept-4-when-not-to-split) | If one seller is too hot for a shard, check first whether better indexes or a bigger machine solve it |
+| Concept 2 | Hashing spreads writes; here the same hashed collection spread the hot seller too |
+
+## Key takeaways
+
+1. All rows with the same key value stay together: the most frequent value sets a floor on one shard's load.
+2. MongoDB refused to move a 200,153-document single-seller range (limit 71,088 at 4 MB ranges).
+3. A compound key with time lets the seller's history be cut and moved, but new orders still go to one shard.
+4. Citus can isolate a tenant into its own shard (colocated tables split too) and move it, but cannot split it.
+5. Only a key that does not start with the hot value spreads its writes, and then its queries fan out.
+
+## Check questions
+
+1. Why could the balancer keep the two shards balanced overall while seller 1 stayed on sh1?
+2. Where does the 71,088 limit in the moveRange error come from?
+3. The compound key made seller 1's history movable. Why did it not spread the 50,000 new orders?
+4. Why did `isolate_tenant_to_new_shard` without CASCADE fail, and what did CASCADE change in `c_by_seller`?
+5. After moving the isolated shard to w1, w1 held 74 MB and w2 49 MB. Was the move a mistake?
+6. A seller needs more write capacity than one shard has. Give a key design that spreads its writes and say what it costs.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-5-choosing-a-shard-key/concept-4-hot-keys/answers">Worked answers to Q1–Q6</DeepDive>

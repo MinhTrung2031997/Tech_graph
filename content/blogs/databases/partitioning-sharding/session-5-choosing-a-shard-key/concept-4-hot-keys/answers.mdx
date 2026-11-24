@@ -1,0 +1,63 @@
+---
+title: "Answers: Hot keys, and a checklist for choosing"
+description: "Worked answers to the Session 5 Concept 4 check questions."
+companion: "answers"
+tags: ["sharding", "hot-key", "tenant-isolation", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/reference/command/moveRange/"
+  - "https://www.mongodb.com/docs/manual/core/sharding-data-partitioning/#jumbo-chunks"
+  - "https://docs.citusdata.com/en/stable/develop/api_udf.html#isolate-tenant-to-new-shard"
+---
+
+<Tldr>
+A key value is the unit of placement. A hot value can be moved, isolated or given better hardware; only a different key can split it.
+</Tldr>
+
+## Q1. Balanced overall, not for seller 1
+
+**Question:** why could the balancer keep the two shards balanced overall while seller 1 stayed on sh1?
+
+The balancer compares total data per shard. It could not move seller 1's range, but it could move ranges of other sellers the other way until the totals were within 3 × 4 MB (sh1 524,641 / sh2 525,359 owned). Balanced storage says nothing about where the busiest seller's reads and writes go: all of them still hit sh1.
+
+> **Common mistake:** reading `sh.status()` or `getShardDistribution()` as a load report. They show data size, not traffic.
+
+## Q2. The 71,088 limit
+
+**Question:** where does the 71,088 limit in the moveRange error come from?
+
+A migration may move at most about twice the configured range size in documents: 2 × 4,194,304 bytes / 118 bytes average document size ≈ 71,088 documents. Seller 1's range had 200,153. With the default 128 MB range size the limit would be much higher, but a single seller can outgrow any limit.
+
+> **Common mistake:** raising the range size to make the move succeed. It may let this range move once, but it makes every migration bigger and does not stop the range from growing.
+
+## Q3. Why the compound key did not spread new orders
+
+**Question:** the compound key made seller 1's history movable. Why did it not spread the 50,000 new orders?
+
+Within seller 1, ranges are ordered by `created_at`, and new orders have the newest timestamps. They all fall into seller 1's last range, the one ending at the next seller's first key, which lives on one shard. The second field is monotonic within the first, so the hotspot of Concept 2 reappears per seller.
+
+> **Common mistake:** adding `created_at` to the key and expecting write relief for a hot tenant. Only storage is relieved.
+
+## Q4. CASCADE
+
+**Question:** why did `isolate_tenant_to_new_shard` without CASCADE fail, and what did CASCADE change in `c_by_seller`?
+
+`c_hot` and `c_by_seller` are colocated: both distributed on an integer column with 32 shards, so Citus placed them in the same colocation group, where shard N of each table covers the same hash range and sits on the same worker. Splitting one table's shard would break that, so Citus requires CASCADE. With CASCADE both tables split the same hash range into three shards (below seller 1, seller 1 alone, above), giving 34 shards each, and moving the seller-1 shard also moved its `c_by_seller` partner.
+
+> **Common mistake:** relying on default colocation without knowing it happened. Tables you never meant to join will be split and moved together.
+
+## Q5. 74 MB vs 49 MB
+
+**Question:** after moving the isolated shard to w1, w1 held 74 MB and w2 49 MB. Was the move a mistake?
+
+Not by itself. Isolation and placement are the first steps: the 21 MB tenant is now a separate unit that can sit on a chosen node. The imbalance simply moved from w2 to w1; the next step is moving some ordinary shards from w1 to w2 (or adding a node for the tenant). Whether it is worth it depends on the tenant's traffic, not only its size.
+
+> **Common mistake:** isolating a tenant and stopping there. Isolation without a placement plan just relabels the problem.
+
+## Q6. Spreading one seller's writes
+
+**Question:** a seller needs more write capacity than one shard has. Give a key design that spreads its writes and say what it costs.
+
+Add a bucket before or after the seller: shard on `{ seller_id: 1, bucket: 1 }` with `bucket = order_id % 8` (MongoDB), or distribute on a computed column such as `seller_id * 8 + id % 8` (Citus). The seller's writes then spread over up to 8 ranges or hash values. The cost: every query for that seller must ask up to 8 places and merge, and the application must compute the bucket on every write. Many teams apply it only to the few giant sellers.
+
+> **Common mistake:** using a random bucket. Use one derived from the order id, so a lookup with both seller and order id is still targeted.

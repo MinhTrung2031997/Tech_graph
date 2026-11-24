@@ -1,0 +1,12 @@
+{
+  "title": "Session 5: Choosing a shard key",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-what-a-shard-key-decides/index",
+    "concept-2-monotonic-keys/index",
+    "concept-3-targeted-vs-scatter-gather/index",
+    "concept-4-hot-keys/index",
+    "lab/index"
+  ]
+}
