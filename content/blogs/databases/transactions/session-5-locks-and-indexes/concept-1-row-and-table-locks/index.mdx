@@ -1,0 +1,275 @@
+---
+title: "Concept 1: Row locks and table locks"
+description: "What a write actually locks in each engine: PostgreSQL's four row-lock strengths stored in the row itself plus table-level modes, InnoDB's intention locks and record locks on index entries, and MongoDB's intent locks with document-level write conflicts. Measured with pg_locks, pgrowlocks, performance_schema.data_locks and $currentOp."
+type: "concept"
+tags: ["transactions", "locking", "postgresql", "mysql", "mongodb", "row-locks"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/explicit-locking.html"
+  - "https://www.postgresql.org/docs/current/pgrowlocks.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locking.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/performance-schema-data-locks-table.html"
+  - "https://www.mongodb.com/docs/manual/faq/concurrency/"
+  - "https://www.mongodb.com/docs/manual/core/transactions-production-consideration/"
+---
+
+<Tldr>
+Every UPDATE locks the rows it changes until the transaction ends, and a second writer of the same row **waits**. But the engines keep the lock in different places and report it differently. **PostgreSQL** writes the row lock **into the row** (its `xmax`), so `pg_locks` shows only a table-level `RowExclusiveLock`; a waiter shows up as waiting for a `ShareLock` on the holder's **transaction id**. It has four row-lock strengths, and `FOR KEY SHARE` (what foreign-key checks take) does not block an UPDATE of non-key columns. **InnoDB** keeps locks in a lock table: an `IX` intention lock on the table plus an `X,REC_NOT_GAP` lock on the **index record** (`performance_schema.data_locks`). **MongoDB** takes only intent locks (`w`) on the database and collection; documents are protected by WiredTiger's optimistic concurrency, so a second **transaction** that touches the same document fails at once with `WriteConflict` (8 ms in the lab), while a plain write **retries in a loop** (215 write conflicts over 3 s) until the transaction commits.
+</Tldr>
+
+## The question
+
+Two sessions both update account 1. One must wait or fail, otherwise the second would overwrite a change it never saw (the lost update of [Session 2](/blogs/databases/transactions/session-2-anomalies/lab)). How does each engine record "this row is taken", and how can you see it?
+
+| Term | Meaning |
+|---|---|
+| Row lock | Exclusive right to change (or protect) one row until commit or rollback |
+| Table lock / intention lock | A lock on the whole table. `IX` (InnoDB) and `RowExclusiveLock` (PostgreSQL) only say "I am changing some rows in here" and do not conflict with each other |
+| Lock wait | A session blocked until the holder commits, rolls back, or a timeout fires |
+| Write conflict (MongoDB) | A write to a document already changed by an uncommitted transaction; it is not queued |
+| **✓ Granted / ✗ Waits** | The lock is given at once, or the requester blocks |
+
+## PostgreSQL: the lock lives in the row
+
+<Flow
+  title="PostgreSQL: two updates of account 1"
+  height={330}
+  nodes={[
+    { id: 't1', label: 'T1 (pid 52421)', sub: 'UPDATE id = 1', x: 20, y: 20, w: 220 },
+    { id: 't2', label: 'T2 (pid 52445)', sub: 'UPDATE id = 1', x: 20, y: 200, w: 220 },
+    { id: 'row', label: 'Row (0,1)', sub: 'xmax = T1', x: 300, y: 110, w: 200 },
+    { id: 'ok', label: '✓ T1 granted', sub: 'No Key Update', x: 580, y: 20, w: 200 },
+    { id: 'wait', label: '✗ T2 waits', sub: 'on T1 xid', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row' },
+    { id: 't2-row', from: 't2', to: 'row' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-wait', from: 'row', to: 'wait' },
+  ]}
+  cases={[
+    {
+      title: 'Same row, both UPDATE',
+      path: 'T1 UPDATE → ✓ row (0,1) marked with T1 → T2 UPDATE → ✗ waits for T1 to end',
+      summary: 'pg_locks never lists the row itself; the wait is on T1\'s transaction id.',
+      steps: [
+        {
+          title: 'T1 updates account 1',
+          note: 'pg_locks shows only RowExclusiveLock on accounts and accounts_pkey, plus T1\'s own transactionid 787521. The row lock is in the tuple: pgrowlocks reports (0,1) locked by 787521 in mode "No Key Update" (balance is not a key column).',
+          code: "BEGIN;\nUPDATE accounts SET balance = balance - 10 WHERE id = 1;\n-- third session:\nSELECT * FROM pgrowlocks('accounts');",
+          active: ['t1', 'row', 'ok'],
+          edges: ['t1-row', 'row-ok'],
+        },
+        {
+          title: 'T2 updates the same row',
+          note: 'T2 reads xmax = 787521, sees T1 still running, takes the tuple lock (ExclusiveLock on tuple (0,1), granted, so it is first in line) and requests ShareLock on transactionid 787521: granted = false. wait_event = transactionid, pg_blocking_pids = {52421}.',
+          code: "SELECT pid, wait_event_type, wait_event, pg_blocking_pids(pid)\nFROM pg_stat_activity WHERE state <> 'idle';",
+          active: ['t2', 'row', 'wait'],
+          edges: ['t2-row', 'row-wait'],
+        },
+        {
+          title: 'T1 ends, T2 continues',
+          note: 'When T1 commits, its transaction id lock is released, T2 wakes, re-reads the row version T1 produced and applies its own change on top. With READ COMMITTED it simply updates the new version; stricter levels may raise a serialization error instead (Session 3).',
+          active: ['t1', 't2', 'row', 'ok'],
+          edges: ['row-ok'],
+        },
+      ],
+    },
+    {
+      title: 'Four row-lock strengths',
+      path: 'T1 FOR KEY SHARE → T2 UPDATE balance ✓ 0.65 ms; T2 UPDATE id ✗ timeout',
+      summary: 'Measured with lock_timeout = 1 s while T1 held each mode on account 2.',
+      subs: { row: 'xmax = T1 (Key Share)', ok: 'balance update', wait: 'key update' },
+      steps: [
+        {
+          title: 'FOR KEY SHARE allows non-key updates',
+          note: 'Foreign-key checks lock the parent row FOR KEY SHARE. Another session can still update balance (0.65 ms) because the key is not changing; only UPDATE … SET id = … (or DELETE) has to wait: it hit the 1 s lock_timeout.',
+          code: "-- T1\nSELECT id FROM accounts WHERE id = 2 FOR KEY SHARE;\n-- T2\nUPDATE accounts SET balance = balance + 1 WHERE id = 2;   -- ✓ 0.65 ms\nUPDATE accounts SET id = 20002 WHERE id = 2;              -- ✗ lock timeout",
+          active: ['t1', 't2', 'row', 'ok', 'wait'],
+          edges: ['t1-row', 't2-row', 'row-ok', 'row-wait'],
+        },
+        {
+          title: 'FOR UPDATE blocks everything',
+          note: 'Measured matrix (T2 request → result while T1 holds): FOR KEY SHARE blocks only key updates; FOR SHARE also blocks UPDATE; FOR NO KEY UPDATE (what a normal UPDATE takes) blocks FOR SHARE and both UPDATEs but not FOR KEY SHARE; FOR UPDATE blocks all four.',
+          subs: { row: 'xmax = T1 (For Update)', ok: 'nothing', wait: 'all four requests' },
+          active: ['t1', 't2', 'row', 'wait'],
+          edges: ['t1-row', 't2-row', 'row-wait'],
+        },
+      ],
+    },
+  ]}
+/>
+
+Measured conflict matrix (T2's request while T1 holds a lock on account 2, `lock_timeout = 1s`):
+
+| T1 holds ↓ / T2 asks → | `FOR KEY SHARE` | `FOR SHARE` | `UPDATE balance` | `UPDATE id` |
+|---|---|---|---|---|
+| `FOR KEY SHARE` | ✓ 1.6 ms | ✓ 1.2 ms | ✓ 0.65 ms | ✗ timeout |
+| `FOR SHARE` | ✓ | ✓ | ✗ timeout | ✗ timeout |
+| `FOR NO KEY UPDATE` (plain UPDATE) | ✓ 2.4 ms | ✗ timeout | ✗ timeout | ✗ timeout |
+| `FOR UPDATE` (or DELETE, key UPDATE) | ✗ timeout | ✗ timeout | ✗ timeout | ✗ timeout |
+
+Because row locks live in the rows, PostgreSQL can lock millions of rows without a lock table filling up; the price is a write to each locked row (Session 4 explains `xmax` and hint bits).
+
+## MySQL InnoDB: intention lock plus a record lock on the index
+
+<Flow
+  title="InnoDB: two updates of account 1"
+  height={330}
+  nodes={[
+    { id: 't1', label: 'T1 (trx 45018)', sub: 'UPDATE id = 1', x: 20, y: 20, w: 220 },
+    { id: 't2', label: 'T2 (trx 45019)', sub: 'UPDATE id = 1', x: 20, y: 200, w: 220 },
+    { id: 'rec', label: 'PRIMARY record 1', sub: 'X,REC_NOT_GAP', x: 300, y: 110, w: 200 },
+    { id: 'ok', label: '✓ T1 GRANTED', sub: 'IX on table', x: 580, y: 20, w: 200 },
+    { id: 'wait', label: '✗ T2 WAITING', sub: 'same record', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-rec', from: 't1', to: 'rec' },
+    { id: 't2-rec', from: 't2', to: 'rec' },
+    { id: 'rec-ok', from: 'rec', to: 'ok' },
+    { id: 'rec-wait', from: 'rec', to: 'wait' },
+  ]}
+  cases={[
+    {
+      title: 'Same row, both UPDATE',
+      path: 'T1 → IX on accounts + ✓ X,REC_NOT_GAP on PRIMARY 1 → T2 → ✗ WAITING on the same record',
+      summary: 'data_locks lists both requests; data_lock_waits links them.',
+      steps: [
+        {
+          title: 'T1 locks the index record',
+          note: 'Two rows in data_locks: TABLE IX (intention to lock rows) and RECORD X,REC_NOT_GAP on index PRIMARY, LOCK_DATA 1. InnoDB locks index entries, not "rows": the clustered index entry is the row.',
+          code: "SELECT ENGINE_TRANSACTION_ID, INDEX_NAME, LOCK_TYPE, LOCK_MODE, LOCK_STATUS, LOCK_DATA\nFROM performance_schema.data_locks WHERE OBJECT_SCHEMA = 'bank';",
+          active: ['t1', 'rec', 'ok'],
+          edges: ['t1-rec', 'rec-ok'],
+        },
+        {
+          title: 'T2 queues on the same record',
+          note: 'T2 also gets IX (intention locks never conflict with each other), then requests X,REC_NOT_GAP on record 1: LOCK_STATUS WAITING. sys.innodb_lock_waits shows waiting_query = the UPDATE, blocking_query = whatever T1 runs now (here SELECT SLEEP(6)), which is why the blocking statement is often not the one that took the lock.',
+          code: 'SELECT waiting_query, blocking_query, wait_age FROM sys.innodb_lock_waits;',
+          active: ['t2', 'rec', 'wait'],
+          edges: ['t2-rec', 'rec-wait'],
+        },
+        {
+          title: 'Readers are not blocked',
+          note: 'While T1 held the lock, a plain SELECT balance returned 1000.00 at once (a consistent read from the snapshot, Session 3). SELECT … FOR SHARE needs an S lock on the record and failed after innodb_lock_wait_timeout: ERROR 1205.',
+          code: "SET SESSION innodb_lock_wait_timeout = 1;\nSELECT balance FROM accounts WHERE id = 1;            -- 1000.00\nSELECT balance FROM accounts WHERE id = 1 FOR SHARE;  -- ERROR 1205",
+          active: ['t1', 't2', 'rec', 'ok', 'wait'],
+          edges: ['rec-ok', 'rec-wait'],
+        },
+      ],
+    },
+  ]}
+/>
+
+InnoDB has only shared (`S`) and exclusive (`X`) record locks; there is no equivalent of `FOR KEY SHARE`. A foreign-key check on the parent takes `S`, which blocks an UPDATE of any column of the parent row ([Indexing Session 9, Concept 3](/blogs/databases/indexing/session-9-indexes-for-joins/concept-3-foreign-keys) measured this).
+
+## MongoDB: intent locks and write conflicts
+
+<Flow
+  title="MongoDB: a transaction holds account 1"
+  height={330}
+  nodes={[
+    { id: 't1', label: 'T1 transaction', sub: 'updateOne _id 1', x: 20, y: 20, w: 220 },
+    { id: 't2', label: 'T2', sub: 'updateOne _id 1', x: 20, y: 200, w: 220 },
+    { id: 'doc', label: 'Document _id 1', sub: 'uncommitted change', x: 300, y: 110, w: 200 },
+    { id: 'conf', label: '✗ T2 in a txn', sub: 'WriteConflict, 8 ms', x: 580, y: 20, w: 200 },
+    { id: 'retry', label: '✗ T2 plain write', sub: 'retries until commit', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-doc', from: 't1', to: 'doc' },
+    { id: 't2-doc', from: 't2', to: 'doc' },
+    { id: 'doc-conf', from: 'doc', to: 'conf' },
+    { id: 'doc-retry', from: 'doc', to: 'retry' },
+  ]}
+  cases={[
+    {
+      title: 'Second writer in a transaction',
+      path: 'T1 txn writes _id 1 → T2 txn writes _id 1 → ✗ WriteConflict at once (TransientTransactionError)',
+      summary: 'No queue: the second transaction is aborted and must retry.',
+      steps: [
+        {
+          title: 'T1 writes inside a transaction',
+          note: '$currentOp (idleSessions: true) shows T1 as "inactive transaction" holding only intent locks: Global w, Database w, Collection w (w = intent exclusive). There is no document lock in the lock manager; WiredTiger keeps T1\'s uncommitted version of _id 1 in the document\'s update chain.',
+          code: 'db.getSiblingDB("admin").aggregate([{ $currentOp: { idleSessions: true } },\n  { $match: { transaction: { $exists: true } } }])',
+          active: ['t1', 'doc'],
+          edges: ['t1-doc'],
+        },
+        {
+          title: 'T2 transaction fails immediately',
+          note: 'T2\'s update of _id 1 inside its own transaction failed after 8 ms: WriteConflict (code 112) with label TransientTransactionError. The whole transaction is aborted; the driver\'s withTransaction retries it (Session 7).',
+          code: 'MongoServerError: WriteConflict  errorLabels: ["TransientTransactionError"]',
+          active: ['t2', 'doc', 'conf'],
+          edges: ['t2-doc', 'doc-conf'],
+        },
+      ],
+    },
+    {
+      title: 'Second writer outside a transaction',
+      path: 'T1 txn writes _id 1 → T2 plain updateOne → ✗ retries (215 write conflicts in 3 s) → ✓ applies after T1 commits',
+      summary: 'A single-document write looks like it waits, but it is a retry loop, not a lock queue.',
+      steps: [
+        {
+          title: 'The plain write keeps retrying',
+          note: 'Measured: T2 returned after 4,816 ms, right after T1 committed. While it waited, $currentOp showed waitingForLock: false, writeConflicts: 215 and numYields: 214 after 3 s: the server retries the write with back-off each time it meets T1\'s uncommitted version.',
+          code: '{ op: "update", waitingForLock: false, writeConflicts: 215, numYields: 214, secs_running: 3 }',
+          active: ['t1', 't2', 'doc', 'retry'],
+          edges: ['t2-doc', 'doc-retry'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Comparison
+
+| | PostgreSQL | MySQL InnoDB | MongoDB |
+|---|---|---|---|
+| Where the row lock lives | In the row (`xmax`, infomask) | Lock table, one bitmap per page of index records | No row lock; uncommitted version in the WiredTiger update chain |
+| Table-level marker | `RowExclusiveLock` | `IX` intention lock | Intent `w` on database and collection |
+| Second writer | Waits on the holder's transaction id | Waits on the record | Transaction: `WriteConflict` at once. Plain write: retries until commit |
+| Row-lock strengths | 4 (`KEY SHARE`, `SHARE`, `NO KEY UPDATE`, `UPDATE`) | 2 (`S`, `X`) | n/a |
+| Where to look | `pg_locks`, `pg_stat_activity`, `pgrowlocks` | `performance_schema.data_locks`, `data_lock_waits`, `sys.innodb_lock_waits` | `$currentOp`, `serverStatus().transactions` |
+
+<Pitfall>
+`pg_locks` does not list row locks that nobody is waiting for: looking for "rows locked by T1" there finds nothing. Use `pgrowlocks` (it reads the table) or look for waiters (`pg_blocking_pids`). In MySQL the opposite trap: `sys.innodb_lock_waits.blocking_query` shows what the blocker is running **now**, not the statement that took the lock.
+</Pitfall>
+
+## Real-world scenario: "the UPDATE hangs"
+
+An order service sometimes hangs for 50 s on `UPDATE accounts SET balance = …` and then fails with `Lock wait timeout exceeded`.
+
+| Engine | First query | What it showed |
+|---|---|---|
+| MySQL | `SELECT * FROM sys.innodb_lock_waits` | `blocking_query` = NULL: the blocker is idle inside a transaction (it locked the row, then the app waited on an HTTP call) |
+| PostgreSQL | `pg_stat_activity` + `pg_blocking_pids(pid)` | Blocker in state `idle in transaction` |
+| MongoDB | `$currentOp` with `idleSessions: true` | An "inactive transaction" with `timeOpenMicros` growing |
+
+Fix: never keep a transaction open across a network call; Session 8 covers `idle_in_transaction_session_timeout` and friends.
+
+## Why this matters for the next concepts
+
+| Next | Connection |
+|---|---|
+| Concept 2: gap and next-key locks | InnoDB locks **index records and the gaps between them**, not only rows |
+| Concept 3: unindexed writes | Which records get locked depends on which index the statement scans |
+| Concept 4: NOWAIT, SKIP LOCKED, timeouts | What to do instead of waiting |
+
+## Key takeaways
+
+1. A write locks what it changes until the transaction ends; a second writer waits (PostgreSQL, InnoDB) or conflicts (MongoDB).
+2. PostgreSQL stores row locks in the row; `pg_locks` shows only table locks and transaction-id waits. `pgrowlocks` shows row locks.
+3. PostgreSQL has four row-lock strengths; `FOR KEY SHARE` (foreign-key checks) does not block updates of non-key columns.
+4. InnoDB locks index records in a lock table: `IX` on the table plus `X,REC_NOT_GAP` on the record; `data_locks` shows them.
+5. MongoDB transactions do not queue on documents: the second transaction gets `WriteConflict` at once; a plain write retries until the transaction finishes.
+
+## Check questions
+
+1. T1 has updated account 1 and is still open. Where would you look in PostgreSQL to prove it, and why is `pg_locks` alone not enough?
+2. What does T2 wait for in PostgreSQL when it updates the same row: the row, or something else?
+3. Why can a PostgreSQL session update `balance` of a row another session holds `FOR KEY SHARE`, but not change its `id`?
+4. In InnoDB, T1 updates account 1. List the locks `data_locks` shows and what each means.
+5. `sys.innodb_lock_waits` says the blocking query is `SELECT SLEEP(6)`. Why is that not the statement that took the lock?
+6. In MongoDB, why does a second transaction fail immediately while a plain `updateOne` on the same document eventually succeeds?
+7. Which engine lets a plain SELECT read account 1 while it is being updated, and what value does it see?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-5-locks-and-indexes/concept-1-row-and-table-locks/answers">Worked answers to Q1–Q7</DeepDive>

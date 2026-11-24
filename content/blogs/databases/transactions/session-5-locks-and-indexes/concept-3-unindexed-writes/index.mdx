@@ -1,0 +1,250 @@
+---
+title: "Concept 3: An UPDATE without an index locks what it scans"
+description: "The topic deferred from the Indexing course: InnoDB locks every index record a statement scans, not only the rows it changes. UPDATE inventory … WHERE shelf = 7 with no index on shelf locked all 5,013 records (and blocked updates of other shelves) to change 100 rows; READ COMMITTED or an index on shelf cut it to 100. PostgreSQL and MongoDB lock only the rows they change, but still scan the whole table."
+type: "concept"
+tags: ["transactions", "locking", "indexing", "mysql", "innodb", "postgresql", "mongodb"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locks-set.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html#isolevel_read-committed"
+  - "https://dev.mysql.com/doc/refman/8.4/en/information-schema-innodb-trx-table.html"
+  - "https://www.postgresql.org/docs/current/pgrowlocks.html"
+---
+
+<Tldr>
+"A locking read, an UPDATE or a DELETE generally sets record locks on **every index record that is scanned**", whether or not it matches (MySQL manual). With no index on `shelf`, `UPDATE inventory SET stock = stock - 1 WHERE shelf = 7` scans the whole clustered index: under REPEATABLE READ it held **5,013 next-key locks** (5,000 rows + 13 page supremums) to change **100 rows**, so an update of an item on shelf 8 and an insert both timed out. `WHERE stock < 0`, matching **nothing**, locked the same 5,013. Under **READ COMMITTED** InnoDB releases non-matching rows after checking them: 100 locks, other shelves free. With an **index on `shelf`**: 101 next-key + 1 gap lock on the index and 100 on PRIMARY; shelf 8 was free, only an insert into shelf 7 waited. **PostgreSQL** and **MongoDB** lock only the rows they change (100), whatever they scan; the missing index costs them a full scan (5,000 documents examined), not extra blocking.
+</Tldr>
+
+## The setup
+
+`inventory` has 5,000 SKUs on 50 shelves (100 each). `shelf` is deliberately **not indexed**. T1 takes one item from every SKU on shelf 7 and keeps the transaction open; T2 then touches other rows.
+
+| Term | Meaning |
+|---|---|
+| Scanned record | An index entry the statement reads to evaluate its WHERE clause |
+| Matched row | A scanned row that satisfies the WHERE clause and gets changed |
+| Semi-consistent read | InnoDB under READ COMMITTED: a locked, non-matching row is checked against its last committed version and skipped without waiting |
+| `trx_rows_locked` | Approximate number of rows a transaction has locked (`information_schema.innodb_trx`) |
+| **✓ Free / ✗ Locked** | Can T2 change or insert that row now? |
+
+## MySQL InnoDB
+
+<Flow
+  title="InnoDB: UPDATE … WHERE shelf = 7"
+  height={330}
+  nodes={[
+    { id: 't1', label: 'T1 UPDATE', sub: 'shelf = 7', x: 20, y: 20, w: 220 },
+    { id: 'scan', label: 'Index scanned', sub: 'PRIMARY, 5,000 rows', x: 300, y: 20, w: 200 },
+    { id: 't2', label: 'T2', sub: 'other rows', x: 580, y: 20, w: 200 },
+    { id: 'match', label: 'Shelf 7 rows', sub: '100 changed', x: 300, y: 200, w: 200 },
+    { id: 'other', label: 'Other shelves', sub: '4,900 rows', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-scan', from: 't1', to: 'scan' },
+    { id: 'scan-match', from: 'scan', to: 'match' },
+    { id: 'scan-other', from: 'scan', to: 'other' },
+    { id: 't2-other', from: 't2', to: 'other' },
+  ]}
+  cases={[
+    {
+      title: 'REPEATABLE READ, no index',
+      path: 'full scan of PRIMARY → ✗ next-key lock on all 5,013 records → T2 update of shelf 8 ✗, insert ✗',
+      summary: '100 rows changed, the whole table locked.',
+      subs: { match: '✗ 100 locked', other: '✗ 4,900 locked too' },
+      steps: [
+        {
+          title: 'Scan and lock everything',
+          note: 'No index on shelf, so InnoDB reads every PRIMARY record and locks each one it reads with a next-key lock. data_locks: 5,013 × X on PRIMARY (5,000 records + the supremum of each of the 13 leaf pages). innodb_trx: trx_rows_locked 5,013, trx_rows_modified 100.',
+          code: "UPDATE inventory SET stock = stock - 1 WHERE shelf = 7;\nSELECT trx_rows_locked, trx_lock_structs, trx_lock_memory_bytes, trx_rows_modified\nFROM information_schema.innodb_trx;",
+          active: ['t1', 'scan', 'match', 'other'],
+          edges: ['t1-scan', 'scan-match', 'scan-other'],
+        },
+        {
+          title: 'Unrelated rows are blocked',
+          note: 'T2 updates SKU-000008 (shelf 8): ERROR 1205 after 1 s. T2 inserts a new SKU on shelf 8: ERROR 1205. Neither touches shelf 7.',
+          code: "UPDATE inventory SET stock = stock - 1 WHERE sku = 'SKU-000008';   -- ✗ 1205\nINSERT INTO inventory VALUES ('SKU-999999', 1, 8);                   -- ✗ 1205",
+          active: ['t2', 'other'],
+          edges: ['t2-other'],
+        },
+        {
+          title: 'Cheap in memory, expensive in waiting',
+          note: 'All 5,013 locks took 14 lock structs and 1,128 bytes: InnoDB stores record locks as one bitmap per page, so lock memory does not warn you. Even UPDATE … WHERE stock < 0, which matched 0 rows, held the same 5,013 locks.',
+          code: 'trx_rows_locked 5013 · trx_lock_structs 14 · trx_lock_memory_bytes 1128 · trx_rows_modified 0',
+          active: ['t1', 'scan', 'other'],
+          edges: ['t1-scan', 'scan-other'],
+        },
+      ],
+    },
+    {
+      title: 'READ COMMITTED, no index',
+      path: 'full scan → non-matching rows unlocked after the check → ✓ 100 record locks only → T2 ✓',
+      summary: 'Same scan, locks released for rows that did not match.',
+      subs: { match: '✗ 100 locked', other: '✓ free' },
+      steps: [
+        {
+          title: 'Unlock what did not match',
+          note: 'data_locks: 100 × X,REC_NOT_GAP, trx_rows_locked 100. Under READ COMMITTED InnoDB releases the lock on each scanned row that fails the WHERE clause. T2\'s update of shelf 8 and its insert both succeeded at once.',
+          code: "SET SESSION transaction_isolation = 'READ-COMMITTED';\nUPDATE inventory SET stock = stock - 1 WHERE shelf = 7;",
+          active: ['t1', 'scan', 'match', 'other', 't2'],
+          edges: ['t1-scan', 'scan-match', 't2-other'],
+        },
+      ],
+    },
+    {
+      title: 'REPEATABLE READ, index on shelf',
+      path: 'inventory_shelf → ✓ 101 next-key + 1 gap (index) + 100 PRIMARY → shelf 8 ✓, insert into shelf 7 ✗',
+      summary: 'The index shrinks "what is scanned" to what matches.',
+      subs: { scan: 'inventory_shelf, 100 entries', match: '✗ 100 locked + gaps', other: '✓ free' },
+      steps: [
+        {
+          title: 'Scan only shelf 7',
+          note: 'data_locks: 101 × X and 1 × X,GAP on inventory_shelf, 100 × X,REC_NOT_GAP on PRIMARY (202 rows locked in innodb_trx). T2: update SKU-000008 ✓, insert on shelf 8 ✓, insert on shelf 7 ✗ (the gaps of shelf 7 are locked, Concept 2).',
+          code: "CREATE INDEX inventory_shelf ON inventory (shelf);",
+          active: ['t1', 'scan', 'match', 'other', 't2'],
+          edges: ['t1-scan', 'scan-match', 't2-other'],
+        },
+      ],
+    },
+  ]}
+/>
+
+| T1 statement (100 matches) | Isolation | Index on `shelf` | Rows locked | T2 updates shelf 8 | T2 inserts shelf 8 |
+|---|---|---|---|---|---|
+| `WHERE shelf = 7` | RR | no | 5,013 | ✗ 1205 | ✗ 1205 |
+| `WHERE shelf = 7` | RC | no | 100 | ✓ | ✓ |
+| `WHERE stock < 0` (0 matches) | RR | no | 5,013 | ✗ 1205 | not tested |
+| `WHERE shelf = 7` | RR | yes | 202 | ✓ | ✓ (shelf 7: ✗) |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: UPDATE … WHERE shelf = 7, no index"
+  height={330}
+  nodes={[
+    { id: 't1', label: 'T1 UPDATE', sub: 'shelf = 7', x: 20, y: 20, w: 220 },
+    { id: 'scan', label: 'Seq Scan', sub: '5,000 rows read', x: 300, y: 20, w: 200 },
+    { id: 't2', label: 'T2', sub: 'other rows', x: 580, y: 20, w: 200 },
+    { id: 'match', label: 'Shelf 7 rows', sub: '✗ 100 locked', x: 300, y: 200, w: 200 },
+    { id: 'other', label: 'Other shelves', sub: '✓ not locked', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-scan', from: 't1', to: 'scan' },
+    { id: 'scan-match', from: 'scan', to: 'match' },
+    { id: 't2-other', from: 't2', to: 'other' },
+  ]}
+  cases={[
+    {
+      title: 'Lock only what changes',
+      path: 'Seq Scan of 5,000 rows → ✗ 100 rows locked (pgrowlocks) → T2 on shelf 8 ✓ 0.37 ms, shelf 7 ✗',
+      summary: 'Reading a row never locks it; only the 100 updated rows get xmax = T1.',
+      steps: [
+        {
+          title: 'Scan everything, lock 100',
+          note: 'pgrowlocks(\'inventory\') returned 100 rows. pg_locks shows a single RowExclusiveLock on the table. The scan read all 5,000 rows but locked none of the 4,900 that did not match.',
+          code: "BEGIN;\nUPDATE inventory SET stock = stock - 1 WHERE shelf = 7;\nSELECT count(*) FROM pgrowlocks('inventory');   -- 100",
+          active: ['t1', 'scan', 'match'],
+          edges: ['t1-scan', 'scan-match'],
+        },
+        {
+          title: 'Other rows are free',
+          note: 'T2 updated SKU-000008 (shelf 8) in 0.37 ms and inserted a new SKU on shelf 7 without waiting (no gap locks). Updating SKU-000007, which is on shelf 7, hit the 1 s lock_timeout.',
+          code: "UPDATE inventory SET stock = stock - 1 WHERE sku = 'SKU-000008';   -- ✓ 0.37 ms\nUPDATE inventory SET stock = stock - 1 WHERE sku = 'SKU-000007';   -- ✗ lock timeout",
+          active: ['t2', 'other', 'match'],
+          edges: ['t2-other'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: updateMany({ shelf: 7 }) in a transaction, no index"
+  height={330}
+  nodes={[
+    { id: 't1', label: 'T1 transaction', sub: 'updateMany shelf 7', x: 20, y: 20, w: 220 },
+    { id: 'scan', label: 'COLLSCAN', sub: '5,000 docs examined', x: 300, y: 20, w: 200 },
+    { id: 't2', label: 'T2 transactions', sub: 'one update each', x: 580, y: 20, w: 200 },
+    { id: 'match', label: 'Shelf 7 docs', sub: '✗ 100 modified', x: 300, y: 200, w: 200 },
+    { id: 'other', label: 'Other shelves', sub: '✓ untouched', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-scan', from: 't1', to: 'scan' },
+    { id: 'scan-match', from: 'scan', to: 'match' },
+    { id: 't2-other', from: 't2', to: 'other' },
+  ]}
+  cases={[
+    {
+      title: 'Conflicts only on modified documents',
+      path: 'COLLSCAN 5,000 → 100 modified → T2 txn on SKU-000008 ✓, on SKU-000007 ✗ WriteConflict',
+      summary: 'Only documents with an uncommitted change can conflict.',
+      steps: [
+        {
+          title: 'Scan everything, modify 100',
+          note: 'updateMany modified 100 documents; explain shows totalDocsExamined 5,000 for { shelf: 7 }. Reads during the scan take no document locks.',
+          code: 's.startTransaction();\ninventory.updateMany({ shelf: 7 }, { $inc: { stock: -1 } })   // modifiedCount 100',
+          active: ['t1', 'scan', 'match'],
+          edges: ['t1-scan', 'scan-match'],
+        },
+        {
+          title: 'Only shelf 7 conflicts',
+          note: 'A transaction updating SKU-000008 committed; one updating SKU-000007 failed at once with WriteConflict.',
+          active: ['t2', 'other', 'match'],
+          edges: ['t2-other'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Comparison
+
+| | PostgreSQL | InnoDB RR | InnoDB RC | MongoDB |
+|---|---|---|---|---|
+| Rows locked by `WHERE shelf = 7`, no index | 100 | 5,013 (all) | 100 | 100 (conflict set) |
+| Effect of the missing index | Full scan (CPU, I/O) | Full scan **and** table-wide blocking | Full scan, brief locks while checking | Full scan |
+| Effect of adding the index | Faster | Faster and 25× fewer locks | Faster | Faster |
+
+<Pitfall>
+In InnoDB, an index is a **concurrency** decision, not only a speed decision. An UPDATE or DELETE whose WHERE clause cannot use an index locks the whole table under the default REPEATABLE READ, even if it matches nothing. A periodic cleanup like `DELETE FROM jobs WHERE status = 'done' AND created_at < …` without a usable index blocks every worker for its whole duration. `EXPLAIN` the write: `type: ALL` means every row will be locked.
+</Pitfall>
+
+## Real-world scenario: the "harmless" stock reset
+
+A back-office button runs `UPDATE inventory SET stock = 0 WHERE discontinued = 1` (no index on `discontinued`, 3 matching rows). Every time someone clicks it during a sale, checkout stalls for seconds: checkouts update other SKUs, and they all wait for the button's transaction, which holds next-key locks on every SKU until it commits (and the button's transaction also writes an audit log over HTTP before committing).
+
+| Fix | Locks held |
+|---|---|
+| Index on `discontinued` | 3 rows + gaps |
+| Select the SKUs first (plain read), then `UPDATE … WHERE sku IN (…)` by primary key | 3 rows |
+| Run the session in READ COMMITTED | 3 rows (after a brief lock per scanned row) |
+| Commit before the HTTP call | Shorter lock window, whatever is locked |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Indexing Session 3](/blogs/databases/indexing/session-3-query-planner/concept-5-ignored-index) | Whether the planner can use the index decides what is scanned, hence what InnoDB locks |
+| [Indexing Session 8](/blogs/databases/indexing/session-8-when-indexes-hurt/concept-1-write-amplification) | Each index costs writes; on InnoDB a missing one can cost concurrency |
+| Concept 4 | The job queue: `FOR UPDATE SKIP LOCKED` without an index locked 90,420 records |
+
+## Key takeaways
+
+1. InnoDB locks every index record a locking statement **scans**, not only the rows it changes.
+2. Without a usable index under REPEATABLE READ, an UPDATE or DELETE locks the whole table (5,013 locks for 100 changes), even with zero matches.
+3. Lock memory stays tiny (bitmaps per page), so nothing warns you; `trx_rows_locked` and `data_locks` show it.
+4. READ COMMITTED releases non-matching rows; an index limits the scan itself. Both cut the locks to the matches.
+5. PostgreSQL and MongoDB lock or conflict only on rows they change; the missing index costs them a full scan, not blocking.
+
+## Check questions
+
+1. Why did T1 hold 5,013 locks when it changed 100 rows? Where does the 13 come from?
+2. Why did an update of a shelf-8 item wait for a transaction that updated shelf 7?
+3. `UPDATE inventory SET stock = 0 WHERE stock < 0` matched no rows. Why did it still block other writers?
+4. What does READ COMMITTED do differently with the 4,900 non-matching rows?
+5. After adding an index on `shelf`, an insert on shelf 8 succeeded but one on shelf 7 waited. Explain both.
+6. Why does the same unindexed UPDATE not block shelf-8 updates in PostgreSQL?
+7. How would you check, before running it, whether a DELETE will lock the whole table in MySQL?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-5-locks-and-indexes/concept-3-unindexed-writes/answers">Worked answers to Q1–Q7</DeepDive>

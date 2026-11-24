@@ -1,0 +1,194 @@
+---
+title: "Lab and session quiz: Locks and indexes"
+description: "Watch row locks in pgrowlocks and performance_schema.data_locks, map InnoDB's record, gap and next-key locks for point, range and secondary-index reads, lock a whole table with an unindexed UPDATE, and build a job queue with SKIP LOCKED in three engines."
+type: "how-to"
+tags: ["transactions", "locking", "postgresql", "mysql", "mongodb", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pgrowlocks.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/performance-schema-data-locks-table.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locks-set.html"
+---
+
+<Tldr>
+Uses the containers and the `bank` database from the [Session 1 lab](/blogs/databases/transactions/session-1-transaction-guarantees/lab) (PostgreSQL `idx-pg`, MySQL `idx-mysql`, MongoDB replica set `tx-mongo`). Every exercise needs **two or three terminals**: one holds a transaction open, one tries to get in, one watches. Before each run, write down what you expect to be locked and who will wait.
+</Tldr>
+
+## Setup
+
+```bash
+alias pg='docker exec -it idx-pg psql -U postgres -d bank'
+alias my='docker exec -it idx-mysql mysql -uroot -plab bank'
+alias mg='docker exec -it tx-mongo mongosh --quiet bank'
+```
+
+```sql
+-- pg: row-lock inspector (ships with PostgreSQL's contrib modules)
+CREATE EXTENSION IF NOT EXISTS pgrowlocks;
+```
+
+A watcher query for each engine (keep it in the third terminal):
+
+```sql
+-- pg
+SELECT pid, state, wait_event_type, wait_event, pg_blocking_pids(pid), left(query, 50)
+FROM pg_stat_activity WHERE datname = 'bank' AND pid <> pg_backend_pid();
+
+-- my
+SELECT INDEX_NAME, LOCK_MODE, LOCK_STATUS, COUNT(*) n, MIN(LOCK_DATA), MAX(LOCK_DATA)
+FROM performance_schema.data_locks
+WHERE OBJECT_SCHEMA = 'bank' AND LOCK_TYPE = 'RECORD' GROUP BY 1, 2, 3;
+```
+
+```js
+// mg
+db.getSiblingDB("admin").aggregate([{ $currentOp: { idleSessions: true } },
+  { $match: { $or: [{ transaction: { $exists: true } }, { ns: /^bank\./ }] } }])
+```
+
+## Exercise 1: who holds what (Concept 1)
+
+Terminal 1 in each engine: start a transaction and update account 1, do not commit.
+
+```sql
+BEGIN;                                                    -- my: START TRANSACTION;
+UPDATE accounts SET balance = balance - 10 WHERE id = 1;
+```
+
+Terminal 2: `UPDATE accounts SET balance = balance + 5 WHERE id = 1;` (hangs). Terminal 3: run the watcher, then in PostgreSQL `SELECT * FROM pgrowlocks('accounts');`.
+
+```js
+// mg, terminal 1
+const s = db.getMongo().startSession(); s.startTransaction();
+s.getDatabase("bank").accounts.updateOne({ _id: 1 }, { $inc: { balance: NumberDecimal("-10") } });
+// terminal 2: once inside a transaction, once as a plain updateOne
+```
+
+Then the PostgreSQL row-lock matrix: T1 holds account 2 with each of `FOR KEY SHARE`, `FOR SHARE`, `FOR NO KEY UPDATE`, `FOR UPDATE`; T2 runs `SET lock_timeout = '1s'` and tries `FOR KEY SHARE`, `FOR SHARE`, an update of `balance`, an update of `id`.
+
+| Fill in | PostgreSQL | MySQL | MongoDB (txn / plain) |
+|---|---|---|---|
+| Lock rows listed for T1 | | | |
+| What T2 waits for | | | |
+| Plain SELECT of account 1 during the wait | | | |
+
+## Exercise 2: gaps (Concept 2, MySQL)
+
+```sql
+-- my
+CREATE INDEX accounts_branch ON accounts (branch);
+-- terminal 1, one statement at a time (ROLLBACK between them)
+START TRANSACTION; SELECT * FROM accounts WHERE id = 500 FOR UPDATE;
+START TRANSACTION; SELECT * FROM accounts WHERE id = 10005 FOR UPDATE;
+START TRANSACTION; SELECT * FROM accounts WHERE id BETWEEN 100 AND 105 FOR UPDATE;
+START TRANSACTION; SELECT id FROM accounts WHERE branch = 'B03' FOR UPDATE;
+-- terminal 2, with a short timeout
+SET SESSION innodb_lock_wait_timeout = 1;
+START TRANSACTION; INSERT INTO accounts VALUES (20000, 'x', 'B03', 0, 1); ROLLBACK;
+START TRANSACTION; INSERT INTO accounts VALUES (20003, 'x', 'B02', 0, 1); ROLLBACK;
+START TRANSACTION; INSERT INTO accounts VALUES (20002, 'x', 'B04', 0, 1); ROLLBACK;
+```
+
+Repeat the B03 case after `SET SESSION transaction_isolation = 'READ-COMMITTED';` in terminal 1. Then run the B03 read in PostgreSQL under `BEGIN ISOLATION LEVEL SERIALIZABLE` and look for `SIReadLock` in `pg_locks` while terminal 2 inserts.
+
+Expected (lab): 1 record lock; 1 lock on the supremum (both inserts above 10000 wait); 1 record + 5 next-key locks; 1,001 next-key + 1 gap + 1,000 primary locks, with the **B02** insert waiting too.
+
+## Exercise 3: the unindexed UPDATE (Concept 3)
+
+```sql
+-- terminal 1 (my, then pg)
+START TRANSACTION;                                       -- pg: BEGIN;
+UPDATE inventory SET stock = stock - 1 WHERE shelf = 7;   -- 100 rows
+-- my, terminal 3
+SELECT trx_rows_locked, trx_lock_structs, trx_lock_memory_bytes, trx_rows_modified
+FROM information_schema.innodb_trx;
+-- terminal 2
+UPDATE inventory SET stock = stock - 1 WHERE sku = 'SKU-000008';   -- shelf 8
+```
+
+Run the MySQL part three ways: REPEATABLE READ; READ COMMITTED; REPEATABLE READ after `CREATE INDEX inventory_shelf ON inventory (shelf)`. Also try `UPDATE inventory SET stock = 0 WHERE stock < 0` in RR. Drop the index and reset (`UPDATE inventory SET stock = 100`) afterwards.
+
+| Run | Rows locked (MySQL) | Shelf-8 update |
+|---|---|---|
+| RR, no index | | |
+| RC, no index | | |
+| RR, index | | |
+| PostgreSQL (`pgrowlocks`) | | |
+
+## Exercise 4: a job queue (Concept 4)
+
+```sql
+-- terminal 1 (pg and my)
+BEGIN;   -- my: START TRANSACTION;
+SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 3 FOR UPDATE;
+-- terminal 2
+SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 3 FOR UPDATE SKIP LOCKED;
+SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 3 FOR UPDATE NOWAIT;
+-- my, terminal 3: count the locks, then try an unrelated update
+UPDATE jobs SET locked_by = 'x' WHERE id = 5;
+```
+
+Repeat the MySQL part after `CREATE INDEX jobs_status ON jobs (status, id)`.
+
+Lock timeouts, the difference that matters (terminal 1 holds account 7):
+
+```sql
+-- pg, terminal 2
+BEGIN;
+UPDATE accounts SET balance = balance + 1 WHERE id = 8;
+SET LOCAL lock_timeout = '500ms';
+UPDATE accounts SET balance = balance + 1 WHERE id = 7;
+UPDATE accounts SET balance = balance + 1 WHERE id = 9;
+COMMIT;
+-- my, terminal 2 (run as a script with --force, or line by line)
+SET SESSION innodb_lock_wait_timeout = 1;
+START TRANSACTION;
+UPDATE accounts SET balance = balance + 1 WHERE id = 8;
+UPDATE accounts SET balance = balance + 1 WHERE id = 7;
+UPDATE accounts SET balance = balance + 1 WHERE id = 9;
+COMMIT;
+SELECT id, balance FROM accounts WHERE id IN (7, 8, 9);
+```
+
+MongoDB queue, four terminals at once:
+
+```js
+for (let i = 0; i < 50; i++)
+  db.jobs.findOneAndUpdate({ status: "queued" },
+    { $set: { status: "running", locked_by: "w1" } }, { sort: { _id: 1 } });
+// afterwards
+db.jobs.distinct("_id", { status: "running" }).length;   // = number of claims?
+```
+
+## Reset
+
+```sql
+-- pg
+UPDATE accounts SET balance = 1000 WHERE id <= 10; DELETE FROM accounts WHERE id > 10000;
+UPDATE inventory SET stock = 100; DELETE FROM inventory WHERE sku LIKE 'SKU-99999%';
+-- my
+UPDATE accounts SET balance = 1000 WHERE id <= 10; DELETE FROM accounts WHERE id > 10000;
+UPDATE inventory SET stock = 100; DELETE FROM inventory WHERE sku LIKE 'SKU-99999%';
+DROP INDEX inventory_shelf ON inventory;   -- if created
+```
+
+```js
+// mg
+db.jobs.updateMany({ status: "running" }, { $set: { status: "queued", locked_by: null } });
+db.accounts.updateMany({ _id: { $lte: 10 } }, { $set: { balance: NumberDecimal("1000.00") } });
+```
+
+`accounts_branch` and `jobs_status` can stay; Session 6 does not depend on them.
+
+## Session quiz
+
+1. In PostgreSQL, T1 updated account 1. Name two places you can see that, and one place you cannot.
+2. Why does a foreign-key check in PostgreSQL not block an update of the parent's `balance`, while in InnoDB it does?
+3. `SELECT … WHERE id = 10005 FOR UPDATE` returned nothing. Which inserts does it block in InnoDB REPEATABLE READ, and why?
+4. A query on branch B03 blocked an insert into branch B02. Draw the index entries around the boundary and mark the locked gap.
+5. `UPDATE inventory … WHERE shelf = 7` changed 100 rows. Give the number of locked rows in InnoDB RR, InnoDB RC, InnoDB RR with an index on `shelf`, and PostgreSQL.
+6. A MySQL worker pool uses `SKIP LOCKED` correctly but admin updates of old jobs time out. What is the cause and the fix?
+7. After a lock-wait error, which engine still lets the transaction commit its earlier statements, and why is that dangerous?
+8. Why is there no `SKIP LOCKED` in MongoDB, and what replaces it for a queue?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-5-locks-and-indexes/lab/answers">Answers to the session quiz</DeepDive>

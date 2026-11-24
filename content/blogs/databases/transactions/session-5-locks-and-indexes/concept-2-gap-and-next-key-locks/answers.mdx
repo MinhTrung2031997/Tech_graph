@@ -1,0 +1,76 @@
+---
+title: "Answers: Gap and next-key locks"
+description: "Worked answers to the Session 5 Concept 2 check questions."
+companion: "answers"
+tags: ["transactions", "locking", "gap-locks", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locking.html#innodb-gap-locks"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locks-set.html"
+---
+
+<Tldr>
+InnoDB RR protects "what a locking read saw" by locking the index stretch it scanned, gaps included. The other engines rely on snapshots.
+</Tldr>
+
+## Q1. Three kinds of record-level lock
+
+**Question:** what is the difference between a record lock, a gap lock and a next-key lock, and what does each block?
+
+| Lock | `LOCK_MODE` | Covers | Blocks |
+|---|---|---|---|
+| Record | `X,REC_NOT_GAP` | One index entry | Updates, deletes and locking reads of that entry |
+| Gap | `X,GAP` | The open interval before an entry | Inserts into the interval (insert intention locks) only |
+| Next-key | `X` | The entry plus the gap before it | Both of the above |
+
+Gap locks never conflict with other gap locks: they exist only to keep inserts out.
+
+> **Common mistake:** assuming a gap lock blocks reads. Plain reads are never blocked; even other `FOR UPDATE` reads of the same gap succeed.
+
+## Q2. A missing id blocks all new ids
+
+**Question:** why did `SELECT … WHERE id = 10005 FOR UPDATE` block an insert of id 20000?
+
+The row does not exist, so to make the result repeatable InnoDB must stop anyone inserting id 10005. It locks the gap where 10005 would go: after the last entry, 10000, which is the **supremum** pseudo-record of the last page. That one next-key lock covers every key above 10000, so id 10003 and id 20000 both had to wait (ERROR 1205 after the 1 s timeout).
+
+> **Common mistake:** "it only locks id 10005". InnoDB cannot lock a key that does not exist; it locks the whole gap around it.
+
+## Q3. One lock vs a thousand
+
+**Question:** why did `id = 500 FOR UPDATE` take no gap lock, but `branch = 'B03' FOR UPDATE` took over a thousand?
+
+`id` is a **unique** index and the row was found: no other row can ever have id 500, so a record lock suffices. `branch` is **non-unique**: a new B03 row could be inserted between any two B03 entries, so every entry gets a next-key lock (1,001 including a page supremum) and the gap before the first B04 entry gets a gap lock. Each matching row is also locked in PRIMARY (1,000 `X,REC_NOT_GAP`).
+
+> **Common mistake:** expecting the lock count to equal the number of matched rows. In RR it is matched entries in every index used, plus gaps.
+
+## Q4. B02 blocked by a B03 query
+
+**Question:** explain why an insert into branch **B02** waited for a transaction that locked branch **B03**.
+
+The secondary index is sorted by `(branch, id)`. The last B02 entry was `(B02, 9992)` and the first B03 entry `(B03, 3)`. The next-key lock on `(B03, 3)` covers the gap between them. The new entry `(B02, 20003)` sorts exactly there (after `(B02, 9992)`, before `(B03, 3)`), so its insert intention lock waited. `(B04, 20002)` sorted after `(B04, 4)`, outside the locked stretch, and went through.
+
+> **Common mistake:** thinking locks follow the WHERE condition's values. They follow index **positions**, and gaps have no value.
+
+## Q5. READ COMMITTED
+
+**Question:** what changes under READ COMMITTED, and what anomaly do you accept in exchange?
+
+InnoDB stops taking gap and next-key locks for searches and index scans (they remain only for foreign-key and duplicate-key checks): the B03 query took 1,000 + 1,000 record locks and the B03 insert succeeded at once. In exchange, phantoms are possible: running the same locking query twice in one transaction can return the newly inserted row. Many applications run MySQL in READ COMMITTED for exactly this reason.
+
+> **Common mistake:** believing READ COMMITTED takes "fewer locks on the rows it updates". Matching rows are still locked until commit; only gaps (and, Concept 3, non-matching rows) are released.
+
+## Q6. Phantoms in PostgreSQL SERIALIZABLE
+
+**Question:** how does PostgreSQL SERIALIZABLE prevent phantoms without blocking T2's insert?
+
+T1's queries run on a snapshot, so new rows are simply invisible to it (T1 counted 1,000 twice). SERIALIZABLE also records what T1 read as `SIReadLock`s (2 index pages and the relation here). These never block; at commit time, if T1's reads and T2's writes form a dangerous pattern with another dependency (Session 3), one transaction gets serialization error 40001 and must retry.
+
+> **Common mistake:** calling SIReadLocks "locks" in the blocking sense. Nobody ever waits for one.
+
+## Q7. Two sessions, one gap
+
+**Question:** two sessions both run `SELECT … WHERE id = 20001 FOR UPDATE` (missing) and both succeed. Why is that possible, and what happens when both then insert?
+
+Both get a next-key lock on the supremum, and gap-type locks are compatible with each other. When each then INSERTs, its insert intention lock must wait for the **other** session's gap lock: each waits for the other, a deadlock. InnoDB detects it immediately and rolls one back (Session 6 shows the report). PostgreSQL has no gap locks, so the same sequence just inserts both rows.
+
+> **Common mistake:** treating `SELECT … FOR UPDATE` as a mutex for a key that does not exist yet.

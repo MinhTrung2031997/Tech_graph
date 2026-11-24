@@ -1,0 +1,90 @@
+---
+title: "Answers: Locks and indexes session quiz"
+description: "Worked answers to the Session 5 quiz, with the lab's measured values."
+companion: "answers"
+tags: ["transactions", "locking", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locks-set.html"
+  - "https://www.postgresql.org/docs/current/explicit-locking.html"
+---
+
+<Tldr>
+What gets locked is decided by the access path and the isolation level; how long it is held is decided by the transaction.
+</Tldr>
+
+## Q1. Seeing T1's row lock in PostgreSQL
+
+**Question:** in PostgreSQL, T1 updated account 1. Name two places you can see that, and one place you cannot.
+
+You can see it with `pgrowlocks('accounts')` (row `(0,1)`, mode `No Key Update`) and, once someone waits, in `pg_stat_activity` / `pg_blocking_pids()` (waiter blocked by T1's pid) and in `pg_locks` as the waiter's `ShareLock` on T1's transaction id. You cannot see the row itself in `pg_locks`: uncontended row locks live only in the tuple header.
+
+> **Common mistake:** "no rows in pg_locks, so nothing is locked".
+
+## Q2. FK checks and parent updates
+
+**Question:** why does a foreign-key check in PostgreSQL not block an update of the parent's `balance`, while in InnoDB it does?
+
+PostgreSQL's FK check takes `FOR KEY SHARE` on the parent row, which conflicts only with key changes and deletes; updating `balance` takes `FOR NO KEY UPDATE`, compatible with it. InnoDB has only `S` and `X` record locks: the FK check takes `S` on the parent record, and any UPDATE needs `X` on it.
+
+> **Common mistake:** assuming all engines' FK checks are equally cheap for concurrency.
+
+## Q3. Locking a missing id
+
+**Question:** `SELECT … WHERE id = 10005 FOR UPDATE` returned nothing. Which inserts does it block in InnoDB REPEATABLE READ, and why?
+
+Every insert of an id above 10000 (the largest existing id): InnoDB locks the gap where 10005 would go, which, after the last row, is the next-key lock on the last page's supremum pseudo-record, covering everything to infinity. In the lab, inserts of 10003 and 20000 both timed out.
+
+> **Common mistake:** expecting only id 10005 to be blocked.
+
+## Q4. The B02/B03 boundary
+
+**Question:** a query on branch B03 blocked an insert into branch B02. Draw the index entries around the boundary and mark the locked gap.
+
+```text
+… (B02, 9982) (B02, 9992) ░░░░░░░░ (B03, 3) (B03, 13) … (B03, 9993) ░░░ (B04, 4) …
+                          └ locked ┘ └──── next-key locks on every B03 entry ────┘└ gap lock
+new entry (B02, 20003) sorts here ↑ → waits
+new entry (B04, 20002) sorts after (B04, 4) → free
+```
+
+The next-key lock on `(B03, 3)` covers the gap that starts right after the last B02 entry.
+
+> **Common mistake:** thinking of locks as covering "branch values"; they cover index positions.
+
+## Q5. Rows locked by the shelf update
+
+**Question:** `UPDATE inventory … WHERE shelf = 7` changed 100 rows. Give the number of locked rows in InnoDB RR, InnoDB RC, InnoDB RR with an index on `shelf`, and PostgreSQL.
+
+| Setup | Locked (lab) |
+|---|---|
+| InnoDB RR, no index | 5,013 (every record + 13 page supremums) |
+| InnoDB RC, no index | 100 |
+| InnoDB RR, index on `shelf` | 202 (101 next-key + 1 gap on the index, 100 PRIMARY) |
+| PostgreSQL (`pgrowlocks`) | 100 |
+
+> **Common mistake:** assuming the count follows the number of changed rows in every engine.
+
+## Q6. The admin page that times out
+
+**Question:** a MySQL worker pool uses `SKIP LOCKED` correctly but admin updates of old jobs time out. What is the cause and the fix?
+
+The claim query `WHERE status = 'queued' ORDER BY id LIMIT n FOR UPDATE SKIP LOCKED` has no usable index, so it scans PRIMARY from the beginning and, under REPEATABLE READ, locks every finished job it passes (90,420 locks in the lab). Admin updates of those jobs wait for the worker's transaction. Fix: `CREATE INDEX jobs_status ON jobs (status, id)` (3 + 3 locks after it), or run the workers under READ COMMITTED, and keep worker transactions short.
+
+> **Common mistake:** raising `innodb_lock_wait_timeout` for the admin page.
+
+## Q7. Committing after a lock-wait error
+
+**Question:** after a lock-wait error, which engine still lets the transaction commit its earlier statements, and why is that dangerous?
+
+MySQL: error 1205 rolls back only the timed-out statement (with the default `innodb_rollback_on_timeout = OFF`), and a later COMMIT saves the rest (accounts 8 and 9 changed, 7 not). That breaks atomicity of the business operation if the code does not roll back explicitly. PostgreSQL aborts the whole transaction on any error; MongoDB's `withTransaction` retries or aborts the whole transaction.
+
+> **Common mistake:** writing one retry handler for "lock errors" that treats 1205 and 1213 the same.
+
+## Q8. No SKIP LOCKED in MongoDB
+
+**Question:** why is there no `SKIP LOCKED` in MongoDB, and what replaces it for a queue?
+
+MongoDB reads never lock documents, and transactions do not wait for each other on documents (they conflict and retry), so there is nothing to skip. A queue claims work with one atomic single-document write: `findOneAndUpdate({ status: "queued" }, { $set: { status: "running" } }, { sort: { _id: 1 } })`. Four workers × 50 claims produced 200 distinct jobs. Index `{ status: 1, _id: 1 }`: without it each claim examined 90,001 documents.
+
+> **Common mistake:** wrapping `find()` + `updateMany()` in a transaction and expecting it to behave like `SKIP LOCKED`.

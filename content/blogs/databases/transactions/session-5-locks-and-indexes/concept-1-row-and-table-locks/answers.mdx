@@ -1,0 +1,74 @@
+---
+title: "Answers: Row locks and table locks"
+description: "Worked answers to the Session 5 Concept 1 check questions."
+companion: "answers"
+tags: ["transactions", "locking", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locking.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-production-consideration/"
+---
+
+<Tldr>
+PostgreSQL: lock in the row, wait on the transaction id. InnoDB: lock on the index record in a lock table. MongoDB: no document lock; conflicts instead.
+</Tldr>
+
+## Q1. Proving T1 holds account 1 in PostgreSQL
+
+**Question:** T1 has updated account 1 and is still open. Where would you look in PostgreSQL to prove it, and why is `pg_locks` alone not enough?
+
+`pg_locks` shows T1's `RowExclusiveLock` on `accounts` and `accounts_pkey` and its own `transactionid` lock, but **no row**: row locks are stored in the tuple header (`xmax` and infomask bits), not in the shared lock table. Use `SELECT * FROM pgrowlocks('accounts')`, which reads the table and reported `(0,1)` locked by transaction 787521 in mode `No Key Update`. Without the extension, you only see row locks indirectly, when someone waits for them.
+
+> **Common mistake:** concluding "no row locks" from an empty `pg_locks` row list. PostgreSQL never puts uncontended row locks there.
+
+## Q2. What T2 waits for
+
+**Question:** what does T2 wait for in PostgreSQL when it updates the same row: the row, or something else?
+
+The **holder's transaction id**. T2 found `xmax = 787521` (still running) on the row, took the **tuple lock** (`ExclusiveLock` on tuple `(0,1)`, which makes it first in line among later waiters) and then requested `ShareLock` on `transactionid 787521`, which is granted only when T1 commits or rolls back. `pg_stat_activity` shows `wait_event = transactionid`.
+
+> **Common mistake:** reading "waits for ShareLock on transaction" as a table share lock. It is a wait for another transaction to finish.
+
+## Q3. FOR KEY SHARE vs updates
+
+**Question:** why can a PostgreSQL session update `balance` of a row another session holds `FOR KEY SHARE`, but not change its `id`?
+
+`FOR KEY SHARE` only promises "the key will not change and the row will not be deleted": that is all a foreign-key check needs to know about the parent. An UPDATE that does not touch a key column takes `FOR NO KEY UPDATE`, which is compatible with `KEY SHARE` (✓ 0.65 ms in the lab). Changing `id` takes `FOR UPDATE`, which conflicts with every row lock (✗ lock timeout).
+
+> **Common mistake:** thinking any row lock blocks any update. PostgreSQL has four strengths precisely so FK checks do not block ordinary updates of the parent.
+
+## Q4. InnoDB locks for one UPDATE
+
+**Question:** in InnoDB, T1 updates account 1. List the locks `data_locks` shows and what each means.
+
+| LOCK_TYPE | INDEX_NAME | LOCK_MODE | LOCK_DATA | Meaning |
+|---|---|---|---|---|
+| TABLE | NULL | `IX` | NULL | "I will lock some rows of this table": blocks only table-level `S`/`X` locks (e.g. `LOCK TABLES … WRITE`) |
+| RECORD | PRIMARY | `X,REC_NOT_GAP` | 1 | Exclusive lock on index record 1 only, not the gap before it |
+
+> **Common mistake:** expecting a lock on "the row" separate from the index. In InnoDB the clustered index entry is the row; locks always sit on index records.
+
+## Q5. The misleading blocking query
+
+**Question:** `sys.innodb_lock_waits` says the blocking query is `SELECT SLEEP(6)`. Why is that not the statement that took the lock?
+
+`blocking_query` is what the blocking connection is executing **now**. The lock was taken by an earlier statement of the same transaction (the UPDATE) and is held until the transaction ends. If the blocker is idle in its transaction, `blocking_query` is NULL. Find the real statement with `performance_schema.events_statements_history` for that thread, or in the application log.
+
+> **Common mistake:** "optimizing" the query shown as blocker, which is innocent.
+
+## Q6. MongoDB: conflict vs retry
+
+**Question:** in MongoDB, why does a second transaction fail immediately while a plain `updateOne` on the same document eventually succeeds?
+
+MongoDB does not queue writers on a document. Both writes meet T1's uncommitted version and get a write conflict. Inside a **transaction**, the conflict aborts the transaction at once (`WriteConflict`, label `TransientTransactionError`, 8 ms), because the server cannot replay the earlier operations of that transaction. A **single-document write** outside a transaction can be retried by the server itself: it yielded and retried 215 times over 3 s and applied after T1 committed (4.8 s total).
+
+> **Common mistake:** expecting a MongoDB transaction to wait like a SQL transaction. The client must retry it.
+
+## Q7. Reading during an update
+
+**Question:** which engine lets a plain SELECT read account 1 while it is being updated, and what value does it see?
+
+All three. PostgreSQL and InnoDB plain SELECTs read the last committed version (1000.00 in the lab) without waiting; MongoDB reads also see the committed version. Only **locking reads** (`FOR SHARE` / `FOR UPDATE`) wait: InnoDB's `FOR SHARE` failed with ERROR 1205 after 1 s.
+
+> **Common mistake:** adding `FOR UPDATE` to reports "to get correct data", which turns every report into a writer-blocker.

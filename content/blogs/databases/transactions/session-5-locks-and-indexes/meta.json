@@ -1,0 +1,12 @@
+{
+  "title": "Session 5: Locks and indexes",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-row-and-table-locks/index",
+    "concept-2-gap-and-next-key-locks/index",
+    "concept-3-unindexed-writes/index",
+    "concept-4-nowait-skip-locked-timeouts/index",
+    "lab/index"
+  ]
+}
