@@ -1,0 +1,63 @@
+---
+title: "Answers: What COMMIT waits for"
+description: "Worked answers to the Session 1 Concept 3 check questions."
+companion: "answers"
+tags: ["transactions", "durability", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/wal-async-commit.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-parameters.html#sysvar_innodb_flush_log_at_trx_commit"
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+---
+
+<Tldr>
+Durable = the log record is on stable storage (and, for MongoDB majority, on enough members) before the client hears "committed".
+</Tldr>
+
+## Q1. Why the log is enough
+
+**Question:** why is flushing the log enough for durability, when the changed data pages are still only in memory?
+
+The log record describes the change completely. After a crash, recovery starts from the last checkpoint and replays every log record since then onto the data files, recreating the lost in-memory changes. Writing one sequential log record per commit is far cheaper than writing every changed 8 KB or 16 KB page at random positions, which is why all three engines are built this way (write-ahead logging).
+
+> **Common mistake:** thinking `COMMIT` writes the table. It writes the log; the table pages are written later by checkpoints and background writers.
+
+## Q2. What `synchronous_commit = off` can lose
+
+**Question:** what exactly can a crash lose with PostgreSQL `synchronous_commit = off`, and what can it not do?
+
+It can lose transactions that were acknowledged as committed but whose commit records were still in WAL buffers: at most about 3 × `wal_writer_delay` (≈ 600 ms by default). After recovery those transactions are simply absent, entirely, as if they had rolled back. It cannot leave a transaction half applied, break constraints or corrupt data, because the WAL is still written in order before data pages.
+
+> **Common mistake:** equating it with `fsync = off`, which can corrupt the database after an OS crash.
+
+## Q3. Two logs in MySQL
+
+**Question:** why does MySQL flush two logs per commit with the default settings?
+
+The **redo log** belongs to InnoDB and makes the change recoverable. The **binary log** belongs to the server and is what replicas and point-in-time recovery read. Both must agree on which transactions committed, so MySQL uses an internal two-phase commit: InnoDB prepares and flushes the redo log, the binary log is written and synced (`sync_binlog = 1`), then InnoDB commits. After a crash, a prepared transaction is committed if it is in the binary log and rolled back otherwise. Group commit lets many transactions share each of those fsyncs.
+
+> **Common mistake:** setting `sync_binlog = 0` for speed and later finding replicas missing transactions that the primary had committed.
+
+## Q4. Setting 2
+
+**Question:** what does `innodb_flush_log_at_trx_commit = 2` protect against, and what not?
+
+At each commit the redo is **written** to the operating system's file cache, and **fsynced** about once per second. A crash of the MySQL process loses nothing, since the OS still holds the data. A crash of the operating system or a power loss can lose up to about one second of commits. Setting `0` also loses up to about a second on a MySQL crash.
+
+> **Common mistake:** assuming a cloud VM never loses its OS cache; hypervisor or host failures do exactly that.
+
+## Q5. majority vs j: true
+
+**Question:** what does MongoDB `w: "majority"` add over `w: 1, j: true` on a real three-node replica set?
+
+`w: 1, j: true` guarantees the write is in the primary's journal. If the primary then fails before a secondary copied it, the new primary does not have the write, and when the old primary rejoins it **rolls the write back**. `w: "majority"` waits until two of three members have it (journaled), so it survives the failover. The lab's one-node set cannot show the difference; there, majority is one node.
+
+> **Common mistake:** "journaled means durable". On a replica set, it means durable until a failover.
+
+## Q6. Relaxed durability in e-commerce
+
+**Question:** which data in an e-commerce system would you allow to use relaxed durability, and how would you scope the setting?
+
+Candidates: page-view and click events, search logs, recommendation signals, session state that can be rebuilt, cache tables. Not: orders, payments, stock reservations, anything confirmed to a customer or partner. Scope it narrowly: PostgreSQL `SET LOCAL synchronous_commit = off` in those transactions or `ALTER ROLE events_writer SET synchronous_commit = off`; MongoDB write concern per operation or per collection client. MySQL's setting is server-wide, so in MySQL the usual answer is batching (Concept 4) or a separate server for the event data.
+
+> **Common mistake:** changing the server-wide default because one workload is slow, which silently relaxes payments too.

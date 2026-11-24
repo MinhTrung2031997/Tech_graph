@@ -1,0 +1,70 @@
+---
+title: "Answers: When a statement fails inside a transaction"
+description: "Worked answers to the Session 1 Concept 2 check questions."
+companion: "answers"
+tags: ["transactions", "errors", "savepoints", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-savepoint.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-error-handling.html"
+---
+
+<Tldr>
+Know which unit each engine rolls back on an error (statement or transaction), and make the code's reaction match.
+</Tldr>
+
+## Q1. The SELECT that failed
+
+**Question:** in PostgreSQL, why did a plain `SELECT` fail right after the CHECK error?
+
+After any error PostgreSQL marks the transaction as failed and rejects every command except `ROLLBACK` (or `ROLLBACK TO SAVEPOINT`) with "current transaction is aborted, commands ignored until end of transaction block". It does not try to work out which earlier changes are still valid; the transaction as a whole can no longer commit.
+
+> **Common mistake:** reading the second error as a new problem and debugging the `SELECT`. The first error in the log is the real one.
+
+## Q2. 10,001,500 with a transaction
+
+**Question:** why did the MySQL total become 10,001,500 even though the code used a transaction?
+
+InnoDB rolled back only the failing `UPDATE` (statement-level rollback). The credit stayed pending in the open transaction, and the `COMMIT` that followed made it permanent. The transaction worked as designed; the script ignored the error.
+
+> **Common mistake:** "the transaction should have rolled back automatically". In MySQL only some errors do that (deadlocks, and lock wait timeouts when `innodb_rollback_on_timeout` is ON).
+
+## Q3. MySQL error handling
+
+**Question:** what must MySQL application code do after an error inside a transaction?
+
+Send `ROLLBACK` (or `ROLLBACK TO SAVEPOINT` when skipping a step on purpose), then decide whether to retry the whole transaction. Framework helpers (`Repo.transaction`, Spring `@Transactional`, Django `atomic`) roll back when an exception escapes the block; the danger is catching the exception inside the block and carrying on.
+
+> **Common mistake:** catching the exception, logging it, and letting the block finish normally, which commits.
+
+## Q4. What a savepoint undoes
+
+**Question:** what does `ROLLBACK TO SAVEPOINT` undo, and what does it leave?
+
+It undoes every change made **after** the savepoint (including the failed statement) and, in PostgreSQL, clears the aborted state. Changes made before the savepoint remain pending, the savepoint itself stays defined, and the transaction stays open. In the lab: the +100 on account 3 survived, the failed debit of account 4 was undone, and the transaction went on to debit account 5.
+
+> **Common mistake:** expecting `ROLLBACK TO SAVEPOINT` to end the transaction; it still needs `COMMIT` or `ROLLBACK`.
+
+## Q5. ON_ERROR_ROLLBACK
+
+**Question:** how does psql's `ON_ERROR_ROLLBACK` work, and why is it risky in scripts?
+
+With `ON_ERROR_ROLLBACK on`, psql issues a hidden `SAVEPOINT` before every statement inside a transaction and `ROLLBACK TO` it when the statement fails, so the transaction continues. That reproduces MySQL's statement-level behaviour: the lab's transfer committed the credit and the total became 10,001,500. Interactively it saves retyping; in a script it turns a failed step into a partial commit. The value `interactive` limits it to interactive sessions.
+
+> **Common mistake:** putting `\set ON_ERROR_ROLLBACK on` in a shared `.psqlrc` used by deployment scripts.
+
+## Q6. Continuing in MongoDB
+
+**Question:** after a validation error in a MongoDB transaction, can the code continue the same transaction? What should it do?
+
+No. The server aborted it; every later operation and the commit fail with `NoSuchTransaction`. Call `abortTransaction()` (or let `withTransaction` do it) and decide: the error had no `TransientTransactionError` label, so retrying the identical transaction would fail again. Fix the input or start a new transaction without the failing step.
+
+> **Common mistake:** retrying every transaction error in a loop. Only errors labelled `TransientTransactionError` (and `UnknownTransactionCommitResult` for the commit) are worth retrying.
+
+## Q7. Deadlock in MySQL
+
+**Question:** a deadlock occurs in the middle of a MySQL transaction. Is the earlier work still pending, as with ERROR 3819?
+
+No. A deadlock (ERROR 1213) rolls back the **whole** victim transaction. In a lab run, T1 added 1 to account 60, then deadlocked with T2 on account 61 and was chosen as the victim: account 60 ended at 1,001, which is T2's +1 alone, so T1's earlier +1 had been undone. The code must retry the whole transaction from the start ([Session 6](/blogs/databases/transactions/session-6-deadlocks/lab)).
+
+> **Common mistake:** retrying only the statement that reported the deadlock, which runs it in a new autocommit transaction without the earlier work.

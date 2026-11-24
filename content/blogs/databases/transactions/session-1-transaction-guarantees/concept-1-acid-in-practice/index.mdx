@@ -1,0 +1,326 @@
+---
+title: "Concept 1: ACID in practice"
+description: "What the four ACID letters promise, what autocommit means in PostgreSQL, MySQL and MongoDB, and a transfer of 1,500 between two accounts that created money out of nothing when each statement was its own transaction. Measured in all three engines."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "acid", "autocommit"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/tutorial-transactions.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-autocommit-commit-rollback.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions/"
+  - "https://www.mongodb.com/docs/manual/core/write-operations-atomicity/"
+---
+
+<Tldr>
+A **transaction** groups statements so that they take effect **all together or not at all**. Without one, every statement is its own transaction (**autocommit**), and a failure in the middle leaves the work half done. In the lab, a transfer of 1,500 from account 1 (balance 1,000) to account 2 ran as two statements: the credit committed, the debit failed the `balance >= 0` rule, and the bank's total grew from **10,000,000 to 10,001,500** in PostgreSQL, MySQL and MongoDB alike. Inside a transaction the same failure left the total at **10,000,000**. ACID names four promises; this session covers **A**tomicity and **D**urability, Sessions 2 and 3 cover **I**solation.
+</Tldr>
+
+## The four promises
+
+| Letter | Promise | What breaks without it | Where in this course |
+|---|---|---|---|
+| **A**tomicity | All statements of a transaction take effect, or none do | Half-finished transfers, orders without their items | This concept and Concept 2 |
+| **C**onsistency | Every commit leaves the data valid under the declared rules (CHECK, UNIQUE, foreign keys) | Negative balances, orphan rows | The CHECK constraint in this lab |
+| **I**solation | Concurrent transactions do not see each other's partial work | Anomalies: lost updates, write skew | [Session 2](/blogs/databases/transactions/session-2-anomalies/concept-1-dirty-reads), Session 3 |
+| **D**urability | Once `COMMIT` returns, a crash does not undo it | Confirmed payments that vanish after a power cut | Concepts 3 and 4 |
+
+Consistency is partly the application's job: the database only enforces the rules you declare. The lab's `accounts` table declares `CHECK (balance >= 0)`; MongoDB gets the same rule from a collection validator.
+
+## Autocommit: every statement is a transaction
+
+| Engine | Default | How to group statements |
+|---|---|---|
+| PostgreSQL | Each statement commits on its own (psql and drivers send no `BEGIN`) | `BEGIN … COMMIT` |
+| MySQL | `autocommit = 1`: each statement commits on its own | `START TRANSACTION … COMMIT`, or `SET autocommit = 0` |
+| MongoDB | Each **single-document** write is atomic on its own; nothing groups documents | `session.startTransaction()` … `commitTransaction()` (replica set or sharded cluster only) |
+
+| Term | Meaning |
+|---|---|
+| Transfer | Credit account 2 with 1,500, debit account 1 by 1,500; both start at 1,000 |
+| Total | `sum(balance)` over the 10,000 accounts: 10,000,000.00 before every run |
+| **✓ Committed** | The change is permanent and visible to others |
+| **✗ Rejected** | The statement failed the `balance >= 0` rule and changed nothing |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: a transfer with and without a transaction"
+  height={320}
+  nodes={[
+    { id: 'app', label: 'Transfer 1,500', sub: 'account 1 → account 2', x: 20, y: 20, w: 200 },
+    { id: 'credit', label: 'Credit account 2', sub: '1,000 → 2,500', x: 280, y: 20, w: 200 },
+    { id: 'debit', label: 'Debit account 1', sub: '1,000 → −500', x: 560, y: 20, w: 220 },
+    { id: 'ok', label: '✓ Committed', sub: '', x: 280, y: 140, w: 200 },
+    { id: 'fail', label: '✗ CHECK balance ≥ 0', sub: 'statement rejected', x: 560, y: 140, w: 220 },
+    { id: 'total', label: 'sum(balance)', sub: '', x: 20, y: 250, w: 760 },
+  ]}
+  edges={[
+    { id: 'app-credit', from: 'app', to: 'credit' },
+    { id: 'credit-debit', from: 'credit', to: 'debit' },
+    { id: 'credit-ok', from: 'credit', to: 'ok' },
+    { id: 'debit-fail', from: 'debit', to: 'fail' },
+    { id: 'ok-total', from: 'ok', to: 'total' },
+    { id: 'fail-total', from: 'fail', to: 'total' },
+  ]}
+  cases={[
+    {
+      title: 'Autocommit',
+      path: 'credit ✓ committed at once → debit ✗ rejected → total 10,001,500',
+      summary: 'Two statements, two transactions: the first one cannot be undone by the second one failing.',
+      subs: { ok: 'credit is permanent', total: '10,001,500.00: 1,500 created' },
+      steps: [
+        {
+          title: 'The credit commits by itself',
+          note: 'Without BEGIN, PostgreSQL wraps each statement in its own transaction and commits it as soon as it succeeds. Account 2 now holds 2,500 for everyone to see.',
+          code: 'UPDATE accounts SET balance = balance + 1500 WHERE id = 2;   -- UPDATE 1',
+          active: ['app', 'credit', 'ok'],
+          edges: ['app-credit', 'credit-ok'],
+        },
+        {
+          title: 'The debit is rejected',
+          note: 'Account 1 would drop to −500. The CHECK constraint rejects the statement: ERROR: new row for relation "accounts" violates check constraint "accounts_balance_check".',
+          code: 'UPDATE accounts SET balance = balance - 1500 WHERE id = 1;\n-- ERROR:  … violates check constraint "accounts_balance_check"',
+          active: ['credit', 'debit', 'fail'],
+          edges: ['credit-debit', 'debit-fail'],
+        },
+        {
+          title: 'Money created',
+          note: 'Account 2 kept its 1,500, account 1 lost nothing: the bank now holds 10,001,500.00. Each statement was atomic; the transfer was not.',
+          code: 'SELECT sum(balance) FROM accounts;   -- 10001500.00',
+          active: ['ok', 'fail', 'total'],
+          edges: ['ok-total', 'fail-total'],
+        },
+      ],
+    },
+    {
+      title: 'One transaction',
+      path: 'BEGIN → credit (not yet committed) → debit ✗ → whole transaction rolled back → total 10,000,000',
+      summary: 'The failure takes the credit with it.',
+      subs: { ok: 'never reached', total: '10,000,000.00: unchanged' },
+      steps: [
+        {
+          title: 'Credit inside the transaction',
+          note: 'After BEGIN the credit is applied but only this session can see it. Nothing is permanent until COMMIT.',
+          code: 'BEGIN;\nUPDATE accounts SET balance = balance + 1500 WHERE id = 2;',
+          active: ['app', 'credit'],
+          edges: ['app-credit'],
+        },
+        {
+          title: 'The debit fails',
+          note: 'Same CHECK error. PostgreSQL now marks the whole transaction as failed (Concept 2): the only way out is a rollback.',
+          active: ['credit', 'debit', 'fail'],
+          edges: ['credit-debit', 'debit-fail'],
+        },
+        {
+          title: 'COMMIT becomes ROLLBACK',
+          note: 'psql printed ROLLBACK in reply to COMMIT. The credit was discarded with the rest, and the total stayed at 10,000,000.00.',
+          code: 'COMMIT;   -- ROLLBACK\nSELECT sum(balance) FROM accounts;   -- 10000000.00',
+          active: ['fail', 'total'],
+          edges: ['fail-total'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL
+
+<Flow
+  title="MySQL: a transfer with and without a transaction"
+  height={320}
+  nodes={[
+    { id: 'app', label: 'Transfer 1,500', sub: 'account 1 → account 2', x: 20, y: 20, w: 200 },
+    { id: 'credit', label: 'Credit account 2', sub: '1,000 → 2,500', x: 280, y: 20, w: 200 },
+    { id: 'debit', label: 'Debit account 1', sub: '1,000 → −500', x: 560, y: 20, w: 220 },
+    { id: 'ok', label: '✓ Committed', sub: '', x: 280, y: 140, w: 200 },
+    { id: 'fail', label: '✗ ERROR 3819', sub: 'CHECK violated', x: 560, y: 140, w: 220 },
+    { id: 'total', label: 'sum(balance)', sub: '', x: 20, y: 250, w: 760 },
+  ]}
+  edges={[
+    { id: 'app-credit', from: 'app', to: 'credit' },
+    { id: 'credit-debit', from: 'credit', to: 'debit' },
+    { id: 'credit-ok', from: 'credit', to: 'ok' },
+    { id: 'debit-fail', from: 'debit', to: 'fail' },
+    { id: 'ok-total', from: 'ok', to: 'total' },
+    { id: 'fail-total', from: 'fail', to: 'total' },
+  ]}
+  cases={[
+    {
+      title: 'Autocommit = 1',
+      path: 'credit ✓ committed → debit ✗ ERROR 3819 → total 10,001,500',
+      summary: 'Identical outcome to PostgreSQL: the default mode commits every statement.',
+      subs: { ok: 'credit is permanent', total: '10,001,500.00' },
+      steps: [
+        {
+          title: 'Credit, committed',
+          note: 'With autocommit = 1 (the default), InnoDB commits the UPDATE as soon as it finishes.',
+          code: 'UPDATE accounts SET balance = balance + 1500 WHERE id = 2;   -- 1 row affected',
+          active: ['app', 'credit', 'ok'],
+          edges: ['app-credit', 'credit-ok'],
+        },
+        {
+          title: 'Debit rejected',
+          note: "ERROR 3819 (HY000): Check constraint 'accounts_chk_1' is violated. MySQL enforces CHECK constraints since 8.0.16; older versions parsed and ignored them.",
+          active: ['credit', 'debit', 'fail'],
+          edges: ['credit-debit', 'debit-fail'],
+        },
+        {
+          title: 'Money created',
+          note: 'sum(balance) = 10,001,500.00.',
+          active: ['ok', 'fail', 'total'],
+          edges: ['ok-total', 'fail-total'],
+        },
+      ],
+    },
+    {
+      title: 'Transaction + ROLLBACK',
+      path: 'START TRANSACTION → credit → debit ✗ → application sends ROLLBACK → total 10,000,000',
+      summary: 'In MySQL the application must send the ROLLBACK itself (Concept 2 shows what COMMIT does instead).',
+      subs: { ok: 'never reached', total: '10,000,000.00' },
+      steps: [
+        {
+          title: 'Credit inside the transaction',
+          code: 'START TRANSACTION;\nUPDATE accounts SET balance = balance + 1500 WHERE id = 2;',
+          note: 'The change is in the buffer pool and the undo log, invisible to other sessions.',
+          active: ['app', 'credit'],
+          edges: ['app-credit'],
+        },
+        {
+          title: 'Debit fails, transaction still open',
+          note: 'ERROR 3819 undoes only the failing statement. The credit is still pending inside the open transaction.',
+          active: ['credit', 'debit', 'fail'],
+          edges: ['credit-debit', 'debit-fail'],
+        },
+        {
+          title: 'ROLLBACK',
+          note: 'The application sees the error and rolls back: the credit is undone and the total stays at 10,000,000.00.',
+          code: 'ROLLBACK;\nSELECT sum(balance) FROM accounts;   -- 10000000.00',
+          active: ['fail', 'total'],
+          edges: ['fail-total'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+MongoDB has no CHECK constraints; the lab adds the same rule as a **validator**: `db.runCommand({ collMod: "accounts", validator: { balance: { $gte: 0 } } })`.
+
+<Flow
+  title="MongoDB: a transfer with and without a transaction"
+  height={320}
+  nodes={[
+    { id: 'app', label: 'Transfer 1,500', sub: 'account 1 → account 2', x: 20, y: 20, w: 200 },
+    { id: 'credit', label: 'updateOne _id 2', sub: '$inc balance +1,500', x: 280, y: 20, w: 200 },
+    { id: 'debit', label: 'updateOne _id 1', sub: '$inc balance −1,500', x: 560, y: 20, w: 220 },
+    { id: 'ok', label: '✓ Acknowledged', sub: '', x: 280, y: 140, w: 200 },
+    { id: 'fail', label: '✗ Validation failed', sub: 'code 121', x: 560, y: 140, w: 220 },
+    { id: 'total', label: '$sum of balance', sub: '', x: 20, y: 250, w: 760 },
+  ]}
+  edges={[
+    { id: 'app-credit', from: 'app', to: 'credit' },
+    { id: 'credit-debit', from: 'credit', to: 'debit' },
+    { id: 'credit-ok', from: 'credit', to: 'ok' },
+    { id: 'debit-fail', from: 'debit', to: 'fail' },
+    { id: 'ok-total', from: 'ok', to: 'total' },
+    { id: 'fail-total', from: 'fail', to: 'total' },
+  ]}
+  cases={[
+    {
+      title: 'Two single-document writes',
+      path: 'credit ✓ acknowledged → debit ✗ Document failed validation → total 10,001,500',
+      summary: 'Each document write is atomic; two documents are two independent writes.',
+      subs: { ok: 'credit is permanent', total: '10,001,500.00' },
+      steps: [
+        {
+          title: 'Credit acknowledged',
+          note: 'A single-document update is always atomic in MongoDB, and it is committed when acknowledged.',
+          code: 'db.accounts.updateOne({ _id: 2 }, { $inc: { balance: NumberDecimal("1500") } })',
+          active: ['app', 'credit', 'ok'],
+          edges: ['app-credit', 'credit-ok'],
+        },
+        {
+          title: 'Debit rejected',
+          note: 'MongoServerError: Document failed validation (code 121, DocumentValidationFailure).',
+          active: ['credit', 'debit', 'fail'],
+          edges: ['credit-debit', 'debit-fail'],
+        },
+        {
+          title: 'Money created',
+          note: 'The $sum over balance is 10,001,500.00, exactly as in the SQL engines.',
+          active: ['ok', 'fail', 'total'],
+          edges: ['ok-total', 'fail-total'],
+        },
+      ],
+    },
+    {
+      title: 'Multi-document transaction',
+      path: 'startTransaction → credit → debit ✗ → server aborts the transaction → total 10,000,000',
+      summary: 'A write error inside a transaction aborts it on the server.',
+      subs: { ok: 'never reached', total: '10,000,000.00' },
+      steps: [
+        {
+          title: 'Credit inside the transaction',
+          note: 'Transactions need a replica set (the lab runs a one-node replica set). Writes go through the session.',
+          code: 'const s = db.getMongo().startSession();\nconst a = s.getDatabase("bank").accounts;\ns.startTransaction();\na.updateOne({ _id: 2 }, { $inc: { balance: NumberDecimal("1500") } });',
+          active: ['app', 'credit'],
+          edges: ['app-credit'],
+        },
+        {
+          title: 'Debit fails, transaction aborted',
+          note: 'The validation error aborts the transaction on the server: the next read in the session failed with NoSuchTransaction ("Transaction with { txnNumber: 3 } has been aborted"), and so did commitTransaction().',
+          active: ['credit', 'debit', 'fail'],
+          edges: ['credit-debit', 'debit-fail'],
+        },
+        {
+          title: 'Nothing applied',
+          note: 'The credit was discarded with the transaction: total 10,000,000.00.',
+          active: ['fail', 'total'],
+          edges: ['fail-total'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+"Each statement is atomic" is not the same as "my operation is atomic". An ORM call such as `account.save()` followed by `other.save()` is two transactions unless the code opens one around them. The lab total grew by 1,500 in every engine, with no error that the second call could not have reported anyway.
+</Pitfall>
+
+## Real-world scenario: the order without items
+
+A checkout inserts an `orders` row, then its `order_items`, then decrements stock, each through a separate repository call with autocommit. A timeout on the third call leaves a paid order with items but untouched stock; a crash after the first leaves an order with no items at all. Support finds them weeks later.
+
+| Fix | Effect |
+|---|---|
+| One transaction around the three writes | All or nothing |
+| Constraints for the invariants (`stock >= 0`, foreign keys) | The database rejects invalid states, even from buggy code |
+| Idempotent retry of the whole transaction | Safe to repeat after a timeout ([Session 7](/blogs/databases/transactions/session-7-application-patterns/lab)) |
+
+## Why this matters for transactions
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 2: errors inside a transaction | The three engines react differently when a statement fails |
+| Concepts 3–4: durability and commit cost | What `COMMIT` actually waits for |
+| [Session 2: anomalies](/blogs/databases/transactions/session-2-anomalies/concept-1-dirty-reads) | Atomicity alone does not stop two transactions from interfering |
+
+## Key takeaways
+
+1. A transaction makes a group of statements all-or-nothing; without one, each statement commits by itself.
+2. PostgreSQL and MySQL default to autocommit; MongoDB writes are atomic per document only.
+3. A transfer split into two autocommitted statements created 1,500 out of nothing in all three engines.
+4. Declared rules (CHECK, validators) give the C in ACID; the database enforces only what you declare.
+5. MongoDB multi-document transactions need a replica set or sharded cluster.
+
+## Check questions
+
+1. What does each letter of ACID promise, and which one did the autocommit transfer break?
+2. Why did the total grow by exactly 1,500 and not shrink?
+3. How does autocommit differ between PostgreSQL, MySQL and MongoDB?
+4. Why can't a standalone MongoDB server run the transaction from this page?
+5. The CHECK constraint stopped account 1 from going negative. Which part of ACID is that, and who defines the rule?
+6. An ORM saves an order and then its items with two `save()` calls. What can go wrong, and how do you fix it?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-1-transaction-guarantees/concept-1-acid-in-practice/answers">Worked answers to Q1–Q6</DeepDive>

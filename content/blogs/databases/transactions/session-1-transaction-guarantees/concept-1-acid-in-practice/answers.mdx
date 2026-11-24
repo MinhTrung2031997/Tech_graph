@@ -1,0 +1,73 @@
+---
+title: "Answers: ACID in practice"
+description: "Worked answers to the Session 1 Concept 1 check questions."
+companion: "answers"
+tags: ["transactions", "acid", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/tutorial-transactions.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions/"
+---
+
+<Tldr>
+Atomicity is a property of a transaction, not of your business operation: it only covers the statements you put inside one.
+</Tldr>
+
+## Q1. The four letters
+
+**Question:** what does each letter of ACID promise, and which one did the autocommit transfer break?
+
+| Letter | Promise |
+|---|---|
+| Atomicity | All of a transaction's changes happen, or none |
+| Consistency | Each commit leaves the declared rules satisfied |
+| Isolation | Concurrent transactions do not see each other's partial work |
+| Durability | A committed change survives a crash |
+
+The transfer broke **atomicity of the business operation**: each statement was atomic, but the two statements ran as two transactions, so one could commit while the other failed.
+
+> **Common mistake:** blaming consistency. Every row still satisfied `balance >= 0`; the rule that money is only moved, never created, was never declared and lives only in the application.
+
+## Q2. Why +1,500
+
+**Question:** why did the total grow by exactly 1,500 and not shrink?
+
+The credit ran first and committed (+1,500). The debit was rejected as a whole by the CHECK constraint (or validator), so it changed nothing. Net: +1,500. Had the code debited first, the debit would have failed on its own and the credit would then have run: same +1,500. Had both succeeded, the total would be unchanged.
+
+> **Common mistake:** assuming the rejected statement applied partially; a failed statement is always undone completely.
+
+## Q3. Autocommit in the three engines
+
+**Question:** how does autocommit differ between PostgreSQL, MySQL and MongoDB?
+
+| Engine | Default | Grouping |
+|---|---|---|
+| PostgreSQL | Each statement is its own transaction | `BEGIN … COMMIT` |
+| MySQL | `autocommit = 1`, same behaviour | `START TRANSACTION … COMMIT`, or `SET autocommit = 0` (then every statement opens a transaction that stays open until `COMMIT`) |
+| MongoDB | Each single-document write is atomic; a multi-document write such as `updateMany` is atomic per document only | Session + `startTransaction()` |
+
+> **Common mistake:** thinking `updateMany` in MongoDB is all-or-nothing. Outside a transaction it can stop halfway and leave some documents updated.
+
+## Q4. Standalone MongoDB
+
+**Question:** why can't a standalone MongoDB server run the transaction from this page?
+
+Multi-document transactions depend on the replication machinery: the commit is a single oplog entry, and the read concern `snapshot` and write concern `majority` are defined in terms of replica set members. A standalone `mongod` has no oplog, so `startTransaction()` fails with "Transaction numbers are only allowed on a replica set member or mongos". The lab runs a one-node replica set (`--replSet rs0` plus `rs.initiate()`), which is enough.
+
+> **Common mistake:** testing transaction code against a standalone development server and only discovering the error in staging.
+
+## Q5. Who enforces the rule
+
+**Question:** the CHECK constraint stopped account 1 from going negative. Which part of ACID is that, and who defines the rule?
+
+**Consistency**. The database guarantees that no commit leaves a declared rule broken, but **you** declare the rules: CHECK, NOT NULL, UNIQUE, foreign keys, MongoDB validators. Rules that exist only in application code (for example "a transfer moves money and never creates it") are protected only by atomicity and careful code.
+
+> **Common mistake:** "the database keeps my data consistent" without having declared any constraints.
+
+## Q6. Two `save()` calls
+
+**Question:** an ORM saves an order and then its items with two `save()` calls. What can go wrong, and how do you fix it?
+
+With autocommit each `save()` is its own transaction. A crash, timeout or validation error after the first leaves an order without items (or with some items). Fix: wrap both in one transaction (`Repo.transaction`, `@Transactional`, `with transaction.atomic()`, MongoDB `session.withTransaction`), and add constraints that make the broken state impossible, such as a foreign key from items to orders.
+
+> **Common mistake:** adding a retry around the second `save()` only; a crash between the calls still leaves the first one committed.

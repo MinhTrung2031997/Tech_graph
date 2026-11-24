@@ -1,0 +1,293 @@
+---
+title: "Concept 2: When a statement fails inside a transaction"
+description: "The same failing debit inside BEGIN … COMMIT gave three different results: PostgreSQL refused every further command and turned COMMIT into ROLLBACK, MySQL undid only the failed statement and committed the credit (money created again), MongoDB aborted the whole transaction on the server. Savepoints, psql's ON_ERROR_ROLLBACK, and what your driver must do."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "errors", "savepoints"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-savepoint.html"
+  - "https://www.postgresql.org/docs/current/app-psql.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-error-handling.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-in-applications/"
+---
+
+<Tldr>
+A transaction is all-or-nothing only if the failure **ends** it. The engines disagree on what a failed statement does to the transaction around it. **PostgreSQL** puts the transaction into an aborted state: every later command fails with "current transaction is aborted", and `COMMIT` replies `ROLLBACK`. **MySQL** undoes only the failing statement and keeps the transaction open, so a `COMMIT` after the error **committed the credit**: the total became 10,001,500, exactly as without a transaction. **MongoDB** aborts the transaction on the server; the next operation and the commit fail with `NoSuchTransaction`. **Savepoints** give PostgreSQL and MySQL partial rollback on purpose; psql's `ON_ERROR_ROLLBACK` uses them automatically and reproduced MySQL's behaviour, including the created money.
+</Tldr>
+
+## Three reactions to one error
+
+| Engine | After the failed statement | What `COMMIT` does | Total after `COMMIT` |
+|---|---|---|---|
+| PostgreSQL | Transaction **aborted**: every command fails until `ROLLBACK` | Replies `ROLLBACK` | 10,000,000.00 |
+| MySQL | Only the **statement** is undone; the transaction continues | Commits what succeeded | **10,001,500.00** |
+| MongoDB | Transaction **aborted on the server** | Fails: `NoSuchTransaction` | 10,000,000.00 |
+
+| Term | Meaning |
+|---|---|
+| Statement-level rollback | The failed statement's own changes are undone; earlier statements stay |
+| Transaction-level abort | All changes since `BEGIN` are discarded |
+| Savepoint | A named point inside a transaction to roll back to without ending the transaction |
+| **✓ Safe** | The end state is all-or-nothing |
+| **✗ Partial** | Some statements of the transaction were committed |
+
+## PostgreSQL: the aborted state
+
+<Flow
+  title="PostgreSQL: an error poisons the transaction"
+  height={300}
+  nodes={[
+    { id: 'credit', label: 'Credit account 2', sub: 'inside BEGIN', x: 20, y: 20, w: 200 },
+    { id: 'debit', label: 'Debit account 1', sub: 'CHECK fails', x: 300, y: 20, w: 200 },
+    { id: 'aborted', label: 'Transaction aborted', sub: 'commands ignored', x: 580, y: 20, w: 200 },
+    { id: 'sp', label: 'ROLLBACK TO SAVEPOINT', sub: 'undo the debit only', x: 300, y: 160, w: 200 },
+    { id: 'safe', label: '✓ All or nothing', sub: '', x: 580, y: 160, w: 200 },
+    { id: 'partial', label: '✗ Credit committed', sub: '', x: 20, y: 160, w: 200 },
+  ]}
+  edges={[
+    { id: 'credit-debit', from: 'credit', to: 'debit' },
+    { id: 'debit-aborted', from: 'debit', to: 'aborted' },
+    { id: 'aborted-safe', from: 'aborted', to: 'safe' },
+    { id: 'debit-sp', from: 'debit', to: 'sp' },
+    { id: 'sp-safe', from: 'sp', to: 'safe' },
+    { id: 'sp-partial', from: 'sp', to: 'partial' },
+  ]}
+  cases={[
+    {
+      title: 'Default',
+      path: 'credit → debit ✗ → transaction aborted → COMMIT answers ROLLBACK → ✓ total 10,000,000',
+      summary: 'PostgreSQL refuses to commit a transaction in which any statement failed.',
+      subs: { safe: 'total 10,000,000.00' },
+      steps: [
+        {
+          title: 'The debit fails',
+          note: 'ERROR: new row for relation "accounts" violates check constraint "accounts_balance_check". From now on the transaction is marked failed.',
+          code: 'BEGIN;\nUPDATE accounts SET balance = balance + 1500 WHERE id = 2;\nUPDATE accounts SET balance = balance - 1500 WHERE id = 1;   -- ERROR',
+          active: ['credit', 'debit'],
+          edges: ['credit-debit'],
+        },
+        {
+          title: 'Everything else is refused',
+          note: 'The next statement, even a SELECT, fails: ERROR: current transaction is aborted, commands ignored until end of transaction block.',
+          code: 'SELECT balance FROM accounts WHERE id = 2;\n-- ERROR:  current transaction is aborted, commands ignored until end of transaction block',
+          active: ['debit', 'aborted'],
+          edges: ['debit-aborted'],
+        },
+        {
+          title: 'COMMIT rolls back',
+          note: 'psql printed ROLLBACK in reply to COMMIT. The client cannot accidentally commit half a transaction.',
+          code: 'COMMIT;   -- ROLLBACK',
+          active: ['aborted', 'safe'],
+          edges: ['aborted-safe'],
+        },
+      ],
+    },
+    {
+      title: 'Explicit savepoint',
+      path: 'credit → SAVEPOINT → debit ✗ → ROLLBACK TO SAVEPOINT → other work → COMMIT',
+      summary: 'Undo just the failed step and carry on, deliberately.',
+      subs: { sp: 'transaction usable again', safe: '3: 1,100 · 4: 1,000 · 5: 900' },
+      steps: [
+        {
+          title: 'Mark a savepoint before the risky step',
+          note: 'Account 3 is credited 100, then a savepoint is set before trying to debit account 4 by 1,500.',
+          code: 'BEGIN;\nUPDATE accounts SET balance = balance + 100 WHERE id = 3;\nSAVEPOINT before_debit;\nUPDATE accounts SET balance = balance - 1500 WHERE id = 4;   -- ERROR',
+          active: ['credit', 'debit'],
+          edges: ['credit-debit'],
+        },
+        {
+          title: 'Roll back to it',
+          note: 'ROLLBACK TO SAVEPOINT clears the failed state and undoes only the work after the savepoint. The transaction is usable again.',
+          code: 'ROLLBACK TO SAVEPOINT before_debit;',
+          active: ['debit', 'sp'],
+          edges: ['debit-sp'],
+        },
+        {
+          title: 'Take another path and commit',
+          note: 'The code debits account 5 instead and commits: accounts 3, 4, 5 end at 1,100, 1,000, 900. Total unchanged. The decision to continue was explicit.',
+          code: 'UPDATE accounts SET balance = balance - 100 WHERE id = 5;\nCOMMIT;',
+          active: ['sp', 'safe'],
+          edges: ['sp-safe'],
+        },
+      ],
+    },
+    {
+      title: 'psql ON_ERROR_ROLLBACK',
+      path: 'implicit savepoint before each statement → debit ✗ rolled back alone → COMMIT → ✗ credit committed',
+      summary: 'A client setting that silently turns PostgreSQL into MySQL.',
+      subs: { sp: 'automatic, per statement', partial: 'total 10,001,500.00' },
+      steps: [
+        {
+          title: 'An automatic savepoint per statement',
+          note: 'With \\set ON_ERROR_ROLLBACK on, psql sends a SAVEPOINT before every statement and rolls back to it when the statement fails.',
+          code: 'psql -v ON_ERROR_ROLLBACK=on …\nBEGIN; UPDATE … id = 2 (+1500); UPDATE … id = 1 (−1500);   -- ERROR\nCOMMIT;',
+          active: ['credit', 'debit', 'sp'],
+          edges: ['credit-debit', 'debit-sp'],
+        },
+        {
+          title: 'The credit is committed',
+          note: 'COMMIT succeeded and the total became 10,001,500.00. Some drivers have the same option (for example JDBC autosave=always); it is convenient interactively and dangerous in application code.',
+          active: ['sp', 'partial'],
+          edges: ['sp-partial'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: statement-level rollback
+
+<Flow
+  title="MySQL: the transaction survives the error"
+  height={300}
+  nodes={[
+    { id: 'credit', label: 'Credit account 2', sub: 'inside the transaction', x: 20, y: 20, w: 200 },
+    { id: 'debit', label: 'Debit account 1', sub: 'ERROR 3819', x: 300, y: 20, w: 200 },
+    { id: 'open', label: 'Transaction still open', sub: 'credit pending', x: 580, y: 20, w: 200 },
+    { id: 'partial', label: '✗ COMMIT', sub: 'credit committed', x: 580, y: 160, w: 200 },
+    { id: 'safe', label: '✓ ROLLBACK', sub: 'credit undone', x: 300, y: 160, w: 200 },
+  ]}
+  edges={[
+    { id: 'credit-debit', from: 'credit', to: 'debit' },
+    { id: 'debit-open', from: 'debit', to: 'open' },
+    { id: 'open-partial', from: 'open', to: 'partial' },
+    { id: 'open-safe', from: 'open', to: 'safe' },
+  ]}
+  cases={[
+    {
+      title: 'COMMIT after the error',
+      path: 'credit → debit ✗ (statement undone) → transaction open → COMMIT → ✗ total 10,001,500',
+      summary: 'The default client behaviour of "keep going" commits half the transfer.',
+      subs: { partial: 'total 10,001,500.00' },
+      steps: [
+        {
+          title: 'Only the statement fails',
+          note: "ERROR 3819 (HY000): Check constraint 'accounts_chk_1' is violated. InnoDB undoes that UPDATE only.",
+          code: 'START TRANSACTION;\nUPDATE accounts SET balance = balance + 1500 WHERE id = 2;\nUPDATE accounts SET balance = balance - 1500 WHERE id = 1;   -- ERROR 3819',
+          active: ['credit', 'debit'],
+          edges: ['credit-debit'],
+        },
+        {
+          title: 'The transaction carries on',
+          note: 'A SELECT in the same transaction returned balance 2,500 for account 2: the credit is still there, uncommitted.',
+          code: 'SELECT balance FROM accounts WHERE id = 2;   -- 2500.00',
+          active: ['debit', 'open'],
+          edges: ['debit-open'],
+        },
+        {
+          title: 'COMMIT commits the credit',
+          note: 'COMMIT returned OK and sum(balance) = 10,001,500.00. The transaction protected nothing because nobody acted on the error.',
+          code: 'COMMIT;\nSELECT sum(balance) FROM accounts;   -- 10001500.00',
+          active: ['open', 'partial'],
+          edges: ['open-partial'],
+        },
+      ],
+    },
+    {
+      title: 'ROLLBACK on error',
+      path: 'credit → debit ✗ → application ROLLBACK → ✓ total 10,000,000',
+      summary: 'In MySQL, all-or-nothing depends on the error handling in your code.',
+      subs: { safe: 'total 10,000,000.00' },
+      steps: [
+        {
+          title: 'Catch the error, roll back',
+          note: 'Every driver raises the error; the code must answer with ROLLBACK (or let the transaction helper do it). Deadlocks (ERROR 1213) are different: InnoDB rolls back the whole transaction itself.',
+          code: 'START TRANSACTION; … -- ERROR 3819\nROLLBACK;\nSELECT sum(balance) FROM accounts;   -- 10000000.00',
+          active: ['credit', 'debit', 'open', 'safe'],
+          edges: ['credit-debit', 'debit-open', 'open-safe'],
+        },
+      ],
+    },
+  ]}
+/>
+
+MySQL also has `SAVEPOINT name` and `ROLLBACK TO SAVEPOINT name`, with the same meaning as in PostgreSQL.
+
+## MongoDB: the server aborts
+
+<Flow
+  title="MongoDB: a write error ends the transaction"
+  height={300}
+  nodes={[
+    { id: 'credit', label: 'Credit _id 2', sub: 'in session', x: 20, y: 20, w: 200 },
+    { id: 'debit', label: 'Debit _id 1', sub: 'validation fails', x: 300, y: 20, w: 200 },
+    { id: 'aborted', label: 'Transaction aborted', sub: 'on the server', x: 580, y: 20, w: 200 },
+    { id: 'next', label: '✗ Next operation', sub: 'NoSuchTransaction', x: 580, y: 160, w: 200 },
+    { id: 'safe', label: '✓ Nothing applied', sub: 'total 10,000,000', x: 300, y: 160, w: 200 },
+  ]}
+  edges={[
+    { id: 'credit-debit', from: 'credit', to: 'debit' },
+    { id: 'debit-aborted', from: 'debit', to: 'aborted' },
+    { id: 'aborted-next', from: 'aborted', to: 'next' },
+    { id: 'aborted-safe', from: 'aborted', to: 'safe' },
+  ]}
+  cases={[
+    {
+      title: 'Validation error in a transaction',
+      path: 'credit → debit ✗ → server aborts → findOne ✗ NoSuchTransaction → commit ✗ NoSuchTransaction → ✓ total unchanged',
+      summary: 'Like PostgreSQL, a failed write cannot be committed around.',
+      steps: [
+        {
+          title: 'The write fails',
+          note: 'Document failed validation (code 121). The error carried no TransientTransactionError label: retrying the same transaction would fail the same way.',
+          code: 's.startTransaction();\na.updateOne({ _id: 2 }, { $inc: { balance: NumberDecimal("1500") } });\na.updateOne({ _id: 1 }, { $inc: { balance: NumberDecimal("-1500") } });   // error 121',
+          active: ['credit', 'debit'],
+          edges: ['credit-debit'],
+        },
+        {
+          title: 'The transaction is gone',
+          note: 'The next read in the session failed: NoSuchTransaction, "Transaction with { txnNumber: 3 } has been aborted". commitTransaction() failed with the same error.',
+          active: ['debit', 'aborted', 'next'],
+          edges: ['debit-aborted', 'aborted-next'],
+        },
+        {
+          title: 'Nothing was written',
+          note: 'The $sum of balance stayed 10,000,000.00. MongoDB has no savepoints: to skip one failed step, the code must start a new transaction.',
+          active: ['aborted', 'safe'],
+          edges: ['aborted-safe'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+A MySQL client that runs a script and ignores errors (`mysql --force`, many migration tools, a `try/except: pass` in application code) followed by `COMMIT` commits whatever succeeded. The lab did exactly that and created 1,500. In MySQL the safety of a transaction depends on the code that handles errors, not on the database.
+</Pitfall>
+
+## Real-world scenario: the batch import that "mostly" worked
+
+A nightly job imports 10,000 payments in one transaction per file, in MySQL, with a loop that logs and skips failed rows before a final `COMMIT`. A malformed file produces 300 errors; the commit makes the other 9,700 permanent and the reconciliation report is off by 300 payments. Moving the same job to PostgreSQL makes the first error abort the file.
+
+| Goal | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| All or nothing per file | Default | `ROLLBACK` on the first error | Default |
+| Skip bad rows, keep the rest | `SAVEPOINT` per row (or validate first) | Default, but log the skipped rows | One transaction per row, or validate first |
+
+## Why this matters for transactions
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 3: serialization failures | PostgreSQL's 40001 errors abort the transaction the same way; the whole transaction must be retried |
+| [Session 6: deadlocks](/blogs/databases/transactions/session-6-deadlocks/lab) | A deadlock rolls back the whole transaction in every engine, even in MySQL |
+| [Session 7: retry loops](/blogs/databases/transactions/session-7-application-patterns/lab) | Retry the transaction, never just the failed statement |
+
+## Key takeaways
+
+1. PostgreSQL aborts the transaction on any error; `COMMIT` then answers `ROLLBACK`.
+2. MySQL undoes only the failed statement; a later `COMMIT` commits the rest (10,001,500 in the lab).
+3. MongoDB aborts the transaction on the server; later operations fail with `NoSuchTransaction`.
+4. Savepoints allow deliberate partial rollback in PostgreSQL and MySQL; MongoDB has none.
+5. psql `ON_ERROR_ROLLBACK` and similar driver options silently give PostgreSQL MySQL-style behaviour.
+
+## Check questions
+
+1. In PostgreSQL, why did a plain `SELECT` fail right after the CHECK error?
+2. Why did the MySQL total become 10,001,500 even though the code used a transaction?
+3. What must MySQL application code do after an error inside a transaction?
+4. What does `ROLLBACK TO SAVEPOINT` undo, and what does it leave?
+5. How does psql's `ON_ERROR_ROLLBACK` work, and why is it risky in scripts?
+6. After a validation error in a MongoDB transaction, can the code continue the same transaction? What should it do?
+7. A deadlock occurs in the middle of a MySQL transaction. Is the earlier work still pending, as with ERROR 3819?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-1-transaction-guarantees/concept-2-errors-inside-a-transaction/answers">Worked answers to Q1–Q7</DeepDive>
