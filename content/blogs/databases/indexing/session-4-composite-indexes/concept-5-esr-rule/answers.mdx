@@ -1,0 +1,73 @@
+---
+title: "Answers: MongoDB's ESR rule"
+description: "Worked answers to the Session 4 Concept 5 check questions."
+companion: "answers"
+tags: ["indexing", "mongodb", "composite-index", "esr", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/tutorial/equality-sort-range-guideline/"
+---
+
+<Tldr>
+Equality narrows, Sort orders, Range filters. Keep the order the index delivers, and LIMIT can stop the scan.
+</Tldr>
+
+## Q1. E, S and R
+
+**Question:** what do E, S and R stand for, and what kind of query condition belongs to each?
+
+| Letter | Stands for | Conditions |
+|---|---|---|
+| E | Equality | `field: value`, `$eq`, `$in` with few values |
+| S | Sort | Fields in `sort()` |
+| R | Range | `$gt`, `$gte`, `$lt`, `$lte`, `$ne`, `$nin`, regex |
+
+> **Common mistake:** treating `$in` with hundreds of values as an equality; it behaves more like a range for sorting.
+
+## Q2. Why sort before range
+
+**Question:** why does putting the sort field before the range field help, even though the range then no longer narrows the seek?
+
+Inside the equality stretch, keys are then in sort order, so results come out already sorted and the scan can **stop** after `limit` matches. The range field is still in the key, so non-matching keys are skipped without fetching documents. Losing the tight seek costs a few extra keys (114 instead of 20); losing the order costs reading and sorting every match.
+
+> **Common mistake:** "a tighter seek is always better". Not when it costs the order and the early stop.
+
+## Q3. 70,000 exact keys vs 114
+
+**Question:** the ERS index examined exactly 70,000 keys, all matches, yet was slower than ESR's 114. Explain.
+
+ERS reads **only** matching keys, but **all** of them: the query needs the newest 20, and in an `amount`-ordered stretch the newest can be anywhere, so every match must be read and passed through a blocking SORT. ESR reads keys in `created_at` order and stops after 20 matches, having skipped 94 non-matching keys along the way.
+
+> **Common mistake:** judging a plan only by "keys examined ≈ documents returned"; check the number returned against the limit.
+
+## Q4. limit(20) vs limit(1000)
+
+**Question:** why did ERS read 70,000 keys for both `limit(20)` and `limit(1000)`, while ESR read 114 and 5,000?
+
+ERS's blocking SORT needs every matching key before emitting anything, so its work is fixed at 70,000 keys regardless of the limit. ESR's work is proportional to the limit: about 1 in 5 paid orders is over 400, so ≈ 5 × limit keys (114 for 20, 5,000 for 1,000).
+
+> **Common mistake:** expecting a smaller limit to speed up every plan.
+
+## Q5. The index without amount
+
+**Question:** `{ status: 1, created_at: -1 }` (without `amount`) also examined 114 keys but 114 documents. What is the difference from the ESR index?
+
+Both walk the same keys in the same order. Without `amount` in the index, MongoDB cannot check `amount > 400` on the key, so it **fetches** each of the 114 documents to test the condition and discards 94. The ESR index tests `amount` in the key and fetches only the 20 matches. On a large, uncached collection, 94 unnecessary document fetches per page add up.
+
+> **Common mistake:** "same keys examined, same cost": document fetches are the expensive part.
+
+## Q6. When E-R-S is better
+
+**Question:** when would E-R-S be the better order?
+
+When the range is very selective and the query returns all its matches anyway (no limit, or a limit larger than the match count). Example: `status: 'paid', amount: { $gt: 499.90 }` matches a handful of documents: E-R-S seeks exactly to them and sorts a few in memory, while E-S-R would walk the whole paid stretch looking for them.
+
+> **Common mistake:** applying ESR mechanically without considering how many documents the range keeps.
+
+## Q7. ESR in PostgreSQL
+
+**Question:** translate ESR into a PostgreSQL index for `WHERE seller_id = ? AND status = ? AND amount > ? ORDER BY created_at DESC LIMIT 50`.
+
+`CREATE INDEX ON orders (seller_id, status, created_at, amount);`: equalities (`seller_id`, `status`), then the sort column (`created_at`), then the range (`amount`). The plan is an Index Scan Backward with `amount > ?` in the Index Cond as a per-entry check, stopping after 50 matches, as in the lab (6 buffers).
+
+> **Common mistake:** `(seller_id, status, amount, created_at)`, which seeks tightly but needs a Sort over all matches.

@@ -1,0 +1,329 @@
+---
+title: "Concept 4: Index + ORDER BY + LIMIT"
+description: "When the index order matches the ORDER BY, the database reads the first N entries and stops: no sort, no full scan. What the filter and the index must look like for that to work, what breaks it (IN lists, missing leading columns, mixed directions), and how the three engines differ."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "composite-index", "order-by", "pagination"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-ordering.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/order-by-optimization.html"
+  - "https://www.mongodb.com/docs/manual/tutorial/sort-results-with-indexes/"
+---
+
+<Tldr>
+"The newest 20 paid orders" can cost **4 pages** or a **full scan plus a sort of 350,000 rows**. With an index on `(status, created_at)`, the paid entries are already in `created_at` order, so the database walks the stretch backwards from the newest, takes 20 and stops: PostgreSQL 0.04 ms, MySQL 0.35 ms, MongoDB 20 keys. Without it: 62 ms, 135 ms. The rule: the **equality columns** of the filter, then the **ORDER BY columns in order**, all in one index. An `IN` list breaks it in PostgreSQL and MySQL (each value is a separate sorted stretch), but MongoDB merges the stretches (SORT_MERGE, 21 keys).
+</Tldr>
+
+## Why an index can replace a sort
+
+| Plan | Work for `WHERE status = 'paid' ORDER BY created_at DESC LIMIT 20` |
+|---|---|
+| Index on `(status, created_at)` | Descend to the end of the paid section, read 20 entries backwards, fetch 20 rows |
+| No suitable index | Read every paid row (350,000), keep the newest 20 in a top-N heap |
+
+An index helps `ORDER BY … LIMIT n` when, **after the equality conditions fix the leading columns**, the remaining index columns are exactly the ORDER BY columns, in order (all ascending, or all reversed).
+
+| Term | Meaning |
+|---|---|
+| Top-N heapsort | A sort that keeps only the best n rows; cheap on memory, but every row must still be read |
+| Incremental Sort (PostgreSQL) | When the index provides a prefix of the ORDER BY, rows are sorted only within groups of equal prefix |
+| **✓ Index order = ORDER BY** | Walk the index, stop after LIMIT |
+| **✗ Order differs** | Read all matches, then sort |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: ORDER BY … LIMIT with (status, created_at)"
+  height={340}
+  nodes={[
+    { id: 'q', label: 'Query', sub: '', x: 20, y: 20, w: 260 },
+    { id: 'yes', label: '✓ Index order = ORDER BY', sub: 'walk and stop', x: 360, y: 20, w: 240 },
+    { id: 'no', label: '✗ Order differs', sub: 'read all, sort', x: 360, y: 150, w: 240 },
+    { id: 'limit', label: 'Limit 20', sub: '', x: 660, y: 20, w: 120 },
+    { id: 'sort', label: 'Sort', sub: 'top-N heapsort', x: 660, y: 150, w: 120 },
+    { id: 'all', label: 'Seq Scan', sub: 'every matching row', x: 360, y: 270, w: 240 },
+  ]}
+  edges={[
+    { id: 'q-yes', from: 'q', to: 'yes' },
+    { id: 'q-no', from: 'q', to: 'no' },
+    { id: 'yes-limit', from: 'yes', to: 'limit' },
+    { id: 'no-all', from: 'no', to: 'all' },
+    { id: 'all-sort', from: 'all', to: 'sort' },
+  ]}
+  cases={[
+    {
+      title: 'Equality + ORDER BY the next column',
+      path: "status = 'paid' ORDER BY created_at DESC ✓ → Index Scan Backward → 20 rows → stop",
+      summary: 'Measured: 4 buffers, 0.04 ms.',
+      subs: { q: 'paid · created_at DESC · 20', limit: '4 buffers' },
+      steps: [
+        {
+          title: '✓ The paid stretch is sorted by created_at',
+          note: 'status is fixed by the equality; inside the paid section, entries are in created_at order. DESC means walking it backwards from the newest.',
+          code: "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders\nWHERE status = 'paid' ORDER BY created_at DESC LIMIT 20;",
+          active: ['q', 'yes'],
+          edges: ['q-yes'],
+        },
+        {
+          title: 'Stop after 20',
+          note: 'Index Scan Backward using orders_status_created_idx, Index Cond: status = paid; Limit takes 20 rows. Buffers: 4 (index descent + 1 heap page, the 20 newest paid orders are neighbours).',
+          active: ['yes', 'limit'],
+          edges: ['yes-limit'],
+        },
+      ],
+    },
+    {
+      title: 'No suitable index',
+      path: '✗ no index in this order → Seq Scan of 350,000 paid rows → top-N heapsort',
+      summary: 'Measured (index disabled): 10,105 buffers, 62 ms.',
+      subs: { q: 'paid · created_at DESC · 20', all: '350,000 rows', sort: '62 ms' },
+      steps: [
+        {
+          title: '✗ Read every paid row',
+          note: 'Without an index in this order, the only way to know the newest 20 is to look at all 350,000 paid rows.',
+          code: "SET enable_indexscan = off;\nEXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders\nWHERE status = 'paid' ORDER BY created_at DESC LIMIT 20;",
+          active: ['q', 'no', 'all'],
+          edges: ['q-no', 'no-all'],
+        },
+        {
+          title: 'Top-N heapsort',
+          note: 'Sort Method: top-N heapsort, Memory: 28 kB. Cheap memory, but 10,105 buffers and 62 ms: 1,500× the indexed plan.',
+          active: ['all', 'sort'],
+          edges: ['all-sort'],
+        },
+      ],
+    },
+    {
+      title: 'IN list',
+      path: "status IN ('paid','shipped') ORDER BY created_at ✗ two sorted stretches → Seq Scan + sort",
+      summary: 'Measured: 65 ms. PostgreSQL 17 does not merge the two stretches.',
+      subs: { q: 'IN (paid, shipped) · DESC', all: '400,000 rows', sort: '65 ms' },
+      steps: [
+        {
+          title: '✗ Two stretches, each sorted',
+          note: 'Paid entries are sorted by date, shipped entries are sorted by date, but together they are not: the index order is (paid, all dates), then (shipped, all dates).',
+          code: "EXPLAIN ANALYZE SELECT * FROM orders\nWHERE status IN ('paid', 'shipped') ORDER BY created_at DESC LIMIT 20;",
+          active: ['q', 'no'],
+          edges: ['q-no'],
+        },
+        {
+          title: 'Read and sort',
+          note: 'The plan reads all 400,000 matching rows and sorts them. Workaround: two LIMIT 20 subqueries, one per status, combined with UNION ALL and sorted again: 40 rows to sort.',
+          active: ['no', 'all', 'sort'],
+          edges: ['no-all', 'all-sort'],
+        },
+      ],
+    },
+    {
+      title: 'ORDER BY without the leading column',
+      path: 'ORDER BY created_at (no status filter) ✗ the index is sorted by status first → Seq Scan + sort',
+      summary: 'Measured with only the composite index: 66 ms.',
+      subs: { q: 'ORDER BY created_at DESC LIMIT 20', all: '1,000,000 rows', sort: '66 ms' },
+      steps: [
+        {
+          title: '✗ Wrong leading column for this order',
+          note: 'Across all statuses, (status, created_at) is not in created_at order. The leftmost-prefix rule applies to ORDER BY too.',
+          code: 'EXPLAIN ANALYZE SELECT * FROM orders ORDER BY created_at DESC LIMIT 20;',
+          active: ['q', 'no', 'all', 'sort'],
+          edges: ['q-no', 'no-all', 'all-sort'],
+        },
+      ],
+    },
+  ]}
+/>
+
+Directions: an index can be read forwards or backwards, so `(status, created_at)` serves both `ORDER BY created_at` and `ORDER BY created_at DESC` after `status = ?`. **Mixed** directions on two sort columns (`ORDER BY created_at ASC, id DESC`) need an index declared with those directions, `(status, created_at, id DESC)`; otherwise PostgreSQL falls back to an Incremental Sort on top of the index (still cheap when the groups are small, as in the lab: 13 buffers).
+
+## MySQL
+
+<Flow
+  title="MySQL: ORDER BY … LIMIT with (status, created_at)"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Query', sub: '', x: 20, y: 20, w: 260 },
+    { id: 'yes', label: '✓ Index order = ORDER BY', sub: 'Backward index scan', x: 360, y: 20, w: 240 },
+    { id: 'no', label: '✗ Order differs', sub: 'Using filesort', x: 360, y: 150, w: 240 },
+    { id: 'fast', label: '0.35 ms', sub: '', x: 660, y: 20, w: 120 },
+    { id: 'slow', label: '≈ 135 ms', sub: '', x: 660, y: 150, w: 120 },
+  ]}
+  edges={[
+    { id: 'q-yes', from: 'q', to: 'yes' },
+    { id: 'q-no', from: 'q', to: 'no' },
+    { id: 'yes-fast', from: 'yes', to: 'fast' },
+    { id: 'no-slow', from: 'no', to: 'slow' },
+  ]}
+  cases={[
+    {
+      title: 'Equality + ORDER BY',
+      path: "status = 'paid' ORDER BY created_at DESC LIMIT 20 ✓ → type: ref, Backward index scan → 0.35 ms",
+      summary: 'No filesort.',
+      subs: { q: 'paid · created_at DESC' },
+      steps: [
+        {
+          title: '✓ Read backwards and stop',
+          note: 'EXPLAIN: type ref, key orders_status_created_idx, Extra: Backward index scan. EXPLAIN ANALYZE: 0.35 ms.',
+          code: "EXPLAIN SELECT * FROM orders WHERE status = 'paid' ORDER BY created_at DESC LIMIT 20;",
+          active: ['q', 'yes', 'fast'],
+          edges: ['q-yes', 'yes-fast'],
+        },
+      ],
+    },
+    {
+      title: 'Without the index',
+      path: '✗ IGNORE INDEX → full scan + filesort → ≈ 135 ms',
+      summary: '≈ 400× slower.',
+      subs: { q: 'same query, IGNORE INDEX' },
+      steps: [
+        {
+          title: '✗ Filesort',
+          note: 'type ALL, Using where; Using filesort: every row read, the newest 20 paid kept by a sort. ≈ 135 ms.',
+          code: "SELECT * FROM orders IGNORE INDEX (orders_status_created_idx)\nWHERE status = 'paid' ORDER BY created_at DESC LIMIT 20;",
+          active: ['q', 'no', 'slow'],
+          edges: ['q-no', 'no-slow'],
+        },
+      ],
+    },
+    {
+      title: 'IN list',
+      path: "status IN ('paid','shipped') ✗ → type: ALL, Using filesort",
+      summary: 'Same limitation as PostgreSQL.',
+      subs: { q: 'IN (paid, shipped) · DESC' },
+      steps: [
+        {
+          title: '✗ Two stretches',
+          note: 'EXPLAIN: type ALL, Using where; Using filesort.',
+          code: "EXPLAIN SELECT * FROM orders WHERE status IN ('paid','shipped') ORDER BY created_at DESC LIMIT 20;",
+          active: ['q', 'no', 'slow'],
+          edges: ['q-no', 'no-slow'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+| Term | Meaning |
+|---|---|
+| Blocking `SORT` stage | Reads every matching document's key before returning the first; limited to 100 MB of memory unless `allowDiskUse` |
+| `SORT_MERGE` | Merges several already-sorted index stretches (one per `$in` value) into one sorted stream |
+| **✓ Index provides the sort / ✗ SORT stage** | As before |
+
+<Flow
+  title="MongoDB: sort + limit with { status: 1, created_at: -1 }"
+  height={320}
+  nodes={[
+    { id: 'q', label: 'Query', sub: '', x: 20, y: 20, w: 260 },
+    { id: 'yes', label: '✓ Index provides the sort', sub: '', x: 360, y: 20, w: 240 },
+    { id: 'merge', label: 'SORT_MERGE', sub: 'per $in value', x: 660, y: 20, w: 120 },
+    { id: 'no', label: '✗ SORT stage', sub: 'blocking', x: 360, y: 150, w: 240 },
+    { id: 'out', label: 'LIMIT 20', sub: '', x: 360, y: 260, w: 240 },
+  ]}
+  edges={[
+    { id: 'q-yes', from: 'q', to: 'yes' },
+    { id: 'q-no', from: 'q', to: 'no' },
+    { id: 'yes-merge', from: 'yes', to: 'merge', quiet: true },
+    { id: 'no-out', from: 'no', to: 'out' },
+  ]}
+  cases={[
+    {
+      title: "status: 'paid'",
+      path: '✓ IXSCAN of the paid stretch, newest first → LIMIT → 20 keys',
+      summary: 'Measured: LIMIT ← FETCH ← IXSCAN, 20 keys, 20 documents.',
+      subs: { q: "{ status: 'paid' } sort created_at -1", out: '20 keys' },
+      steps: [
+        {
+          title: '✓ Already sorted',
+          note: 'The descending created_at field means the stretch is read in the requested order. 20 keys, 20 documents, 0 ms.',
+          code: 'db.orders.find({ status: "paid" }).sort({ created_at: -1 }).limit(20)',
+          active: ['q', 'yes', 'out'],
+          edges: ['q-yes'],
+        },
+      ],
+    },
+    {
+      title: '$in: two statuses',
+      path: '✓ two sorted stretches → SORT_MERGE → LIMIT → 21 keys',
+      summary: 'Unlike PostgreSQL 17 and MySQL, MongoDB merges the stretches.',
+      subs: { q: '$in [paid, shipped]', merge: '21 keys' },
+      steps: [
+        {
+          title: '✓ Merge the sorted streams',
+          note: 'One IXSCAN per status, each in created_at order; SORT_MERGE interleaves them like the merge step of merge sort. 21 keys examined for 20 results.',
+          code: 'db.orders.find({ status: { $in: ["paid", "shipped"] } }).sort({ created_at: -1 }).limit(20)',
+          active: ['q', 'yes', 'merge'],
+          edges: ['q-yes', 'yes-merge'],
+        },
+      ],
+    },
+    {
+      title: 'No status in the filter',
+      path: '✗ sort on created_at alone → whole index read → blocking SORT',
+      summary: 'Measured (hint "es"): 1,000,000 keys, 303 ms.',
+      subs: { q: '{} sort created_at -1', out: '1,000,000 keys first' },
+      steps: [
+        {
+          title: '✗ Blocking SORT',
+          note: 'Across statuses the index is not in created_at order. With the index forced, MongoDB read all 1,000,000 keys, sorted, and only then returned 20.',
+          code: 'db.orders.find().sort({ created_at: -1 }).limit(20).hint("es")',
+          active: ['q', 'no', 'out'],
+          edges: ['q-no', 'no-out'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## The engines side by side
+
+| Query | PostgreSQL 17 | MySQL 8.4 | MongoDB 8.0 |
+|---|---|---|---|
+| `status = 'paid'` newest 20 | Index Scan Backward, 4 buffers | Backward index scan, 0.35 ms | IXSCAN, 20 keys |
+| `status IN (paid, shipped)` newest 20 | Seq Scan + sort, 65 ms | ALL + filesort | SORT_MERGE, 21 keys |
+| Newest 20 overall (no status) | Needs an index on `created_at` | Same | Same |
+| `customer_id = 7 ORDER BY created_at DESC LIMIT 5` with `(customer_id, created_at)` | Index Scan Backward, 8 buffers | — | — |
+
+<Pitfall>
+An `ORDER BY … LIMIT` query that is fast for one filter value can be slow for another. With `(created_at, status)` instead of `(status, created_at)`, "newest 20 paid" walks the newest entries and skips non-paid ones: instant for `paid` (35%), but for a rare status it may walk most of the index before finding 20. Equality columns first makes the cost the same for every value.
+</Pitfall>
+
+## Real-world scenario: an activity feed
+
+A feed shows `WHERE user_id = ? ORDER BY created_at DESC LIMIT 30`, with "load more" pages. With only an index on `user_id`, power users with 200,000 events take 300 ms per page; others are fast.
+
+| Index | Page 1 for a power user | Page 100 (keyset: `AND created_at < :last`) |
+|---|---|---|
+| `(user_id)` | Fetch 200,000 rows, top-N sort | Same: every page re-sorts everything |
+| `(user_id, created_at)` | Walk 30 entries backwards | Descend to `(user_id, :last)`, walk 30 |
+
+Combined with keyset pagination (Session 2, Concept 5), every page costs the same, whatever the user and the page number.
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 5: MongoDB ESR | Places the sort field between equality and range fields |
+| Session 5: covering indexes | Add the selected columns and the "top N" never touches the table |
+| Session 8: checklist | "Does every paginated query have an index ending in its ORDER BY?" |
+
+## Key takeaways
+
+1. An index can replace a sort when, after the equality columns, its columns match the ORDER BY in order (or all reversed).
+2. Then `LIMIT n` stops the walk after n entries: a few pages instead of all matches plus a sort.
+3. Measured: 4 buffers vs 62 ms (PostgreSQL), 0.35 ms vs 135 ms (MySQL), 20 keys (MongoDB).
+4. `IN` lists produce several sorted stretches: PostgreSQL 17 and MySQL sort; MongoDB merges them (SORT_MERGE).
+5. ORDER BY without the leading index columns cannot use the index order.
+6. Mixed directions need matching directions in the index definition.
+7. Equality-first indexes make "top N" cost the same for every filter value.
+
+## Check questions
+
+1. Why does `WHERE status = 'paid' ORDER BY created_at DESC LIMIT 20` read only 4 pages with `(status, created_at)`, but 10,105 without it?
+2. Which index would serve `WHERE customer_id = ? ORDER BY created_at DESC LIMIT 5`, and why not `(created_at, customer_id)`?
+3. Why can't PostgreSQL 17 use `(status, created_at)` to avoid the sort in `status IN ('paid', 'shipped') ORDER BY created_at LIMIT 20`? How does MongoDB handle the same query?
+4. Can `(status, created_at)` serve `WHERE status = 'paid' ORDER BY created_at ASC`? And `ORDER BY created_at ASC, id DESC`?
+5. What is a top-N heapsort, and why is it still expensive with a small LIMIT?
+6. A feed query is fast for normal users and slow for power users. What index and pagination change makes it uniform?
+7. With `(created_at, status)`, why can "newest 20 orders with status = X" be fast for one status and slow for another?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-4-composite-indexes/concept-4-order-by-limit/answers">Worked answers to Q1–Q7</DeepDive>

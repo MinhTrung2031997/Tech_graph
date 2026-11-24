@@ -1,0 +1,294 @@
+---
+title: "Concept 2: The leftmost-prefix rule"
+description: "A composite index on (a, b, c) serves conditions on a, on a and b, and on a, b and c: its leftmost prefixes. What happens without the leading column, how skip scan (MySQL 8.0.13+, PostgreSQL 18) bends the rule, and why MongoDB does not."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "composite-index", "skip-scan"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-multicolumn.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/range-optimization.html#range-access-skip-scan"
+  - "https://dev.mysql.com/doc/refman/8.4/en/multiple-column-indexes.html"
+  - "https://www.mongodb.com/docs/manual/core/indexes/index-types/index-compound/#index-prefixes"
+---
+
+<Tldr>
+An index on `(a, b, c)` can seek with conditions on its **leftmost prefixes**: `a`, `a + b`, `a + b + c`. Without a condition on `a` it has no starting point. In the lab, with only `(status, created_at)`, PostgreSQL 17 answered `created_at` in one day with a **Seq Scan**, and MongoDB with a COLLSCAN. MySQL 8.0.13+ can **skip scan**: one small seek per distinct `status` (5 of them), 2 ms instead of 86 ms, but only when the index covers the query. PostgreSQL 18 adds skip scan too. The practical rule: put the column every query filters on first, and do not count on skip scan for anything but few-valued leading columns.
+</Tldr>
+
+## What each prefix can do
+
+For an index on `(status, created_at)`; the same pattern holds for any number of columns.
+
+| Conditions in the query | Prefix used for seeking | Result |
+|---|---|---|
+| `status = ?` | `status` | ✓ one stretch |
+| `status = ? AND created_at …` | `status, created_at` | ✓ one narrower stretch |
+| `created_at …` | none | ✗ no seek: full index scan, skip scan, or a different plan |
+| For `(a, b, c)`: `a = ? AND c = ?` | `a` | ✓ seek on `a`; `c` is checked on each entry in that stretch (still no table visit for the check) |
+
+The rule is about **seeking**, not about which columns can be read: a column after a gap can still filter entries inside the stretch.
+
+| Term | Meaning |
+|---|---|
+| Leftmost prefix | The first k columns of the index, for any k |
+| Skip scan | For a missing leading column with few distinct values, seek once per value: (cancelled, June) … (delivered, June) … |
+| **✓ Prefix present** | A starting key exists: descend and walk |
+| **✗ Prefix missing** | No starting key; skip scan if supported and cheap, otherwise another plan |
+
+## PostgreSQL 17
+
+<Flow
+  title="PostgreSQL 17: prefixes of (status, created_at)"
+  height={320}
+  nodes={[
+    { id: 'q', label: 'Condition', sub: '', x: 20, y: 20, w: 260 },
+    { id: 'yes', label: '✓ Prefix present', sub: '', x: 360, y: 20, w: 200 },
+    { id: 'no', label: '✗ Prefix missing', sub: 'no skip scan in v17', x: 360, y: 150, w: 200 },
+    { id: 'idx', label: 'Index plan', sub: '', x: 620, y: 20, w: 160 },
+    { id: 'seq', label: 'Seq Scan', sub: '', x: 620, y: 150, w: 160 },
+  ]}
+  edges={[
+    { id: 'q-yes', from: 'q', to: 'yes' },
+    { id: 'q-no', from: 'q', to: 'no' },
+    { id: 'yes-idx', from: 'yes', to: 'idx' },
+    { id: 'no-seq', from: 'no', to: 'seq' },
+  ]}
+  cases={[
+    {
+      title: 'Leading column only',
+      path: "status = 'shipped' ✓ prefix (status) → Bitmap on the composite",
+      summary: 'Measured: 12.7 ms; the composite stands in for a single-column status index.',
+      subs: { q: "status = 'shipped'", idx: 'Bitmap, 50,000 rows' },
+      steps: [
+        {
+          title: '✓ Prefix present',
+          note: 'status is the first column: one stretch.',
+          code: "EXPLAIN ANALYZE SELECT * FROM orders WHERE status = 'shipped';",
+          active: ['q', 'yes', 'idx'],
+          edges: ['q-yes', 'yes-idx'],
+        },
+      ],
+    },
+    {
+      title: 'Both columns',
+      path: "status + created_at range ✓ prefix (status, created_at) → Bitmap, 7 index pages",
+      summary: 'Measured: 959 rows in 0.34 ms.',
+      subs: { q: 'shipped AND June 1–7', idx: 'Bitmap, 959 rows' },
+      steps: [
+        {
+          title: '✓ Full prefix',
+          note: 'Both columns position the scan; the stretch is 959 entries.',
+          code: "EXPLAIN ANALYZE SELECT * FROM orders\nWHERE status = 'shipped' AND created_at >= '2025-06-01' AND created_at < '2025-06-08';",
+          active: ['q', 'yes', 'idx'],
+          edges: ['q-yes', 'yes-idx'],
+        },
+      ],
+    },
+    {
+      title: 'Second column only',
+      path: 'created_at range ✗ prefix missing → Seq Scan',
+      summary: 'Measured: Seq Scan, 29.6 ms, 980,822 rows removed by filter.',
+      subs: { q: 'created_at in June 1–7', seq: '29.6 ms' },
+      steps: [
+        {
+          title: '✗ No starting key',
+          note: 'June sits inside each of the five status sections. Reading the whole index and then the heap looks more expensive than reading the heap once, so the planner scans the table.',
+          code: "EXPLAIN ANALYZE SELECT * FROM orders\nWHERE created_at >= '2025-06-01' AND created_at < '2025-06-08';",
+          active: ['q', 'no', 'seq'],
+          edges: ['q-no', 'no-seq'],
+        },
+        {
+          title: 'PostgreSQL 18: skip scan',
+          note: 'PostgreSQL 18 can skip scan B-tree indexes: one descent per distinct status, then the June range inside it. With 5 statuses that is 5 small stretches instead of a full scan. The lab runs 17, which does not have it.',
+          active: ['no'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: skip scan for covering queries
+
+<Flow
+  title="MySQL: prefixes and skip scan on (status, created_at)"
+  height={330}
+  nodes={[
+    { id: 'q', label: 'Condition', sub: '', x: 20, y: 20, w: 260 },
+    { id: 'yes', label: '✓ Prefix present', sub: 'ref / range', x: 360, y: 20, w: 200 },
+    { id: 'no', label: '✗ Prefix missing', sub: '', x: 360, y: 150, w: 200 },
+    { id: 'skip', label: 'Skip scan', sub: 'one seek per status', x: 620, y: 150, w: 160 },
+    { id: 'all', label: 'type: ALL', sub: '', x: 360, y: 260, w: 200 },
+  ]}
+  edges={[
+    { id: 'q-yes', from: 'q', to: 'yes' },
+    { id: 'q-no', from: 'q', to: 'no' },
+    { id: 'no-skip', from: 'no', to: 'skip', label: 'covering' },
+    { id: 'no-all', from: 'no', to: 'all' },
+  ]}
+  cases={[
+    {
+      title: 'Covering query, no prefix',
+      path: '✗ prefix missing → covering → skip scan: 5 seeks → 2,740 rows in 2 ms',
+      summary: 'Measured: 1.98 ms with skip scan vs 85.5 ms full scan.',
+      subs: { q: 'SELECT status, created_at … one day', skip: '1.98 ms' },
+      steps: [
+        {
+          title: '✗ No status condition',
+          note: 'The query selects only status and created_at, both in the index (covering).',
+          code: "EXPLAIN SELECT status, created_at FROM orders\nWHERE created_at >= '2025-06-01' AND created_at < '2025-06-02';",
+          active: ['q', 'no'],
+          edges: ['q-no'],
+        },
+        {
+          title: 'Skip scan',
+          note: 'Extra: Using index for skip scan. MySQL finds the distinct status values and, for each, seeks to (status, 2025-06-01) and reads to (status, 2025-06-02): 5 small stretches. 2,740 rows in 1.98 ms; the same query without the index took 85.5 ms.',
+          active: ['no', 'skip'],
+          edges: ['no-skip'],
+        },
+      ],
+    },
+    {
+      title: 'Full rows, no prefix',
+      path: '✗ prefix missing → SELECT * is not covered → no skip scan → type: ALL',
+      summary: 'Measured: 113 ms full scan.',
+      subs: { q: 'SELECT * … one day', all: '113 ms' },
+      steps: [
+        {
+          title: '✗ Skip scan needs a covering query',
+          note: 'MySQL\'s skip scan applies only when the index contains every column the query needs. SELECT * is a full table scan.',
+          code: "EXPLAIN SELECT * FROM orders\nWHERE created_at >= '2025-06-01' AND created_at < '2025-06-02';",
+          active: ['q', 'no', 'all'],
+          edges: ['q-no', 'no-all'],
+        },
+      ],
+    },
+    {
+      title: 'Prefix present',
+      path: "status = 'paid' AND created_at … ✓ → type: range",
+      summary: 'The normal case.',
+      subs: { q: "status = 'paid' AND created_at …" },
+      steps: [
+        {
+          title: '✓ Prefix',
+          note: 'type: range on orders_status_created_idx.',
+          code: "EXPLAIN SELECT * FROM orders WHERE status = 'paid' AND created_at >= '2025-06-01';",
+          active: ['q', 'yes'],
+          edges: ['q-yes'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: prefixes only
+
+<Flow
+  title="MongoDB: prefixes of { status: 1, created_at: -1 }"
+  height={320}
+  nodes={[
+    { id: 'q', label: 'Filter', sub: '', x: 20, y: 20, w: 260 },
+    { id: 'yes', label: '✓ Prefix present', sub: 'IXSCAN with bounds', x: 360, y: 20, w: 200 },
+    { id: 'no', label: '✗ Prefix missing', sub: 'index not a candidate', x: 360, y: 150, w: 200 },
+    { id: 'coll', label: 'COLLSCAN', sub: '', x: 620, y: 150, w: 160 },
+    { id: 'hint', label: 'hint(): full index', sub: '', x: 360, y: 260, w: 200 },
+  ]}
+  edges={[
+    { id: 'q-yes', from: 'q', to: 'yes' },
+    { id: 'q-no', from: 'q', to: 'no' },
+    { id: 'no-coll', from: 'no', to: 'coll' },
+    { id: 'no-hint', from: 'no', to: 'hint' },
+  ]}
+  cases={[
+    {
+      title: 'created_at only',
+      path: '✗ status missing → COLLSCAN; forcing the index with hint reads all of it',
+      summary: 'Measured: COLLSCAN 171 ms; hint("es"): 1,000,000 keys and documents, 385 ms.',
+      subs: { q: '{ created_at: one day }', coll: '171 ms', hint: '1M keys, 385 ms' },
+      steps: [
+        {
+          title: '✗ No candidate index',
+          note: 'MongoDB considers only indexes whose prefix appears in the query; none starts with created_at, so the plan is a COLLSCAN.',
+          code: 'db.orders.find({ created_at: { $gte: ISODate("2025-06-01"), $lt: ISODate("2025-06-02") } })',
+          active: ['q', 'no', 'coll'],
+          edges: ['q-no', 'no-coll'],
+        },
+        {
+          title: 'Forcing it does not help',
+          note: 'hint("es") makes MongoDB walk the whole { status, created_at } index with bounds [MinKey, MaxKey] on both fields: 1,000,000 keys and 1,000,000 documents, slower than the COLLSCAN. There is no skip scan.',
+          active: ['no', 'hint'],
+          edges: ['no-hint'],
+        },
+      ],
+    },
+    {
+      title: 'status present',
+      path: '✓ status in the filter → IXSCAN with status bounds',
+      summary: 'The index is a candidate and seeks to the status.',
+      subs: { q: "{ status: 'paid', created_at: … }" },
+      steps: [
+        {
+          title: '✓ Prefix present',
+          note: 'Bounds: status ["paid", "paid"], created_at narrowed to the range.',
+          code: 'db.orders.find({ status: "paid", created_at: { $gte: ISODate("2025-06-01") } })',
+          active: ['q', 'yes'],
+          edges: ['q-yes'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Redundant indexes
+
+Because an index on `(a, b)` serves every query an index on `(a)` serves, the single-column index on the leading column is usually redundant:
+
+| Indexes | Verdict |
+|---|---|
+| `(status)` and `(status, created_at)` | `(status)` is redundant (unless it is much smaller and very hot) |
+| `(created_at)` and `(status, created_at)` | Not redundant: different leading column |
+| `(a, b)` and `(a, b, c)` | `(a, b)` is redundant for queries; keep it only if it enforces uniqueness |
+| `(a, b)` and `(b, a)` | Not redundant: each serves different prefixes |
+
+<Pitfall>
+Skip scan is not a reason to ignore column order. It helps only when the missing leading column has **few** distinct values (one seek each) and, in MySQL, only for covering queries. With `customer_id` (100,000 values) first, a skip scan would be 100,000 seeks.
+</Pitfall>
+
+## Real-world scenario: the tenant column
+
+A multi-tenant SaaS table has `(tenant_id, created_at)` as its main index. Every application query has `tenant_id = ?`. An internal report "orders created today across all tenants" is slow.
+
+| Query | With `(tenant_id, created_at)` |
+|---|---|
+| App: `tenant_id = ? AND created_at > ?` | ✓ one stretch per request |
+| Report: `created_at > today` | ✗ no prefix; skip scan would mean one seek per tenant (thousands) |
+
+**Fix:** a separate index on `(created_at)` for the report, or run the report on a replica or warehouse. Do not reorder the main index to `(created_at, tenant_id)`: every application query would get worse (Concept 3).
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 3: equality before range | Which order of prefix columns gives the tightest stretch |
+| Concept 4: ORDER BY + LIMIT | ORDER BY also has to follow a prefix |
+| Session 8: unused indexes | Redundant prefix indexes are the easiest to drop |
+
+## Key takeaways
+
+1. A composite index seeks only with its leftmost prefixes: `a`, `a+b`, `a+b+c`.
+2. Without the leading column there is no starting key; PostgreSQL 17 and MongoDB then use another plan.
+3. Columns after a gap can still filter entries inside the stretch, without seeking.
+4. MySQL 8.0.13+ skip scan seeks once per leading value, only for covering queries; PostgreSQL 18 adds skip scan.
+5. Skip scan only pays off when the leading column has few distinct values.
+6. An index on `(a)` is redundant next to `(a, b)`; `(b)` is not.
+
+## Check questions
+
+1. With an index on `(a, b, c)`, which of these can seek: `a = 1`; `b = 2`; `a = 1 AND c = 3`; `a = 1 AND b = 2 AND c = 3`; `b = 2 AND c = 3`?
+2. Why did PostgreSQL 17 use a Seq Scan for `created_at` in June 1–7 with only `(status, created_at)`, while it used the same index for `status = 'shipped'`?
+3. How does MySQL's skip scan answer `created_at` in one day using `(status, created_at)`, and why was it not used for `SELECT *`?
+4. What did hinting MongoDB to the `{ status, created_at }` index do for a `created_at`-only query?
+5. Why would skip scan be a bad plan if the leading column were `customer_id`?
+6. You have indexes on `(status)`, `(status, created_at)` and `(created_at)`. Which one is redundant, and why?
+7. In the tenant scenario, why is reordering the main index to `(created_at, tenant_id)` the wrong fix for the report?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-4-composite-indexes/concept-2-leftmost-prefix/answers">Worked answers to Q1–Q7</DeepDive>

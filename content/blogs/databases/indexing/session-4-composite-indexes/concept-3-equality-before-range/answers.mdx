@@ -1,0 +1,75 @@
+---
+title: "Answers: Equality before range"
+description: "Worked answers to the Session 4 Concept 3 check questions."
+companion: "answers"
+tags: ["indexing", "composite-index", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-multicolumn.html"
+  - "https://www.mongodb.com/docs/manual/tutorial/equality-sort-range-guideline/"
+---
+
+<Tldr>
+Equalities narrow the seek; the first range ends the narrowing. Put every equality column before the range column.
+</Tldr>
+
+## Q1. 19 vs 355 pages
+
+**Question:** why does `(status, created_at)` read 19 index pages for shipped orders in June, while `(created_at, status)` reads 355?
+
+| Index | Matching entries | Entries walked |
+|---|---|---|
+| `(status, created_at)` | 4,110, all adjacent: the June part of the shipped section | 4,110 (≈ 16 leaves + descent = 19 pages) |
+| `(created_at, status)` | 4,110, scattered among all statuses' June entries | ≈ 82,000: every June entry (≈ 350 leaves + descent = 355 pages) |
+
+The heap part (831 pages) is the same; the whole difference is how much of the index is walked.
+
+> **Common mistake:** "both indexes contain both columns, so they cost the same".
+
+## Q2. Is the status condition useless?
+
+**Question:** in `(created_at, status)`, is the `status = 'shipped'` condition useless? What does it still do?
+
+Not useless. It cannot narrow the **seek** (the walk still covers all of June), but it is checked on each index entry, so only the 4,110 matching entries go on to the heap. Without `status` in the index, all ≈ 82,000 June rows would be fetched from the heap and filtered there.
+
+> **Common mistake:** "a column after a range is ignored". It filters inside the index instead of seeking.
+
+## Q3. 4,110 vs 159,798
+
+**Question:** MySQL estimated 4,110 rows for one index and 159,798 for the other, for the same query. What do the two numbers represent?
+
+`rows` is the number of index entries MySQL expects to **read** with that access path. With `(status, created_at)` the range is exactly the matches: 4,110. With `(created_at, status)` the range is all of June for every status, 159,798 by its estimate (the real count is ≈ 82,000), and `status` is applied as a filter on those (`Using where`). The page requests followed: 30 vs 257.
+
+> **Common mistake:** reading `rows` as rows returned. It is rows examined by that step.
+
+## Q4. MongoDB's 76,499 keys
+
+**Question:** why did MongoDB's range-first index examine only 76,499 keys instead of all keys with `amount > 400`?
+
+MongoDB keeps bounds for every field of the index, including fields after a range (`status: ["paid", "paid"]`). When the scan reads a key whose `status` is outside its bounds, it **seeks** to the next key that could match, (same amount, `paid`) or (next amount, `paid`), instead of reading the keys in between. So it reads the 70,000 matches plus ≈ 6,500 keys where it had to look before seeking. SQL engines reading `(created_at, status)` walk every key in the range instead.
+
+> **Common mistake:** concluding that index order does not matter in MongoDB. The seeks multiply with the number of distinct range values, and the sort order is still lost.
+
+## Q5. Merchant, status, date
+
+**Question:** design an index for `merchant_id = ? AND status = ? AND created_at > ?`. Does the order of the first two columns matter?
+
+`(merchant_id, status, created_at)` or `(status, merchant_id, created_at)`. For **this** query both give one tight stretch: two equalities, then the range. The order of the equality columns matters for **other** queries: `(merchant_id, status, …)` also serves `WHERE merchant_id = ?` alone (leftmost prefix), which is usually the more common filter, so put `merchant_id` first.
+
+> **Common mistake:** putting `created_at` first "because dates are selective".
+
+## Q6. Two ranges
+
+**Question:** a query has two ranges: `created_at > ? AND amount > ?`. How many of them can narrow a composite index's seek?
+
+**One.** Whichever range column comes first after the equality columns positions the walk; the other becomes a filter inside it (or, in MongoDB, drives seeks within the range). Choose the range column that narrows the most, or that matches the sort (Concept 4), for that position.
+
+> **Common mistake:** expecting `(created_at, amount)` to seek on both.
+
+## Q7. Most selective first?
+
+**Question:** why is "most selective column first" misleading for `created_at`?
+
+`created_at` is highly selective as a column (every value distinct), but queries use it as a **range**, and a range on the first column stops every later column from narrowing the seek. `status` is barely selective, but as an equality it narrows the walk to one section and lets `created_at` narrow further inside it. How a column is compared matters more than how many distinct values it has.
+
+> **Common mistake:** ordering columns by `n_distinct` without looking at the operators in the queries.

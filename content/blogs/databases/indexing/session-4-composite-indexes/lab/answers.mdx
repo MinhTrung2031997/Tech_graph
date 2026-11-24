@@ -1,0 +1,96 @@
+---
+title: "Answers: Composite indexes session quiz"
+description: "Worked answers to the Session 4 quiz."
+companion: "answers"
+tags: ["indexing", "composite-index", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-multicolumn.html"
+  - "https://www.mongodb.com/docs/manual/tutorial/equality-sort-range-guideline/"
+---
+
+<Tldr>
+For every query ask: which leftmost prefix seeks, is the rest of the index in the ORDER BY's order, and where does the range sit?
+</Tldr>
+
+## Q1. Four queries on (customer_id, status, created_at)
+
+**Question:** an index is on `(customer_id, status, created_at)`. For each query, say which prefix seeks and whether a sort is needed: (a) `customer_id = 7`; (b) `customer_id = 7 AND created_at > '2025-06-01'`; (c) `customer_id = 7 AND status = 'paid' ORDER BY created_at DESC LIMIT 10`; (d) `status = 'paid'`.
+
+| Query | Seek prefix | Sort? | Note |
+|---|---|---|---|
+| (a) | `customer_id` | — | One stretch: the customer's entries |
+| (b) | `customer_id` | — | `created_at` is after `status`, so it filters within the customer's stretch instead of narrowing it |
+| (c) | `customer_id, status` | No | Inside (7, paid), entries are by `created_at`; walk backwards, stop at 10 |
+| (d) | none | — | No leading column; skip scan over 100,000 customers is useless |
+
+> **Common mistake:** saying (b) seeks on `created_at`. The gap at `status` stops the seek.
+
+## Q2. Why (customer_id, created_at) suits (b) better
+
+**Question:** why does `(customer_id, status, created_at)` handle query (b) of Q1 less well than `(customer_id, created_at)`?
+
+With `(customer_id, created_at)`, the customer's entries are sorted by date, so `created_at > '2025-06-01'` is one sub-stretch: seek to (7, June 1) and read to the end. With `status` in between, the customer's June entries are split across five status sections, so all of the customer's entries are read and filtered. For a customer with 10 orders it does not matter; for one with 200,000 it does. The same applies to `ORDER BY created_at` for a customer without a status filter.
+
+> **Common mistake:** "the three-column index is strictly better because it has more columns".
+
+## Q3. Skip scan and SELECT *
+
+**Question:** in Exercise 2, why does MySQL's skip scan work for `SELECT status, created_at` but not `SELECT *`?
+
+MySQL only uses skip scan when the index **covers** the query. `status` and `created_at` are both in the index, so the five small range scans answer it alone (≈ 2 ms). `SELECT *` needs every column, which would mean a primary-key lookup per row on top of the skip scan; MySQL does not consider skip scan there and does a full table scan.
+
+> **Common mistake:** concluding skip scan "does not work" in MySQL; it is restricted to covering queries.
+
+## Q4. 30 vs 257 page requests
+
+**Question:** explain the 30 vs 257 page requests in Exercise 3 in terms of which entries each index walks.
+
+| Index | Walk |
+|---|---|
+| `(status, created_at)` | Seek to (shipped, June 1), read to (shipped, July 1): exactly the 4,110 matches, ≈ 30 page requests |
+| `(created_at, status)` | Seek to June 1, read to July 1 across all statuses (MySQL estimated 159,798 entries), checking `status` on each: 257 page requests |
+
+> **Common mistake:** thinking the second index is "not used". It is used, as a range on its first column with a filter on the second.
+
+## Q5. SORT_MERGE
+
+**Question:** in Exercise 4, PostgreSQL sorted 400,000 rows for `status IN ('paid','shipped')` but MongoDB examined 21 keys. What does MongoDB do that PostgreSQL 17 does not, and how can you emulate it in SQL?
+
+MongoDB scans each `$in` value's stretch separately (each already sorted by `created_at`) and **merges** them with SORT_MERGE, emitting the newest of the current heads until the limit is reached. PostgreSQL 17 treats the two stretches as an unordered set and sorts all matches. Emulation:
+
+```sql
+SELECT * FROM (
+  (SELECT * FROM orders WHERE status = 'paid'    ORDER BY created_at DESC LIMIT 20)
+  UNION ALL
+  (SELECT * FROM orders WHERE status = 'shipped' ORDER BY created_at DESC LIMIT 20)
+) t ORDER BY created_at DESC LIMIT 20;
+```
+
+Each branch walks 20 entries; the outer sort handles 40 rows.
+
+> **Common mistake:** adding more indexes; the issue is the plan shape, not a missing index.
+
+## Q6. es vs esr
+
+**Question:** in Exercise 5, `es` and `esr` both examined 114 keys. Which is better on a large, uncached collection, and why?
+
+**`esr`.** It checks `amount > 400` on the index key and fetches only the 20 matching documents. `es` has no `amount` in the key, so it fetches all 114 documents to test the condition and discards 94. On uncached data each fetch can be a random read: 114 vs 20 per page of results.
+
+> **Common mistake:** comparing plans only by keys examined.
+
+## Q7. Range on created_at, sort on amount
+
+**Question:** a query is `WHERE merchant_id = ? AND created_at >= ? AND created_at < ? ORDER BY amount DESC LIMIT 10`. Which index order would you choose, and what trade-off are you accepting?
+
+ESR suggests **`(merchant_id, amount, created_at)`**: walk the merchant's orders from the highest amount down, check the date on each entry, stop after 10 matches. Trade-off: if the date range is **narrow** (one day of a merchant with years of orders), most high-amount entries fall outside it and the walk can be long. The alternative `(merchant_id, created_at, amount)` seeks exactly to the date range but must sort all its rows. Choose by the typical range width: wide ranges favour ESR, narrow ranges favour E-R plus a small sort.
+
+> **Common mistake:** assuming ESR is always optimal; it optimises for limit-and-stop, not for narrow ranges.
+
+## Q8. Which index to drop
+
+**Question:** you have `(status)`, `(status, created_at)` and `(created_at, status)`. Which can you drop without losing any plan from this session's exercises?
+
+**`(status)`**: every query it serves starts with `status`, which `(status, created_at)` also serves (its leftmost prefix). `(created_at, status)` is the only index starting with `created_at`, so it serves date-only filters and sorts; dropping it would lose those plans.
+
+> **Common mistake:** dropping `(created_at, status)` as a "duplicate" of `(status, created_at)`. Same columns, different prefixes.

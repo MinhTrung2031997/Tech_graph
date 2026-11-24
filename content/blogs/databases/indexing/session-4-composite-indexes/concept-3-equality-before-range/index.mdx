@@ -1,0 +1,278 @@
+---
+title: "Concept 3: Equality before range"
+description: "In a composite index, put columns compared with = before the column compared with a range. Why a range on an earlier column turns every later condition into a filter, measured as 19 vs 355 index pages in PostgreSQL and 30 vs 257 page requests in MySQL, and how MongoDB partly softens it."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "composite-index"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-multicolumn.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/range-optimization.html"
+  - "https://www.mongodb.com/docs/manual/tutorial/equality-sort-range-guideline/"
+---
+
+<Tldr>
+For `status = 'shipped' AND created_at` in June, an index on **`(status, created_at)`** seeks straight to "shipped, 1 June" and reads exactly the 4,110 matching entries: **19 index pages**. An index on **`(created_at, status)`** can only seek on the June range, then must step through every June entry of every status, checking `status` on each: **355 index pages**. Once a column is used as a **range**, the columns after it can no longer narrow the seek. So: equality columns first, the range column last. MySQL showed the same (30 vs 257 page requests); MongoDB can seek past non-matching keys after a range, which narrows but does not remove the gap.
+</Tldr>
+
+## Why the order matters
+
+With `(status, created_at)`, all matches are **adjacent**: inside the shipped section, June is one run. With `(created_at, status)`, June is one run, but inside it shipped entries alternate with paid, delivered, pending and cancelled ones:
+
+| `(created_at, status)` entries in June | Matches `status = 'shipped'`? |
+|---|---|
+| 2025-06-01 00:00:… delivered | ✗ |
+| 2025-06-01 00:00:… paid | ✗ |
+| 2025-06-01 00:01:… shipped | ✓ |
+| 2025-06-01 00:01:… pending | ✗ |
+| … 82,000 entries in June … | ≈ 1 in 20 |
+
+| Term | Meaning |
+|---|---|
+| Seek condition | Positions the start and end of the walk (`Index Cond` used as bounds) |
+| Index filter | Checked on each entry inside the walk, without narrowing it |
+| **✓ Equality first** | All conditions are seek conditions: the walk covers only matches |
+| **✗ Range first** | Conditions after the range are only filters: the walk covers the whole range |
+
+## PostgreSQL: 19 vs 355 index pages
+
+<Flow
+  title="PostgreSQL: shipped orders in June through two composite indexes"
+  height={340}
+  nodes={[
+    { id: 'q', label: "status = 'shipped'", sub: 'AND created_at in June', x: 20, y: 20, w: 240 },
+    { id: 'eq', label: '✓ Equality first', sub: '(status, created_at)', x: 340, y: 20, w: 200 },
+    { id: 'rg', label: '✗ Range first', sub: '(created_at, status)', x: 340, y: 150, w: 200 },
+    { id: 'tight', label: 'Walk: only matches', sub: '4,110 entries', x: 600, y: 20, w: 180 },
+    { id: 'wide', label: 'Walk: all of June', sub: '≈ 82,000 entries', x: 600, y: 150, w: 180 },
+    { id: 'heap', label: 'Heap', sub: '831 pages', x: 340, y: 270, w: 200 },
+  ]}
+  edges={[
+    { id: 'q-eq', from: 'q', to: 'eq' },
+    { id: 'q-rg', from: 'q', to: 'rg' },
+    { id: 'eq-tight', from: 'eq', to: 'tight' },
+    { id: 'rg-wide', from: 'rg', to: 'wide' },
+    { id: 'wide-heap', from: 'wide', to: 'heap', quiet: true },
+  ]}
+  cases={[
+    {
+      title: '(status, created_at)',
+      path: '✓ seek to (shipped, 1 June) → walk to (shipped, 1 July) → 4,110 entries, 19 index pages',
+      summary: 'Measured: index part 19 pages; 20 buffers for an index-only count.',
+      steps: [
+        {
+          title: '✓ Both conditions are seek conditions',
+          note: 'Descend to the first entry ≥ (shipped, 2025-06-01). Every entry from there to (shipped, 2025-07-01) matches.',
+          code: "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders\nWHERE status = 'shipped' AND created_at >= '2025-06-01' AND created_at < '2025-07-01';",
+          active: ['q', 'eq'],
+          edges: ['q-eq'],
+        },
+        {
+          title: 'Walk only the matches',
+          note: '4,110 entries on ≈ 16 leaves, plus the descent: 19 index pages (Bitmap Index Scan: Buffers 19). Nothing is read and thrown away.',
+          active: ['eq', 'tight'],
+          edges: ['eq-tight'],
+        },
+        {
+          title: 'Then the heap',
+          note: '831 heap pages for the 4,110 rows; total 0.76 ms.',
+          active: ['tight', 'heap'],
+        },
+      ],
+    },
+    {
+      title: '(created_at, status)',
+      path: '✗ seek only on June → walk every June entry → status checked on each → 355 index pages',
+      summary: 'Measured with the other index dropped: 1,186 buffers = 355 index + 831 heap.',
+      steps: [
+        {
+          title: '✗ Range on the first column',
+          note: 'Descend to the first entry ≥ 2025-06-01. The status condition cannot narrow the seek: after the date range starts, status values are mixed.',
+          code: "-- with only (created_at, status) available\nEXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders\nWHERE status = 'shipped' AND created_at >= '2025-06-01' AND created_at < '2025-07-01';",
+          active: ['q', 'rg'],
+          edges: ['q-rg'],
+        },
+        {
+          title: 'Walk all of June',
+          note: 'Every June entry, ≈ 82,000, is read; status is checked on each inside the index (Index Cond still lists it, but as a per-entry check). 355 index pages, 19× more than the equality-first index.',
+          active: ['rg', 'wide'],
+          edges: ['rg-wide'],
+        },
+        {
+          title: 'Same heap pages',
+          note: 'Only the 4,110 matches go to the heap: the same 831 pages. The extra cost is all inside the index. On a year of data with a narrow equality value, this difference grows with the size of the range.',
+          active: ['wide', 'heap'],
+          edges: ['wide-heap'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: 30 vs 257 page requests
+
+<Flow
+  title="MySQL: the same query through both orders"
+  height={300}
+  nodes={[
+    { id: 'q', label: "status = 'shipped'", sub: 'AND created_at in June', x: 20, y: 20, w: 240 },
+    { id: 'eq', label: '✓ Equality first', sub: '(status, created_at)', x: 340, y: 20, w: 200 },
+    { id: 'rg', label: '✗ Range first', sub: '(created_at, status)', x: 340, y: 150, w: 200 },
+    { id: 'a', label: '30 page requests', sub: 'rows estimate 4,110', x: 600, y: 20, w: 180 },
+    { id: 'b', label: '257 page requests', sub: 'rows estimate 159,798', x: 600, y: 150, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-eq', from: 'q', to: 'eq' },
+    { id: 'q-rg', from: 'q', to: 'rg' },
+    { id: 'eq-a', from: 'eq', to: 'a' },
+    { id: 'rg-b', from: 'rg', to: 'b' },
+  ]}
+  cases={[
+    {
+      title: '(status, created_at)',
+      path: '✓ range over (shipped, June) → 30 page requests',
+      summary: 'COUNT(*) of 4,110 rows, covered by the index.',
+      steps: [
+        {
+          title: '✓ Tight range',
+          note: 'type: range; the optimizer estimates 4,110 rows, exactly the matches. Counting them took 30 page requests.',
+          code: "SELECT COUNT(*) FROM orders FORCE INDEX (orders_status_created_idx)\nWHERE status = 'shipped' AND created_at >= '2025-06-01' AND created_at < '2025-07-01';",
+          active: ['q', 'eq', 'a'],
+          edges: ['q-eq', 'eq-a'],
+        },
+      ],
+    },
+    {
+      title: '(created_at, status)',
+      path: '✗ range over June, status filtered → 257 page requests',
+      summary: 'The estimate (159,798) shows MySQL knows it must read all of June.',
+      steps: [
+        {
+          title: '✗ Wide range',
+          note: 'type: range, Using where; Using index. The range is June for every status: estimated 159,798 entries to read, 257 page requests to count the same 4,110.',
+          code: "SELECT COUNT(*) FROM orders FORCE INDEX (orders_created_status_idx)\nWHERE status = 'shipped' AND created_at >= '2025-06-01' AND created_at < '2025-07-01';",
+          active: ['q', 'rg', 'b'],
+          edges: ['q-rg', 'rg-b'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: seeking inside the range
+
+MongoDB's index scan can use bounds on fields **after** a range: when it meets a key outside the later field's bounds, it seeks ahead to the next key that could match instead of reading every key. That narrows the gap but does not close it.
+
+| Term | Meaning |
+|---|---|
+| Bounds per field | `indexBounds` lists a range for every field, including those after a range |
+| Seek ahead | On a non-matching key, jump to the next possible match (like a tiny skip scan inside the range) |
+| **✓ Equality first / ✗ Range first** | As in the SQL engines |
+
+<Flow
+  title="MongoDB: { status: 'paid', amount: { $gt: 400 } } through two indexes"
+  height={300}
+  nodes={[
+    { id: 'q', label: "status: 'paid'", sub: 'amount > 400', x: 20, y: 20, w: 240 },
+    { id: 'eq', label: '✓ Equality first', sub: '{ status, amount, … }', x: 340, y: 20, w: 200 },
+    { id: 'rg', label: '✗ Range first', sub: '{ amount, status, … }', x: 340, y: 150, w: 200 },
+    { id: 'a', label: '70,000 keys', sub: 'exactly the matches', x: 600, y: 20, w: 180 },
+    { id: 'b', label: '76,499 keys', sub: 'matches + seeks', x: 600, y: 150, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-eq', from: 'q', to: 'eq' },
+    { id: 'q-rg', from: 'q', to: 'rg' },
+    { id: 'eq-a', from: 'eq', to: 'a' },
+    { id: 'rg-b', from: 'rg', to: 'b' },
+  ]}
+  cases={[
+    {
+      title: '{ status, amount, created_at }',
+      path: '✓ bounds status ["paid"], amount (400, ∞) → 70,000 keys, all matches',
+      summary: 'hint("ers"): keysExamined 70,000 = nReturned 70,000.',
+      steps: [
+        {
+          title: '✓ One stretch',
+          note: 'Every key between (paid, 400) and (paid, ∞) matches.',
+          code: 'db.orders.find({ status: "paid", amount: { $gt: 400 } }).hint("ers")',
+          active: ['q', 'eq', 'a'],
+          edges: ['q-eq', 'eq-a'],
+        },
+      ],
+    },
+    {
+      title: '{ amount, status, created_at }',
+      path: '✗ range on amount first → for each amount value, seek to paid → 76,499 keys',
+      summary: 'hint("res"): 76,499 keys for 70,000 matches: 9% extra, not the 3× a full walk of the range would cost.',
+      steps: [
+        {
+          title: '✗ Range first, but bounded seeks',
+          note: 'Within amount > 400 the statuses are mixed. Instead of reading all ≈ 200,000 keys above 400, MongoDB reads a key, sees status ≠ paid, and seeks to the next (amount, paid). 76,499 keys examined for 70,000 matches.',
+          code: 'db.orders.find({ status: "paid", amount: { $gt: 400 } }).hint("res")',
+          active: ['q', 'rg', 'b'],
+          edges: ['q-rg', 'rg-b'],
+        },
+        {
+          title: 'Why it still matters',
+          note: 'The seeks work well here because amount has few distinct values per page of the range. With a high-cardinality range field the number of seeks approaches the number of keys. And range-first loses the sort order (Concept 5): with a sort on created_at, this index needed 76,499 keys and an in-memory SORT.',
+          active: ['b'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Several equalities, one range
+
+The rule extends to any number of columns: **all equality columns first (in any order among themselves), then one range column.** Only one range can narrow the seek; a second range column is a filter.
+
+| Query | Good index | Why |
+|---|---|---|
+| `merchant_id = ? AND status = ? AND created_at > ?` | `(merchant_id, status, created_at)` or `(status, merchant_id, created_at)` | Two equalities, then the range |
+| `merchant_id = ? AND created_at > ? AND amount > ?` | `(merchant_id, created_at, amount)` | One range seeks (`created_at`); `amount` is filtered inside the index |
+| `status IN ('paid', 'pending') AND created_at > ?` | `(status, created_at)` | An `IN` behaves like several equalities: one stretch per value |
+
+Among the equality columns, order matters little for filtering; it matters for **other** queries that use a prefix (Concept 2) and for sorting (Concept 4).
+
+<Pitfall>
+"Put the most selective column first" is a common rule of thumb, and it is wrong when that column is used with a range. `created_at` is far more selective than `status`, but as a range it must go last. Order by **how** each column is compared (equality before range) first, and use selectivity only to break ties.
+</Pitfall>
+
+## Real-world scenario: the dashboard filter
+
+A dashboard counts a merchant's orders by status for a date range: `WHERE merchant_id = ? AND status = ? AND created_at BETWEEN ? AND ?`. The existing index is `(created_at, merchant_id, status)`, created "because date filters are the most common".
+
+| Index | What a one-year query walks |
+|---|---|
+| `(created_at, merchant_id, status)` | Every order of every merchant for the year, checking merchant and status on each |
+| `(merchant_id, status, created_at)` | Only this merchant's orders with this status, for the year |
+
+With 10,000 merchants, the second walk is roughly 10,000 × 5 times shorter.
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 4: ORDER BY + LIMIT | The sort column competes with the range column for the last position |
+| Concept 5: MongoDB ESR | Equality, then Sort, then Range: this rule plus Concept 4 |
+| Session 5: partial indexes | A fixed equality (`status = 'pending'`) can move into the index's WHERE clause |
+
+## Key takeaways
+
+1. In a composite index, columns compared with `=` (or `IN`) go before the column compared with a range.
+2. After a range column, later columns can only filter entries, not narrow the seek.
+3. Measured: 19 vs 355 index pages in PostgreSQL, 30 vs 257 page requests in MySQL, for the same 4,110 rows.
+4. MongoDB seeks ahead inside a range using later bounds, so the penalty is smaller (76,499 vs 70,000 keys) but still real, and the sort order is lost.
+5. Only one range column can narrow the seek; put the most important range last among the leading columns.
+6. Order by comparison type first, selectivity second.
+
+## Check questions
+
+1. Why does `(status, created_at)` read 19 index pages for shipped orders in June, while `(created_at, status)` reads 355?
+2. In `(created_at, status)`, is the `status = 'shipped'` condition useless? What does it still do?
+3. MySQL estimated 4,110 rows for one index and 159,798 for the other, for the same query. What do the two numbers represent?
+4. Why did MongoDB's range-first index examine only 76,499 keys instead of all keys with `amount > 400`?
+5. Design an index for `merchant_id = ? AND status = ? AND created_at > ?`. Does the order of the first two columns matter?
+6. A query has two ranges: `created_at > ? AND amount > ?`. How many of them can narrow a composite index's seek?
+7. Why is "most selective column first" misleading for `created_at`?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-4-composite-indexes/concept-3-equality-before-range/answers">Worked answers to Q1–Q7</DeepDive>

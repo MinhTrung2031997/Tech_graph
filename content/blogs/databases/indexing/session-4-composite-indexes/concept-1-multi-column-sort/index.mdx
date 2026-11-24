@@ -1,0 +1,324 @@
+---
+title: "Concept 1: How multi-column keys are sorted"
+description: "A composite index sorts by the first column, then by the second within equal first values, like a phone book. Which conditions become one contiguous stretch of the index and which do not, in PostgreSQL, MySQL and MongoDB."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "composite-index"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-multicolumn.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/multiple-column-indexes.html"
+  - "https://www.mongodb.com/docs/manual/core/indexes/index-types/index-compound/"
+---
+
+<Tldr>
+A composite index on `(status, created_at)` is **one** B-tree whose entries are sorted by `status` first and, among equal statuses, by `created_at`: all `cancelled` orders by date, then all `delivered` by date, and so on. A query can use it efficiently only for conditions that select **one contiguous stretch** of that order: `status = 'shipped'`, or `status = 'shipped' AND created_at` in June. `created_at` in June alone is spread over five separate stretches (one per status), so PostgreSQL 17 ignored the index for it and scanned the table. Everything in this session follows from this one sort order.
+</Tldr>
+
+## The phone-book order
+
+| Position in the index | `status` | `created_at` |
+|---|---|---|
+| first entries | cancelled | 2025-01-01 00:00:32 |
+| … | cancelled | … rising … |
+| ≈ 50,000th | cancelled | 2025-12-31 23:59:… |
+| next | delivered | 2025-01-01 00:01:03 |
+| … | delivered | … rising … |
+| … | paid, pending, shipped | each by date |
+
+The entries are in exactly the order of `ORDER BY status, created_at`. Each entry also carries the row pointer: a ctid in PostgreSQL, the primary key in InnoDB (so the InnoDB entry is really `(status, created_at, id)`), a RecordId in MongoDB.
+
+| Condition | Stretches of the index | Efficient? |
+|---|---|---|
+| `status = 'shipped'` | 1 | ✓ |
+| `status = 'shipped' AND created_at` in June | 1 (narrower) | ✓ |
+| `status IN ('paid', 'shipped')` | 2 | ✓ (two descents) |
+| `created_at` in June | 5 (June inside each status) | ✗ in general |
+| `ORDER BY status, created_at` | the whole index, in order | ✓ |
+| `ORDER BY created_at` | — the index is not in this order | ✗ |
+
+## Size: one index, two columns
+
+| PostgreSQL index | Leaves | Note |
+|---|---|---|
+| `(status)` | 848 | Deduplicated: 5 distinct keys |
+| `(created_at)` | 2,733 | |
+| `(status, created_at)` | 4,270 | Almost every pair is distinct, so no deduplication; wider entries |
+| `(customer_id, created_at)` | 3,832 | |
+
+A composite index is bigger than either single-column index, but it can replace the single-column index on its **first** column (Concept 2).
+
+## PostgreSQL: walking (status, created_at)
+
+| Term | Meaning |
+|---|---|
+| Contiguous stretch | A run of adjacent index entries; reached with one descent and a walk along the leaves |
+| Index Cond | Conditions used to position and stop the walk |
+| **✓ One stretch** | The condition fixes the leading column(s), so matches are adjacent |
+| **✗ Many stretches** | Matches are scattered through the index |
+
+<Flow
+  title="PostgreSQL: which stretch of (status, created_at) a query reads"
+  height={340}
+  nodes={[
+    { id: 'q', label: 'Condition', sub: '', x: 20, y: 20, w: 240 },
+    { id: 'can', label: 'cancelled …', sub: 'by date', x: 20, y: 150, w: 140 },
+    { id: 'del', label: 'delivered …', sub: 'by date', x: 175, y: 150, w: 140 },
+    { id: 'paid', label: 'paid …', sub: 'by date', x: 330, y: 150, w: 140 },
+    { id: 'pend', label: 'pending …', sub: 'by date', x: 485, y: 150, w: 140 },
+    { id: 'ship', label: 'shipped …', sub: 'by date', x: 640, y: 150, w: 140 },
+    { id: 'one', label: '✓ One stretch', sub: '', x: 330, y: 20, w: 200 },
+    { id: 'many', label: '✗ Many stretches', sub: '', x: 590, y: 20, w: 190 },
+    { id: 'plan', label: 'Plan', sub: '', x: 250, y: 270, w: 300 },
+  ]}
+  edges={[
+    { id: 'q-one', from: 'q', to: 'one' },
+    { id: 'one-ship', from: 'one', to: 'ship', quiet: true },
+    { id: 'ship-plan', from: 'ship', to: 'plan', quiet: true },
+    { id: 'del-plan', from: 'del', to: 'plan', quiet: true },
+  ]}
+  cases={[
+    {
+      title: "status = 'shipped'",
+      path: '✓ one stretch: the whole shipped section, 50,000 entries',
+      summary: 'Measured: Bitmap Index Scan on the composite index, 195 index pages, 12.7 ms.',
+      subs: { q: "status = 'shipped'", ship: '50,000 entries' },
+      steps: [
+        {
+          title: '✓ The leading column is fixed',
+          note: 'All shipped entries are adjacent: one descent to the first shipped entry, then a walk to the last.',
+          code: "EXPLAIN ANALYZE SELECT * FROM orders WHERE status = 'shipped';",
+          active: ['q', 'one', 'ship'],
+          edges: ['q-one', 'one-ship'],
+        },
+        {
+          title: 'Plan',
+          note: 'Bitmap Index Scan on orders_status_created_idx, Index Cond: status = shipped. The created_at part of each entry is simply carried along.',
+          active: ['ship', 'plan'],
+          edges: ['ship-plan'],
+          subs: { plan: 'Bitmap on (status, created_at)' },
+        },
+      ],
+    },
+    {
+      title: "shipped AND created_at in June 1–7",
+      path: '✓ one stretch: inside shipped, the dates from 1 to 7 June: 959 entries',
+      summary: 'Measured: 7 index pages, 195 heap pages, 0.34 ms.',
+      subs: { q: 'shipped AND June 1–7', ship: '959 in June 1–7' },
+      steps: [
+        {
+          title: '✓ Both columns narrow the same stretch',
+          note: 'Within the shipped section, entries are sorted by created_at, so June 1–7 is a sub-stretch: descend to (shipped, 2025-06-01), walk until (shipped, 2025-06-08).',
+          code: "EXPLAIN ANALYZE SELECT * FROM orders\nWHERE status = 'shipped' AND created_at >= '2025-06-01' AND created_at < '2025-06-08';",
+          active: ['q', 'one', 'ship'],
+          edges: ['q-one', 'one-ship'],
+        },
+        {
+          title: 'Plan: both conditions in Index Cond',
+          note: 'Index Cond: (status = shipped) AND (created_at >= …) AND (created_at < …). Index part: 7 pages.',
+          active: ['ship', 'plan'],
+          edges: ['ship-plan'],
+          subs: { plan: 'Index Cond on both columns' },
+        },
+      ],
+    },
+    {
+      title: 'created_at in June 1–7 only',
+      path: '✗ five stretches, one per status → the planner reads the table instead',
+      summary: 'Measured (PostgreSQL 17, only the composite index): Seq Scan, 29.6 ms.',
+      subs: { q: 'created_at in June 1–7', can: 'June inside', del: 'June inside', paid: 'June inside', pend: 'June inside', ship: 'June inside' },
+      steps: [
+        {
+          title: '✗ The leading column is not fixed',
+          note: 'June entries exist inside every status section, separated by all the other dates. There is no single range to seek to.',
+          code: "EXPLAIN ANALYZE SELECT * FROM orders\nWHERE created_at >= '2025-06-01' AND created_at < '2025-06-08';",
+          active: ['q', 'many', 'can', 'del', 'paid', 'pend', 'ship'],
+        },
+        {
+          title: 'Plan: Seq Scan',
+          note: 'PostgreSQL 17 can only read the whole composite index for this, so it chose a Seq Scan (Rows Removed by Filter: 980,822). PostgreSQL 18 and MySQL 8.0.13+ can "skip scan" few-valued leading columns (Concept 2); MongoDB cannot.',
+          active: ['del', 'plan'],
+          edges: ['del-plan'],
+          subs: { plan: 'Seq Scan' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL InnoDB: the primary key is the last column
+
+| Term | Meaning |
+|---|---|
+| Secondary entry | `(status, created_at, id)`: the indexed columns plus the primary key, always |
+| `key_len` (EXPLAIN) | How many bytes of the key the access uses: shows how many leading columns were used |
+| **✓ Prefix of the key / ✗ Not a prefix** | Same stretch rule as PostgreSQL |
+
+<Flow
+  title="InnoDB: which part of (status, created_at, id) a query uses"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Condition', sub: '', x: 20, y: 20, w: 240 },
+    { id: 'c1', label: 'status', sub: 'column 1', x: 330, y: 20, w: 140 },
+    { id: 'c2', label: 'created_at', sub: 'column 2', x: 490, y: 20, w: 140 },
+    { id: 'c3', label: 'id', sub: 'primary key', x: 650, y: 20, w: 130 },
+    { id: 'yes', label: '✓ Prefix of the key', sub: 'type: ref / range', x: 120, y: 160, w: 260 },
+    { id: 'no', label: '✗ Not a prefix', sub: 'type: ALL (or skip scan)', x: 470, y: 160, w: 260 },
+  ]}
+  edges={[
+    { id: 'q-c1', from: 'q', to: 'c1' },
+    { id: 'c1-c2', from: 'c1', to: 'c2' },
+    { id: 'c2-c3', from: 'c2', to: 'c3' },
+    { id: 'q-yes', from: 'q', to: 'yes', quiet: true },
+    { id: 'q-no', from: 'q', to: 'no', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'status and a created_at range',
+      path: 'status = … ✓ → created_at range ✓ → type: range, rows 4,110',
+      summary: "status = 'shipped' AND created_at in June.",
+      subs: { q: 'shipped AND June' },
+      steps: [
+        {
+          title: '✓ Columns 1 and 2',
+          note: 'EXPLAIN: type range, key orders_status_created_idx, rows 4,110, Using index condition. The count needed 30 page requests.',
+          code: "EXPLAIN SELECT * FROM orders\nWHERE status = 'shipped' AND created_at >= '2025-06-01' AND created_at < '2025-07-01';",
+          active: ['q', 'c1', 'c2', 'yes'],
+          edges: ['q-c1', 'c1-c2', 'q-yes'],
+        },
+      ],
+    },
+    {
+      title: 'Only created_at',
+      path: 'column 1 missing ✗ → FORCE INDEX still gives type: ALL',
+      summary: 'Even forced, the index cannot serve a condition on column 2 alone.',
+      subs: { q: 'created_at in June 1–7' },
+      steps: [
+        {
+          title: '✗ Not a prefix',
+          note: 'FORCE INDEX (orders_status_created_idx) … WHERE created_at in June 1–7: type ALL, rows 996,111. MySQL refuses rather than read the whole index for a full-row query.',
+          code: "EXPLAIN SELECT * FROM orders FORCE INDEX (orders_status_created_idx)\nWHERE created_at >= '2025-06-01' AND created_at < '2025-06-08';",
+          active: ['q', 'c2', 'no'],
+          edges: ['q-no'],
+        },
+      ],
+    },
+    {
+      title: 'Ordering by the hidden id',
+      path: 'status = … → entries sorted by created_at, then id ✓ ORDER BY created_at, id needs no sort',
+      summary: 'The appended primary key is part of the sort order.',
+      subs: { q: 'paid, ORDER BY created_at, id' },
+      steps: [
+        {
+          title: '✓ All three columns in order',
+          note: 'Because id is the implicit last column, WHERE status = \'paid\' ORDER BY created_at, id can be read straight from the index, with no filesort.',
+          code: "EXPLAIN SELECT * FROM orders WHERE status = 'paid' ORDER BY created_at, id LIMIT 20;",
+          active: ['q', 'c1', 'c2', 'c3', 'yes'],
+          edges: ['q-c1', 'c1-c2', 'c2-c3', 'q-yes'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: compound indexes and direction
+
+| Term | Meaning |
+|---|---|
+| Compound index | `{ status: 1, created_at: -1 }`: field order and a direction (1 ascending, −1 descending) per field |
+| Direction | Matters only when sorting on several fields in mixed directions (Concept 4) |
+| `indexBounds` | Shows the stretch: `status: ["paid", "paid"], created_at: [MaxKey, MinKey]` |
+| **✓ Prefix fixed / ✗ Prefix missing** | Same rule; MongoDB has no skip scan |
+
+<Flow
+  title="MongoDB: bounds on a compound index"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Filter', sub: '', x: 20, y: 20, w: 240 },
+    { id: 'idx', label: '{ status: 1, created_at: -1 }', sub: '', x: 330, y: 20, w: 300 },
+    { id: 'yes', label: '✓ Prefix fixed', sub: 'tight bounds', x: 120, y: 160, w: 240 },
+    { id: 'no', label: '✗ Prefix missing', sub: 'index not a candidate', x: 470, y: 160, w: 240 },
+  ]}
+  edges={[
+    { id: 'q-idx', from: 'q', to: 'idx' },
+    { id: 'idx-yes', from: 'idx', to: 'yes' },
+    { id: 'idx-no', from: 'idx', to: 'no' },
+  ]}
+  cases={[
+    {
+      title: "status: 'paid'",
+      path: '✓ bounds status ["paid","paid"], created_at [MaxKey, MinKey] → one stretch, newest first',
+      summary: 'The descending created_at means the stretch starts at the newest paid order.',
+      subs: { q: "{ status: 'paid' }" },
+      steps: [
+        {
+          title: '✓ One stretch',
+          note: 'indexBounds: status ["paid", "paid"], created_at [MaxKey, MinKey]: every date, in descending order.',
+          code: 'db.orders.find({ status: "paid" }).sort({ created_at: -1 }).limit(3).explain()',
+          active: ['q', 'idx', 'yes'],
+          edges: ['q-idx', 'idx-yes'],
+        },
+      ],
+    },
+    {
+      title: 'created_at only',
+      path: '✗ status not in the filter → the index is not a candidate',
+      summary: 'Without a usable index, the query is a COLLSCAN.',
+      subs: { q: '{ created_at: { $gte: … } }' },
+      steps: [
+        {
+          title: '✗ No prefix',
+          note: 'MongoDB only considers an index whose leading field appears in the filter (or the sort). A query on created_at alone needs an index that starts with created_at.',
+          code: 'db.orders.find({ created_at: { $gte: ISODate("2025-06-01") } })',
+          active: ['q', 'idx', 'no'],
+          edges: ['q-idx', 'idx-no'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+"An index on (a, b) is an index on a and an index on b" is half true: it serves `a` (it starts with `a`) but not `b` on its own. Column order is a design decision, not a detail.
+</Pitfall>
+
+## Real-world scenario: one index per screen
+
+An admin app has screens "orders of a merchant", "orders of a merchant by date" and "a merchant's pending orders, newest first". The team has three single-column indexes: `merchant_id`, `created_at`, `status`.
+
+| Screen query | Best single index | One composite `(merchant_id, status, created_at)` |
+|---|---|---|
+| `WHERE merchant_id = ?` | `merchant_id` | ✓ prefix (merchant_id) |
+| `WHERE merchant_id = ? ORDER BY created_at DESC` | `merchant_id`, then sort | ✗ status sits between them; needs `(merchant_id, created_at)` |
+| `WHERE merchant_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 50` | BitmapAnd + sort | ✓ one stretch, already ordered, stops after 50 |
+
+Two composites, `(merchant_id, created_at)` and `(merchant_id, status, created_at)`, replace the three single-column indexes and serve every screen without a sort. Concepts 2–4 explain each ✓ and ✗.
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 2: leftmost prefix | Which prefixes of the sort order a query can use |
+| Concept 3: equality before range | Why the range column goes after the equality columns |
+| Concept 4: ORDER BY + LIMIT | The index order can replace a sort |
+| Session 5: covering indexes | Extra columns can ride along in the entries |
+
+## Key takeaways
+
+1. A composite index is one B-tree sorted by its columns left to right, like a phone book.
+2. Efficient conditions select one contiguous stretch: equality on the leading column(s), optionally a range on the next.
+3. A condition on a later column alone is spread across one stretch per leading value.
+4. InnoDB secondary entries end with the primary key, which is part of the sort order.
+5. MongoDB compound indexes have a direction per field; it matters for mixed-direction sorts.
+6. A composite index is bigger than a single-column one but can replace the index on its first column.
+
+## Check questions
+
+1. In what order are entries of an index on `(status, created_at)` stored? Describe the first few thousand.
+2. Which of these select one contiguous stretch of `(status, created_at)`: `status = 'paid'`; `created_at > '2025-12-01'`; `status = 'paid' AND created_at > '2025-12-01'`; `status IN ('paid', 'pending')`?
+3. Why did PostgreSQL 17 choose a Seq Scan for `created_at` in June 1–7 when the only index was `(status, created_at)`?
+4. What does an InnoDB secondary index on `(status, created_at)` really store per entry, and what does that allow?
+5. Why is `(status, created_at)` bigger than `(status)` alone in PostgreSQL?
+6. What do MongoDB's `indexBounds` for `{ status: "paid" }` on `{ status: 1, created_at: -1 }` tell you?
+7. Which single composite index would serve both `WHERE merchant_id = ?` and `WHERE merchant_id = ? AND created_at > ?`?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-4-composite-indexes/concept-1-multi-column-sort/answers">Worked answers to Q1–Q7</DeepDive>

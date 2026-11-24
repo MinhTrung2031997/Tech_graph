@@ -1,0 +1,76 @@
+---
+title: "Answers: The leftmost-prefix rule"
+description: "Worked answers to the Session 4 Concept 2 check questions."
+companion: "answers"
+tags: ["indexing", "composite-index", "skip-scan", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/range-optimization.html#range-access-skip-scan"
+  - "https://www.mongodb.com/docs/manual/core/indexes/index-types/index-compound/#index-prefixes"
+---
+
+<Tldr>
+Seek with a leftmost prefix; filter with anything else inside the stretch; skip scan only for few leading values.
+</Tldr>
+
+## Q1. Which can seek on (a, b, c)
+
+**Question:** with an index on `(a, b, c)`, which of these can seek: `a = 1`; `b = 2`; `a = 1 AND c = 3`; `a = 1 AND b = 2 AND c = 3`; `b = 2 AND c = 3`?
+
+| Condition | Seek prefix | Note |
+|---|---|---|
+| `a = 1` | `a` ✓ | |
+| `b = 2` | none ✗ | Skip scan at best |
+| `a = 1 AND c = 3` | `a` ✓ | `c` filters entries within the `a = 1` stretch |
+| `a = 1 AND b = 2 AND c = 3` | `a, b, c` ✓ | Tightest |
+| `b = 2 AND c = 3` | none ✗ | Skip scan at best |
+
+> **Common mistake:** "`a = 1 AND c = 3` cannot use the index". It uses the `a` prefix; only `c` cannot narrow the seek.
+
+## Q2. Seq Scan vs Bitmap
+
+**Question:** why did PostgreSQL 17 use a Seq Scan for `created_at` in June 1–7 with only `(status, created_at)`, while it used the same index for `status = 'shipped'`?
+
+`status` is the leading column, so `status = 'shipped'` is one stretch with a starting key. `created_at` alone has no starting key: June dates are inside each of the five status sections. PostgreSQL 17 has no skip scan, so using the index would mean reading all of it; a Seq Scan was cheaper.
+
+> **Common mistake:** "the index only works for status". It works for any query with a `status` condition, plus a `created_at` condition alongside it.
+
+## Q3. MySQL skip scan
+
+**Question:** how does MySQL's skip scan answer `created_at` in one day using `(status, created_at)`, and why was it not used for `SELECT *`?
+
+It enumerates the distinct values of the missing leading column (5 statuses) and, for each, seeks to `(status, '2025-06-01')` and reads up to `(status, '2025-06-02')`: five short range scans, 2,740 rows in 1.98 ms (`Using index for skip scan`). MySQL only does this when the index **covers** the query; `SELECT *` needs other columns, so it fell back to a full table scan (113 ms).
+
+> **Common mistake:** expecting skip scan for any query with a missing prefix.
+
+## Q4. Hinting MongoDB
+
+**Question:** what did hinting MongoDB to the `{ status, created_at }` index do for a `created_at`-only query?
+
+It walked the **entire** index with bounds `[MinKey, MaxKey]` on `status` and `[MaxKey, MinKey]` on `created_at`, examining 1,000,000 keys and fetching 1,000,000 documents: 385 ms, slower than the 171 ms COLLSCAN. MongoDB has no skip scan, and here it did not even filter `created_at` inside the index before fetching.
+
+> **Common mistake:** assuming `hint()` makes a query faster. It only forces the plan you name.
+
+## Q5. Skip scan on customer_id
+
+**Question:** why would skip scan be a bad plan if the leading column were `customer_id`?
+
+Skip scan costs one seek (a full descent) per distinct leading value. `customer_id` has 100,000 values: 100,000 descents of ≈ 3 pages each, far more than a full scan. Skip scan is only useful for leading columns with a handful of values, like `status`.
+
+> **Common mistake:** "skip scan makes column order irrelevant". It only softens the rule for low-cardinality leading columns.
+
+## Q6. The redundant index
+
+**Question:** you have indexes on `(status)`, `(status, created_at)` and `(created_at)`. Which one is redundant, and why?
+
+`(status)`: every query it can serve starts with `status`, which `(status, created_at)` serves equally (its prefix). `(created_at)` is not redundant: no other index starts with `created_at`. (In PostgreSQL, `(status)` alone is much smaller thanks to deduplication, which can make it worth keeping for very frequent status-only queries; measure before deciding.)
+
+> **Common mistake:** dropping `(created_at)` because "created_at is already in the composite".
+
+## Q7. The tenant report
+
+**Question:** in the tenant scenario, why is reordering the main index to `(created_at, tenant_id)` the wrong fix for the report?
+
+Every application query is `tenant_id = ? AND created_at > ?`. With `(created_at, tenant_id)`, the seek can only use the `created_at` range, which covers **all tenants'** recent rows; `tenant_id` filters inside that stretch. Each request would read every tenant's entries for the period instead of only its own. One rare report would be fixed by slowing down every request. Add a separate `(created_at)` index (or move the report elsewhere) instead.
+
+> **Common mistake:** "the composite has both columns either way". The order decides which one narrows the seek.
