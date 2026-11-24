@@ -1,0 +1,78 @@
+---
+title: "Answers: InnoDB clustered primary key and secondary indexes"
+description: "Worked answers to the Session 6 Concept 2 check questions."
+companion: "answers"
+tags: ["indexing", "mysql", "innodb", "secondary-index", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-index-types.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-purge-configuration.html"
+---
+
+<Tldr>
+The primary key is the row pointer in every InnoDB secondary entry: its width is paid in every index, and changing it is paid in every index.
+</Tldr>
+
+## Q1. 1,078 → 2,866 leaves
+
+**Question:** why did the same secondary index grow from 1,078 to 2,866 leaves when the primary key changed from `BIGINT` to `CHAR(36)`?
+
+Each entry is `(c, id)`. With `BIGINT`, that is 4 + 8 bytes plus a small header; with `CHAR(36)`, 4 + 36 bytes plus header: about 2.5× wider, so about 2.5× fewer entries per 16 KB page and 2.66× the leaves. The indexed column did not change at all; only the row pointer got wider.
+
+> **Common mistake:** attributing the growth to the UUID's randomness; the index was rebuilt sorted, so this is pure width.
+
+## Q2. Which indexes each update touches
+
+**Question:** which secondary indexes does InnoDB touch when you update a non-indexed column, an indexed column, and the primary key?
+
+| Update | Secondary indexes touched |
+|---|---|
+| Non-indexed column | None |
+| Indexed column | Only the indexes containing that column (delete-mark old entry, insert new) |
+| Primary key | All of them (every entry contains the key) |
+
+> **Common mistake:** assuming InnoDB behaves like PostgreSQL's non-HOT updates.
+
+## Q3. Delete-marked entries
+
+**Question:** what is a delete-marked entry, and why doesn't InnoDB remove it immediately?
+
+When a secondary key value changes or a row is deleted, InnoDB flags the old entry as deleted instead of removing it. Transactions with older read views may still need to find the row through that entry (they see the old version via the undo log). Purge removes the entry once no active read view can see it.
+
+> **Common mistake:** "InnoDB has no dead entries because it updates in place". The clustered record is updated in place; secondary entries are delete-marked.
+
+## Q4. Long transactions and index scans
+
+**Question:** how can a long-running transaction slow down index scans in InnoDB?
+
+Its read view is old, so purge cannot remove anything newer than it: delete-marked secondary entries and undo records accumulate (history list length grows). Index scans then step over many delete-marked entries, and reads that need older versions follow longer undo chains. Ending the transaction lets purge catch up.
+
+> **Common mistake:** thinking only writes are affected by long transactions.
+
+## Q5. Wide keys: InnoDB vs PostgreSQL
+
+**Question:** why does a wide primary key hurt InnoDB more than PostgreSQL?
+
+In InnoDB the primary key is copied into **every secondary index entry** (and is the key of the clustered index). In PostgreSQL, secondary entries point at a 6-byte ctid; a wide primary key only makes the primary-key index itself bigger. With five secondary indexes, InnoDB pays for the width six times, PostgreSQL once.
+
+> **Common mistake:** applying the same primary-key advice to both engines without considering this.
+
+## Q6. Updating an indexed column, three engines
+
+**Question:** compare what updating an indexed column costs in InnoDB, PostgreSQL and MongoDB.
+
+| Engine | Index work |
+|---|---|
+| InnoDB | That column's indexes: delete-mark + insert (2× page writes in the lab) |
+| PostgreSQL | Every index gets a new entry (the update cannot be HOT); old entries wait for VACUUM |
+| MongoDB | That field's indexes: remove + insert; others untouched (RecordId unchanged) |
+
+> **Common mistake:** "same cost everywhere"; PostgreSQL pays per index on the table, the others per changed index.
+
+## Q7. UUIDs in MySQL
+
+**Question:** a team wants UUID primary keys in MySQL. What storage and ordering would you recommend, and why?
+
+Store them as `BINARY(16)`, not `CHAR(36)` (+46% instead of +166% per secondary index in the lab), and make them **time-ordered**: UUIDv7, or `UUID_TO_BIN(UUID(), 1)` which reorders a v1 UUID's time fields first. Time order makes inserts append at the right edge of the clustered index instead of splitting random pages (Session 2, Concept 6; 79 MB vs 128 MB in Concept 4). Alternatively, keep a `BIGINT AUTO_INCREMENT` primary key and store the UUID in a unique secondary column for external use.
+
+> **Common mistake:** `BINARY(16)` with random UUIDv4: narrower, but still splitting pages across the whole clustered index.

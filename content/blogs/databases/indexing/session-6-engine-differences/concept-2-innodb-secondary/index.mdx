@@ -1,0 +1,236 @@
+---
+title: "Concept 2: InnoDB clustered primary key and secondary indexes"
+description: "How InnoDB maintains secondary indexes: every entry carries the primary key, so key width multiplies index size (+46% for BINARY(16), +166% for CHAR(36)); indexed-column updates delete-mark and insert; primary-key updates touch every index; purge cleans up later. Compared with PostgreSQL and MongoDB."
+type: "concept"
+tags: ["indexing", "mysql", "postgresql", "mongodb", "innodb", "secondary-index", "purge"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-index-types.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-purge-configuration.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-change-buffer.html"
+---
+
+<Tldr>
+Session 1 established that InnoDB's table **is** the primary-key B-tree and every secondary entry is `(indexed columns, primary key)`. This concept looks at maintenance. The primary key is copied into **every** entry of **every** secondary index: the same 1M-row index on an `INT` column took **1,078** leaves with a `BIGINT` key, **1,570** (+46%) with `BINARY(16)` and **2,866** (+166%) with a `CHAR(36)` UUID. An update to an indexed column delete-marks the old entry and inserts a new one in that index only (twice the page writes of a non-indexed update in the lab); an update to the **primary key** moves the row and rewrites its entry in every secondary index. Delete-marked entries wait for the **purge** thread, much as PostgreSQL's dead entries wait for VACUUM.
+</Tldr>
+
+## The primary key is in every entry
+
+| Secondary index on `c INT`, 1M rows (built after loading) | Entry | Leaf pages |
+|---|---|---|
+| `id BIGINT` | 4 + 8 bytes + header | **1,078** |
+| `id BINARY(16)` | 4 + 16 bytes + header | **1,570** (+46%) |
+| `id CHAR(36)` | 4 + 36 bytes + header | **2,866** (+166%) |
+
+The cost is paid once per secondary index: a table with five secondary indexes and a `CHAR(36)` key pays it five times, plus in the clustered index itself. That is why a wide primary key hurts InnoDB much more than PostgreSQL, whose index entries carry a fixed 6-byte ctid.
+
+| Term | Meaning |
+|---|---|
+| Delete-mark | InnoDB does not remove a secondary entry immediately on update or delete; it flags it, because older transactions may still need it |
+| Purge | Background threads that remove delete-marked entries and undo records once no read view needs them |
+| History list length | Undo logs waiting for purge (`SHOW ENGINE INNODB STATUS`); grows when long transactions hold old read views |
+| Change buffer | Defers changes to non-unique secondary index pages not in memory; **off by default since 8.4** (`innodb_change_buffering = none`) |
+| **✓ Only this index / ✗ Every index** | Which secondary indexes an update touches |
+
+<Flow
+  title="InnoDB: what updates do to secondary indexes"
+  height={340}
+  nodes={[
+    { id: 'upd', label: 'UPDATE', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'clu', label: 'Clustered record', sub: '', x: 310, y: 20, w: 220 },
+    { id: 'one', label: '✓ Only this index', sub: 'delete-mark + insert', x: 600, y: 20, w: 180 },
+    { id: 'none', label: 'No secondary change', sub: 'non-indexed column', x: 20, y: 150, w: 220 },
+    { id: 'all', label: '✗ Every index', sub: 'primary key changed', x: 310, y: 150, w: 220 },
+    { id: 'purge', label: 'Purge', sub: 'removes delete-marked', x: 600, y: 150, w: 180 },
+  ]}
+  edges={[
+    { id: 'upd-clu', from: 'upd', to: 'clu' },
+    { id: 'clu-one', from: 'clu', to: 'one' },
+    { id: 'clu-none', from: 'clu', to: 'none', quiet: true },
+    { id: 'clu-all', from: 'clu', to: 'all' },
+    { id: 'one-purge', from: 'one', to: 'purge' },
+    { id: 'all-purge', from: 'all', to: 'purge' },
+  ]}
+  cases={[
+    {
+      title: 'Non-indexed column',
+      path: 'clustered record changed in place → no secondary index touched',
+      summary: 'Measured: 20,000 rows, 40,356 page write requests.',
+      subs: { upd: 'SET balance = …' },
+      steps: [
+        {
+          title: 'In place, old value to undo',
+          note: 'The clustered record changes where it is; secondary entries hold (indexed columns, id), none of which changed.',
+          code: 'UPDATE acct SET balance = balance + 1 WHERE id % 10 = 0;',
+          active: ['upd', 'clu', 'none'],
+          edges: ['upd-clu', 'clu-none'],
+        },
+      ],
+    },
+    {
+      title: 'Indexed column',
+      path: 'status changes → ✓ in the status index only: delete-mark old entry, insert new → purge later',
+      summary: 'Measured: 20,000 rows, 80,892 page write requests (2×).',
+      subs: { upd: "SET status = 'closed'" },
+      steps: [
+        {
+          title: 'Change the record',
+          note: 'The clustered record is updated in place, as before.',
+          code: "UPDATE acct SET status = 'closed' WHERE id % 10 = 0;",
+          active: ['upd', 'clu'],
+          edges: ['upd-clu'],
+        },
+        {
+          title: '✓ Only the status index',
+          note: "('active', id) is delete-marked and ('closed', id) is inserted, usually on a different leaf. The customer_id index is untouched (its entry is (customer_id, id), unchanged). Twice the page writes of the non-indexed update.",
+          active: ['clu', 'one'],
+          edges: ['clu-one'],
+        },
+        {
+          title: 'Purge removes the old entry',
+          note: 'Once no read view can see the old status, purge removes the delete-marked entry. A long-running transaction keeps old read views alive, so delete-marked entries (and undo) pile up, and secondary index scans step over them.',
+          active: ['one', 'purge'],
+          edges: ['one-purge'],
+        },
+      ],
+    },
+    {
+      title: 'Primary key',
+      path: 'id changes → row moves in the clustered index → ✗ entry rewritten in every secondary index',
+      summary: 'The most expensive update InnoDB can do.',
+      subs: { upd: 'SET id = …' },
+      steps: [
+        {
+          title: 'The row moves',
+          note: 'The clustered index is sorted by id, so a new id means a delete and an insert elsewhere in the table.',
+          code: 'UPDATE acct SET id = id + 10000000 WHERE id = 7;',
+          active: ['upd', 'clu'],
+          edges: ['upd-clu'],
+        },
+        {
+          title: '✗ Every secondary index changes',
+          note: 'Every secondary entry for this row contains the old id, so each one is delete-marked and re-inserted with the new id. With five secondary indexes that is ten secondary changes plus the row move. Keep primary keys immutable.',
+          active: ['clu', 'all', 'purge'],
+          edges: ['clu-all', 'all-purge'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## The same events in PostgreSQL and MongoDB
+
+| Event | InnoDB | PostgreSQL | MongoDB |
+|---|---|---|---|
+| Update a non-indexed column | No secondary change | No index change if HOT; otherwise a new entry in **every** index | No index change |
+| Update an indexed column | That index: delete-mark + insert | **Every** index gets a new entry | That index: remove + insert |
+| Update the primary key | Row moves; every secondary entry rewritten | Like any indexed column | `_id` is immutable |
+| What the entry points at | Primary key value | ctid (6 bytes) | RecordId |
+| Wide primary key costs | Every secondary index | Only the primary-key index | Only the `_id` index |
+| Cleanup | Purge | VACUUM | WiredTiger, transparently |
+
+<Flow
+  title="PostgreSQL: an update of an indexed column"
+  height={250}
+  nodes={[
+    { id: 'upd', label: "SET status = 'closed'", sub: '', x: 20, y: 20, w: 220 },
+    { id: 'ver', label: 'New heap version', sub: 'new ctid', x: 310, y: 20, w: 220 },
+    { id: 'all', label: '✗ Every index', sub: 'id, customer_id, status', x: 600, y: 20, w: 180 },
+  ]}
+  edges={[
+    { id: 'upd-ver', from: 'upd', to: 'ver' },
+    { id: 'ver-all', from: 'ver', to: 'all' },
+  ]}
+  cases={[
+    {
+      title: 'Indexed column',
+      path: 'not HOT → new ctid → ✗ new entry in every index',
+      summary: 'Session 6, Concept 1: the customer_id index grew 381 → 542 pages.',
+      steps: [
+        {
+          title: 'Every index, not just status',
+          note: 'The new version has a new ctid; since every index points at ctids, all of them get an entry. InnoDB would have touched only the status index.',
+          code: "UPDATE acct SET status = 'closed' WHERE id % 2 = 0;",
+          active: ['upd', 'ver', 'all'],
+          edges: ['upd-ver', 'ver-all'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Flow
+  title="MongoDB: an update of an indexed field"
+  height={250}
+  nodes={[
+    { id: 'upd', label: "$set status: 'closed'", sub: '', x: 20, y: 20, w: 220 },
+    { id: 'doc', label: 'Same RecordId', sub: 'new document version', x: 310, y: 20, w: 220 },
+    { id: 'one', label: '✓ status index only', sub: 'remove + insert key', x: 600, y: 20, w: 180 },
+  ]}
+  edges={[
+    { id: 'upd-doc', from: 'upd', to: 'doc' },
+    { id: 'doc-one', from: 'doc', to: 'one' },
+  ]}
+  cases={[
+    {
+      title: 'Indexed field',
+      path: 'RecordId unchanged → ✓ only the status index changes',
+      summary: 'Like InnoDB, unrelated indexes are untouched.',
+      steps: [
+        {
+          title: 'Only the changed key',
+          note: 'Indexes point at the RecordId, which an update does not change. The status index removes the old key and inserts the new one; other indexes stay as they are.',
+          code: 'db.acct.updateMany({ _id: { $mod: [2, 0] } }, { $set: { status: "closed" } })',
+          active: ['upd', 'doc', 'one'],
+          edges: ['upd-doc', 'doc-one'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+A long-running transaction (an analytics query, a forgotten open session in a client tool) stops purge for everything newer than its read view. Delete-marked secondary entries and undo records pile up, and index scans get slower as they step over entries that are logically gone. Watch the history list length and kill idle transactions.
+</Pitfall>
+
+## Real-world scenario: CHAR(36) primary keys
+
+A service stores UUIDs as `CHAR(36)` primary keys in InnoDB, with four secondary indexes. Its database is twice the size of a similar service using `BIGINT` keys.
+
+| | `BIGINT` | `BINARY(16)` time-ordered | `CHAR(36)` random |
+|---|---|---|---|
+| Bytes of key in every secondary entry | 8 | 16 | 36 (more with a multi-byte charset) |
+| One secondary index (lab, 1M rows) | 1,078 leaves | 1,570 | 2,866 |
+| Clustered index fill (Session 2) | ≈ 15/16 | ≈ 15/16 | ≈ ⅔ (random inserts) |
+
+**Fix:** store UUIDs as `BINARY(16)` with `UUID_TO_BIN(uuid, 1)` (time-ordered), or use a `BIGINT` key and keep the UUID as a unique secondary column for external references (Concept 4).
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 4: choosing a primary key | Width and order of the key, per engine |
+| Session 8: write amplification | Which updates touch which indexes |
+| Session 8: index-design checklist | "Is the primary key narrow and immutable?" |
+
+## Key takeaways
+
+1. Every InnoDB secondary entry contains the primary key: key width multiplies every secondary index (+46% for `BINARY(16)`, +166% for `CHAR(36)` in the lab).
+2. Updating a non-indexed column touches no secondary index.
+3. Updating an indexed column delete-marks the old entry and inserts a new one, in that index only.
+4. Updating the primary key moves the row and rewrites its entry in every secondary index.
+5. Purge removes delete-marked entries once no read view needs them; long transactions delay it.
+6. The change buffer is off by default since MySQL 8.4.
+
+## Check questions
+
+1. Why did the same secondary index grow from 1,078 to 2,866 leaves when the primary key changed from `BIGINT` to `CHAR(36)`?
+2. Which secondary indexes does InnoDB touch when you update a non-indexed column, an indexed column, and the primary key?
+3. What is a delete-marked entry, and why doesn't InnoDB remove it immediately?
+4. How can a long-running transaction slow down index scans in InnoDB?
+5. Why does a wide primary key hurt InnoDB more than PostgreSQL?
+6. Compare what updating an indexed column costs in InnoDB, PostgreSQL and MongoDB.
+7. A team wants UUID primary keys in MySQL. What storage and ordering would you recommend, and why?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-6-engine-differences/concept-2-innodb-secondary/answers">Worked answers to Q1–Q7</DeepDive>
