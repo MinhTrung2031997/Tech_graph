@@ -1,0 +1,13 @@
+{
+  "title": "Session 3: Indexes and constraints on partitions",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-local-indexes/index",
+    "concept-2-building-indexes-online/index",
+    "concept-3-unique-keys/index",
+    "concept-4-foreign-keys/index",
+    "concept-5-mongodb-alternatives/index",
+    "lab/index"
+  ]
+}

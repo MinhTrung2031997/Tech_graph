@@ -1,0 +1,222 @@
+---
+title: "Concept 2: Adding an index to a partitioned table without blocking writes"
+description: "PostgreSQL refuses CREATE INDEX CONCURRENTLY on a partitioned table, and a plain CREATE INDEX on the parent locks the parent and all 25 partitions in SHARE mode at once: an insert waited 849 ms. The online recipe is CREATE INDEX ON ONLY the parent, CREATE INDEX CONCURRENTLY on each partition (an insert during it took 2.0 ms), and ALTER INDEX … ATTACH PARTITION; the parent index became valid after the last attach. MySQL's ALTER TABLE … ADD INDEX, LOCK=NONE works on a partitioned table directly."
+type: "concept"
+tags: ["partitioning", "indexing", "locking", "postgresql", "mysql"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY"
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE-MAINTENANCE"
+  - "https://www.postgresql.org/docs/17/sql-alterindex.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html"
+---
+
+<Tldr>
+On a busy partitioned table, the one-line `CREATE INDEX ON orders_p (amount)` is the wrong tool. PostgreSQL rejects `CONCURRENTLY` on a partitioned table (`cannot create index on partitioned table "orders_p" concurrently`), and the plain build took a **SHARE lock on the parent and all 25 partitions up front**, held until the end: an insert into June 2025 **waited 849 ms** of the 1.38 s build (reads were fine). The online recipe has three steps. First, `CREATE INDEX … ON ONLY orders_p` creates an **invalid** parent index with no children. Then `CREATE INDEX CONCURRENTLY` runs on each partition (76 ms for one month, while an insert into that month took **2.0 ms**). Finally, `ALTER INDEX … ATTACH PARTITION` attaches each one. The parent flipped to **valid** once every partition had an attached index (about 3.9 s for 25 builds and attaches; a partition created meanwhile got its index automatically). In MySQL, `ALTER TABLE orders_p ADD INDEX …, ALGORITHM=INPLACE, LOCK=NONE` works on the partitioned table directly: an insert during the 8.1 s build took 7.2 ms.
+</Tldr>
+
+## Why it matters
+
+The [Indexing course](/blogs/databases/indexing/session-8-when-indexes-hurt/concept-3-concurrently-locking) showed `CREATE INDEX CONCURRENTLY` keeping a plain table writable during a build. Partitioned tables are usually the biggest and busiest tables you have, and that shortcut does not exist for them in PostgreSQL.
+
+| Term | Meaning |
+|---|---|
+| `SHARE` lock | Table lock taken by `CREATE INDEX`: allows reads, blocks INSERT/UPDATE/DELETE |
+| `CREATE INDEX … ON ONLY parent` | Creates the parent's index without touching partitions; marked invalid (`indisvalid = false`) |
+| `CREATE INDEX CONCURRENTLY` | Builds without blocking writes (`SHARE UPDATE EXCLUSIVE`), slower, cannot run in a transaction block |
+| `ALTER INDEX parent_idx ATTACH PARTITION part_idx` | Links a partition's existing index to the parent index |
+| **✓ Free / ✗ Blocked** | Can a writer insert into that partition right now? |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: index on amount for orders_p (25 partitions)"
+  height={300}
+  nodes={[
+    { id: 'ddl', label: 'DDL session', sub: 'builds the index', x: 20, y: 20, w: 220 },
+    { id: 'parent', label: 'orders_p', sub: 'parent table', x: 290, y: 20, w: 220 },
+    { id: 'writer', label: 'Writer', sub: 'INSERT June 2025', x: 560, y: 20, w: 220 },
+    { id: 'others', label: '24 other partitions', sub: '2024_01 … 2026_01', x: 20, y: 200, w: 220 },
+    { id: 'june', label: 'orders_p_2025_06', sub: '205k rows', x: 290, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'ddl-parent', from: 'ddl', to: 'parent' },
+    { id: 'parent-others', from: 'parent', to: 'others' },
+    { id: 'parent-june', from: 'parent', to: 'june' },
+    { id: 'writer-june', from: 'writer', to: 'june' },
+  ]}
+  cases={[
+    {
+      title: 'CREATE INDEX on the parent',
+      path: 'CONCURRENTLY → ✗ error · plain CREATE INDEX → SHARE on parent + 25 partitions → writer ✗ waits 849 ms, readers ✓',
+      summary: 'One statement, one transaction, every partition locked until the end.',
+      subs: { parent: '✗ SHARE lock', others: '✗ SHARE lock each', june: '✗ SHARE lock' },
+      steps: [
+        {
+          title: 'CONCURRENTLY is refused',
+          note: 'PostgreSQL 17 does not support CREATE INDEX CONCURRENTLY on a partitioned table.',
+          code: 'CREATE INDEX CONCURRENTLY orders_p_amount_idx ON orders_p (amount);\nERROR:  cannot create index on partitioned table "orders_p" concurrently',
+          active: ['ddl', 'parent'],
+          edges: ['ddl-parent'],
+        },
+        {
+          title: 'The plain build locks everything at once',
+          note: 'pg_locks 0.3 s into the build: ShareLock granted on orders_p and on all 25 partitions, including the ones not built yet. Each partition is indexed in turn, but none is released until the statement commits.',
+          code: "SELECT c.relname FROM pg_locks l JOIN pg_class c ON c.oid = l.relation\nWHERE l.pid = <builder pid> AND l.mode = 'ShareLock';\n-- orders_p, orders_p_2024_01, … , orders_p_2026_01",
+          active: ['ddl', 'parent', 'others', 'june'],
+          edges: ['ddl-parent', 'parent-others', 'parent-june'],
+        },
+        {
+          title: 'Writers wait, readers do not',
+          note: 'Started 0.5 s into the 1.38 s build: an INSERT into June 2025 took 849 ms (it waited for the build to commit); a SELECT count(*) of one June day took 5.8 ms. On a larger table the wait is the whole build.',
+          code: "INSERT INTO orders_p VALUES (9000001, 1, 'shopee', 'delivered', 10, '2025-06-15');\n-- Time: 849.395 ms",
+          active: ['writer', 'june'],
+          edges: ['writer-june'],
+        },
+      ],
+    },
+    {
+      title: 'ON ONLY + CONCURRENTLY + ATTACH',
+      path: 'ON ONLY → invalid parent index, 0 children → CIC per partition (writer ✓ 2.0 ms) → ATTACH each → ✓ valid',
+      summary: 'Each partition is built online; the parent index is metadata.',
+      subs: { june: '✓ free during CIC', others: '✓ free' },
+      steps: [
+        {
+          title: 'Create the parent index only',
+          note: 'ON ONLY creates the partitioned index on orders_p alone. It is marked invalid and has no partition indexes yet. It takes milliseconds.',
+          code: "CREATE INDEX orders_p_amount_idx ON ONLY orders_p (amount);\nSELECT indisvalid FROM pg_index WHERE indexrelid = 'orders_p_amount_idx'::regclass;  -- f",
+          active: ['ddl', 'parent'],
+          edges: ['ddl-parent'],
+          subs: { parent: 'index invalid, 0 children' },
+        },
+        {
+          title: 'Build one partition concurrently',
+          note: 'CREATE INDEX CONCURRENTLY on orders_p_2025_06 took 76 ms; an INSERT into that partition started during it took 2.0 ms.',
+          code: 'CREATE INDEX CONCURRENTLY orders_p_2025_06_amount_idx ON orders_p_2025_06 (amount);\nALTER INDEX orders_p_amount_idx ATTACH PARTITION orders_p_2025_06_amount_idx;',
+          active: ['ddl', 'june', 'writer'],
+          edges: ['parent-june', 'writer-june'],
+          subs: { june: '✓ indexed, attached' },
+        },
+        {
+          title: 'Attached indexes are used at once',
+          note: 'With the parent still invalid, a query on June 2025 used orders_p_2025_06_amount_idx (Bitmap Index Scan), while one on May 2025 still ran a Seq Scan. New partitions are covered automatically: orders_p_2026_02, created while the parent was invalid, got its own orders_p_2026_02_amount_idx.',
+          code: "EXPLAIN SELECT * FROM orders_p WHERE amount = 77.77\n  AND created_at >= '2025-06-01' AND created_at < '2025-07-01';\n-- Bitmap Index Scan on orders_p_2025_06_amount_idx",
+          active: ['parent', 'june', 'others'],
+          edges: ['parent-june', 'parent-others'],
+        },
+        {
+          title: 'Repeat, then the parent is valid',
+          note: 'A shell loop did CIC + ATTACH for the remaining 24 partitions in 3.84 s. indisvalid stayed false until the last partition was attached, then became true. If a CIC fails it leaves an INVALID partition index behind: drop it and run the build again.',
+          code: "for t in <partitions without an attached index>; do\n  psql -c \"CREATE INDEX CONCURRENTLY ${t}_amount_idx ON $t (amount)\" \\\n       -c \"ALTER INDEX orders_p_amount_idx ATTACH PARTITION ${t}_amount_idx\"\ndone\n-- indisvalid: f … f, then t after the last attach",
+          active: ['ddl', 'parent', 'others', 'june'],
+          edges: ['ddl-parent', 'parent-others', 'parent-june'],
+          subs: { parent: '✓ index valid', others: '✓ indexed, attached' },
+        },
+      ],
+    },
+  ]}
+/>
+
+| | Plain `CREATE INDEX` on parent | ON ONLY + CIC + ATTACH |
+|---|---|---|
+| Lock on partitions | SHARE on all, for the whole build | SHARE UPDATE EXCLUSIVE on one at a time |
+| Insert during the build | Waited 849 ms | 2.0 ms |
+| Wall time (5M rows) | 1.38 s | ≈3.9 s (25 partitions one by one, from a shell loop) |
+| Failure | Rolls back everything | Leaves one INVALID partition index to drop and retry |
+| Usable before it finishes | No | Yes, partition by partition |
+
+## MySQL
+
+MySQL has no parent index object and no `ON ONLY`. Online DDL works on the partitioned table directly.
+
+<Flow
+  title="MySQL: ALTER TABLE orders_p ADD INDEX (seller_id), LOCK=NONE"
+  height={300}
+  nodes={[
+    { id: 'ddl', label: 'DDL session', sub: 'ALTER TABLE', x: 20, y: 20, w: 220 },
+    { id: 'tbl', label: 'orders_p', sub: '24 partitions', x: 290, y: 20, w: 220 },
+    { id: 'writer', label: 'Writer', sub: 'INSERT June 2025', x: 560, y: 20, w: 220 },
+    { id: 'others', label: '23 other partitions', sub: 'p2024_01 … p2025_12', x: 20, y: 200, w: 220 },
+    { id: 'june', label: 'p2025_06', sub: 'one tablespace', x: 290, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'ddl-tbl', from: 'ddl', to: 'tbl' },
+    { id: 'tbl-others', from: 'tbl', to: 'others' },
+    { id: 'tbl-june', from: 'tbl', to: 'june' },
+    { id: 'writer-june', from: 'writer', to: 'june' },
+  ]}
+  cases={[
+    {
+      title: 'Online index build',
+      path: 'ALGORITHM=INPLACE, LOCK=NONE → builds 24 partition indexes → writer ✓ 7.2 ms during an 8.1 s build',
+      summary: 'One statement, still online.',
+      subs: { june: '✓ free', others: '✓ free' },
+      steps: [
+        {
+          title: 'Ask for no lock explicitly',
+          note: 'With LOCK=NONE, MySQL fails the statement instead of silently taking a stronger lock if the operation cannot run online.',
+          code: 'ALTER TABLE orders_p ADD INDEX orders_p_seller_idx (seller_id),\n  ALGORITHM=INPLACE, LOCK=NONE;    -- 8.1 s',
+          active: ['ddl', 'tbl', 'others', 'june'],
+          edges: ['ddl-tbl', 'tbl-others', 'tbl-june'],
+        },
+        {
+          title: 'Writes keep flowing',
+          note: 'An INSERT into June 2025, 1 s into the build, took 7.2 ms. Per the MySQL manual, the online build still needs a short exclusive metadata lock at the start and at the end, which a long-running transaction on orders_p can delay (not measured here).',
+          code: "INSERT INTO orders_p VALUES (9000001, 1, 'shopee', 'delivered', 10, '2025-06-15');\n-- 7.2 ms",
+          active: ['writer', 'june'],
+          edges: ['writer-june'],
+        },
+      ],
+    },
+  ]}
+/>
+
+The partitioned build was slower than on the plain table (6.3 and 9.8 s vs 2.9 and 3.1 s in two runs), and every entry is wider ([Concept 1](/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-1-local-indexes)).
+
+## MongoDB
+
+No partitions, so this does not apply. Per the MongoDB manual, `createIndex` on a collection holds an exclusive lock only briefly at the start and end of the build (not measured in this session).
+
+<Pitfall>
+Do not run the one-line `CREATE INDEX ON parent` on a production partitioned table in PostgreSQL. It holds a SHARE lock on **every** partition until it commits, including the current month that takes all the inserts. Script ON ONLY → CIC per partition → ATTACH instead, and check `indisvalid` on the parent at the end. A partitioned index stuck at `indisvalid = false` usually means one partition was skipped or its CIC failed and left an INVALID index.
+</Pitfall>
+
+## Real-world scenario: the index for a new report
+
+Finance asks for a report by `amount` band on the 3-year, monthly-partitioned `orders` table at 10:00. A developer runs `CREATE INDEX ON orders (amount)` from a migration. The build takes 20 minutes on production data, and checkout inserts into the current month queue behind its SHARE lock for those 20 minutes.
+
+| Step | Lock | Checkout |
+|---|---|---|
+| `CREATE INDEX orders_amount_idx ON ONLY orders (amount)` | Brief | Unaffected |
+| `CREATE INDEX CONCURRENTLY` on each old month (off-peak) | One partition, writes allowed | Unaffected |
+| `CREATE INDEX CONCURRENTLY` on the current month | Writes allowed | Unaffected, slower build |
+| `ALTER INDEX … ATTACH PARTITION` for each | Brief | Unaffected |
+| Check `indisvalid` on the parent | none | Done |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Indexing Session 8](/blogs/databases/indexing/session-8-when-indexes-hurt/concept-3-concurrently-locking) | CONCURRENTLY and lock queues on a plain table |
+| Concept 3 | Unique indexes follow the same recipe, but must include the partition key |
+| [Transactions Session 5](/blogs/databases/transactions/session-5-locks-and-indexes/concept-1-row-and-table-locks) | Table lock modes and what SHARE conflicts with |
+
+## Key takeaways
+
+1. PostgreSQL has no `CREATE INDEX CONCURRENTLY` for a partitioned table.
+2. A plain `CREATE INDEX` on the parent locks the parent and every partition in SHARE mode until it commits: reads continue, writes wait (849 ms here).
+3. The online recipe: `ON ONLY` parent index → `CREATE INDEX CONCURRENTLY` per partition → `ALTER INDEX … ATTACH PARTITION`. The parent becomes valid after the last attach.
+4. Attached partition indexes are used immediately; partitions created in the meantime get the index automatically.
+5. MySQL's `ALTER TABLE … ADD INDEX, ALGORITHM=INPLACE, LOCK=NONE` stays online on a partitioned table (insert 7.2 ms during the build).
+
+## Check questions
+
+1. What error does PostgreSQL 17 give for `CREATE INDEX CONCURRENTLY` on a partitioned table?
+2. During a plain `CREATE INDEX` on the parent, which relations were locked, in which mode, and when?
+3. Why did a SELECT finish in 5.8 ms during that build, while an INSERT waited 849 ms?
+4. After `CREATE INDEX … ON ONLY orders_p (amount)`, is the index used by queries? What about after attaching one partition's index?
+5. A partition was created while the parent index was still invalid. Did it get an index?
+6. The parent index stays at `indisvalid = false` after your script finished. What do you check?
+7. Why should a MySQL online DDL statement say `LOCK=NONE` explicitly?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-2-building-indexes-online/answers">Worked answers to Q1–Q7</DeepDive>

@@ -1,0 +1,258 @@
+---
+title: "Concept 3: Unique keys must include the partition key"
+description: "Because every index is per partition, a unique constraint can only be checked inside one partition. PostgreSQL and MySQL therefore refuse a primary key on id for a table partitioned by created_at, and the accepted key (id, created_at) let order 2500000 exist twice in different months. Three ways to keep a global unique id, measured: a lookup table filled by a trigger (inserts 2.3× slower), partitioning by the unique column itself (date queries scan all 24 partitions unless they also give an id range), or ids that are unique by construction."
+type: "concept"
+tags: ["partitioning", "constraints", "unique", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE-LIMITATIONS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-limitations-partitioning-keys-unique-keys.html"
+  - "https://www.mongodb.com/docs/manual/core/timeseries/timeseries-limitations/"
+---
+
+<Tldr>
+A unique index can only check the partition a row lands in, so both engines require every unique key to **contain the partition key**. `ALTER TABLE orders_p ADD PRIMARY KEY (id)` failed in PostgreSQL ("unique constraint on partitioned table must include all partitioning columns"), and in MySQL with ERROR 1503. With the accepted key `(id, created_at)`, a second **order 2500000** dated June 2025 was **accepted** even though order 2500000 already existed in December 2024. Only an exact `(id, created_at)` repeat was rejected. There are three ways to get a global unique id back:
+- **A lookup table `order_ids (id PRIMARY KEY)` filled by a trigger.** It rejected the duplicate, but 100k inserts went from 290 to 668 ms, and the table takes 281 MB for 5M ids.
+- **Partitioning by `id` itself.** `PRIMARY KEY (id)` is then allowed, but a one-day query scanned all 24 partitions (0.88 ms instead of 0.31 ms) unless it also gave an id range.
+- **Ids unique by construction**, such as an identity column or UUIDv7. These avoid collisions but enforce nothing.
+</Tldr>
+
+## Why the rule exists
+
+Each partition's index only contains that partition's rows ([Concept 1](/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-1-local-indexes)). An insert goes to exactly one partition, chosen by `created_at`, and is checked against that partition's unique index only. If the unique key contains the partition key, two rows with equal keys necessarily have equal `created_at` and land in the **same** partition, so the local check is a global check. If it does not, equal ids can land in different partitions and no index sees both.
+
+| Term | Meaning |
+|---|---|
+| Partition key | The column(s) in `PARTITION BY RANGE (created_at)` that route each row |
+| Local uniqueness | Unique within one partition: what a partition index can enforce |
+| Global uniqueness | Unique across the whole table: what `PRIMARY KEY (id)` means on a plain table |
+| Lookup table | A separate plain table with `PRIMARY KEY (id)` used only to claim ids |
+| **✓ Accepted / ✗ Rejected** | Outcome of the insert |
+
+## PostgreSQL
+
+```sql
+ALTER TABLE orders_p ADD PRIMARY KEY (id);
+-- ERROR:  unique constraint on partitioned table must include all partitioning columns
+-- DETAIL:  PRIMARY KEY constraint on table "orders_p" lacks column "created_at" which is part of the partition key.
+CREATE UNIQUE INDEX orders_p_id_uq ON orders_p (id);       -- same error, "UNIQUE constraint"
+ALTER TABLE orders_p ADD PRIMARY KEY (id, created_at);     -- OK, 784 ms (24 + 2 partition indexes)
+```
+
+<Flow
+  title="PostgreSQL: INSERT order 2500000 dated 2025-06-15"
+  height={300}
+  nodes={[
+    { id: 'ins', label: 'INSERT id 2500000', sub: 'created_at 2025-06-15', x: 20, y: 20, w: 220 },
+    { id: 'parent', label: 'orders_p', sub: 'PK (id, created_at)', x: 290, y: 20, w: 220 },
+    { id: 'ids', label: 'order_ids', sub: 'PK (id), lookup table', x: 560, y: 20, w: 220 },
+    { id: 'dec', label: 'orders_p_2024_12', sub: 'holds id 2500000', x: 290, y: 200, w: 220 },
+    { id: 'jun', label: 'orders_p_2025_06', sub: 'target partition', x: 560, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'ins-parent', from: 'ins', to: 'parent' },
+    { id: 'parent-dec', from: 'parent', to: 'dec' },
+    { id: 'parent-jun', from: 'parent', to: 'jun' },
+    { id: 'parent-ids', from: 'parent', to: 'ids' },
+  ]}
+  cases={[
+    {
+      title: 'Composite key (id, created_at)',
+      path: 'route by created_at → orders_p_2025_06 → check its PK only → ✓ accepted → id 2500000 now exists twice',
+      summary: 'Each partition is unique on its own; the table is not.',
+      subs: { dec: '✗ never checked', jun: '✓ (2500000, 06-15) new' },
+      steps: [
+        {
+          title: 'Routing picks one partition',
+          note: 'The row is routed by created_at to orders_p_2025_06. Its uniqueness is checked against orders_p_2025_06_pkey only; orders_p_2024_12 is never consulted.',
+          code: "INSERT INTO orders_p VALUES (2500000, 9, 'lazada', 'delivered', 5, '2025-06-15 10:00');\n-- INSERT 0 1",
+          active: ['ins', 'parent', 'jun', 'dec'],
+          edges: ['ins-parent', 'parent-jun'],
+        },
+        {
+          title: 'The duplicate is real',
+          note: 'Two rows with id 2500000, in two partitions. Anything that treats id as the order number (payments, joins, the API) now sees two orders.',
+          code: "SELECT id, created_at, tableoid::regclass FROM orders_p WHERE id = 2500000;\n-- 2500000 | 2024-12-31 11:59:47+00 | orders_p_2024_12\n-- 2500000 | 2025-06-15 10:00:00+00 | orders_p_2025_06",
+          active: ['parent', 'dec', 'jun'],
+          edges: ['parent-dec', 'parent-jun'],
+        },
+        {
+          title: 'Only an exact repeat is caught',
+          note: 'Inserting the same (id, created_at) again lands in the same partition, where the local index sees it.',
+          code: 'ERROR:  duplicate key value violates unique constraint "orders_p_2025_06_pkey"\nDETAIL:  Key (id, created_at)=(2500000, 2025-06-15 10:00:00+00) already exists.',
+          active: ['ins', 'jun'],
+          edges: ['parent-jun'],
+          subs: { jun: '✗ exact repeat rejected' },
+        },
+      ],
+    },
+    {
+      title: 'Lookup table + trigger',
+      path: 'BEFORE INSERT trigger → INSERT INTO order_ids → ✗ duplicate key order_ids_pkey → whole insert ✗ rejected',
+      summary: 'A plain table with PRIMARY KEY (id) acts as the global index.',
+      subs: { ids: '✗ id 2500000 taken', jun: '✗ insert rolled back' },
+      steps: [
+        {
+          title: 'Claim the id first',
+          note: 'order_ids was filled with all 5M ids (4.15 s, 281 MB with its index). A row-level BEFORE INSERT trigger on orders_p inserts NEW.id into it; a duplicate makes the whole statement fail.',
+          code: "CREATE TABLE order_ids (id bigint PRIMARY KEY);\nCREATE FUNCTION orders_p_claim_id() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN\n  INSERT INTO order_ids VALUES (NEW.id);\n  RETURN NEW;\nEND $$;\nCREATE TRIGGER orders_p_claim_id BEFORE INSERT ON orders_p\n  FOR EACH ROW EXECUTE FUNCTION orders_p_claim_id();",
+          active: ['ins', 'parent', 'ids'],
+          edges: ['ins-parent', 'parent-ids'],
+        },
+        {
+          title: 'The duplicate is rejected',
+          note: 'The same June insert of id 2500000 now fails, from inside the trigger.',
+          code: 'ERROR:  duplicate key value violates unique constraint "order_ids_pkey"\nDETAIL:  Key (id)=(2500000) already exists.\nCONTEXT:  SQL statement "INSERT INTO order_ids VALUES (NEW.id)"',
+          active: ['ids', 'jun', 'parent'],
+          edges: ['parent-ids', 'parent-jun'],
+        },
+        {
+          title: 'What it costs',
+          note: 'Inserting 100,000 new orders into one partition, best of 3: 290 ms without the trigger, 668 ms with it (2.3×). It also needs a DELETE trigger (or a periodic cleanup) when old partitions are dropped, or order_ids keeps every id forever.',
+          code: '-- 100k rows: 290 / 430 / 463 ms without, 668 / 1289 / 954 ms with the trigger',
+          active: ['ins', 'parent', 'ids', 'jun'],
+          edges: ['ins-parent', 'parent-ids', 'parent-jun'],
+        },
+      ],
+    },
+  ]}
+/>
+
+### Partition by the unique column instead
+
+If `id` is the partition key, `PRIMARY KEY (id)` is allowed and is globally unique. In this dataset ids grow with time, so 24 equal id ranges look like months, but the planner only knows the id bounds:
+
+```sql
+CREATE TABLE orders_pid (LIKE orders INCLUDING DEFAULTS, PRIMARY KEY (id)) PARTITION BY RANGE (id);
+-- 24 partitions of 208,334 ids each, plus an index on created_at
+```
+
+| One-day count (6,840 rows), best of 6 | Partitions scanned | Time |
+|---|---|---|
+| `orders` (plain) | – | 0.274 ms |
+| `orders_p` (by `created_at`) | 1 | 0.305 ms |
+| `orders_pid` (by `id`) | 24 | 0.881 ms |
+| `orders_pid` + `AND id BETWEEN 2906978 AND 2913817` | 1 | – |
+
+You trade one problem for its mirror image. Lookups by id now prune, date queries don't, and dropping a month means knowing its id range.
+
+### The three options
+
+| Option | Enforces global uniqueness | Cost measured here | Watch out for |
+|---|---|---|---|
+| Lookup table + trigger | Yes | Inserts 2.3× slower, +281 MB | Cleanup when partitions are dropped; one more hot table |
+| Partition by the unique column | Yes | Date queries scan every partition (0.31 → 0.88 ms) | Retention by date becomes retention by id range |
+| Ids unique by construction (identity, sequence, UUIDv7) | No, avoids collisions | None | Manual inserts, imports and merges can still collide |
+
+## MySQL
+
+```sql
+CREATE TABLE orders_bad (id BIGINT NOT NULL PRIMARY KEY, seller_id INT NOT NULL, created_at DATETIME NOT NULL)
+  PARTITION BY RANGE COLUMNS (created_at) (PARTITION p0 VALUES LESS THAN ('2024-02-01'));
+-- ERROR 1503 (HY000): A PRIMARY KEY must include all columns in the table's partitioning function
+--   (prefixed columns are not considered).
+-- with PRIMARY KEY (id, created_at), UNIQUE KEY (seller_id, id):
+-- ERROR 1503 (HY000): A UNIQUE INDEX must include all columns in the table's partitioning function
+--   (prefixed columns are not considered).
+```
+
+<Flow
+  title="MySQL: unique keys on orders_p (PARTITION BY RANGE COLUMNS (created_at))"
+  height={300}
+  nodes={[
+    { id: 'ddl', label: 'CREATE TABLE', sub: 'key choice', x: 20, y: 20, w: 220 },
+    { id: 'tbl', label: 'orders_p', sub: '24 partitions', x: 290, y: 20, w: 220 },
+    { id: 'ins', label: 'INSERT id 2500000', sub: 'created_at 2025-06-15', x: 560, y: 20, w: 220 },
+    { id: 'dec', label: 'p2024_12', sub: 'holds id 2500000', x: 290, y: 200, w: 220 },
+    { id: 'jun', label: 'p2025_06', sub: 'target partition', x: 560, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'ddl-tbl', from: 'ddl', to: 'tbl' },
+    { id: 'tbl-dec', from: 'tbl', to: 'dec' },
+    { id: 'ins-jun', from: 'ins', to: 'jun' },
+  ]}
+  cases={[
+    {
+      title: 'Key without the partition column',
+      path: 'PRIMARY KEY (id) or UNIQUE (seller_id, id) → ✗ ERROR 1503 at CREATE TABLE',
+      summary: 'Refused before any data exists.',
+      subs: { tbl: '✗ not created' },
+      steps: [
+        {
+          title: 'The table is never created',
+          note: 'MySQL checks every PRIMARY KEY and UNIQUE index against the partitioning function. "Prefixed columns are not considered" means an index on a prefix of a column, such as name(10), does not count as containing the column.',
+          code: 'ERROR 1503 (HY000): A PRIMARY KEY must include all columns in the table\'s partitioning function',
+          active: ['ddl', 'tbl'],
+          edges: ['ddl-tbl'],
+        },
+      ],
+    },
+    {
+      title: 'PRIMARY KEY (id, created_at)',
+      path: 'route to p2025_06 → local PK check ✓ → id 2500000 in p2024_12 and p2025_06',
+      summary: 'Same outcome as PostgreSQL.',
+      subs: { dec: '✗ never checked', jun: '✓ accepted' },
+      steps: [
+        {
+          title: 'A second order 2500000',
+          note: 'The insert succeeds; SELECT … WHERE id = 2500000 returns two rows (2024-12-31 11:59:47 and 2025-06-15 10:00:00).',
+          code: "INSERT INTO orders_p VALUES (2500000, 9, 'lazada', 'delivered', 5, '2025-06-15 10:00:00');\nSELECT id, created_at FROM orders_p WHERE id = 2500000;   -- 2 rows",
+          active: ['ins', 'jun', 'tbl', 'dec'],
+          edges: ['ins-jun', 'tbl-dec'],
+        },
+      ],
+    },
+  ]}
+/>
+
+The same three options apply in MySQL. A trigger on a partitioned InnoDB table can insert into a plain `order_ids` table. That was not timed here.
+
+## MongoDB
+
+A plain collection's `_id` index is global, so `_id` is always unique (an insert of `_id: 2500000` failed with `E11000 duplicate key error`). Global uniqueness gets lost once you split data in MongoDB:
+
+- **Time-series collections** refuse unique indexes altogether.
+- **Collection per period** has a separate `_id` index in each collection.
+
+[Concept 5](/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-5-mongodb-alternatives) covers both cases.
+
+<Pitfall>
+`PRIMARY KEY (id, created_at)` looks like the same key with an extra column. It is a weaker constraint: it no longer says "one row per id". Code that upserts by id (`INSERT … ON CONFLICT (id, created_at)`) also changes meaning. A retried insert with a slightly different `created_at` (the retry's `now()`) creates a second order instead of hitting the conflict. Generate `created_at` once, in the client or the first attempt, and reuse it on retries.
+</Pitfall>
+
+## Real-world scenario: the marketplace import
+
+A seller-center import re-sends the last 3 days of orders from Shopee every night, using Shopee's order number as `id`. The orders table was just partitioned by `created_at` with `PRIMARY KEY (id, created_at)`. The import computes `created_at` from a timestamp that Shopee rounds differently on re-sends (seconds vs milliseconds). Every night, about 2% of orders get inserted a second time, and finance's GMV report drifts up.
+
+| Fix | Result |
+|---|---|
+| Upsert key = the marketplace's order number + the **partition key value exactly as first stored** | No duplicates, if `created_at` is truncated consistently (e.g. to seconds) |
+| `order_ids` lookup table with `PRIMARY KEY (marketplace, external_id)` | Duplicates rejected whatever the timestamp |
+| Partition by a hash of the external id instead | Global key, but date queries and monthly retention no longer prune |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Indexing Session 6](/blogs/databases/indexing/session-6-engine-differences/concept-4-uuid-v4-v7) | Time-ordered ids (UUIDv7) make "partition by id" behave like "partition by time" |
+| Concept 4 | A foreign key must reference a unique key, so it also needs the partition key |
+| [Transactions Session 7](/blogs/databases/transactions/session-7-application-patterns/concept-5-idempotency-advisory-locks) | Idempotency keys rely on a unique constraint that a partitioned table may not give you |
+
+## Key takeaways
+
+1. A partition index can only check its own partition, so every unique key must include the partition key (PostgreSQL error above; MySQL ERROR 1503).
+2. `PRIMARY KEY (id, created_at)` allows the same id in two partitions: order 2500000 was inserted twice.
+3. Global uniqueness needs a separate mechanism: a lookup table (2.3× slower inserts), partitioning by the unique column (date queries stop pruning), or ids unique by construction (no enforcement).
+4. Upserts and retries keyed on `(id, created_at)` depend on `created_at` being identical on every attempt.
+
+## Check questions
+
+1. Why can a unique index that contains the partition key be checked locally, while one that does not cannot?
+2. What exactly did PostgreSQL say to `ADD PRIMARY KEY (id)` on `orders_p`, and what did MySQL say?
+3. With `PRIMARY KEY (id, created_at)`, which of these inserts were accepted: order 2500000 dated June 2025; the same row again?
+4. The lookup-table trigger made inserts 2.3× slower. Where does the extra work go, and what else must you add for retention?
+5. `orders_pid` is partitioned by id. Why did a one-day query scan 24 partitions, and how did adding an id range help?
+6. A retried insert used `now()` again for `created_at`. What can go wrong with `ON CONFLICT (id, created_at)`?
+7. Which MongoDB layouts lose global `_id` uniqueness?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-3-unique-keys/answers">Worked answers to Q1–Q7</DeepDive>

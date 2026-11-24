@@ -1,0 +1,79 @@
+---
+title: "Answers: Adding an index to a partitioned table without blocking writes"
+description: "Worked answers to the Session 3 Concept 2 check questions."
+companion: "answers"
+tags: ["partitioning", "indexing", "locking", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE-MAINTENANCE"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html"
+---
+
+<Tldr>
+In PostgreSQL the online build happens partition by partition; the parent index is only bookkeeping that becomes valid at the end.
+</Tldr>
+
+## Q1. The error
+
+**Question:** what error does PostgreSQL 17 give for `CREATE INDEX CONCURRENTLY` on a partitioned table?
+
+`ERROR:  cannot create index on partitioned table "orders_p" concurrently`. The concurrent build waits out older transactions between its phases, using separate transactions for one table, and that machinery is not implemented for a tree of partitions.
+
+> **Common mistake:** assuming the migration tool's "concurrent" flag applies to partitioned tables. It fails on the parent; run it on each partition instead.
+
+## Q2. What the plain build locked
+
+**Question:** during a plain `CREATE INDEX` on the parent, which relations were locked, in which mode, and when?
+
+All of them, at the start: `pg_locks` 0.3 s into the 1.38 s build showed `ShareLock` granted on `orders_p` and on all 25 partitions, including partitions whose index had not been built yet. The locks are held until the statement's transaction commits.
+
+> **Common mistake:** expecting each partition to be locked only while its own index is being built.
+
+## Q3. SELECT fast, INSERT slow
+
+**Question:** why did a SELECT finish in 5.8 ms during that build, while an INSERT waited 849 ms?
+
+A SELECT takes `ACCESS SHARE`, which does not conflict with `SHARE`. An INSERT takes `ROW EXCLUSIVE`, which does: `SHARE` exists precisely to stop the table from changing while the index is built from its rows. The INSERT, started 0.5 s into the build, waited until the build committed.
+
+> **Common mistake:** testing an index build with read traffic only and calling it safe.
+
+## Q4. Is the ON ONLY index used?
+
+**Question:** after `CREATE INDEX … ON ONLY orders_p (amount)`, is the index used by queries? What about after attaching one partition's index?
+
+The ON ONLY index itself has no entries and is invalid, so it can't be used. Queries use **partition** indexes, and those can be used as soon as they exist: after `orders_p_2025_06_amount_idx` was built (and attached), a June query used it with a Bitmap Index Scan, while a May query still did a Seq Scan.
+
+> **Common mistake:** waiting for the parent to become valid before expecting any benefit. Each partition benefits as soon as its own index is built.
+
+## Q5. A new partition in the meantime
+
+**Question:** a partition was created while the parent index was still invalid. Did it get an index?
+
+Yes. `orders_p_2026_02`, created after the ON ONLY step, came with `orders_p_2026_02_amount_idx`, already attached. Every partitioned index on the parent, valid or not, is reproduced on new partitions.
+
+> **Common mistake:** adding the new month to the CIC script and getting "Another index is already attached for partition …" from the ATTACH.
+
+## Q6. Parent still invalid
+
+**Question:** the parent index stays at `indisvalid = false` after your script finished. What do you check?
+
+Which partitions have no index attached to it:
+
+```sql
+SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+WHERE i.inhparent = 'orders_p'::regclass
+  AND NOT EXISTS (SELECT 1 FROM pg_index x JOIN pg_inherits ii ON ii.inhrelid = x.indexrelid
+                  WHERE x.indrelid = c.oid AND ii.inhparent = 'orders_p_amount_idx'::regclass);
+```
+
+Usual causes: a partition skipped by the script, or a failed CIC that left an INVALID partition index (a failed `CREATE UNIQUE INDEX CONCURRENTLY` on duplicates did that in the lab). Drop the invalid one, build again, attach.
+
+> **Common mistake:** attaching a second index to a partition that already has one attached: PostgreSQL refuses ("Another index is already attached for partition").
+
+## Q7. LOCK=NONE explicitly
+
+**Question:** why should a MySQL online DDL statement say `LOCK=NONE` explicitly?
+
+Without it MySQL picks the least restrictive lock it can, which for some operations is `SHARED` or `EXCLUSIVE`, and the statement proceeds silently. With `LOCK=NONE`, an operation that cannot run without blocking writes fails immediately instead. On the lab table the index build ran with writes flowing (insert 7.2 ms).
+
+> **Common mistake:** relying on the default and discovering the table lock in production.

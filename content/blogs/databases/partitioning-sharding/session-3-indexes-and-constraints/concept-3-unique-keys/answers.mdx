@@ -1,0 +1,70 @@
+---
+title: "Answers: Unique keys must include the partition key"
+description: "Worked answers to the Session 3 Concept 3 check questions."
+companion: "answers"
+tags: ["partitioning", "constraints", "unique", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE-LIMITATIONS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-limitations-partitioning-keys-unique-keys.html"
+---
+
+<Tldr>
+Uniqueness is enforced where the index lives. With local indexes only, "unique" means "unique per partition" unless the key itself decides the partition.
+</Tldr>
+
+## Q1. Why the partition key makes a local check enough
+
+**Question:** why can a unique index that contains the partition key be checked locally, while one that does not cannot?
+
+If the key contains `created_at`, two rows with the same key have the same `created_at` and so are routed to the same partition. That partition's index sees both, and the local check catches every duplicate. If the key is `id` alone, two rows with the same id can have different `created_at` values, land in different partitions, and no single index contains both.
+
+> **Common mistake:** "the database could check all partitions on insert". It could, but that would be 24 probes per insert plus locking to stop two concurrent inserts racing in different partitions, which is what a global index would do. Neither engine implements it.
+
+## Q2. The two errors
+
+**Question:** what exactly did PostgreSQL say to `ADD PRIMARY KEY (id)` on `orders_p`, and what did MySQL say?
+
+PostgreSQL: `ERROR:  unique constraint on partitioned table must include all partitioning columns` with `DETAIL:  PRIMARY KEY constraint on table "orders_p" lacks column "created_at" which is part of the partition key.` MySQL: `ERROR 1503 (HY000): A PRIMARY KEY must include all columns in the table's partitioning function (prefixed columns are not considered).` (and the same with `A UNIQUE INDEX` for a unique key).
+
+> **Common mistake:** working around MySQL's rule by partitioning on an expression of a key column (e.g. `YEAR(created_at)`). The rule is about the columns used in the function, so `created_at` must still be in every unique key.
+
+## Q3. Which inserts were accepted
+
+**Question:** with `PRIMARY KEY (id, created_at)`, which of these inserts were accepted: order 2500000 dated June 2025; the same row again?
+
+The first was **accepted**: `(2500000, 2025-06-15 10:00)` is a new key in `orders_p_2025_06`, even though `(2500000, 2024-12-31 11:59:47)` exists in `orders_p_2024_12`. The second was **rejected** by `orders_p_2025_06_pkey`: same key, same partition.
+
+> **Common mistake:** testing the constraint by inserting an exact copy of an existing row. That is rejected and hides the real gap.
+
+## Q4. Where the trigger's cost goes
+
+**Question:** the lookup-table trigger made inserts 2.3× slower. Where does the extra work go, and what else must you add for retention?
+
+Each row runs a PL/pgSQL function, which does a second insert into `order_ids`: one more heap tuple, one more B-tree insertion into a 5M-entry index, and one more WAL record. 100k rows went from 290 ms to 668 ms. For retention, dropping an old partition does not fire row triggers, so its ids stay in `order_ids` forever unless you delete them as part of the retention job (`DELETE FROM order_ids WHERE id BETWEEN …`). That job deletes rows one by one again, which partition dropping was meant to avoid (Session 4).
+
+> **Common mistake:** forgetting UPDATEs that change `id`. Either forbid them or handle them in the trigger too.
+
+## Q5. Partitioned by id, queried by date
+
+**Question:** `orders_pid` is partitioned by id. Why did a one-day query scan 24 partitions, and how did adding an id range help?
+
+Pruning compares the query's conditions with each partition's bounds, and those bounds are on `id`. A condition on `created_at` says nothing about id bounds, so all 24 partitions stay, and each one's `created_at` index is probed (0.88 ms vs 0.31 ms). The correlation between id and time is in the data, not in the bounds. Adding `AND id BETWEEN 2906978 AND 2913817` (that day's id range) gave the planner a condition on the partition key, and it kept 1 partition.
+
+> **Common mistake:** expecting the planner to infer the id range from the dates because "ids grow with time".
+
+## Q6. Retries and `now()`
+
+**Question:** a retried insert used `now()` again for `created_at`. What can go wrong with `ON CONFLICT (id, created_at)`?
+
+The retry has a different `created_at`, so `(id, created_at)` does not conflict with the first attempt (if the first attempt actually committed, e.g. the client timed out after the commit). The upsert inserts a second row with the same id instead of updating. If the new timestamp crosses a month boundary, the second row even lands in another partition. Set `created_at` once, when the order is created, and send it unchanged with every retry.
+
+> **Common mistake:** assuming the upsert is idempotent because it was idempotent before partitioning, when the key was `id` alone.
+
+## Q7. MongoDB layouts without global uniqueness
+
+**Question:** which MongoDB layouts lose global `_id` uniqueness?
+
+A **time-series collection**: unique indexes are refused (`InvalidOptions 72: Unique indexes are not supported on time-series collections`), and the same `order_id` was inserted twice. **One collection per period**: each collection has its own `_id` index, so `_id: 2500000` existed in both `orders_2024_12` and `orders_2025_06`. A single plain collection keeps `_id` unique (E11000 on the duplicate).
+
+> **Common mistake:** relying on `_id` uniqueness after moving to monthly collections, for example when re-importing a month.

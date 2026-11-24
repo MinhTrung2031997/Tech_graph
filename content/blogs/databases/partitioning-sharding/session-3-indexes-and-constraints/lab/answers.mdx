@@ -1,0 +1,87 @@
+---
+title: "Answers: Indexes and constraints on partitions session quiz"
+description: "Worked answers to the Session 3 quiz, with the lab's measured values."
+companion: "answers"
+tags: ["partitioning", "indexing", "constraints", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-limitations.html"
+---
+
+<Tldr>
+Every index and every unique check lives inside one partition. Everything in this session follows from that.
+</Tldr>
+
+## Q1. Descents for `WHERE id = 42`
+
+**Question:** a table partitioned by month has a partitioned index on `id`. How many index descents does `WHERE id = 42` cost with 24 partitions, and with 730 daily ones?
+
+One per partition that cannot be pruned. Without a `created_at` condition nothing can be pruned: 24 descents with monthly partitions (73 buffers in the lab instead of 4), and 730 with daily partitions over two years. Add the partition key to the query (or look the date up first) to get back to one.
+
+> **Common mistake:** counting only the partition that contains the row. The other 23 are searched too, and find nothing.
+
+## Q2. Overhead visible vs invisible
+
+**Question:** why is the per-partition overhead invisible in a query that returns one seller's 1,000 orders, but dominant in a one-row lookup?
+
+The overhead is a fixed 2–3 index pages per partition. A one-row lookup on the plain table costs 4 pages in total, so 24 × 3 extra pages make it ~10× slower (0.013 → 0.137 ms). The seller query reads about 950 heap pages either way, because the seller's orders are spread over all months, and the extra 44 index pages add 13% (1.28 → 1.44 ms).
+
+> **Common mistake:** judging partitioning by report queries alone.
+
+## Q3. The bigger InnoDB index
+
+**Question:** why did the InnoDB `seller_id` index grow by 37% after partitioning, with the same rows?
+
+InnoDB secondary index entries contain the primary key. MySQL forces `created_at` into the primary key of a table partitioned by `created_at`, so the key went from `(id)` to `(id, created_at)`, and every entry of every secondary index grew by the size of a DATETIME. The narrow `seller_id` index grew most: 96.6 → 132.4 MB.
+
+> **Common mistake:** sizing partitioned InnoDB tables from the unpartitioned table's index sizes.
+
+## Q4. Locks of a plain index build
+
+**Question:** what does a plain `CREATE INDEX ON orders_p (amount)` lock, and for how long? Give the online alternative in three steps.
+
+It takes a SHARE lock on the parent and on every partition at the start, and holds them all until it commits. Reads continue, but writes wait: an insert waited 849 ms in the lab. The online alternative:
+1. `CREATE INDEX orders_p_amount_idx ON ONLY orders_p (amount)` creates an invalid parent index with no children.
+2. `CREATE INDEX CONCURRENTLY` on each partition. An insert during it took 2.0 ms.
+3. `ALTER INDEX orders_p_amount_idx ATTACH PARTITION …` for each one. The parent becomes valid after the last attach.
+
+> **Common mistake:** trying `CREATE INDEX CONCURRENTLY` on the parent. PostgreSQL refuses it for partitioned tables.
+
+## Q5. Why unique keys need the partition key
+
+**Question:** why must every unique key on a partitioned table include the partition key? What did that allow in the lab?
+
+Each unique index exists per partition and checks only its own rows. Only when the key includes the partition key do duplicates necessarily land in the same partition. Both engines therefore refuse `PRIMARY KEY (id)` on a table partitioned by `created_at`. The accepted `PRIMARY KEY (id, created_at)` let order 2500000 exist twice, in December 2024 and June 2025, in both PostgreSQL and MySQL.
+
+> **Common mistake:** treating `(id, created_at)` as "id is still unique, plus a column".
+
+## Q6. Three ways to a global unique id
+
+**Question:** compare the three ways to keep a globally unique order id, each with its measured cost.
+
+| Way | Enforces | Measured cost |
+|---|---|---|
+| Lookup table `order_ids (id PK)` + BEFORE INSERT trigger | Yes | 100k inserts 290 → 668 ms; 281 MB for 5M ids; needs cleanup when partitions are dropped |
+| Partition by `id` (`orders_pid`) | Yes | One-day query scans 24 partitions, 0.31 → 0.88 ms, unless an id range is added |
+| Ids unique by construction (identity, UUIDv7) | No | None, but imports and manual inserts can still collide |
+
+> **Common mistake:** relying on a sequence and calling the id "unique": nothing stops a second row with the same id from a backfill.
+
+## Q7. Detach blocked by the FK
+
+**Question:** why could `orders_p_2024_01` not be detached once `order_items` referenced it, and how do you design retention for parent and child?
+
+Detaching removes January's rows from `orders_p`, and `order_items` still had rows referencing them, so PostgreSQL refused ("removing partition … violates foreign key constraint"). `DROP TABLE` was refused on the dependent constraint. An unreferenced month (December 2025) detached in 57 ms. Design: partition the child by the same key (`order_created_at`) with the same bounds and drop the child's month first, then the parent's. If the child must outlive the parent, don't use an FK into the partitioned table.
+
+> **Common mistake:** using `DROP … CASCADE`, which drops the FK constraint itself and leaves the child rows dangling.
+
+## Q8. MongoDB layouts
+
+**Question:** which MongoDB layout gives instant monthly drops, which gives the smallest storage, and which keeps `_id` globally unique?
+
+- **Instant monthly drops:** one collection per month (`drop()` one collection).
+- **Smallest storage:** the time-series collection, 32 MB plus 0.2 MB of indexes, against 146 MB plus 115 MB for the plain collection.
+- **Globally unique `_id`:** only the plain collection. The time-series collection refuses unique indexes, and per-month collections are unique only within a month.
+
+> **Common mistake:** assuming one layout can have all three.
