@@ -1,0 +1,108 @@
+---
+title: "Answers: Query planner session quiz"
+description: "Worked answers to the Session 3 quiz, checked against the lab."
+companion: "answers"
+tags: ["indexing", "query-planner", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/row-estimation-examples.html"
+  - "https://www.postgresql.org/docs/current/runtime-config-query.html#RUNTIME-CONFIG-QUERY-CONSTANTS"
+---
+
+<Tldr>
+Estimates come from statistics, costs from estimates × constants, plans from the cheapest cost. Most surprises trace back to one of those three steps.
+</Tldr>
+
+## Q1. Estimate for cancelled
+
+**Question:** using `pg_stats`, estimate the rows for `status = 'cancelled'` before running `EXPLAIN`.
+
+`cancelled` is in the MCV list with frequency ≈ 0.0488. Estimate = 1,000,000 × 0.0488 ≈ **48,800** (the exact number depends on your sample). Actual: 50,000.
+
+> **Common mistake:** 1,000,000 / 5 = 200,000: that rule is for values outside the MCV list.
+
+## Q2. Accurate vs 9.4× off
+
+**Question:** the estimate for `status = 'shipped' AND channel = 'web'` was accurate, but the one for `id <= 100000 AND created_at < '2025-02-07'` was 9.4× too low. What is different about the two pairs of columns?
+
+The planner multiplies selectivities, assuming the columns are **independent**.
+
+| Pair | Relationship in the data | Product of selectivities | Reality |
+|---|---|---|---|
+| `status`, `channel` | Independent (`shipped` = every 20th id, `web` = every 3rd) | 0.051 × 0.335 ≈ 1.7% | 1.67% ✓ |
+| `id`, `created_at` | Perfectly correlated (`created_at` rises with `id`) | 10% × 10% = 1% | 10% ✗ |
+
+> **Common mistake:** blaming stale statistics; both single-column estimates were right.
+
+## Q3. The Nested Loop that did not hurt
+
+**Question:** after inserting 300,000 rows without `ANALYZE`, why did the join choose a Nested Loop, and why did that not hurt on the lab?
+
+The outer side (`orders_stale WHERE status = 'refunded'`) was estimated at **1 row**, so "look up matches in `orders` once through `orders_customer_idx`" looked nearly free. It actually ran 300,000 times. It did not hurt here because every lookup was an index-only scan of a small, fully cached index (≈ 11 entries each, memory speed): 388 ms, while the hash join after `ANALYZE` had to build a hash of 1M `orders` entries (515 ms). On a larger, uncached table, 300,000 lookups would be 300,000 descents and random page reads, seconds or minutes.
+
+> **Common mistake:** concluding stale statistics are harmless. The estimate was off by 300,000×; this time the consequence happened to be cheap.
+
+## Q4. Seq Scan cost for a bigger table
+
+**Question:** recompute the Seq Scan cost if `orders` had 20,000 pages and 1M rows, with two `AND` conditions.
+
+| Part | Calculation | Cost |
+|---|---|---|
+| Pages | 20,000 × 1.0 | 20,000 |
+| Rows | 1,000,000 × 0.01 | 10,000 |
+| Conditions | 1,000,000 × 2 × 0.0025 | 5,000 |
+| **Total** | | **35,000** |
+
+(In practice the second condition is evaluated only for rows passing the first, but the planner charges both per row.)
+
+> **Common mistake:** charging the conditions once, not per row.
+
+## Q5. random_page_cost = 1.1 with data in memory
+
+**Question:** why did lowering `random_page_cost` to 1.1 make one query slower, even though the lab data was in memory?
+
+The constant prices every out-of-order heap page visit. At 1.1, an Index Scan over 500,000 scattered rows looked cheaper (20,537) than the Seq Scan (22,602), so the planner chose it. But an Index Scan visits a heap page per matching row, about 500,000 visits, jumping across the table and revisiting pages, each with buffer lookup, pin and visibility work. A Seq Scan does 10,102 page visits and filters rows in a tight loop. Memory removed the disk cost, not the per-visit cost: 117 ms vs 31 ms.
+
+> **Common mistake:** "random_page_cost only matters for disks". It also stands in for the overhead of non-sequential access.
+
+## Q6. Same rows, different plans
+
+**Question:** in Exercise 4, `created_at < '2025-07-01'` used an Index Scan while `customer_id <= 50000` used a Seq Scan, for about the same number of rows. Explain with the cost formula.
+
+The heap part of an Index Scan is priced as **max + c² × (min − max)**:
+
+| | Correlation c | Heap pages | Price per page | Index Scan total |
+|---|---|---|---|---|
+| `created_at` | 1.0 | ≈ 4,991, in order | mostly `seq_page_cost` 1.0 | ≈ 19,083 < 22,602 → Index Scan |
+| `customer_id` | ≈ 0 | nearly all, scattered | `random_page_cost` 4.0 | well above 22,602 → Seq Scan |
+
+> **Common mistake:** "created_at is indexed better". Both are plain B-trees; the heap order differs.
+
+## Q7. Which side MySQL converts
+
+**Question:** in MySQL, `sku = 123` scanned the table and `customer_id = '7'` did not. Which side of the comparison gets converted in each case?
+
+Comparing a string with a number, MySQL converts **the string to a number**.
+
+| Condition | String side | Converted | Index |
+|---|---|---|---|
+| `sku = 123` | The column `sku` | Every row's value | ✗ unusable |
+| `customer_id = '7'` | The literal `'7'` | Once, to 7 | ✓ ref |
+
+> **Common mistake:** "MySQL always converts the literal". Only when the literal is the string side.
+
+## Q8. A regex that scans the whole index
+
+**Question:** MongoDB examined 1,000,000 keys for `{ sku: /00123$/ }` but returned 200 documents. Was the index useful at all? What would make this query fast?
+
+Somewhat: it tested the regex against 1,000,000 **index keys** (small, compact) and fetched only the 200 matching documents, which is cheaper than a COLLSCAN that decompresses and examines 1,000,000 full documents. But it is a full index scan, not a seek.
+
+To make it fast, give the query a prefix to seek on:
+
+| Approach | How |
+|---|---|
+| Store the searchable part separately | e.g. a `sku_suffix` or reversed-`sku` field, indexed, queried with an anchored regex or equality |
+| Exact match instead of pattern | If users search by full SKU, use equality |
+| Text search | A text index or a dedicated search engine for free-form substring search |
+
+> **Common mistake:** adding `/i` "to be safe": a case-insensitive regex also cannot use tight bounds.

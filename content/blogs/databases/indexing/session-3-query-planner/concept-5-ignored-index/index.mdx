@@ -1,0 +1,459 @@
+---
+title: "Concept 5: Why the database ignores your index"
+description: "The two kinds of 'my index is not used': the index cannot serve the condition as written (functions, casts, type mismatches, leading wildcards, collations, ORs, negations), or it can but the planner correctly judges a scan cheaper. Every case reproduced in PostgreSQL, MySQL and MongoDB."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "query-planner", "troubleshooting"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-types.html"
+  - "https://www.postgresql.org/docs/current/indexes-opclass.html"
+  - "https://www.postgresql.org/docs/current/indexes-expressional.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/type-conversion.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/index-merge-optimization.html"
+  - "https://www.mongodb.com/docs/manual/reference/operator/query/regex/#index-use"
+---
+
+<Tldr>
+"The database ignores my index" has two different causes. **Either the index cannot serve the condition as written**: the column is wrapped in a function or cast (`created_at::date = …`, `id = 7.0`, `sku = 123` in MySQL), the pattern starts with a wildcard, the collation does not support `LIKE` prefixes, or an `OR` includes an unindexed column. **Or the index could serve it, but a scan is cheaper**: too many rows, a tiny table, or stale statistics. The first kind is fixed by rewriting the query or indexing the expression; the second is usually the planner being right. In MongoDB a type mismatch does not even slow down: `customer_id: "7"` uses the index and silently returns **nothing**.
+</Tldr>
+
+## Two questions the planner asks
+
+| Question | If no |
+|---|---|
+| 1. **Can** this index serve the condition? The condition must compare the indexed column (or indexed expression), unchanged, with an operator the index supports | The index is not a candidate at all |
+| 2. **Should** it, given the cost? Index route cheaper than the alternatives (Concept 3)? | The planner picks a scan, deliberately |
+
+A condition the index can serve is called **sargable** (Search ARGument ABLE).
+
+## The cases, measured
+
+| Condition | PostgreSQL | MySQL | MongoDB | Kind |
+|---|---|---|---|---|
+| `created_at::date = '2025-03-01'` / `DATE(created_at) = …` | Seq Scan | `ALL` | (`$expr` with `$dayOfMonth`: COLLSCAN) | Function on the column |
+| `created_at >= '2025-03-01' AND created_at < '2025-03-02'` | Index Scan | `range` | IXSCAN | Same question, sargable |
+| `customer_id + 0 = 7` | Seq Scan | `ALL` | — | Expression on the column |
+| `id = 7.0` (numeric literal on a `bigint`) | Seq Scan | — | — | Column cast to the literal's type |
+| `sku = 123` (number vs `VARCHAR`) | — | `ALL` | — | Column converted to a number |
+| `customer_id: "7"` (string vs number) | — | — | IXSCAN, **0 results** | Type mismatch: wrong answer, fast |
+| `sku LIKE 'SKU-00012%'` | Seq Scan (en_US collation); Index Scan with `text_pattern_ops` | `range` | `/^SKU-00012/`: 2,001 keys | Prefix: collation-dependent |
+| `sku LIKE '%00123'` | Seq Scan | `ALL` | `/00123$/`: all 1,000,000 keys scanned | Leading wildcard |
+| `customer_id = 7 OR amount = 12.34` | Seq Scan | `ALL` | COLLSCAN | OR with an unindexed column |
+| `customer_id = 7 OR status = 'refunded'` | BitmapOr | `index_merge` (union) | OR of two IXSCANs | OR, both indexed |
+| `status <> 'delivered'` | Seq Scan (65% of rows) | — | IXSCAN over two ranges, 650,001 keys | Negation |
+| `status = 'delivered'` | Bitmap (cheaper than Seq) | `ref`, **slower** than a scan | IXSCAN | Low selectivity |
+
+## PostgreSQL: can it, should it?
+
+| Term | Meaning |
+|---|---|
+| Sargable | Indexed column (or indexed expression) on one side, unchanged; a supported operator; a constant or parameter on the other |
+| Operator class | Which operators an index supports; `text_pattern_ops` adds byte-wise `LIKE 'prefix%'` support under non-C collations |
+| **✓ Can serve / ✗ Cannot serve** | Question 1 |
+| **✓ Cheaper / ✗ Scan is cheaper** | Question 2 |
+
+<Flow
+  title="PostgreSQL: why an index is or is not used"
+  height={340}
+  nodes={[
+    { id: 'q', label: 'Condition', sub: '', x: 20, y: 20, w: 240 },
+    { id: 'can', label: '✓ Can serve', sub: 'sargable', x: 330, y: 20, w: 200 },
+    { id: 'cannot', label: '✗ Cannot serve', sub: '', x: 20, y: 150, w: 240 },
+    { id: 'cheap', label: '✓ Cheaper', sub: 'index plan', x: 600, y: 20, w: 180 },
+    { id: 'dear', label: '✗ Scan is cheaper', sub: '', x: 330, y: 150, w: 200 },
+    { id: 'fix', label: 'Fix', sub: '', x: 20, y: 270, w: 240 },
+    { id: 'seq', label: 'Seq Scan', sub: '', x: 330, y: 270, w: 200 },
+  ]}
+  edges={[
+    { id: 'q-can', from: 'q', to: 'can' },
+    { id: 'q-cannot', from: 'q', to: 'cannot' },
+    { id: 'can-cheap', from: 'can', to: 'cheap' },
+    { id: 'can-dear', from: 'can', to: 'dear' },
+    { id: 'cannot-fix', from: 'cannot', to: 'fix' },
+    { id: 'cannot-seq', from: 'cannot', to: 'seq', quiet: true },
+    { id: 'dear-seq', from: 'dear', to: 'seq' },
+  ]}
+  cases={[
+    {
+      title: 'Sargable range',
+      path: "created_at >= '2025-03-01' AND < '2025-03-02' ✓ can serve ✓ cheaper → Index Scan",
+      summary: 'The baseline: bare column, supported operator, few rows.',
+      subs: { q: 'created_at in [1 Mar, 2 Mar)', cheap: 'Index Scan' },
+      steps: [
+        {
+          title: '✓ The index can serve it',
+          note: 'The bare indexed column is compared with constants using >= and <, which the B-tree supports: one contiguous range of orders_created_idx.',
+          code: "EXPLAIN SELECT * FROM orders\nWHERE created_at >= '2025-03-01' AND created_at < '2025-03-02';",
+          active: ['q', 'can'],
+          edges: ['q-can'],
+        },
+        {
+          title: '✓ And it is cheaper',
+          note: 'About 2,740 rows on ≈ 28 consecutive heap pages: Index Scan, a few dozen pages instead of 10,102.',
+          active: ['can', 'cheap'],
+          edges: ['can-cheap'],
+        },
+      ],
+    },
+    {
+      title: 'Cast on the column',
+      path: "created_at::date = '2025-03-01' ✗ cannot serve → Seq Scan; fix: a range",
+      summary: 'The index holds timestamps, not dates.',
+      subs: { q: "created_at::date = '2025-03-01'", cannot: 'column is transformed', fix: 'created_at >= d AND < d + 1' },
+      steps: [
+        {
+          title: '✗ The index cannot serve it',
+          note: 'orders_created_idx is sorted by created_at. The condition asks about created_at::date, a different value computed per row; the index has no entries for it.',
+          code: "EXPLAIN SELECT * FROM orders WHERE created_at::date = '2025-03-01';",
+          active: ['q', 'cannot', 'seq'],
+          edges: ['q-cannot', 'cannot-seq'],
+          subs: { seq: 'Parallel Seq Scan' },
+        },
+        {
+          title: 'Fix: rewrite as a range',
+          note: 'created_at >= \'2025-03-01\' AND created_at < \'2025-03-02\' asks the same question in terms of the indexed column: Index Scan. Or create an expression index on (created_at::date) if the query cannot change (Session 5).',
+          active: ['cannot', 'fix'],
+          edges: ['cannot-fix'],
+        },
+      ],
+    },
+    {
+      title: 'Numeric literal on a bigint',
+      path: 'id = 7.0 → bigint column cast to numeric ✗ cannot serve → Seq Scan; fix: id = 7',
+      summary: 'One character of the literal changes the plan from 4 pages to the whole table.',
+      subs: { q: 'id = 7.0', cannot: 'id cast to numeric', fix: 'id = 7 (or a bigint parameter)' },
+      steps: [
+        {
+          title: '✗ The column is cast',
+          note: '7.0 is numeric. Comparing bigint with numeric casts the column side (id::numeric = 7.0), and orders_pkey does not index id::numeric. Same with an application that binds a decimal parameter.',
+          code: 'EXPLAIN SELECT * FROM orders WHERE id = 7.0;',
+          active: ['q', 'cannot', 'seq'],
+          edges: ['q-cannot', 'cannot-seq'],
+          subs: { seq: 'Parallel Seq Scan' },
+        },
+        {
+          title: 'Fix: match the type',
+          note: 'WHERE id = 7: Index Scan using orders_pkey. Check the parameter types your driver sends.',
+          active: ['cannot', 'fix'],
+          edges: ['cannot-fix'],
+        },
+      ],
+    },
+    {
+      title: 'LIKE prefix, en_US collation',
+      path: "sku LIKE 'SKU-00012%' ✗ cannot serve (collation) → Seq Scan; fix: text_pattern_ops",
+      summary: 'Measured: plain index → Seq Scan; text_pattern_ops index → Index Scan.',
+      subs: { q: "sku LIKE 'SKU-00012%'", cannot: 'en_US.utf8 ordering', fix: 'index (sku text_pattern_ops)' },
+      steps: [
+        {
+          title: '✗ The index order is not byte order',
+          note: 'Under en_US.utf8 (the lab database collation), text sorts by linguistic rules, so "all strings starting with SKU-00012" are not guaranteed to be one contiguous range of the index. sku = \'SKU-000123\' uses the index; the LIKE prefix does not.',
+          code: "CREATE INDEX orders_sku_idx ON orders (sku);\nEXPLAIN SELECT * FROM orders WHERE sku LIKE 'SKU-00012%';",
+          active: ['q', 'cannot', 'seq'],
+          edges: ['q-cannot', 'cannot-seq'],
+        },
+        {
+          title: 'Fix: an index with byte-wise ordering',
+          note: 'CREATE INDEX … (sku text_pattern_ops) sorts by bytes: Index Scan for the prefix. Databases created with the C collation do not need it. A leading wildcard (LIKE \'%00123\') cannot use either; it needs a trigram index (Session 7).',
+          active: ['cannot', 'fix'],
+          edges: ['cannot-fix'],
+        },
+      ],
+    },
+    {
+      title: 'OR with an unindexed column',
+      path: 'customer_id = 7 OR amount = 12.34 ✗ the amount branch cannot use any index → Seq Scan',
+      summary: 'With both columns indexed, the same shape becomes a BitmapOr.',
+      subs: { q: 'customer_id = 7 OR amount = 12.34', cannot: 'no index on amount', fix: 'index amount, or UNION' },
+      steps: [
+        {
+          title: '✗ One branch has no index',
+          note: 'Rows matching amount = 12.34 can be anywhere and no index finds them, so the whole table must be read anyway; the customer_id index cannot help.',
+          code: 'EXPLAIN SELECT * FROM orders WHERE customer_id = 7 OR amount = 12.34;',
+          active: ['q', 'cannot', 'seq'],
+          edges: ['q-cannot', 'cannot-seq'],
+        },
+        {
+          title: 'Fix: index every branch',
+          note: 'customer_id = 7 OR status = \'refunded\' (both indexed) gives a BitmapOr of two Bitmap Index Scans. Rewriting as UNION of two queries also works.',
+          active: ['cannot', 'fix'],
+          edges: ['cannot-fix'],
+        },
+      ],
+    },
+    {
+      title: 'Low selectivity',
+      path: "status <> 'delivered' (65%) ✓ could use the index ✗ scan is cheaper → Seq Scan",
+      summary: 'Not a problem to fix: the planner is right.',
+      subs: { q: "status <> 'delivered'", dear: '65% of rows' },
+      steps: [
+        {
+          title: '✓ Usable in principle',
+          note: 'An index could return everything below and above delivered. Most planners do not try for <>; either way the question is cost.',
+          code: "EXPLAIN SELECT * FROM orders WHERE status <> 'delivered';",
+          active: ['q', 'can'],
+          edges: ['q-can'],
+        },
+        {
+          title: '✗ A scan is cheaper',
+          note: '650,000 rows on every page: a Seq Scan reads each page once. Forcing an index would be slower (Concept 3). If you only need a rare subset, say so: status IN (\'pending\', \'cancelled\').',
+          active: ['can', 'dear', 'seq'],
+          edges: ['can-dear', 'dear-seq'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: conversions, functions and ORs
+
+| Term | Meaning |
+|---|---|
+| Implicit conversion | Comparing a string column with a number converts **every row's value** to a number: `'SKU-000123'` → 0, so the index order is useless |
+| `index_merge` | Combines several indexes for `OR` (union) or `AND` (intersection) |
+| **✓ Can serve / ✗ Cannot serve** | As in PostgreSQL |
+
+<Flow
+  title="MySQL: why an index is or is not used"
+  height={340}
+  nodes={[
+    { id: 'q', label: 'Condition', sub: '', x: 20, y: 20, w: 240 },
+    { id: 'can', label: '✓ Can serve', sub: '', x: 330, y: 20, w: 200 },
+    { id: 'cannot', label: '✗ Cannot serve', sub: '', x: 20, y: 150, w: 240 },
+    { id: 'plan', label: 'Index plan', sub: '', x: 600, y: 20, w: 180 },
+    { id: 'all', label: 'type: ALL', sub: 'full table scan', x: 330, y: 150, w: 200 },
+    { id: 'fix', label: 'Fix', sub: '', x: 20, y: 270, w: 240 },
+  ]}
+  edges={[
+    { id: 'q-can', from: 'q', to: 'can' },
+    { id: 'q-cannot', from: 'q', to: 'cannot' },
+    { id: 'can-plan', from: 'can', to: 'plan' },
+    { id: 'cannot-all', from: 'cannot', to: 'all' },
+    { id: 'cannot-fix', from: 'cannot', to: 'fix' },
+  ]}
+  cases={[
+    {
+      title: 'Number compared with VARCHAR',
+      path: 'sku = 123 → every sku converted to a number ✗ cannot serve → type: ALL',
+      summary: "sku = 'SKU-000123' uses the index (ref, 200 rows); sku = 123 scans 996,111 rows.",
+      subs: { q: 'sku = 123', cannot: 'string → number per row', fix: "sku = '123'" },
+      steps: [
+        {
+          title: '✗ Implicit conversion',
+          note: 'MySQL compares a string with a number numerically: each sku is converted to a number (most become 0), so the comparison has nothing to do with the index\'s string order.',
+          code: 'EXPLAIN SELECT * FROM orders WHERE sku = 123;',
+          active: ['q', 'cannot', 'all'],
+          edges: ['q-cannot', 'cannot-all'],
+        },
+        {
+          title: 'Fix: quote the value',
+          note: "sku = '123' compares strings: ref access. The reverse case (customer_id = '7' on an INT column) is harmless: the constant is converted once and the index is used.",
+          active: ['cannot', 'fix'],
+          edges: ['cannot-fix'],
+        },
+      ],
+    },
+    {
+      title: 'Function on the column',
+      path: "DATE(created_at) = '2025-03-01' ✗ → type: ALL; range rewrite ✓ → type: range",
+      summary: 'Same fix as PostgreSQL; MySQL also offers functional indexes (8.0.13+).',
+      subs: { q: 'DATE(created_at) = …', cannot: 'function on column', fix: 'range or functional index' },
+      steps: [
+        {
+          title: '✗ DATE() hides the column',
+          note: 'type: ALL, 996,111 rows.',
+          code: "EXPLAIN SELECT * FROM orders WHERE DATE(created_at) = '2025-03-01';",
+          active: ['q', 'cannot', 'all'],
+          edges: ['q-cannot', 'cannot-all'],
+        },
+        {
+          title: 'Fix: a range',
+          note: "created_at >= '2025-03-01' AND created_at < '2025-03-02': type: range, rows 2,740.",
+          active: ['cannot', 'fix'],
+          edges: ['cannot-fix'],
+        },
+      ],
+    },
+    {
+      title: 'LIKE prefix',
+      path: "sku LIKE 'SKU-00012%' ✓ can serve → type: range",
+      summary: 'MySQL\'s collations allow prefix ranges; leading wildcards still cannot.',
+      subs: { q: "sku LIKE 'SKU-00012%'", plan: 'range, 2,000 rows' },
+      steps: [
+        {
+          title: '✓ Prefix range',
+          note: 'type: range, key: orders_sku_idx. LIKE \'%00123\' is type: ALL.',
+          code: "EXPLAIN SELECT * FROM orders WHERE sku LIKE 'SKU-00012%';",
+          active: ['q', 'can', 'plan'],
+          edges: ['q-can', 'can-plan'],
+        },
+      ],
+    },
+    {
+      title: 'OR of two indexed columns',
+      path: "customer_id = 7 OR status = 'refunded' ✓ → index_merge union",
+      summary: 'With amount instead of status (unindexed), type: ALL.',
+      subs: { q: 'customer_id = 7 OR status = …', plan: 'index_merge: union' },
+      steps: [
+        {
+          title: '✓ Both branches indexed',
+          note: 'type: index_merge, Using union(orders_customer_idx, orders_status_idx), rows 11.',
+          code: "EXPLAIN SELECT * FROM orders WHERE customer_id = 7 OR status = 'refunded';",
+          active: ['q', 'can', 'plan'],
+          edges: ['q-can', 'can-plan'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: types, regexes and $or
+
+| Term | Meaning |
+|---|---|
+| Type bracketing | A query value only matches values of the same BSON type: `"7"` (string) never equals `7` (number) |
+| Anchored regex | `/^SKU-00012/`: becomes a tight index range |
+| Unanchored or case-insensitive regex | `/00123$/`, `/^sku/i`: the whole index is scanned, each key tested |
+| `SUBPLAN` | Plans each `$or` branch separately; if one branch has no index, the whole query falls back to COLLSCAN |
+| **✓ Tight bounds / ✗ No usable bounds** | Whether the index narrows the search |
+
+<Flow
+  title="MongoDB: when an index helps and when it does not"
+  height={340}
+  nodes={[
+    { id: 'q', label: 'Filter', sub: '', x: 20, y: 20, w: 240 },
+    { id: 'tight', label: '✓ Tight bounds', sub: 'few keys', x: 330, y: 20, w: 200 },
+    { id: 'loose', label: '✗ No usable bounds', sub: '', x: 20, y: 150, w: 240 },
+    { id: 'ix', label: 'IXSCAN', sub: '', x: 600, y: 20, w: 180 },
+    { id: 'fullix', label: 'Whole index scanned', sub: '', x: 330, y: 150, w: 200 },
+    { id: 'coll', label: 'COLLSCAN', sub: '', x: 20, y: 270, w: 240 },
+  ]}
+  edges={[
+    { id: 'q-tight', from: 'q', to: 'tight' },
+    { id: 'q-loose', from: 'q', to: 'loose' },
+    { id: 'tight-ix', from: 'tight', to: 'ix' },
+    { id: 'loose-fullix', from: 'loose', to: 'fullix' },
+    { id: 'loose-coll', from: 'loose', to: 'coll' },
+  ]}
+  cases={[
+    {
+      title: 'Wrong type: "7" vs 7',
+      path: 'customer_id: "7" ✓ tight bounds ["7","7"] → IXSCAN finds 0 keys → empty result',
+      summary: 'Fast and wrong: the documents store numbers.',
+      subs: { q: '{ customer_id: "7" }', ix: '0 keys, 0 results' },
+      steps: [
+        {
+          title: '✓ The index is used',
+          note: 'indexBounds: customer_id ["7", "7"]: a string range. Strings and numbers sort in different sections of the index.',
+          code: 'db.orders.find({ customer_id: "7" })',
+          active: ['q', 'tight', 'ix'],
+          edges: ['q-tight', 'tight-ix'],
+        },
+        {
+          title: 'Zero results',
+          note: 'totalKeysExamined 0, nReturned 0. With { customer_id: 7 }: 10 keys, 10 documents. In SQL this would be a slow query; in MongoDB it is a silent bug. Validate types at the application boundary or with a schema validator.',
+          active: ['ix'],
+        },
+      ],
+    },
+    {
+      title: 'Unanchored regex',
+      path: '/00123$/ ✗ no usable bounds → all 1,000,000 index keys tested → 200 documents',
+      summary: 'Anchored /^SKU-00012/: 2,001 keys. Case-insensitive /^sku-00012/i: 1,000,000 keys.',
+      subs: { q: '{ sku: /00123$/ }', fullix: '1,000,000 keys' },
+      steps: [
+        {
+          title: '✗ No prefix to seek to',
+          note: 'Without a fixed prefix, the bounds are the entire string range ["", {}).',
+          code: 'db.orders.find({ sku: /00123$/ })',
+          active: ['q', 'loose'],
+          edges: ['q-loose'],
+        },
+        {
+          title: 'Scan every key',
+          note: 'MongoDB still uses the index, testing the regex on each of the 1,000,000 keys, and fetches only the 200 matching documents. Cheaper than a COLLSCAN (keys are smaller than documents), but nowhere near the 2,001 keys of the anchored /^SKU-00012/. The /i flag has the same effect even when anchored.',
+          active: ['loose', 'fullix'],
+          edges: ['loose-fullix'],
+        },
+      ],
+    },
+    {
+      title: '$or with an unindexed branch',
+      path: '{ $or: [ customer_id, amount ] } ✗ amount has no index → SUBPLAN ← COLLSCAN',
+      summary: 'With both branches indexed: SUBPLAN ← FETCH ← OR ← two IXSCANs.',
+      subs: { q: '$or: [customer_id, amount]', coll: '1,000,000 documents' },
+      steps: [
+        {
+          title: '✗ One branch cannot use an index',
+          note: 'SUBPLAN plans each branch; amount = 12.34 has no index, so the whole $or must scan.',
+          code: 'db.orders.find({ $or: [ { customer_id: 7 }, { amount: 12.34 } ] })',
+          active: ['q', 'loose', 'coll'],
+          edges: ['q-loose', 'loose-coll'],
+        },
+        {
+          title: 'Fix: index every branch',
+          note: 'With { $or: [ { customer_id: 7 }, { status: "refunded" } ] }, each branch uses its index and the results are merged (10 keys examined).',
+          active: ['coll'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+Do not "fix" a correct Seq Scan. Before rewriting a query or adding hints, check which question failed: if `EXPLAIN` shows the index **is** a candidate (forcing it with `SET enable_seqscan = off` makes the planner use it) and the forced plan is slower, the planner was right. Only a "cannot serve" case is a bug in the query or the index.
+</Pitfall>
+
+## A checklist when an index is ignored
+
+| Check | How |
+|---|---|
+| Is the column wrapped in a function, cast or arithmetic? | Rewrite as a range or comparison on the bare column; or index the expression |
+| Does the literal or parameter type match the column type? | Compare `id = 7` vs `id = 7.0`; in MySQL quote string values; in MongoDB check BSON types |
+| Leading wildcard or case-insensitive pattern? | Needs a trigram/text index (Session 7) or a stored normalised column |
+| `LIKE 'prefix%'` in PostgreSQL with a non-C collation? | Index with `text_pattern_ops` |
+| `OR` with an unindexed branch? | Index it or split into `UNION` |
+| Are statistics current? | `ANALYZE`; compare estimated vs actual rows |
+| Is the condition selective at all? | Count matching rows; above ≈ 10–20% a scan is usually right |
+| Composite index with the leading column missing from the query? | Session 4 |
+
+## Real-world scenario: the timezone cast
+
+An API filters orders by "today in the user's timezone": `WHERE (created_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date = $1`. It is fast in development (small table) and scans 40M rows in production.
+
+| | Condition | Plan |
+|---|---|---|
+| Before | `(created_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date = $1` | Seq Scan: the indexed column is transformed |
+| After | `created_at >= $start AND created_at < $end`, with `$start`/`$end` computed in the app as the day's boundaries in that timezone | Index Scan on `created_at` |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 4: composite indexes | The leading-column rule is another "cannot serve" case |
+| Session 5: expression indexes | Index the function when the query cannot change |
+| Session 7: trigram and text indexes | For leading wildcards and case-insensitive search |
+| Session 8: checklist | This list, applied before adding any index |
+
+## Key takeaways
+
+1. An unused index means either the index cannot serve the condition, or a scan is cheaper.
+2. Sargable conditions compare the bare indexed column with a constant using a supported operator.
+3. Functions, casts and arithmetic on the column hide it: `created_at::date`, `id = 7.0`, MySQL `sku = 123`.
+4. Rewrite as ranges on the bare column, or index the expression.
+5. `LIKE 'prefix%'` needs byte-ordered indexes in PostgreSQL under non-C collations; leading wildcards need specialist indexes.
+6. An `OR` with any unindexed branch forces a full scan in all three engines.
+7. MongoDB type mismatches return wrong (empty) results quickly, rather than slow results.
+8. Low selectivity and tiny tables are the planner being right, not a problem to fix.
+
+## Check questions
+
+1. Name the two different reasons an index might not be used, and how you can tell which one applies.
+2. Why does `created_at::date = '2025-03-01'` scan the table, and how do you rewrite it?
+3. `WHERE id = 7.0` scans the whole table in PostgreSQL. Why, and what is the general lesson for application code?
+4. In MySQL, why does `sku = 123` scan the table while `customer_id = '7'` uses the index?
+5. Why can't a plain PostgreSQL B-tree index on `sku` serve `LIKE 'SKU-00012%'` in the lab database, and what fixes it?
+6. What did MongoDB do with `{ customer_id: "7" }`, and why is that worse than a slow query?
+7. `customer_id = 7 OR amount = 12.34` scans the table in all three engines. Why, and what are two fixes?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-3-query-planner/concept-5-ignored-index/answers">Worked answers to Q1–Q7</DeepDive>

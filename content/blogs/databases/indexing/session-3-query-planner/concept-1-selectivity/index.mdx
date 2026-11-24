@@ -1,0 +1,422 @@
+---
+title: "Concept 1: Selectivity and cardinality"
+description: "The two numbers every query planner works from: what fraction of rows a condition keeps (selectivity) and how many rows each step returns (cardinality). How they decide between an index and a full scan in PostgreSQL, MySQL and MongoDB, measured on the lab."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "query-planner", "selectivity"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/row-estimation-examples.html"
+  - "https://www.postgresql.org/docs/current/planner-stats.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/explain-output.html"
+  - "https://www.mongodb.com/docs/manual/core/query-plans/"
+---
+
+<Tldr>
+**Selectivity** is the fraction of rows a condition keeps (`status = 'shipped'`: 5%). **Cardinality** is how many rows a plan step returns (1M × 5% = 50,000). An index pays off when selectivity is **low**: few rows, so few table pages. In the lab, PostgreSQL used an index for `customer_id <= N` up to about **20%** of the table and switched to a Seq Scan at 50%; for the physically ordered `created_at` it kept the index up to 50%. Planners never know these numbers exactly; they **estimate** them, and a bad estimate is the most common reason for a bad plan.
+</Tldr>
+
+## Two words, one idea
+
+| Term | Meaning | `status = 'shipped'` on 1M orders |
+|---|---|---|
+| Selectivity | Fraction of rows that satisfy a condition, 0 to 1 | 0.05 |
+| Cardinality (of a step) | Rows the step returns = input rows × selectivity | 50,000 |
+| Cardinality (of a column) | Number of distinct values; PostgreSQL calls it `n_distinct` | `status`: 5, `customer_id`: ≈ 100,000 |
+| "Highly selective" | Keeps very few rows (low selectivity number) | `customer_id = 7`: 0.001% |
+
+The two uses of "cardinality" are related: an equality on a column with many distinct values is usually highly selective (1 / 100,000 for `customer_id`), and one on a column with few values is not (≈ 1/5 for `status`).
+
+## Estimates vs reality on the lab
+
+PostgreSQL's estimate is the `rows=` in `EXPLAIN`; the real count is `actual … rows=`.
+
+| Condition | Estimated rows | Actual rows | Selectivity |
+|---|---|---|---|
+| `status = 'shipped'` | 51,000 | 50,000 | 5% |
+| `status = 'pending'` | 199,267 | 200,000 | 20% |
+| `status = 'refunded'` | 1 | 0 | 0% |
+| `customer_id = 7` | 11 | 7 | 0.001% |
+| `customer_id BETWEEN 1 AND 1000` | 8,314 | 9,956 | 1% |
+| `created_at < '2025-02-01'` | 86,170 | 84,931 | 8.5% |
+| `status = 'shipped' AND channel = 'web'` | 17,060 | 16,666 | 1.7% |
+| `id <= 100000 AND created_at < '2025-02-07'` | 10,654 | **100,000** | 10% |
+
+Most estimates are within a few percent. The last one is off by **9.4×**: the planner multiplies the two selectivities (10% × 10% = 1%) as if the columns were independent, but `created_at` rises with `id`, so the second condition removes nothing. Concept 2 shows where each estimate comes from.
+
+## How selectivity picks the plan
+
+| Selectivity | Pages the index route touches | Typical winner |
+|---|---|---|
+| Tiny (a few rows) | Height + a few table pages | Index Scan |
+| Small (≈ 0.1–20%), rows scattered | Many table pages, but fewer than all | Bitmap Heap Scan (PostgreSQL) |
+| Large (≈ 20%+), rows scattered | Almost every table page, randomly | Full scan |
+| Large, rows physically ordered | A contiguous stretch of the table | Index Scan can still win |
+
+| Term | Meaning |
+|---|---|
+| **✓ Selective** | Few enough rows that an index route reads fewer, cheaper pages than a full scan |
+| **✗ Not selective** | So many rows that reading the whole table in order is cheaper |
+
+<Flow
+  title="PostgreSQL: selectivity → estimated rows → plan"
+  height={330}
+  nodes={[
+    { id: 'q', label: 'WHERE clause', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'sel', label: 'Selectivity', sub: 'from statistics', x: 310, y: 20, w: 180 },
+    { id: 'rows', label: 'Estimated rows', sub: '1M × selectivity', x: 570, y: 20, w: 210 },
+    { id: 'yes', label: '✓ Selective', sub: 'index route', x: 120, y: 150, w: 220 },
+    { id: 'no', label: '✗ Not selective', sub: 'full scan', x: 460, y: 150, w: 220 },
+    { id: 'idx', label: 'Index / Bitmap Scan', sub: '', x: 20, y: 260, w: 300 },
+    { id: 'seq', label: 'Seq Scan', sub: '22,602 cost units', x: 460, y: 260, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-sel', from: 'q', to: 'sel' },
+    { id: 'sel-rows', from: 'sel', to: 'rows' },
+    { id: 'rows-yes', from: 'rows', to: 'yes', quiet: true },
+    { id: 'rows-no', from: 'rows', to: 'no', quiet: true },
+    { id: 'yes-idx', from: 'yes', to: 'idx' },
+    { id: 'no-seq', from: 'no', to: 'seq' },
+  ]}
+  cases={[
+    {
+      title: 'customer_id = 7',
+      path: 'selectivity ≈ 0.00001 → 11 rows ✓ selective → Bitmap Heap Scan',
+      summary: 'Measured: rows=11 estimated, 7 actual; cost 47.56 vs 22,602 for a Seq Scan.',
+      subs: { q: 'customer_id = 7' },
+      steps: [
+        {
+          title: 'Estimate the selectivity',
+          note: 'customer_id has ≈ 91,000 distinct values in the statistics, and 7 is not one of the most common, so the planner assumes it is as frequent as an average value: about 1 / 91,474.',
+          code: 'EXPLAIN SELECT * FROM orders WHERE customer_id = 7;',
+          active: ['q', 'sel'],
+          edges: ['q-sel'],
+          subs: { sel: '≈ 1 / 91,474' },
+        },
+        {
+          title: 'Estimated rows: 11',
+          note: '1,000,000 / 91,474 ≈ 11. The real number is 7; close enough.',
+          active: ['sel', 'rows'],
+          edges: ['sel-rows'],
+          subs: { rows: '11 rows' },
+        },
+        {
+          title: '✓ Selective: index route',
+          note: '11 rows cost about 3 index pages + 11 heap pages. The Bitmap Heap Scan costs 47.56 units, the Seq Scan 22,602.',
+          active: ['rows', 'yes', 'idx'],
+          edges: ['rows-yes', 'yes-idx'],
+          subs: { idx: 'Bitmap: cost 47.56' },
+        },
+      ],
+    },
+    {
+      title: 'customer_id <= 20000',
+      path: 'selectivity 20% → 203,858 rows ✓ still selective → Bitmap Heap Scan',
+      summary: 'Measured: Bitmap 20.7 ms vs Seq Scan 22.3 ms (warm cache): the crossover is near.',
+      subs: { q: 'customer_id <= 20000' },
+      steps: [
+        {
+          title: 'Selectivity from the histogram',
+          note: '20,000 is about 20% of the way through the customer_id histogram.',
+          code: 'EXPLAIN SELECT * FROM orders WHERE customer_id <= 20000;',
+          active: ['q', 'sel', 'rows'],
+          edges: ['q-sel', 'sel-rows'],
+          subs: { sel: '≈ 0.20', rows: '203,858 rows' },
+        },
+        {
+          title: '✓ Just selective enough',
+          note: '200,000 scattered rows touch practically every heap page, but a Bitmap Heap Scan reads them in file order, so its estimated cost (15,158) still beats the Seq Scan (22,602). Measured: 20.7 ms vs 22.3 ms.',
+          active: ['rows', 'yes', 'idx'],
+          edges: ['rows-yes', 'yes-idx'],
+          subs: { idx: 'Bitmap: cost 15,158' },
+        },
+      ],
+    },
+    {
+      title: 'customer_id <= 50000',
+      path: 'selectivity 50% → 502,623 rows ✗ not selective → Seq Scan',
+      summary: 'Half the table: reading every page in order is cheaper than any index route.',
+      subs: { q: 'customer_id <= 50000' },
+      steps: [
+        {
+          title: 'Half the rows',
+          note: 'The estimate is 502,623 rows (actual 500,356).',
+          code: 'EXPLAIN SELECT * FROM orders WHERE customer_id <= 50000;',
+          active: ['q', 'sel', 'rows'],
+          edges: ['q-sel', 'sel-rows'],
+          subs: { sel: '≈ 0.50', rows: '502,623 rows' },
+        },
+        {
+          title: '✗ Not selective: Seq Scan',
+          note: 'Every heap page is needed anyway, and the index adds its own pages and per-entry work. The Seq Scan, 22,602 units, wins.',
+          active: ['rows', 'no', 'seq'],
+          edges: ['rows-no', 'no-seq'],
+        },
+      ],
+    },
+    {
+      title: 'created_at < 1 July (correlated)',
+      path: 'selectivity 49% → 494,454 rows, but physically ordered ✓ → Index Scan',
+      summary: 'The same 50% that forced a Seq Scan on customer_id keeps the index on created_at.',
+      subs: { q: "created_at < '2025-07-01'" },
+      steps: [
+        {
+          title: 'Half the rows again',
+          note: 'Estimated 494,454 rows (actual 495,890).',
+          code: "EXPLAIN SELECT * FROM orders WHERE created_at < '2025-07-01';",
+          active: ['q', 'sel', 'rows'],
+          edges: ['q-sel', 'sel-rows'],
+          subs: { sel: '≈ 0.49', rows: '494,454 rows' },
+        },
+        {
+          title: '✓ Ordered rows: the first half of the table',
+          note: 'created_at has correlation 1.0: the matching rows are exactly the first ≈ 5,000 heap pages, read in order. The Index Scan costs 19,083 < 22,602. Selectivity alone does not decide; where the rows are matters too (Session 1, Concept 4).',
+          active: ['rows', 'yes', 'idx'],
+          edges: ['rows-yes', 'yes-idx'],
+          subs: { idx: 'Index Scan: cost 19,083' },
+        },
+      ],
+    },
+  ]}
+/>
+
+### MySQL: rows and filtered
+
+| Term | Meaning |
+|---|---|
+| `rows` | Estimated rows the access method reads |
+| `filtered` | Estimated % of those rows that survive the remaining conditions |
+| Index dive | For a range on an indexed column, the optimizer descends the index to the range's ends and estimates the rows between them |
+| **✓ Selective / ✗ Not** | Same decision: index range/ref vs full table scan (`type: ALL`) |
+
+<Flow
+  title="MySQL: selectivity → plan"
+  height={330}
+  nodes={[
+    { id: 'q', label: 'WHERE clause', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'est', label: 'Estimate', sub: '', x: 310, y: 20, w: 200 },
+    { id: 'rows', label: 'rows / filtered', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'yes', label: '✓ Selective', sub: 'index access', x: 120, y: 150, w: 220 },
+    { id: 'no', label: '✗ Not selective', sub: 'type: ALL', x: 460, y: 150, w: 220 },
+    { id: 'idx', label: 'type: range / ref', sub: '', x: 20, y: 260, w: 300 },
+    { id: 'all', label: 'Full table scan', sub: '', x: 460, y: 260, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-est', from: 'q', to: 'est' },
+    { id: 'est-rows', from: 'est', to: 'rows' },
+    { id: 'rows-yes', from: 'rows', to: 'yes', quiet: true },
+    { id: 'rows-no', from: 'rows', to: 'no', quiet: true },
+    { id: 'yes-idx', from: 'yes', to: 'idx' },
+    { id: 'no-all', from: 'no', to: 'all' },
+  ]}
+  cases={[
+    {
+      title: 'customer_id <= 1000',
+      path: 'index dive → rows 18,000 ✓ selective → type: range',
+      summary: 'Estimated 18,000, actual 10,000: index dives can be off by 2×.',
+      subs: { q: 'customer_id <= 1000', est: 'index dive' },
+      steps: [
+        {
+          title: 'Index dive',
+          note: 'MySQL descends orders_customer_idx to customer_id = 1 and to 1000 and estimates the entries between them from the pages it saw.',
+          code: 'EXPLAIN SELECT * FROM orders WHERE customer_id <= 1000;',
+          active: ['q', 'est', 'rows'],
+          edges: ['q-est', 'est-rows'],
+          subs: { rows: 'rows=18,000' },
+        },
+        {
+          title: '✓ Selective: range scan',
+          note: 'type: range, key: orders_customer_idx, Using index condition. Measured: 40 ms vs 72 ms for a full scan at 5,000 customers.',
+          active: ['rows', 'yes', 'idx'],
+          edges: ['rows-yes', 'yes-idx'],
+        },
+      ],
+    },
+    {
+      title: 'customer_id <= 20000',
+      path: 'estimate ≈ 42% → ✗ not selective → type: ALL',
+      summary: 'MySQL gives up on the index earlier than PostgreSQL (no bitmap scans).',
+      subs: { q: 'customer_id <= 20000', est: 'index dive' },
+      steps: [
+        {
+          title: 'Too many rows',
+          note: 'filtered=41.94 (it estimates 42%; the truth is 20%).',
+          code: 'EXPLAIN SELECT * FROM orders WHERE customer_id <= 20000;',
+          active: ['q', 'est', 'rows'],
+          edges: ['q-est', 'est-rows'],
+          subs: { rows: 'filtered=41.94' },
+        },
+        {
+          title: '✗ Full table scan',
+          note: 'Each matching row would need a clustered-index lookup; InnoDB has no bitmap heap scan to read them in order. type: ALL.',
+          active: ['rows', 'no', 'all'],
+          edges: ['rows-no', 'no-all'],
+        },
+      ],
+    },
+    {
+      title: "status = 'delivered' (a wrong choice)",
+      path: 'index statistics → rows 498,055 ✓ treated as selective → type: ref, slower than a full scan',
+      summary: 'Measured: 144 ms through the index vs 103 ms with IGNORE INDEX.',
+      subs: { q: "status = 'delivered'", est: 'index statistics' },
+      steps: [
+        {
+          title: 'Estimate from index statistics',
+          note: 'For an equality on an indexed column (ref access), MySQL uses the index\'s average rows per value. It estimates 498,055 (actual 350,000).',
+          code: "EXPLAIN SELECT SUM(amount) FROM orders WHERE status = 'delivered';",
+          active: ['q', 'est', 'rows'],
+          edges: ['q-est', 'est-rows'],
+          subs: { rows: 'rows=498,055' },
+        },
+        {
+          title: '✓ Chosen anyway: type: ref',
+          note: 'The optimizer still prefers the ref plan. 350,000 clustered-index lookups took 144 ms; the full scan, forced with IGNORE INDEX, took 103 ms. Low-selectivity indexes invite wrong choices (Concept 5).',
+          active: ['rows', 'yes', 'idx'],
+          edges: ['rows-yes', 'yes-idx'],
+          subs: { idx: 'ref: 144 ms (full scan: 103 ms)' },
+        },
+      ],
+    },
+  ]}
+/>
+
+### MongoDB: no estimates, a race
+
+| Term | Meaning |
+|---|---|
+| Candidate plans | One per usable index (and combinations); a collection scan is considered only when no index applies |
+| Trial period | Candidates run side by side until one returns 101 documents or does 10,000 units of work (or a fraction of the collection) |
+| Score | Based on documents returned per unit of work; the best scorer wins and is cached |
+| **✓ Index applies / ✗ No index applies** | IXSCAN candidates vs COLLSCAN |
+
+<Flow
+  title="MongoDB: how a plan is chosen"
+  height={330}
+  nodes={[
+    { id: 'q', label: 'find(filter)', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'cands', label: 'Candidate plans', sub: '', x: 310, y: 20, w: 200 },
+    { id: 'trial', label: 'Trial run', sub: 'up to 101 docs', x: 580, y: 20, w: 200 },
+    { id: 'yes', label: '✓ Index applies', sub: 'IXSCAN candidates', x: 120, y: 150, w: 220 },
+    { id: 'no', label: '✗ No index applies', sub: 'COLLSCAN', x: 400, y: 150, w: 200 },
+    { id: 'win', label: 'Winner, cached', sub: '', x: 560, y: 260, w: 220 },
+    { id: 'coll', label: 'COLLSCAN', sub: '', x: 20, y: 260, w: 300 },
+  ]}
+  edges={[
+    { id: 'q-yes', from: 'q', to: 'yes' },
+    { id: 'q-no', from: 'q', to: 'no', quiet: true },
+    { id: 'yes-cands', from: 'yes', to: 'cands' },
+    { id: 'cands-trial', from: 'cands', to: 'trial' },
+    { id: 'trial-win', from: 'trial', to: 'win', quiet: true },
+    { id: 'yes-win', from: 'yes', to: 'win', quiet: true },
+    { id: 'no-coll', from: 'no', to: 'coll' },
+  ]}
+  cases={[
+    {
+      title: 'One index applies',
+      path: 'status index ✓ applies → only one candidate → used without a trial, even at 35%',
+      summary: "find({ status: 'delivered' }): IXSCAN 107 ms vs forced COLLSCAN 142 ms.",
+      subs: { q: "{ status: 'delivered' }", win: 'IXSCAN(status_1)' },
+      steps: [
+        {
+          title: 'One usable index',
+          note: 'Only status_1 matches the filter. MongoDB does not cost a collection scan against it: if an index applies, a COLLSCAN is not a candidate.',
+          code: 'db.orders.find({ status: "delivered" })',
+          active: ['q', 'yes'],
+          edges: ['q-yes'],
+        },
+        {
+          title: 'Used directly',
+          note: 'A single candidate needs no trial. Here it was also the faster plan (107 ms vs 142 ms forced with hint({ $natural: 1 })), but MongoDB did not check: selectivity never entered the decision.',
+          active: ['yes', 'win'],
+          edges: ['yes-win'],
+        },
+      ],
+    },
+    {
+      title: 'Two indexes apply',
+      path: 'customer_id_1 and status_1 ✓ → trial: 101 docs vs 24 docs in 2,001 works → customer_id_1 wins',
+      summary: "find({ status: 'shipped', customer_id: { $lte: 1000 } }).",
+      subs: { q: '{ status, customer_id }', win: 'IXSCAN(customer_id_1)' },
+      steps: [
+        {
+          title: 'Two candidates',
+          note: 'Each index can drive the query: one scans customer_id ≤ 1000 and filters status, the other scans status = shipped and filters customer_id.',
+          code: 'db.orders.find({ status: "shipped", customer_id: { $lte: 1000 } })',
+          active: ['q', 'yes', 'cands'],
+          edges: ['q-yes', 'yes-cands'],
+          subs: { cands: 'customer_id_1, status_1' },
+        },
+        {
+          title: 'Race them',
+          note: 'Both run in turns. After 2,001 units of work, the customer_id plan has returned 101 matching documents, the status plan 24.',
+          active: ['cands', 'trial'],
+          edges: ['cands-trial'],
+          subs: { trial: '101 vs 24 docs' },
+        },
+        {
+          title: 'Winner cached',
+          note: 'Scores 1.051 vs 1.012: customer_id_1 wins and goes into the plan cache for this query shape. Selectivity was measured by running, not estimated.',
+          active: ['trial', 'win'],
+          edges: ['trial-win'],
+        },
+      ],
+    },
+    {
+      title: 'No index applies',
+      path: 'no index on amount ✗ → COLLSCAN',
+      summary: 'find({ amount: 12.34 }): every document examined.',
+      subs: { q: '{ amount: 12.34 }' },
+      steps: [
+        {
+          title: '✗ No candidate index',
+          note: 'No index contains amount, so the only plan is a collection scan.',
+          code: 'db.orders.find({ amount: 12.34 })',
+          active: ['q', 'no', 'coll'],
+          edges: ['q-no', 'no-coll'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+"Add an index on every column in the WHERE clause" ignores selectivity. An index on `status` (5 values) helps only for the rare values; for `delivered` (35%), PostgreSQL's planner reads most of the table anyway, MySQL can pick the index and be **slower** than a full scan, and MongoDB will use it without checking. Index the conditions that keep few rows.
+</Pitfall>
+
+## Real-world scenario: the "status" index on a queue table
+
+A `jobs` table has 50M rows: 49.9M `done`, 100,000 `pending`. Workers poll `WHERE status = 'pending' ORDER BY created_at LIMIT 100`. An index on `status` helps that query a lot (0.2% selectivity) but is 98% entries for `done` that no query ever reads.
+
+| Option | Size | Selectivity it serves |
+|---|---|---|
+| Index on `(status)` | Entries for all 50M rows | Good for `pending`, useless for `done` |
+| Partial index `ON jobs (created_at) WHERE status = 'pending'` (Session 5) | 100,000 entries | Exactly the polling query, already ordered |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 2: statistics | Where the selectivity estimates come from |
+| Concept 3: cost model | How estimated rows become a cost |
+| Session 4: composite indexes | Combining conditions to reach low selectivity |
+| Session 5: partial indexes | Indexing only the selective slice |
+
+## Key takeaways
+
+1. Selectivity = fraction of rows a condition keeps; cardinality = rows a step returns (or distinct values of a column).
+2. Low selectivity favours an index; high selectivity favours a full scan; physical order shifts the crossover.
+3. In the lab, PostgreSQL kept an index route up to ≈ 20% for scattered rows and ≈ 50% for ordered rows.
+4. Planners estimate selectivity; most estimates were within a few percent, but correlated columns were off by 9.4×.
+5. MySQL estimates with index dives and index statistics, and can pick a low-selectivity index that is slower than a full scan.
+6. MongoDB does not estimate: it races candidate plans and caches the winner; a single applicable index is always used.
+
+## Check questions
+
+1. Define selectivity and cardinality, and give both for `status = 'pending'` on the lab table.
+2. Why is `customer_id = 7` highly selective while `status = 'paid'` is not, even though both are equalities?
+3. The planner estimated 10,654 rows for `id <= 100000 AND created_at < '2025-02-07'`; the truth is 100,000. What assumption caused this?
+4. PostgreSQL switched from Bitmap Heap Scan to Seq Scan between 20% and 50% for `customer_id`, but kept an Index Scan at 49% for `created_at`. Why?
+5. MySQL used the `status` index for `status = 'delivered'` and was 40% slower than a full scan. Why is a low-selectivity condition risky for its optimizer?
+6. How does MongoDB decide between two applicable indexes, and what does it do when only one applies?
+7. Give a selectivity at which you would expect a full scan to beat an index on scattered rows, and explain using pages.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-3-query-planner/concept-1-selectivity/answers">Worked answers to Q1–Q7</DeepDive>

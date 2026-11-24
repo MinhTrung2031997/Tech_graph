@@ -2,13 +2,12 @@
   "title": "Session 3: The query planner",
   "collapsible": true,
   "defaultOpen": false,
-  "pages": [],
-  "planned": [
-    "Concept 1: Selectivity and cardinality",
-    "Concept 2: Statistics and ANALYZE",
-    "Concept 3: The cost model",
-    "Concept 4: Index Scan vs Bitmap Scan vs Seq Scan",
-    "Concept 5: Why the database ignores your index",
-    "Lab and session quiz"
+  "pages": [
+    "concept-1-selectivity/index",
+    "concept-2-statistics/index",
+    "concept-3-cost-model/index",
+    "concept-4-scan-types/index",
+    "concept-5-ignored-index/index",
+    "lab/index"
   ]
 }

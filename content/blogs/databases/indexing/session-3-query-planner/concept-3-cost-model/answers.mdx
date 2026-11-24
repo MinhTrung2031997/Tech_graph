@@ -1,0 +1,101 @@
+---
+title: "Answers: The cost model"
+description: "Worked answers to the Session 3 Concept 3 check questions, with every cost recomputed from the constants."
+companion: "answers"
+tags: ["indexing", "query-planner", "cost-model", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/runtime-config-query.html#RUNTIME-CONFIG-QUERY-CONSTANTS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/cost-model.html"
+---
+
+<Tldr>
+Cost = pages × cost per page + rows × cost per row. Every number on this page comes from that one sentence and the default constants.
+</Tldr>
+
+## Q1. The Seq Scan cost
+
+**Question:** recompute the Seq Scan cost of `orders` (10,102 pages, 1M rows, one `WHERE` condition) from the constants.
+
+| Part | Calculation | Cost |
+|---|---|---|
+| Pages | 10,102 × `seq_page_cost` 1.0 | 10,102 |
+| Rows | 1,000,000 × `cpu_tuple_cost` 0.01 | 10,000 |
+| Condition | 1,000,000 × `cpu_operator_cost` 0.0025 | 2,500 |
+| **Total** | | **22,602** |
+
+`EXPLAIN` shows exactly `cost=0.00..22602.00`.
+
+> **Common mistake:** charging the condition per returned row. Every row read is checked.
+
+## Q2. The 48.62 Index Scan
+
+**Question:** break the Index Scan cost of 48.62 for `customer_id = 7` into its parts.
+
+| Part | Calculation | Cost |
+|---|---|---|
+| Startup: descent | ≈ 0.42 (comparisons down 3 levels) | 0.42 |
+| Index leaf | 1 page × `random_page_cost` 4.0 | 4.00 |
+| Index entries | 11 × (0.005 + 0.0025) | 0.08 |
+| Heap pages | 11 pages × 4.0 (uncorrelated: each a random read) | 44.00 |
+| Heap rows | 11 × 0.01 | 0.11 |
+| **Total** | | **≈ 48.6** |
+
+> **Common mistake:** pricing the heap pages at 1.0. Scattered rows are random reads.
+
+## Q3. 49% cheaper, 50% dearer
+
+**Question:** why does an Index Scan on `created_at` returning 49% of the rows cost less than the Seq Scan, while one on `customer_id` returning 50% costs more?
+
+The heap part of an Index Scan is priced as **max + c² × (min − max)**, where c is the column's correlation, max prices every heap page as a random read and min prices one random read followed by sequential pages.
+
+| | Correlation | Heap pages priced as | Total |
+|---|---|---|---|
+| `created_at` | 1.0 | ≈ 4,991 pages, mostly × 1.0 | ≈ 19,083 < 22,602 |
+| `customer_id` | ≈ 0 | Most heap pages, × 4.0, plus revisits | > 22,602 |
+
+> **Common mistake:** "the planner prefers timestamps". It prefers physical order, which `created_at` happens to have here.
+
+## Q4. random_page_cost = 1.1
+
+**Question:** what happened when `random_page_cost` was lowered to 1.1, and why was the planner's new choice slower?
+
+The Index Scan for `customer_id <= 50000` (500,000 scattered rows) was re-priced at 20,537, below the Seq Scan's 22,602, so the planner switched to it. It ran in 117 ms warm and 185 ms cold, against 31 ms and 42 ms for the Seq Scan. Visiting 500,000 rows through the index means jumping between heap pages in key order and visiting most pages many times; even when the pages are in memory, that costs more per row than one sequential pass. The constant was set to describe "random disk reads are cheap" but also discounted the real cost of out-of-order access.
+
+> **Common mistake:** "SSDs make random I/O free, so 1.1 is always right". Test with your own queries and cache state.
+
+## Q5. 100,677 vs 103,874
+
+**Question:** MySQL's table-scan cost was 100,677 in one run and 103,874 in another. Explain the difference.
+
+Both share eval_cost = 996,111 rows × 0.1 = 99,611. The read cost depends on how many of the 4,263 pages InnoDB reports as already in the buffer pool:
+
+| Run | Pages priced at | read_cost | Total |
+|---|---|---|---|
+| Buffer pool warm | `memory_block_read_cost` 0.25 | 4,263 × 0.25 ≈ 1,066 | 100,677 |
+| Buffer pool cold | `io_block_read_cost` 1.0 | 4,263 × 1.0 = 4,263 | 103,874 |
+
+> **Common mistake:** assuming the cost is fixed for a given query. MySQL's estimate includes how much of the data is cached.
+
+## Q6. MongoDB's scores
+
+**Question:** how did MongoDB arrive at the scores 1.0507 and 1.0122?
+
+Score = 1 (base) + productivity (advanced / works) + small bonuses.
+
+| Plan | advanced / works | 1 + productivity | Reported |
+|---|---|---|---|
+| A: `customer_id_1` | 101 / 2,001 = 0.0505 | 1.0505 | 1.0507 |
+| B: `status_1` | 24 / 2,001 = 0.0120 | 1.0120 | 1.0122 |
+
+The tiny remainder comes from tie-breaking bonuses (for example, not needing an in-memory sort). A wins and is cached.
+
+> **Common mistake:** "MongoDB picks the index with fewer keys". It measures returned documents per unit of work during the trial.
+
+## Q7. enable_seqscan = off
+
+**Question:** why are `enable_seqscan = off` and similar settings dangerous outside experiments?
+
+They do not remove a plan type; they add a huge penalty to it, so the planner avoids it **whatever the data**. A query that should switch to a Seq Scan when it covers most of the table (a long reporting window, a common value) keeps an index plan that reads the table in random order. They are also session-wide, so every other query in the session is affected. Use them to compare plans; fix real problems with statistics, indexes or query changes.
+
+> **Common mistake:** setting them in the application's connection settings to "force indexes".

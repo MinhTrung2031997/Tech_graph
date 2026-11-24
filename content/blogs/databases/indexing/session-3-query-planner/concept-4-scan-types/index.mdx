@@ -1,0 +1,413 @@
+---
+title: "Concept 4: Index Scan vs Bitmap Scan vs Seq Scan"
+description: "The three ways PostgreSQL reads a table, when each wins, and how bitmaps combine indexes and go lossy. MySQL's equivalents (ref/range, Multi-Range Read, full scan) and MongoDB's IXSCAN vs COLLSCAN, measured on the lab."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "query-planner", "bitmap-scan"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/using-explain.html"
+  - "https://www.postgresql.org/docs/current/indexes-bitmap-scans.html"
+  - "https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-WORK-MEM"
+  - "https://dev.mysql.com/doc/refman/8.4/en/mrr-optimization.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/index-merge-optimization.html"
+  - "https://www.mongodb.com/docs/manual/reference/explain-results/"
+---
+
+<Tldr>
+PostgreSQL has three ways to read a table. An **Index Scan** fetches rows in index order, one heap page at a time: best for a few rows, or many rows that are physically ordered. A **Bitmap Heap Scan** first collects every matching page from one or more indexes, then reads those pages once, in file order: best for a few hundred to a few hundred thousand scattered rows, and the only way to **combine** two indexes (BitmapAnd/BitmapOr). A **Seq Scan** reads everything: best when most pages are needed anyway. In the lab, `customer_id ≤ 5000 AND status = 'shipped'` used both indexes at once and ran in **4.3 ms**. MySQL approximates the bitmap idea with Multi-Range Read (29 ms vs 41 ms); MongoDB has IXSCAN → FETCH or COLLSCAN.
+</Tldr>
+
+## The three scans
+
+| | Index Scan | Bitmap Heap Scan | Seq Scan |
+|---|---|---|---|
+| Order of heap pages | Index order (random unless correlated) | File order, each page once | File order, every page |
+| Rows come out | Sorted by the index key | In physical order (no sort for free) | In physical order |
+| Can stop early (`LIMIT`) | ✓ | ✗ (bitmap built first) | ✓ |
+| Combine two indexes | ✗ | ✓ BitmapAnd / BitmapOr | — |
+| Wins when | Few rows, or ordered rows, or `ORDER BY … LIMIT` | Many scattered rows, or several conditions | Most of the table |
+
+The lab sweep, `customer_id <= N` (scattered) and `created_at < date` (ordered):
+
+| Selectivity | `customer_id` (correlation −0.01) | `created_at` (correlation 1.0) |
+|---|---|---|
+| 0.001% – 0.3% | Bitmap Heap Scan | Index Scan |
+| 1% – 20% | Bitmap Heap Scan | Index Scan |
+| ≈ 50% | Seq Scan | Index Scan |
+| ≈ 75% | Seq Scan | Seq Scan |
+
+## PostgreSQL: how a bitmap scan works
+
+| Term | Meaning |
+|---|---|
+| Bitmap Index Scan | Reads the index and sets one bit per matching row (exact) or per matching page (lossy) |
+| BitmapAnd / BitmapOr | Intersect or merge bitmaps from several indexes before touching the heap |
+| Exact vs lossy | If the bitmap would exceed `work_mem`, pages degrade to "some row on this page matches": every row on them must be rechecked |
+| `Heap Blocks: exact=… lossy=…` | How many heap pages were read with exact vs lossy bits |
+| **✓ Exact** | Only the matching rows are checked |
+| **✗ Lossy** | Every row on the page is checked again (`Rows Removed by Index Recheck`) |
+
+<Flow
+  title="PostgreSQL: Index Scan, Bitmap Heap Scan, Seq Scan"
+  height={360}
+  nodes={[
+    { id: 'q', label: 'Query', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'idx', label: 'Index A', sub: 'orders_customer_idx', x: 310, y: 20, w: 210 },
+    { id: 'idx2', label: 'Index B', sub: 'orders_status_idx', x: 590, y: 20, w: 190 },
+    { id: 'bmp', label: 'Bitmap', sub: 'pages with matches', x: 590, y: 140, w: 190 },
+    { id: 'exact', label: '✓ Exact', sub: 'bits per row', x: 590, y: 260, w: 190 },
+    { id: 'lossy', label: '✗ Lossy', sub: 'recheck whole page', x: 20, y: 260, w: 220 },
+    { id: 'heap', label: 'Heap pages', sub: '', x: 310, y: 260, w: 210 },
+    { id: 'seq', label: 'Seq Scan', sub: 'every page', x: 20, y: 140, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-idx', from: 'q', to: 'idx' },
+    { id: 'q-seq', from: 'q', to: 'seq' },
+    { id: 'idx-bmp', from: 'idx', to: 'bmp' },
+    { id: 'idx2-bmp', from: 'idx2', to: 'bmp', label: 'AND' },
+    { id: 'bmp-exact', from: 'bmp', to: 'exact' },
+    { id: 'bmp-lossy', from: 'bmp', to: 'lossy', quiet: true },
+    { id: 'bmp-heap', from: 'bmp', to: 'heap', label: 'file order' },
+    { id: 'idx-heap', from: 'idx', to: 'heap', quiet: true },
+    { id: 'seq-heap', from: 'seq', to: 'heap', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Index Scan',
+      path: 'index in key order → heap page per entry → rows sorted by key',
+      summary: "created_at < '2025-02-01': 84,931 rows, physically ordered: Index Scan.",
+      subs: { idx: 'orders_created_idx', q: "created_at < '2025-02-01'" },
+      steps: [
+        {
+          title: 'Walk the index',
+          note: 'The index is read in created_at order, from the start of the range.',
+          code: "EXPLAIN ANALYZE SELECT * FROM orders WHERE created_at < '2025-02-01';",
+          active: ['q', 'idx'],
+          edges: ['q-idx'],
+        },
+        {
+          title: 'Heap page per entry, in index order',
+          note: 'Each entry\'s ctid is fetched right away. Because created_at follows the heap order, consecutive entries land on the same or the next page: effectively a sequential read of the first ≈ 860 pages. Rows come out sorted by created_at, and a LIMIT could stop it after a few.',
+          active: ['idx', 'heap'],
+          edges: ['idx-heap'],
+          subs: { heap: 'pages 0 → ≈ 860, in order' },
+        },
+      ],
+    },
+    {
+      title: 'Bitmap, exact',
+      path: 'index → bitmap of 6,376 pages ✓ exact → heap in file order, each page once',
+      summary: 'customer_id <= 1000: 9,956 scattered rows (Session 1, Concept 4).',
+      subs: { q: 'customer_id <= 1000' },
+      steps: [
+        {
+          title: 'Bitmap Index Scan',
+          note: 'The whole index range is read first, and a bit is set for every matching row\'s ctid. No heap page is touched yet.',
+          code: 'EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id <= 1000;',
+          active: ['q', 'idx', 'bmp'],
+          edges: ['q-idx', 'idx-bmp'],
+          subs: { bmp: '6,376 pages marked' },
+        },
+        {
+          title: '✓ Exact',
+          note: 'The bitmap fits in work_mem (4 MB), so it records exactly which rows match.',
+          active: ['bmp', 'exact'],
+          edges: ['bmp-exact'],
+        },
+        {
+          title: 'Heap in file order',
+          note: 'Pages are read in increasing page number, each once, taking only the marked rows: Heap Blocks: exact=6,376. The price: rows come out in page order, not customer order.',
+          active: ['bmp', 'heap'],
+          edges: ['bmp-heap'],
+          subs: { heap: '6,376 pages, once each' },
+        },
+      ],
+    },
+    {
+      title: 'Bitmap, lossy',
+      path: 'work_mem 64 kB → bitmap too big ✗ lossy for 9,310 pages → 736,036 rows rechecked',
+      summary: 'customer_id <= 20000 with work_mem = 64kB: exact=791, lossy=9,310.',
+      subs: { q: 'customer_id <= 20000' },
+      steps: [
+        {
+          title: 'A bitmap for 200,000 rows',
+          note: 'With work_mem = 64kB, a row-level bitmap for 200,000 rows does not fit.',
+          code: "SET work_mem = '64kB';\nEXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id <= 20000;",
+          active: ['q', 'idx', 'bmp'],
+          edges: ['q-idx', 'idx-bmp'],
+        },
+        {
+          title: '✗ Lossy: one bit per page',
+          note: 'Postgres degrades most of the bitmap to page level: "page 812 has at least one match", without saying which rows.',
+          active: ['bmp', 'lossy'],
+          edges: ['bmp-lossy'],
+          subs: { lossy: '9,310 pages' },
+        },
+        {
+          title: 'Recheck every row on lossy pages',
+          note: 'Each row on a lossy page is checked against customer_id <= 20000 again: Rows Removed by Index Recheck: 736,036. It still ran in 29 ms here (vs 21 ms exact), but on big tables lossy bitmaps add a lot of CPU. If you see lossy blocks, raise work_mem for that query.',
+          active: ['lossy', 'heap'],
+          edges: ['bmp-heap'],
+          subs: { heap: 'exact=791 lossy=9,310' },
+        },
+      ],
+    },
+    {
+      title: 'BitmapAnd: two indexes',
+      path: 'customer index → bitmap A, status index → bitmap B → A AND B → 2,304 heap pages',
+      summary: "customer_id <= 5000 AND status = 'shipped': 2,580 rows in 4.3 ms.",
+      subs: { q: "customer ≤ 5000 AND shipped" },
+      steps: [
+        {
+          title: 'Two Bitmap Index Scans',
+          note: 'orders_customer_idx yields 50,090 matches; orders_status_idx yields 50,000. Neither condition alone is very selective.',
+          code: "EXPLAIN ANALYZE SELECT * FROM orders\nWHERE customer_id <= 5000 AND status = 'shipped';",
+          active: ['q', 'idx', 'idx2', 'bmp'],
+          edges: ['q-idx', 'idx-bmp', 'idx2-bmp'],
+        },
+        {
+          title: 'AND the bitmaps',
+          note: 'BitmapAnd keeps only rows set in both: 2,580 rows, on 2,304 pages. An Index Scan can use only one index; a bitmap can combine any number.',
+          active: ['bmp', 'exact'],
+          edges: ['bmp-exact'],
+          subs: { bmp: '2,304 pages' },
+        },
+        {
+          title: 'Heap: 2,304 pages',
+          note: 'Heap Blocks: exact=2,304. Execution 4.3 ms. A composite index on (status, customer_id) would be faster still (Session 4), but the bitmap gets far with two single-column indexes.',
+          active: ['bmp', 'heap'],
+          edges: ['bmp-heap'],
+        },
+      ],
+    },
+    {
+      title: 'Seq Scan',
+      path: 'customer_id <= 50000: half the rows → read every page in order',
+      summary: 'Measured: 31 ms; the forced Index Scan took 117 ms.',
+      subs: { q: 'customer_id <= 50000' },
+      steps: [
+        {
+          title: 'Every page, in order',
+          note: 'With half the rows matching, every page holds matches. A Seq Scan reads all 10,102 pages once and filters: 22,602 cost units, cheapest.',
+          code: 'EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id <= 50000;',
+          active: ['q', 'seq', 'heap'],
+          edges: ['q-seq', 'seq-heap'],
+          subs: { heap: 'all 10,102 pages' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL InnoDB: ref/range, MRR, full scan
+
+InnoDB has no bitmap heap scan, but **Multi-Range Read (MRR)** applies the same idea to secondary-index lookups: collect the primary keys from the index range, sort them, then look up the rows in primary-key order, which is clustered-index order.
+
+| Term | Meaning |
+|---|---|
+| `type: ref / range` | Secondary-index access; each entry → a clustered-index lookup in index order |
+| MRR (`Using MRR`) | Buffer the primary keys, sort them, look up rows in key order: fewer, more sequential page visits |
+| `mrr_cost_based` | On by default: MRR is used only when the optimizer estimates it cheaper, which is rarely |
+| index_merge | MySQL's way of combining two indexes (union, intersection), like BitmapOr/BitmapAnd |
+| **✓ MRR / ✗ No MRR** | Sorted lookups vs lookups in index order |
+
+<Flow
+  title="InnoDB: secondary range with and without MRR"
+  height={340}
+  nodes={[
+    { id: 'q', label: 'customer_id <= 5000', sub: 'type: range', x: 20, y: 20, w: 220 },
+    { id: 'sec', label: 'Secondary range', sub: '(customer_id, id) entries', x: 310, y: 20, w: 220 },
+    { id: 'full', label: 'Full table scan', sub: '72 ms', x: 600, y: 20, w: 180 },
+    { id: 'off', label: '✗ No MRR', sub: 'lookups in customer order', x: 20, y: 150, w: 240 },
+    { id: 'on', label: '✓ MRR', sub: 'sort ids first', x: 310, y: 150, w: 220 },
+    { id: 'buf', label: 'Sorted id buffer', sub: 'read_rnd_buffer_size', x: 600, y: 150, w: 180 },
+    { id: 'clu', label: 'Clustered lookups', sub: '', x: 310, y: 270, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-sec', from: 'q', to: 'sec' },
+    { id: 'q-off', from: 'q', to: 'off', quiet: true },
+    { id: 'sec-on', from: 'sec', to: 'on', quiet: true },
+    { id: 'off-clu', from: 'off', to: 'clu' },
+    { id: 'on-buf', from: 'on', to: 'buf' },
+    { id: 'buf-clu', from: 'buf', to: 'clu', label: 'id order' },
+  ]}
+  cases={[
+    {
+      title: 'Default: no MRR',
+      path: 'secondary range ✗ no MRR → one clustered lookup per entry, in customer order',
+      summary: 'Measured: 40.6 ms for 50,090 rows.',
+      steps: [
+        {
+          title: 'Walk the secondary range',
+          note: 'Entries come out in (customer_id, id) order.',
+          code: 'SELECT SUM(amount) FROM orders WHERE customer_id <= 5000;',
+          active: ['q', 'sec'],
+          edges: ['q-sec'],
+        },
+        {
+          title: '✗ Lookups in customer order',
+          note: 'Each entry\'s id is looked up immediately: ids jump around the table (100,000, 200,000, … 25,841 …), so leaves are visited in random order and many times.',
+          active: ['q', 'off', 'clu'],
+          edges: ['q-off', 'off-clu'],
+          subs: { clu: '40.6 ms' },
+        },
+      ],
+    },
+    {
+      title: 'Full table scan',
+      path: 'IGNORE INDEX → every clustered leaf, filter each row',
+      summary: 'Measured: 72.4 ms for the same 50,090 rows.',
+      steps: [
+        {
+          title: 'Read the whole table',
+          note: 'Without the index, InnoDB walks all 4,203 leaves and evaluates customer_id <= 5000 on 1M rows. Slower than either lookup strategy at 5% selectivity.',
+          code: 'SELECT SUM(amount) FROM orders IGNORE INDEX (orders_customer_idx) WHERE customer_id <= 5000;',
+          active: ['q', 'full'],
+          subs: { full: '72.4 ms' },
+        },
+      ],
+    },
+    {
+      title: 'MRR forced on',
+      path: 'secondary range → ✓ MRR: buffer and sort ids → clustered lookups in id order',
+      summary: 'Measured: 29.4 ms (Extra: Using MRR).',
+      steps: [
+        {
+          title: 'Turn off the cost-based gate',
+          note: 'With mrr_cost_based=off, MySQL uses MRR whenever it can.',
+          code: "SET optimizer_switch = 'mrr=on,mrr_cost_based=off';\nSELECT SUM(amount) FROM orders WHERE customer_id <= 5000;",
+          active: ['q', 'sec'],
+          edges: ['q-sec'],
+        },
+        {
+          title: '✓ Collect and sort the ids',
+          note: 'Primary keys from the range are buffered (read_rnd_buffer_size) and sorted.',
+          active: ['sec', 'on', 'buf'],
+          edges: ['sec-on', 'on-buf'],
+        },
+        {
+          title: 'Look up in id order',
+          note: 'Rows are fetched in clustered-index order, so neighbouring ids share leaves and each leaf is visited once per buffer: 29.4 ms vs 40.6 ms. The same idea as a bitmap heap scan, applied in batches.',
+          active: ['buf', 'clu'],
+          edges: ['buf-clu'],
+          subs: { clu: '29.4 ms' },
+        },
+      ],
+    },
+  ]}
+/>
+
+MySQL's `index_merge` plays the role of BitmapOr/BitmapAnd: in Concept 5's lab, `customer_id = 7 OR status = 'refunded'` used `index_merge` with `Using union(orders_customer_idx, orders_status_idx)`.
+
+## MongoDB: IXSCAN → FETCH or COLLSCAN
+
+| Term | Meaning |
+|---|---|
+| `IXSCAN` → `FETCH` | Index order, one document fetch per key (like an Index Scan) |
+| `COLLSCAN` | Every document in RecordId order (like a Seq Scan) |
+| Index intersection (`AND_SORTED`, `AND_HASH`) | Exists, but is rarely chosen; compound indexes are the intended way to serve several conditions |
+| **✓ Index applies / ✗ None** | With an applicable index, MongoDB uses it (Concept 1) |
+
+<Flow
+  title="MongoDB: the two access paths"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'find(filter)', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'yes', label: '✓ Index applies', sub: '', x: 310, y: 20, w: 210 },
+    { id: 'no', label: '✗ No index applies', sub: '', x: 20, y: 140, w: 220 },
+    { id: 'ix', label: 'IXSCAN', sub: 'keys in order', x: 310, y: 140, w: 210 },
+    { id: 'fetch', label: 'FETCH', sub: 'document per key', x: 310, y: 240, w: 210 },
+    { id: 'coll', label: 'COLLSCAN', sub: 'every document', x: 20, y: 240, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-yes', from: 'q', to: 'yes' },
+    { id: 'yes-ix', from: 'yes', to: 'ix' },
+    { id: 'ix-fetch', from: 'ix', to: 'fetch' },
+    { id: 'no-coll', from: 'no', to: 'coll' },
+    { id: 'q-no', from: 'q', to: 'no', quiet: true },
+  ]}
+  cases={[
+    {
+      title: "status = 'delivered'",
+      path: '✓ status_1 applies → IXSCAN 350,000 keys → FETCH 350,000 documents',
+      summary: 'Measured: 107 ms; forced COLLSCAN 142 ms.',
+      subs: { q: "{ status: 'delivered' }" },
+      steps: [
+        {
+          title: '✓ An index applies',
+          note: 'status_1 matches the filter, so MongoDB uses it, without weighing a COLLSCAN.',
+          code: 'db.orders.find({ status: "delivered" })',
+          active: ['q', 'yes', 'ix'],
+          edges: ['q-yes', 'yes-ix'],
+        },
+        {
+          title: 'FETCH every match',
+          note: '350,000 keys, 350,000 document fetches: 107 ms. Here still faster than the 142 ms COLLSCAN, partly because the collection is small and cached.',
+          active: ['ix', 'fetch'],
+          edges: ['ix-fetch'],
+        },
+      ],
+    },
+    {
+      title: 'amount = 12.34',
+      path: '✗ no index on amount → COLLSCAN',
+      summary: 'Every document examined.',
+      subs: { q: '{ amount: 12.34 }' },
+      steps: [
+        {
+          title: '✗ No index applies',
+          note: 'The only plan is a collection scan.',
+          code: 'db.orders.find({ amount: 12.34 })',
+          active: ['q', 'no', 'coll'],
+          edges: ['q-no', 'no-coll'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+A Bitmap Heap Scan cannot deliver rows in index order and cannot stop early. For `ORDER BY created_at LIMIT 20`, the planner needs an Index Scan on a matching index (Session 4); if it chooses a bitmap, it must collect and sort all matches first. When a "top N" query is slow, check whether the plan is an Index Scan feeding the Limit or a Bitmap followed by a Sort.
+</Pitfall>
+
+## Real-world scenario: two indexes vs one composite
+
+An orders search filters on `merchant_id` and `status`, with separate single-column indexes. PostgreSQL uses a BitmapAnd of both and the query runs fine; on MySQL the same query picks one index and filters, and is slower; MongoDB picks one index after a trial.
+
+| Engine | With two single-column indexes | With one composite `(merchant_id, status)` |
+|---|---|---|
+| PostgreSQL | BitmapAnd: reads both index ranges, then the intersection | One index range: only matching entries |
+| MySQL | One index + filter, or index_merge intersection | One index range |
+| MongoDB | One index + filter (intersection rarely chosen) | One index range |
+
+**Lesson:** bitmaps make PostgreSQL forgiving, but a composite index is the portable answer for conditions that always appear together (Session 4).
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 5: ignored indexes | Often the planner chose a Bitmap or Seq Scan on purpose |
+| Session 4: composite indexes | Beat BitmapAnd for combined conditions |
+| Session 4: ORDER BY + LIMIT | Needs an Index Scan, not a bitmap |
+| Session 5: covering indexes | Index-only scans skip the heap entirely |
+
+## Key takeaways
+
+1. Index Scan: heap pages in index order, rows sorted, can stop early; best for few or ordered rows.
+2. Bitmap Heap Scan: collect matching pages first, read them once in file order; best for many scattered rows; can AND/OR several indexes.
+3. Seq Scan: every page once; best when most pages hold matches.
+4. Bitmaps go lossy when they exceed `work_mem`: every row on lossy pages is rechecked.
+5. MySQL's MRR sorts primary keys before lookups (29 ms vs 41 ms in the lab) but is off unless judged cheaper; index_merge combines indexes.
+6. MongoDB has IXSCAN → FETCH and COLLSCAN; it uses an applicable index without costing a COLLSCAN.
+
+## Check questions
+
+1. For each of Index Scan, Bitmap Heap Scan and Seq Scan, describe the order in which heap pages are read.
+2. Why did PostgreSQL choose a Bitmap Heap Scan for `customer_id <= 1000` but an Index Scan for `created_at < '2025-02-01'`?
+3. What does `Heap Blocks: exact=791 lossy=9310` mean, and what would you change?
+4. How did `customer_id <= 5000 AND status = 'shipped'` use two indexes at once, and why can an Index Scan not do that?
+5. What does MySQL's MRR do, and why was it 28% faster here?
+6. Why can a Bitmap Heap Scan not serve `ORDER BY created_at LIMIT 20` efficiently?
+7. MongoDB used `status_1` for `status = 'delivered'` (35% of documents). Would PostgreSQL have used an index for the same query? What did it actually choose?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-3-query-planner/concept-4-scan-types/answers">Worked answers to Q1–Q7</DeepDive>

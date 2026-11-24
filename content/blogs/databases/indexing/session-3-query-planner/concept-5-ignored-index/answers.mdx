@@ -1,0 +1,91 @@
+---
+title: "Answers: Why the database ignores your index"
+description: "Worked answers to the Session 3 Concept 5 check questions."
+companion: "answers"
+tags: ["indexing", "query-planner", "troubleshooting", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-opclass.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/type-conversion.html"
+  - "https://www.mongodb.com/docs/manual/reference/operator/query/regex/#index-use"
+---
+
+<Tldr>
+First ask "can the index serve this condition as written?", then "is it cheaper?". Rewrite or index the expression for the first; leave the planner alone for the second.
+</Tldr>
+
+## Q1. Two reasons
+
+**Question:** name the two different reasons an index might not be used, and how you can tell which one applies.
+
+| Reason | Test |
+|---|---|
+| **Cannot serve** the condition (not sargable, wrong type, wrong operator class, OR with an unindexed branch) | Disable the alternative (`SET enable_seqscan = off` in a test session): the plan still does not use the index, or uses it only as a full index scan |
+| **Should not**: a scan is cheaper (low selectivity, small table) | With the scan disabled, the planner does use the index, and `EXPLAIN ANALYZE` shows the forced plan is slower or no faster |
+
+> **Common mistake:** jumping to `FORCE INDEX` / hints without knowing which reason applies.
+
+## Q2. created_at::date
+
+**Question:** why does `created_at::date = '2025-03-01'` scan the table, and how do you rewrite it?
+
+The index stores `created_at` timestamps in order. The condition compares a value **computed from** `created_at` (its date), which the index does not contain, so there is no range to seek. Rewrite in terms of the bare column:
+
+```sql
+WHERE created_at >= '2025-03-01' AND created_at < '2025-03-02'
+```
+
+Index Scan, ≈ 2,740 rows. If the query cannot change, `CREATE INDEX ON orders ((created_at::date))` indexes the expression itself (Session 5).
+
+> **Common mistake:** `BETWEEN '2025-03-01' AND '2025-03-01 23:59:59'`, which misses fractional seconds; use a half-open range.
+
+## Q3. id = 7.0
+
+**Question:** `WHERE id = 7.0` scans the whole table in PostgreSQL. Why, and what is the general lesson for application code?
+
+`7.0` is a `numeric` literal; `bigint = numeric` is evaluated by casting the column, `id::numeric = 7.0`, and `orders_pkey` indexes `id`, not `id::numeric`. The index cannot serve it. **Lesson:** bind parameters with the column's exact type. ORMs and drivers that send decimals, strings or a generic numeric type for integer columns can silently turn index lookups into full scans.
+
+> **Common mistake:** "PostgreSQL converts 7.0 to 7". It converts toward the wider type, which is the column side here.
+
+## Q4. MySQL sku = 123 vs customer_id = '7'
+
+**Question:** in MySQL, why does `sku = 123` scan the table while `customer_id = '7'` uses the index?
+
+MySQL compares a string with a number **as numbers**.
+
+| Condition | What gets converted | Index usable? |
+|---|---|---|
+| `sku = 123` (`VARCHAR` column, number literal) | Every row's `sku` value → number | ✗: the index is in string order, and many different strings convert to the same number |
+| `customer_id = '7'` (`INT` column, string literal) | The literal `'7'` → 7, once | ✓: compared with the column as it is |
+
+> **Common mistake:** concluding "quotes don't matter in MySQL". They matter whenever the column is a string.
+
+## Q5. LIKE prefix in PostgreSQL
+
+**Question:** why can't a plain PostgreSQL B-tree index on `sku` serve `LIKE 'SKU-00012%'` in the lab database, and what fixes it?
+
+The database uses the `en_US.utf8` collation, whose ordering follows linguistic rules rather than bytes. Under such collations, "every string starting with SKU-00012" is not guaranteed to form one contiguous range of the index, so the planner cannot turn the `LIKE` into a range. Fix: an index with the byte-wise operator class, `CREATE INDEX … ON orders (sku text_pattern_ops)` (measured: Index Scan), or a column/database with the `C` collation. Equality (`sku = 'SKU-000123'`) works with the plain index either way.
+
+> **Common mistake:** thinking `LIKE` can never use a B-tree. Prefix patterns can, given a suitable ordering; leading wildcards cannot.
+
+## Q6. customer_id: "7" in MongoDB
+
+**Question:** what did MongoDB do with `{ customer_id: "7" }`, and why is that worse than a slow query?
+
+It used the index (bounds `["7", "7"]`), examined **0 keys** and returned **0 documents**, because the stored values are numbers and a string never equals a number in BSON. It was fast and wrong. A slow query shows up in monitoring; an empty result looks like "this customer has no orders" and can propagate silently into reports or business logic.
+
+> **Common mistake:** expecting MongoDB to coerce `"7"` to `7` as MySQL does. It does not.
+
+## Q7. OR with an unindexed column
+
+**Question:** `customer_id = 7 OR amount = 12.34` scans the table in all three engines. Why, and what are two fixes?
+
+The result must include every row with `amount = 12.34`, and without an index on `amount` those rows can only be found by reading everything. Once a full scan is unavoidable, the `customer_id` index adds nothing.
+
+| Fix | Result |
+|---|---|
+| Index `amount` | BitmapOr (PostgreSQL), index_merge union (MySQL), OR of IXSCANs (MongoDB) |
+| Split into `… WHERE customer_id = 7 UNION … WHERE amount = 12.34` | Each part planned on its own (the second still needs an index to be fast) |
+| Question the requirement | Often the OR came from a generic filter UI; separate queries per filter are simpler to index |
+
+> **Common mistake:** indexing `(customer_id, amount)` as a composite. A composite index does not help an OR whose second branch has no leading-column condition (Session 4).

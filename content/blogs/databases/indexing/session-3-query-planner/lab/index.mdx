@@ -1,0 +1,244 @@
+---
+title: "Lab and session quiz: The query planner"
+description: "Watch three planners decide: compare estimated and actual rows, read the statistics behind them, recompute costs by hand, sweep selectivity across Index, Bitmap and Seq Scans, break and fix sargability, and inspect MongoDB's plan trials and cache."
+type: "how-to"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "query-planner", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/using-explain.html"
+  - "https://www.postgresql.org/docs/current/view-pg-stats.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/explain-output.html"
+  - "https://www.mongodb.com/docs/manual/reference/explain-results/"
+---
+
+<Tldr>
+Uses the containers and data from the [Session 1 lab](/blogs/databases/indexing/session-1-storage-basics/lab). Timings are from a laptop and will differ; estimates, costs and plan shapes should match closely, since they come from the same data and default settings. Small differences in estimates are normal: `ANALYZE` samples rows at random.
+</Tldr>
+
+## Setup: three secondary indexes in each engine
+
+```sql
+-- pg
+CREATE INDEX IF NOT EXISTS orders_customer_idx ON orders (customer_id);
+CREATE INDEX IF NOT EXISTS orders_created_idx  ON orders (created_at);
+CREATE INDEX IF NOT EXISTS orders_status_idx   ON orders (status);
+ANALYZE orders;
+```
+
+```sql
+-- my
+CREATE INDEX orders_customer_idx ON orders (customer_id);   -- skip if it exists from Session 2
+CREATE INDEX orders_created_idx  ON orders (created_at);
+CREATE INDEX orders_status_idx   ON orders (status);
+ANALYZE TABLE orders;
+```
+
+```js
+// mg
+db.orders.createIndex({ customer_id: 1 }); db.orders.createIndex({ created_at: 1 }); db.orders.createIndex({ status: 1 });
+```
+
+## Exercise 1: estimates vs reality (Concept 1)
+
+```sql
+-- pg: the first line of each plan shows rows= (estimate) and actual … rows=
+EXPLAIN ANALYZE SELECT * FROM orders WHERE status = 'shipped';
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 7;
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id BETWEEN 1 AND 1000;
+EXPLAIN ANALYZE SELECT * FROM orders WHERE status = 'shipped' AND channel = 'web';
+EXPLAIN ANALYZE SELECT * FROM orders WHERE id <= 100000 AND created_at < '2025-02-07';
+```
+
+| Condition | Estimated | Actual |
+|---|---|---|
+| `status = 'shipped'` | ≈ 51,000 | 50,000 |
+| `customer_id = 7` | ≈ 11 | 7 |
+| `customer_id BETWEEN 1 AND 1000` | ≈ 8,300 | 9,956 |
+| `status = 'shipped' AND channel = 'web'` | ≈ 17,000 | 16,666 |
+| `id <= 100000 AND created_at < '2025-02-07'` | ≈ 10,650 | **100,000** |
+
+## Exercise 2: the statistics behind them (Concept 2)
+
+```sql
+-- pg
+SELECT attname, n_distinct, most_common_vals, most_common_freqs, correlation
+FROM pg_stats WHERE tablename = 'orders' AND attname IN ('status', 'customer_id', 'created_at');
+SELECT (histogram_bounds::text::int[])[1:5] FROM pg_stats WHERE tablename = 'orders' AND attname = 'customer_id';
+```
+
+```text
+ status      | 5      | {delivered,paid,pending,shipped,cancelled} | {0.352,0.349,0.199,0.051,0.049} | 0.29
+ customer_id | ≈ 91k  |                                            |                                 | -0.01
+ created_at  | -1     |                                            |                                 | 1
+ histogram:  {4,1188,2198,3319,4373}
+```
+
+```sql
+-- my
+SELECT index_name, stat_name, stat_value, sample_size FROM mysql.innodb_index_stats
+WHERE table_name = 'orders' AND stat_name = 'n_diff_pfx01';
+-- orders_customer_idx ≈ 99,661 (sample 20) · orders_status_idx 4 (sample 6)
+
+EXPLAIN SELECT * FROM orders WHERE amount > 400;                     -- filtered = 33.33
+ANALYZE TABLE orders UPDATE HISTOGRAM ON amount WITH 100 BUCKETS;
+EXPLAIN SELECT * FROM orders WHERE amount > 400;                     -- filtered ≈ 20.01
+```
+
+Stale statistics on a copy, then a join:
+
+```sql
+-- pg
+CREATE TABLE orders_stale AS SELECT * FROM orders;
+ALTER TABLE orders_stale SET (autovacuum_enabled = off);
+CREATE INDEX ON orders_stale (status);
+ANALYZE orders_stale;
+INSERT INTO orders_stale
+SELECT id + 1000000, customer_id, 'refunded', channel, sku, amount, created_at FROM orders WHERE id <= 300000;
+
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN ANALYZE SELECT count(*) FROM orders_stale s JOIN orders o ON o.customer_id = s.customer_id
+WHERE s.status = 'refunded';
+-- Index Scan on orders_stale … rows=1 (actual rows=300000) → Nested Loop
+ANALYZE orders_stale;
+-- run the EXPLAIN again: rows ≈ 301,000 → Hash Join
+DROP TABLE orders_stale;
+```
+
+On the lab's warm cache the Nested Loop finished first (388 ms vs 515 ms). The lesson is the estimate (1 vs 300,000), not which plan won on this laptop.
+
+## Exercise 3: recompute costs by hand (Concept 3)
+
+```sql
+-- pg
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN SELECT * FROM orders WHERE customer_id <= 100000;         -- Seq Scan: cost=0.00..22602.00
+SET enable_bitmapscan = off;
+EXPLAIN SELECT * FROM orders WHERE customer_id = 7;               -- Index Scan: cost=0.42..48.62
+RESET enable_bitmapscan;
+```
+
+| Plan | By hand | EXPLAIN |
+|---|---|---|
+| Seq Scan | 10,102 × 1.0 + 1,000,000 × 0.01 + 1,000,000 × 0.0025 | 22,602 |
+| Index Scan, `customer_id = 7` | 0.42 + 1 × 4.0 + 11 × 0.0075 + 11 × 4.0 + 11 × 0.01 | 48.62 |
+
+Change one constant and watch a plan flip:
+
+```sql
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id <= 50000;   -- Seq Scan, ≈ 31 ms
+SET random_page_cost = 1.1;
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id <= 50000;   -- Index Scan, cost ≈ 20,537, ≈ 117 ms
+RESET random_page_cost;
+```
+
+```sql
+-- my
+EXPLAIN FORMAT=TREE SELECT * FROM orders IGNORE INDEX (orders_customer_idx) WHERE customer_id <= 1000;
+-- Table scan on orders (cost=100677 …) = 996,111 × 0.1 + 4,263 × 0.25
+EXPLAIN FORMAT=JSON SELECT * FROM orders WHERE customer_id <= 1000\G
+-- "query_cost": "8100.26", "read_cost": "6300.26", "eval_cost": "1800.00"
+```
+
+## Exercise 4: sweep selectivity across scan types (Concept 4)
+
+```sql
+-- pg
+EXPLAIN SELECT * FROM orders WHERE customer_id <= 1;       -- Bitmap Heap Scan
+EXPLAIN SELECT * FROM orders WHERE customer_id <= 1000;    -- Bitmap Heap Scan
+EXPLAIN SELECT * FROM orders WHERE customer_id <= 20000;   -- Bitmap Heap Scan
+EXPLAIN SELECT * FROM orders WHERE customer_id <= 50000;   -- Seq Scan
+EXPLAIN SELECT * FROM orders WHERE created_at < '2025-02-01';  -- Index Scan
+EXPLAIN SELECT * FROM orders WHERE created_at < '2025-07-01';  -- Index Scan (49%!)
+EXPLAIN SELECT * FROM orders WHERE created_at < '2025-10-01';  -- Seq Scan
+```
+
+Lossy bitmaps and BitmapAnd:
+
+```sql
+SET max_parallel_workers_per_gather = 0; SET enable_seqscan = off; SET enable_indexscan = off;
+SET work_mem = '64kB';
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id <= 20000;
+-- Rows Removed by Index Recheck: ≈ 736,000 · Heap Blocks: exact=791 lossy=9310
+RESET ALL;
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id <= 5000 AND status = 'shipped';
+-- BitmapAnd of two Bitmap Index Scans · Heap Blocks: exact=2304 · rows=2580 · ≈ 4 ms
+```
+
+MySQL's Multi-Range Read:
+
+```sql
+-- my
+EXPLAIN ANALYZE SELECT SUM(amount) FROM orders WHERE customer_id <= 5000;    -- ≈ 41 ms
+SET optimizer_switch = 'mrr=on,mrr_cost_based=off';
+EXPLAIN SELECT SUM(amount) FROM orders WHERE customer_id <= 5000;            -- Extra: Using MRR
+EXPLAIN ANALYZE SELECT SUM(amount) FROM orders WHERE customer_id <= 5000;    -- ≈ 29 ms
+SET optimizer_switch = 'default';
+```
+
+## Exercise 5: break and fix sargability (Concept 5)
+
+```sql
+-- pg
+EXPLAIN SELECT * FROM orders WHERE created_at::date = '2025-03-01';                              -- Seq Scan
+EXPLAIN SELECT * FROM orders WHERE created_at >= '2025-03-01' AND created_at < '2025-03-02';     -- Index Scan
+EXPLAIN SELECT * FROM orders WHERE id = 7.0;                                                     -- Seq Scan
+EXPLAIN SELECT * FROM orders WHERE id = 7;                                                       -- Index Scan
+EXPLAIN SELECT * FROM orders WHERE customer_id = 7 OR amount = 12.34;                            -- Seq Scan
+EXPLAIN SELECT * FROM orders WHERE customer_id = 7 OR status = 'refunded';                       -- BitmapOr
+
+CREATE INDEX orders_sku_idx ON orders (sku);
+EXPLAIN SELECT * FROM orders WHERE sku LIKE 'SKU-00012%';                -- Seq Scan (en_US.utf8)
+DROP INDEX orders_sku_idx;
+CREATE INDEX orders_sku_pattern_idx ON orders (sku text_pattern_ops);
+EXPLAIN SELECT * FROM orders WHERE sku LIKE 'SKU-00012%';                -- Index Scan
+DROP INDEX orders_sku_pattern_idx;
+```
+
+```sql
+-- my
+CREATE INDEX orders_sku_idx ON orders (sku);
+EXPLAIN SELECT * FROM orders WHERE sku = 'SKU-000123';   -- ref, rows 200
+EXPLAIN SELECT * FROM orders WHERE sku = 123;            -- ALL, rows 996111
+EXPLAIN SELECT * FROM orders WHERE customer_id = '7';    -- ref: the constant is converted, not the column
+EXPLAIN SELECT * FROM orders WHERE DATE(created_at) = '2025-03-01';   -- ALL
+EXPLAIN SELECT * FROM orders WHERE customer_id = 7 OR status = 'refunded';   -- index_merge, Using union(…)
+```
+
+```js
+// mg
+db.orders.createIndex({ sku: 1 });
+const k = q => db.orders.find(q).explain('executionStats').executionStats;
+[{ sku: /^SKU-00012/ }, { sku: /00123$/ }, { sku: /^sku-00012/i }, { customer_id: '7' }, { customer_id: 7 }]
+  .map(q => ({ q: String(Object.values(q)[0]), keys: k(q).totalKeysExamined, n: k(q).nReturned }));
+// /^SKU-00012/: 2001 keys · /00123$/: 1000000 keys · /^sku-00012/i: 1000000 keys · "7": 0 keys, 0 results · 7: 10 keys, 10 results
+```
+
+## Exercise 6: MongoDB's trial and plan cache (Concepts 1–3)
+
+```js
+// mg
+const e = db.orders.find({ status: 'shipped', customer_id: { $lte: 1000 } }).explain('allPlansExecution');
+e.executionStats.allPlansExecution.map(p => ({
+  index: p.executionStages.inputStage.indexName, works: p.executionStages.works,
+  advanced: p.executionStages.advanced, score: p.score }));
+// customer_id_1: works 2001, advanced 101, score ≈ 1.0507 · status_1: works 2001, advanced 24, score ≈ 1.0122
+
+db.orders.find({ status: 'shipped', customer_id: { $lte: 1000 } }).toArray();
+db.orders.aggregate([{ $planCacheStats: {} }]).toArray().map(c => ({ isActive: c.isActive, works: c.works }));
+// one entry for the shape, works 2001, isActive false until the shape runs again
+db.orders.getPlanCache().clear();
+```
+
+## Session quiz
+
+1. Using `pg_stats`, estimate the rows for `status = 'cancelled'` before running `EXPLAIN`.
+2. The estimate for `status = 'shipped' AND channel = 'web'` was accurate, but the one for `id <= 100000 AND created_at < '2025-02-07'` was 9.4× too low. What is different about the two pairs of columns?
+3. After inserting 300,000 rows without `ANALYZE`, why did the join choose a Nested Loop, and why did that not hurt on the lab?
+4. Recompute the Seq Scan cost if `orders` had 20,000 pages and 1M rows, with two `AND` conditions.
+5. Why did lowering `random_page_cost` to 1.1 make one query slower, even though the lab data was in memory?
+6. In Exercise 4, `created_at < '2025-07-01'` used an Index Scan while `customer_id <= 50000` used a Seq Scan, for about the same number of rows. Explain with the cost formula.
+7. In MySQL, `sku = 123` scanned the table and `customer_id = '7'` did not. Which side of the comparison gets converted in each case?
+8. MongoDB examined 1,000,000 keys for `{ sku: /00123$/ }` but returned 200 documents. Was the index useful at all? What would make this query fast?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-3-query-planner/lab/answers">Answers to the session quiz</DeepDive>
