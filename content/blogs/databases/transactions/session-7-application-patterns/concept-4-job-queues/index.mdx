@@ -1,0 +1,296 @@
+---
+title: "Concept 4: Job queues with SKIP LOCKED"
+description: "Using a table as a queue: 8 workers draining 2,000 jobs. Without a lock each job ran 3–5 times (PostgreSQL 8,588 duplicate runs); with FOR UPDATE every worker queued on the same row (≈ 8–12 s); with FOR UPDATE SKIP LOCKED each worker took the next free job (≈ 2 s). MySQL deadlocked thousands of times under REPEATABLE READ because of gap locks on the status index, and none under READ COMMITTED. MongoDB's findOneAndUpdate claims atomically."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "skip-locked", "job-queue", "gap-locks"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html#innodb-locking-reads-nowait-skip-locked"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locking.html#innodb-gap-locks"
+  - "https://www.mongodb.com/docs/manual/reference/method/db.collection.findOneAndUpdate/"
+---
+
+<Tldr>
+A `jobs` table with `status = 'queued'` is a fine queue, if workers claim jobs correctly. In the lab, 8 workers drained **2,000** jobs, each needing 2 ms of work. **No lock** (SELECT, then UPDATE): every job ran **3–5 times** (10,588 runs in PostgreSQL). **`FOR UPDATE`**: correct, but every worker waited for the same first row, so the work was serialised: **≈ 8–10 s** in PostgreSQL. **`FOR UPDATE SKIP LOCKED`**: each worker skipped rows locked by others and took the next one: **≈ 2 s**, every job exactly once. MySQL added a twist: under its default REPEATABLE READ the same SKIP LOCKED queue hit **2,594–3,017 deadlocks** (gap locks on the `(status, id)` index), and **0** under READ COMMITTED (≈ 1.6 s). MongoDB has no SKIP LOCKED and does not need it: `findOneAndUpdate` claims one queued job atomically (≈ 2.5 s, 0 duplicates). First of all, the claim needs an **index on the queued jobs**: without one every claim walked 90,000 finished jobs.
+</Tldr>
+
+## The claim query needs an index
+
+The queue table keeps 90,000 `done` jobs and 10,000 `queued` ones. "Oldest queued job" without an index on the status:
+
+| Engine | Without index | Index | With index |
+|---|---|---|---|
+| PostgreSQL | Index Scan on `jobs_pkey`, Rows Removed by Filter 90,000, 1,177 buffers, 7.6 ms | `CREATE INDEX jobs_queued_idx ON jobs (id) WHERE status = 'queued'` (partial) | 5 buffers, 0.06 ms |
+| MySQL | Index scan on PRIMARY, 90,001 rows, 9.4 ms | `ALTER TABLE jobs ADD INDEX jobs_status_id (status, id)` | Covering index lookup, 0.1 ms |
+| MongoDB | 90,001 keys and documents examined, 44 ms | `createIndex({ status: 1, _id: 1 })` | 1 key, 1 document |
+
+Every claim runs this query, so at 8 workers the unindexed version is the bottleneck before any locking question arises (Indexing Session 5 covers partial indexes).
+
+## The measurements
+
+8 workers, 2,000 jobs, 2 ms of work per job done while the claim is held. "Runs" counts how many times any worker processed a job.
+
+| Variant | PostgreSQL | MySQL (REPEATABLE READ) | MySQL (READ COMMITTED) | MongoDB |
+|---|---|---|---|---|
+| ✗ No lock: SELECT, then UPDATE | 10,588 runs (8,588 duplicates), ≈ 6.8 s | 8,975–9,445 runs, ≈ 10.5–13.5 s | | findOne + updateOne: 5,151 runs (3,151 duplicates), ≈ 3.9 s |
+| ✗ `FOR UPDATE` | 2,000 runs, ≈ 7.8–10.1 s | 2,000 runs, **14,875 deadlocks**, ≈ 12.2 s | 2,000 runs, 0 deadlocks, ≈ 11.7 s | |
+| ✓ `FOR UPDATE SKIP LOCKED` | 2,000 runs, ≈ 1.9–2.1 s | 2,000 runs, **2,594–3,017 deadlocks**, ≈ 3.9–6.9 s | 2,000 runs, **0 deadlocks, ≈ 1.6 s** | |
+| ✓ `findOneAndUpdate` claim | | | | 2,000 runs, ≈ 2.5 s |
+
+| Term | Meaning |
+|---|---|
+| Claim | Pick one queued job and make sure no other worker picks it |
+| `SKIP LOCKED` | A locking read that silently skips rows other transactions have locked, instead of waiting |
+| `NOWAIT` | A locking read that fails immediately if a row is locked |
+| Empty claim | SKIP LOCKED returned nothing although queued jobs remained (all were locked by others at that moment): 8–40 per run |
+| Lease | A claimed job records who took it and when, so a crashed worker's jobs can be re-queued later |
+| **✓ Once / ✗ Duplicate / ✗ Waiting** | The job ran once; ran more than once; or the worker sat in a lock queue |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: three workers claim jobs"
+  height={310}
+  nodes={[
+    { id: 'w1', label: 'Worker 1', sub: '', x: 20, y: 20, w: 200 },
+    { id: 'w2', label: 'Worker 2', sub: '', x: 20, y: 130, w: 200 },
+    { id: 'w3', label: 'Worker 3', sub: '', x: 20, y: 240, w: 200 },
+    { id: 'j1', label: 'job 90001', sub: 'queued', x: 330, y: 20, w: 200 },
+    { id: 'j2', label: 'job 90002', sub: 'queued', x: 330, y: 130, w: 200 },
+    { id: 'j3', label: 'job 90003', sub: 'queued', x: 330, y: 240, w: 200 },
+    { id: 'ok', label: '✓ Each job once', sub: '', x: 610, y: 60, w: 170 },
+    { id: 'bad', label: '✗ Duplicates', sub: '', x: 610, y: 200, w: 170 },
+  ]}
+  edges={[
+    { id: 'w1-j1', from: 'w1', to: 'j1' },
+    { id: 'w2-j1', from: 'w2', to: 'j1', quiet: true },
+    { id: 'w3-j1', from: 'w3', to: 'j1', quiet: true },
+    { id: 'w2-j2', from: 'w2', to: 'j2' },
+    { id: 'w3-j3', from: 'w3', to: 'j3' },
+    { id: 'j1-ok', from: 'j1', to: 'ok' },
+    { id: 'j3-bad', from: 'j3', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: '✗ No lock',
+      path: 'all three SELECT 90001 → all three UPDATE it → ✗ job 90001 runs three times',
+      summary: '2,000 jobs, 10,588 runs: each job ran ≈ 5 times.',
+      steps: [
+        {
+          title: '✗ Everybody sees the same oldest job',
+          note: 'A plain SELECT takes no lock: the three workers read 90001 at the same time, all run it, all mark it done. Nothing fails; the work is simply repeated (emails sent five times, cards charged five times).',
+          code: "SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1;\n-- work\nUPDATE jobs SET status = 'done' WHERE id = 90001;",
+          active: ['w1', 'w2', 'w3', 'j1', 'j3', 'bad'],
+          edges: ['w1-j1', 'w2-j1', 'w3-j1', 'j3-bad'],
+          subs: { j1: 'run by 1, 2 and 3', bad: '8,588 extra runs' },
+        },
+      ],
+    },
+    {
+      title: '✗ FOR UPDATE',
+      path: 'worker 1 locks 90001 → workers 2, 3 wait on it → 1 commits → 2 gets 90002, 3 waits again → serial',
+      summary: 'Correct but serial: ≈ 7.8–10.1 s, about one job at a time.',
+      steps: [
+        {
+          title: 'Worker 1 locks the oldest job',
+          code: "BEGIN;\nSELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1 FOR UPDATE;   -- 90001\n-- 2 ms of work\nUPDATE jobs SET status = 'done' WHERE id = 90001;\nCOMMIT;",
+          note: 'The row stays locked until COMMIT, for the whole job.',
+          active: ['w1', 'j1'],
+          edges: ['w1-j1'],
+          subs: { j1: 'locked by 1' },
+        },
+        {
+          title: '✗ Everybody else waits on the same row',
+          note: 'Workers 2 and 3 also pick 90001 (it is still queued) and block on its lock. When worker 1 commits, PostgreSQL re-checks the row (now done), skips it and returns the next one (90002) to one waiter. So no job runs twice, but the workers mostly take turns.',
+          active: ['w2', 'w3', 'j1'],
+          edges: ['w2-j1', 'w3-j1'],
+        },
+      ],
+    },
+    {
+      title: '✓ SKIP LOCKED',
+      path: 'worker 1 locks 90001 → worker 2 skips it, locks 90002 → worker 3 skips both, locks 90003 → ✓ parallel',
+      summary: '≈ 1.9–2.1 s, 2,000 runs, 8–17 empty claims near the end.',
+      steps: [
+        {
+          title: '✓ Each worker takes the next free job',
+          code: "SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1\nFOR UPDATE SKIP LOCKED;",
+          note: 'Rows locked by other transactions are skipped without waiting. Three workers, three different jobs, all locked until each commits.',
+          active: ['w1', 'w2', 'w3', 'j1', 'j2', 'j3'],
+          edges: ['w1-j1', 'w2-j2', 'w3-j3'],
+          subs: { j1: 'locked by 1', j2: 'locked by 2', j3: 'locked by 3' },
+        },
+        {
+          title: '✓ Every job exactly once',
+          note: 'If a worker crashes, its transaction rolls back and the job becomes visible again: the lock is the lease. An empty result does not prove the queue is empty (all remaining jobs may be locked): poll again later.',
+          active: ['j1', 'ok'],
+          edges: ['j1-ok'],
+          subs: { ok: '2,000 runs, ≈ 2 s' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: SKIP LOCKED plus gap locks
+
+MySQL 8.0+ supports `SKIP LOCKED` too, but under the default REPEATABLE READ the claim's index scan also takes **gap locks** on `jobs_status_id`. The `UPDATE … SET status = 'done'` moves the job's entry from the `queued` part of the index to the `done` part, which needs an **insert intention** lock in a gap another worker has locked.
+
+<Flow
+  title="MySQL: claiming jobs through the (status, id) index"
+  height={310}
+  nodes={[
+    { id: 'w1', label: 'Worker 1', sub: '', x: 20, y: 20, w: 200 },
+    { id: 'w2', label: 'Worker 2', sub: '', x: 20, y: 200, w: 200 },
+    { id: 'idx', label: 'jobs_status_id', sub: "('done', …) | ('queued', …)", x: 300, y: 110, w: 240 },
+    { id: 'ok', label: '✓ Parallel, once', sub: '', x: 610, y: 20, w: 170 },
+    { id: 'dl', label: '✗ Deadlock 1213', sub: '', x: 610, y: 200, w: 170 },
+  ]}
+  edges={[
+    { id: 'w1-idx', from: 'w1', to: 'idx' },
+    { id: 'w2-idx', from: 'w2', to: 'idx' },
+    { id: 'idx-ok', from: 'idx', to: 'ok' },
+    { id: 'idx-dl', from: 'idx', to: 'dl' },
+  ]}
+  cases={[
+    {
+      title: '✗ REPEATABLE READ',
+      path: 'both hold gap locks in the done range → both UPDATE status = done → insert intention waits on each other → ✗ 1213',
+      summary: 'SKIP LOCKED: 2,594–3,017 deadlocks for 2,000 jobs; FOR UPDATE: 14,875.',
+      steps: [
+        {
+          title: 'Claims lock records and gaps',
+          note: 'Each claim locks the queued entry it returns (and the PRIMARY record). Next-key locking also covers the gap before entries the scan touched.',
+          code: "START TRANSACTION;\nSELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED;",
+          active: ['w1', 'w2', 'idx'],
+          edges: ['w1-idx', 'w2-idx'],
+        },
+        {
+          title: '✗ Both UPDATEs need the other\'s gap',
+          note: 'SHOW ENGINE INNODB STATUS, latest deadlock: both transactions run UPDATE jobs SET status = \'done\' … WHERE id = 91989 / 91990, both HOLD "lock_mode X locks gap before rec" on jobs_status_id and both WAIT for "lock_mode X locks gap before rec insert intention" on the same record. InnoDB rolls one back.',
+          code: "*** (1) HOLDS THE LOCK(S): … index jobs_status_id … lock_mode X locks gap before rec\n*** (1) WAITING FOR THIS LOCK TO BE GRANTED: … lock_mode X locks gap before rec insert intention waiting\n*** WE ROLL BACK TRANSACTION (2)",
+          active: ['idx', 'dl'],
+          edges: ['idx-dl'],
+        },
+      ],
+    },
+    {
+      title: '✓ READ COMMITTED',
+      path: 'SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED → no gap locks → ✓ 0 deadlocks',
+      summary: 'SKIP LOCKED under READ COMMITTED: ≈ 1.6 s, 0 deadlocks, 2,000 runs.',
+      steps: [
+        {
+          title: '✓ Record locks only',
+          note: 'READ COMMITTED disables gap locking for searches and index scans (it is kept only for foreign-key and duplicate-key checks). The queue workers need nothing from REPEATABLE READ.',
+          code: 'SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;   -- queue worker connections only',
+          active: ['w1', 'w2', 'idx', 'ok'],
+          edges: ['w1-idx', 'w2-idx', 'idx-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: claim atomically
+
+MongoDB has no locking reads. It does not need them for a queue: `findOneAndUpdate` finds the first matching document **and** updates it as one atomic operation, so two workers can never get the same queued job.
+
+<Flow
+  title="MongoDB: claiming jobs"
+  height={300}
+  nodes={[
+    { id: 'w1', label: 'Worker 1', sub: '', x: 20, y: 20, w: 200 },
+    { id: 'w2', label: 'Worker 2', sub: '', x: 20, y: 200, w: 200 },
+    { id: 'doc', label: 'jobs', sub: '{ status: 1, _id: 1 } index', x: 300, y: 110, w: 240 },
+    { id: 'ok', label: '✓ Each job once', sub: '', x: 610, y: 20, w: 170 },
+    { id: 'bad', label: '✗ Duplicates', sub: '', x: 610, y: 200, w: 170 },
+  ]}
+  edges={[
+    { id: 'w1-doc', from: 'w1', to: 'doc' },
+    { id: 'w2-doc', from: 'w2', to: 'doc' },
+    { id: 'doc-ok', from: 'doc', to: 'ok' },
+    { id: 'doc-bad', from: 'doc', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: '✗ findOne, then updateOne',
+      path: 'both findOne the oldest queued job → both updateOne it to running → ✗ both run it',
+      summary: '5,151 runs for 2,000 jobs.',
+      steps: [
+        {
+          title: '✗ Two operations, a gap between them',
+          code: "const d = await jobs.findOne({ status: 'queued' }, { sort: { _id: 1 } });\nawait jobs.updateOne({ _id: d._id }, { $set: { status: 'running' } });",
+          note: 'The update does not re-check the status, so both workers "claim" the same job.',
+          active: ['w1', 'w2', 'doc', 'bad'],
+          edges: ['w1-doc', 'w2-doc', 'doc-bad'],
+        },
+      ],
+    },
+    {
+      title: '✓ findOneAndUpdate',
+      path: 'filter status: queued + $set running in one operation → second worker gets the next job → ✓',
+      summary: '2,000 runs in ≈ 2.5 s, no transaction needed.',
+      steps: [
+        {
+          title: '✓ One atomic claim',
+          code: "const job = await jobs.findOneAndUpdate(\n  { status: 'queued' },\n  { $set: { status: 'running', locked_by: workerId, locked_at: new Date() } },\n  { sort: { _id: 1 } });",
+          note: 'If two workers race for the same document, one update wins and the other re-runs its query (an internal write-conflict retry) and gets the next queued job. The job is claimed by a field, not a lock, so the work happens outside any transaction; record locked_at to re-queue jobs of crashed workers.',
+          active: ['w1', 'w2', 'doc', 'ok'],
+          edges: ['w1-doc', 'w2-doc', 'doc-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Two ways to hold a claim
+
+| Style | How | Crash of a worker | Fits |
+|---|---|---|---|
+| Lock while working | `BEGIN; … FOR UPDATE SKIP LOCKED; work; UPDATE … 'done'; COMMIT` (measured above) | Rollback releases the job automatically | Short jobs (milliseconds to seconds) |
+| Claim, commit, work | `UPDATE … SET status = 'running', locked_at = now() … RETURNING id` in a short transaction; work; mark done | Job stays `running`: a sweeper re-queues jobs with an old `locked_at` | Long jobs (do not hold a transaction for minutes, Session 8) |
+
+<Pitfall>
+"Queue empty" is a dangerous conclusion with SKIP LOCKED: the query returns no row when every remaining job is locked by another worker. The lab saw 8–40 such empty claims per run while jobs remained. Workers should sleep and poll again, not exit, and monitoring should count queued rows, not empty claims.
+</Pitfall>
+
+## Real-world scenario: the email queue that sent everything twice
+
+A notifications service runs 4 workers on `SELECT … WHERE status = 'pending' LIMIT 50`, sends the emails, then marks them sent. Customers receive duplicates during busy periods, and the duplicates increase when workers are added.
+
+| Fix | Effect |
+|---|---|
+| `… LIMIT 50 FOR UPDATE SKIP LOCKED` inside a transaction | Each batch claimed by one worker |
+| Partial index `WHERE status = 'pending'` | The claim reads a few pages, not the sent history |
+| MySQL workers at READ COMMITTED | No gap-lock deadlocks between batches |
+| Claim-commit-work with `locked_at` for slow SMTP | No long transactions; crashed batches re-queued |
+| Idempotency key per email (Concept 5) | A rare double run sends nothing twice |
+
+## Why this matters for application patterns
+
+| Later concept | Why this concept matters |
+|---|---|
+| Concept 5: idempotency keys | At-least-once delivery from any queue still needs idempotent handlers |
+| Session 8: when transactions hurt | Holding a transaction for long jobs blocks cleanup; claim-commit-work avoids it |
+| Session 5: locks and indexes | The MySQL deadlocks were gap locks on a secondary index |
+
+## Key takeaways
+
+1. Claiming with a plain SELECT runs jobs many times: 8,588 duplicate runs for 2,000 jobs in PostgreSQL.
+2. `FOR UPDATE` is correct but serialises the workers; `FOR UPDATE SKIP LOCKED` runs them in parallel: ≈ 2 s vs ≈ 8–10 s.
+3. Index the queued jobs (partial index in PostgreSQL): otherwise every claim scans the finished history.
+4. MySQL queue workers should use READ COMMITTED: under REPEATABLE READ, gap locks caused thousands of deadlocks.
+5. MongoDB claims with one atomic `findOneAndUpdate`; record who claimed and when, to recover from crashes.
+
+## Check questions
+
+1. Why did the no-lock variant run each job ≈ 5 times in PostgreSQL?
+2. With plain `FOR UPDATE`, why does no job run twice, and why is it almost as slow as one worker?
+3. What does `SKIP LOCKED` do differently, and why can it return no row while queued jobs remain?
+4. Explain the MySQL deadlock in the report: which index, which locks, and why READ COMMITTED removes it.
+5. Which index would you create for the claim query in each engine, and what did it change?
+6. A job takes 3 minutes. Why should it not hold its row lock for the whole time, and what do you do instead?
+7. Why does MongoDB not need SKIP LOCKED for the same queue?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-7-application-patterns/concept-4-job-queues/answers">Worked answers to Q1–Q7</DeepDive>

@@ -1,0 +1,79 @@
+---
+title: "Answers: Idempotency keys and advisory locks"
+description: "Worked answers to the Session 7 Concept 5 check questions."
+companion: "answers"
+tags: ["transactions", "idempotency", "advisory-locks", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT"
+  - "https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/locking-functions.html"
+---
+
+<Tldr>
+Let a unique constraint decide "first or duplicate", inside the transaction that does the work. Use advisory locks only for mutual exclusion that has no natural row.
+</Tldr>
+
+## Q1. 696 vs 800
+
+**Question:** why did check-then-insert produce 696 charges in PostgreSQL but 800 in MySQL?
+
+PostgreSQL READ COMMITTED takes a new snapshot for **each statement**, so a copy whose `SELECT` ran after another copy had committed saw the key and skipped: 104 of the 600 duplicates were caught by timing. MySQL REPEATABLE READ answers every plain SELECT in a transaction from the read view created by its **first** read; copies that started before the first one committed never saw its row, and since all four copies started at nearly the same moment, every one of them charged: 800.
+
+> **Common mistake:** concluding PostgreSQL is "mostly fine". 696 charges for 200 requests is not fine; the difference is luck in timing.
+
+## Q2. Same transaction
+
+**Question:** why must the idempotency key and the debit be in the same transaction? Describe what goes wrong in each of the two wrong orders.
+
+- **Key committed first, then the debit:** if the debit fails (crash, deadlock, constraint), the key is already recorded. The client's retry sees the key, answers "done", and the payment never happens.
+- **Debit committed first, then the key:** if the process dies between the two, the retry finds no key and charges again.
+
+In one transaction both commit or neither does, so "key present" means exactly "effect applied".
+
+> **Common mistake:** storing idempotency keys in Redis or another store than the data they protect, which recreates the two-system problem (Session 8, outbox).
+
+## Q3. The second copy waits
+
+**Question:** what happens to the second copy's `INSERT … ON CONFLICT DO NOTHING` while the first copy is still uncommitted?
+
+It **waits**. The unique index already contains the first copy's entry, but that transaction might still roll back, so PostgreSQL cannot decide between "conflict" and "insert". The second insert blocks on the first transaction; when it commits, the second resolves to DO NOTHING (0 rows returned); if it had rolled back, the second would insert. MySQL behaves the same way for `INSERT IGNORE` (it waits on the lock held on the duplicate index record), and MongoDB reports a write conflict that withTransaction retries until the first commits.
+
+> **Common mistake:** expecting `ON CONFLICT` to never block. It never errors, but it does wait for in-progress conflicting inserts.
+
+## Q4. MongoDB's lucky result
+
+**Question:** why was MongoDB's check-then-insert correct when it included the debit, and why is that not a design you can rely on?
+
+Every copy also updated the same `accounts` document. Transactions that write the same document conflict: only one commits, the others abort with WriteConflict and are retried by `withTransaction`; on retry their snapshot includes the committed payment, so `findOne` finds the key and they skip. The protection came from the shared account document, not from the key. Requests that touch different documents (different accounts, an order insert only) do not conflict: the payments-only variant produced 457 documents for 200 keys.
+
+> **Common mistake:** testing idempotency only with one hot test account.
+
+## Q5. INSERT IGNORE
+
+**Question:** what is the drawback of `INSERT IGNORE`, and what would you use instead?
+
+`IGNORE` downgrades many errors, not just duplicate keys, to warnings: out-of-range values get clamped, invalid values replaced, NOT NULL violations filled with defaults (in strict mode as well). A bug in the payload would be silently "ignored" as if it were a duplicate. Prefer a plain `INSERT` and catch error **1062** (ER_DUP_ENTRY), or `INSERT … ON DUPLICATE KEY UPDATE id = id` and check `affectedRows` (1 = inserted, 0 = existed).
+
+> **Common mistake:** checking only `affectedRows` after `INSERT IGNORE` and treating every 0 as "duplicate".
+
+## Q6. max + 1
+
+**Question:** why do 8 workers computing `max(number) + 1` produce duplicate numbers, and what are three ways to fix it?
+
+Each worker reads the same maximum before any of them commits its new invoice, so several insert the same number (54 distinct numbers for 400 invoices in PostgreSQL). It is a read-then-write on a value that lives in no single row, so there is nothing for `FOR UPDATE` to lock. Fixes:
+1. A **sequence** / AUTO_INCREMENT or a **counter row** updated atomically (`UPDATE counters SET n = n + 1 … RETURNING n`; MongoDB `findOneAndUpdate` + `$inc`): 400 distinct.
+2. An **advisory lock** around the critical section (`pg_advisory_xact_lock(42)`, `GET_LOCK('invoice', 10)`): 400 distinct, slower (0.47 s vs 0.12 s in PostgreSQL).
+3. A **unique constraint** on `number` plus a retry on duplicate key, which at least turns silent duplicates into errors.
+
+If numbers must be gap-free (some invoicing laws), use the counter row inside the invoice transaction: sequences leave gaps on rollback.
+
+> **Common mistake:** `SELECT max(number) … FOR UPDATE`: PostgreSQL rejects `FOR UPDATE` with aggregates, and in MySQL it locks existing rows, not the next number.
+
+## Q7. Advisory locks behind PgBouncer
+
+**Question:** why is `pg_advisory_lock` dangerous behind PgBouncer in transaction mode, and what do you use instead?
+
+A session-level advisory lock belongs to the **server connection**, and it survives COMMIT (measured: after A's commit, B still could not get lock 42). In transaction mode PgBouncer gives that server connection to other clients after each transaction. The lock is now "held" by whichever client gets the connection next, and the original client may later run its unlock on a different connection, where it fails. Use `pg_advisory_xact_lock`, which is released at the end of the transaction (measured: B got lock 43 right after A's commit) and therefore never outlives the pooled unit of work.
+
+> **Common mistake:** using `pg_try_advisory_lock` for "only one cron instance runs" through a transaction-mode pool and finding two instances running.

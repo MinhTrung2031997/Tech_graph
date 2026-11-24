@@ -1,0 +1,13 @@
+{
+  "title": "Session 7: Application patterns",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-atomic-updates/index",
+    "concept-2-optimistic-vs-pessimistic/index",
+    "concept-3-retry-loops/index",
+    "concept-4-job-queues/index",
+    "concept-5-idempotency-advisory-locks/index",
+    "lab/index"
+  ]
+}

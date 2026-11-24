@@ -1,0 +1,78 @@
+---
+title: "Answers: Optimistic vs pessimistic locking"
+description: "Worked answers to the Session 7 Concept 2 check questions."
+companion: "answers"
+tags: ["transactions", "optimistic-locking", "pessimistic-locking", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-consistent-read.html"
+---
+
+<Tldr>
+Pessimistic locking pays in waiting, optimistic locking pays in retries. Contention decides which bill is smaller.
+</Tldr>
+
+## Q1. What FOR UPDATE adds
+
+**Question:** what does `SELECT … FOR UPDATE` add compared with a plain SELECT followed by UPDATE?
+
+It takes the **row lock at read time** instead of at write time. Between your read and your write no other transaction can modify (or `FOR UPDATE`-read) the row, so the value your decision is based on stays true until you commit. With a plain SELECT the lock is only taken by the UPDATE, after the decision, which is exactly the gap that loses updates. In MySQL it also changes **what** you read: a locking read returns the latest committed version, not the REPEATABLE READ snapshot.
+
+> **Common mistake:** using `FOR UPDATE` outside an explicit transaction. In autocommit mode the lock is released as soon as the SELECT finishes.
+
+## Q2. Thousands of retries vs a handful
+
+**Question:** why did optimistic locking need thousands of retries on one row but only 0–5 across 1,000 rows?
+
+A retry happens only when another worker changed the **same** row between your read and your write. On one row, all 8 workers compete for every write: while one succeeds, the other 7 usually fail and re-read, so each success cost ≈ 3.5–6.5 attempts (2,790–3,875 retries for 800 withdrawals in PostgreSQL). With 1,000 rows, two workers pick the same account at the same moment rarely (8 workers, 1/1,000 chance each), so almost every first attempt succeeds.
+
+> **Common mistake:** benchmarking optimistic locking with random keys over a large table, then deploying it on a hot counter.
+
+## Q3. Optimistic withdrawal in MySQL
+
+**Question:** write the optimistic withdrawal for MySQL and say how the application detects a conflict.
+
+```sql
+-- 1. read (autocommit, or a new transaction per attempt)
+SELECT balance, version FROM accounts WHERE id = 1;          -- e.g. 1000.00, 7
+-- 2. decide in the application, then write only if the version is unchanged
+UPDATE accounts SET balance = 999.00, version = version + 1
+WHERE id = 1 AND version = 7;
+```
+
+`affectedRows` (ROW_COUNT()) = 1 means it applied; 0 means the version changed (or the row is gone): re-read and retry, with a cap on attempts.
+
+> **Common mistake:** checking `changedRows`/`matched` inconsistently across drivers; use the affected-row count your driver documents for UPDATE.
+
+## Q4. The retry that never succeeds
+
+**Question:** why can an optimistic retry loop never succeed if it re-reads with a plain SELECT inside the same InnoDB REPEATABLE READ transaction?
+
+The plain SELECT reads from the transaction's **read view**, created at its first read. Measured: first read version 1, another session committed version 2, the UPDATE `… AND version = 1` affected **0** rows (UPDATE reads the latest version), the plain re-read still returned **1**, and only `SELECT … FOR UPDATE` returned **2**. The loop keeps sending `version = 1` forever. Start a new transaction for each attempt (or re-read with a locking read). PostgreSQL REPEATABLE READ fails differently: the UPDATE raises `40001 could not serialize access due to concurrent update`, so the attempt must be a new transaction anyway.
+
+> **Common mistake:** a `while (true)` retry inside one `Repo.transaction`/`@Transactional` method.
+
+## Q5. MongoDB's "write first" emulation
+
+**Question:** why is "write the document first inside a transaction" not a true pessimistic lock in MongoDB?
+
+A pessimistic lock makes the second writer **wait** for the first. In MongoDB a transactional write to a document already modified by another open transaction fails almost immediately with `WriteConflict` (labelled `TransientTransactionError`, ≈ 4 ms in the lab), and `withTransaction` re-runs the whole callback. The outcome is correct, but the behaviour is optimistic: work is redone, 325–396 times on one hot document in the lab. Non-transactional writes to that document do wait for the transaction to finish.
+
+> **Common mistake:** porting `SELECT … FOR UPDATE` code to MongoDB transactions and expecting queueing instead of retries.
+
+## Q6. The order form
+
+**Question:** two agents edit the same order in a form for several minutes. Which approach do you use and how does the second agent find out?
+
+Optimistic, with the version carried by the form (or an HTTP ETag). The save runs `UPDATE … WHERE id = ? AND version = ?`; for the second agent it affects 0 rows, and the application shows "changed by someone else" with the current data. A pessimistic lock would hold a row lock (and an open transaction, Session 8) for the whole think time.
+
+> **Common mistake:** "last write wins" by default, because the form posts all fields and the UPDATE sets them all.
+
+## Q7. Pessimistic despite low contention
+
+**Question:** when would you prefer pessimistic locking even with low contention?
+
+When the work between read and write is **expensive or not repeatable**: calling a payment provider, sending an email, consuming a one-time code. A retry would repeat it; a lock guarantees the first attempt is the only one. Also when correctness needs several rows to stay stable together and you prefer waiting to aborting. Keep the locked section short, and prefer moving the external call out of the transaction (Concept 5, outbox in Session 8).
+
+> **Common mistake:** holding the row lock while waiting on a slow external API, which turns one slow call into a queue of blocked requests.

@@ -1,0 +1,112 @@
+---
+title: "Answers: Application patterns session quiz"
+description: "Worked answers to the Session 7 quiz."
+companion: "answers"
+tags: ["transactions", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pgbench.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-parameters.html#sysvar_innodb_rollback_on_timeout"
+---
+
+<Tldr>
+Prefer one atomic statement; when you need a decision, protect it with a lock or a version and retry; make every externally triggered handler idempotent.
+</Tldr>
+
+## Q1. Exactly 350 lost
+
+**Question:** in Exercise 1, MySQL lost exactly 350 of 400 withdrawals in both runs. What does that say about how the workers interleaved?
+
+The final balance 950.00 means only **50** withdrawals took effect, one per "round". The 8 workers moved in lockstep: in each round all 8 read the same balance, all 8 wrote the same value minus 1, and the row lock on the UPDATE only made them take turns writing the identical value. With autocommit statements of similar cost, the workers stayed synchronised for all 50 iterations. PostgreSQL (347–349) and MongoDB (314–326) drifted out of step slightly more often.
+
+> **Common mistake:** expecting lost updates to be rare edge cases; with a hot row they are the norm.
+
+## Q2. Stock decrement as one statement
+
+**Question:** rewrite "load product, `if stock >= qty then stock -= qty`, save" as a safe single statement.
+
+```sql
+-- PostgreSQL
+UPDATE inventory SET stock = stock - $2 WHERE sku = $1 AND stock >= $2 RETURNING stock;
+-- MySQL (check affectedRows)
+UPDATE inventory SET stock = stock - ? WHERE sku = ? AND stock >= ?;
+```
+
+```js
+// MongoDB (null = not enough stock)
+db.inventory.findOneAndUpdate({ _id: sku, stock: { $gte: qty } }, { $inc: { stock: -qty } }, { returnDocument: 'after' });
+```
+
+One row / a document back = sold; nothing = not enough stock.
+
+> **Common mistake:** keeping the `if` in the application and only changing `stock -= qty` to `stock = stock - qty`; the check is still stale.
+
+## Q3. Avoiding a hot row
+
+**Question:** give two designs that avoid both the retries and a single hot row.
+
+- **Atomic statement** instead of optimistic read-then-write: the engine queues the writers on the row lock, no retries (but the row is still a throughput limit).
+- **Split the counter** into N bucket rows (`stock_bucket(sku, bucket, qty)`): each request updates a random bucket with stock left; reads sum the buckets.
+- **Append instead of update:** insert a movement row per withdrawal (a ledger) and compute or periodically roll up the balance; inserts of different rows do not conflict.
+- **Batch:** accumulate increments in a queue and apply them in one statement per second.
+
+> **Common mistake:** adding more retries with longer backoff; it lowers the error rate but not the wasted work.
+
+## Q4. 385 failures and a correct sum
+
+**Question:** in Exercise 3, why did 385 of 800 transactions fail without `--max-tries`, and why was the sum still 20,000.00?
+
+Under SERIALIZABLE, transfers among 20 accounts constantly read and write the same rows, and SSI aborts transactions whose dependencies could make the result non-serial (`40001`), plus a few deadlocks (`40P01`, the two UPDATEs in random order). Without retries pgbench just counts them as failed. The sum is unchanged because a failed transaction is rolled back entirely: each transfer either moved 1.00 or did nothing. The failures cost work, not correctness; with `--max-tries=50` all 800 transfers committed (868 retries).
+
+> **Common mistake:** reading a 48% failure rate as data corruption.
+
+## Q5. 1205 and accounting differences
+
+**Question:** occasional `1205` errors and accounting differences. What is the likely link, and what are two fixes?
+
+A lock wait timeout rolls back **only the statement that timed out** (`innodb_rollback_on_timeout = OFF`). If the code (or the framework, or the pool) then commits, the statements before it persist: half a transfer, as in the lab (12 at 995.00, 11 unchanged). Fixes: always `ROLLBACK` in the error handler before retrying or reporting; enable `innodb_rollback_on_timeout = ON` (startup option) so 1205 rolls back the whole transaction; and look for the long transaction that caused the wait (Session 8).
+
+> **Common mistake:** raising `innodb_lock_wait_timeout` so the error appears less often.
+
+## Q6. Why FOR UPDATE was ≈ 6× slower
+
+**Question:** why was the `FOR UPDATE` queue ≈ 6× slower than `SKIP LOCKED` in pgbench?
+
+With `FOR UPDATE` all 8 clients target the same oldest queued row; 7 of them wait for the holder to finish its 2 ms of work and commit, then one of them gets the next row and the rest wait again. The work is effectively serial: 273 tps, ≈ 29 ms latency. With `SKIP LOCKED` each client takes a different row at once: 1,676 tps, ≈ 4.8 ms. Both are correct; only SKIP LOCKED is parallel.
+
+> **Common mistake:** benchmarking a queue with one worker, where both look identical.
+
+## Q7. Webhook processed once
+
+**Question:** design the table and the handler so that the order is marked paid exactly once.
+
+```sql
+CREATE TABLE provider_events (
+  event_id    text PRIMARY KEY,           -- the provider's unique event id
+  order_id    bigint NOT NULL,
+  received_at timestamptz NOT NULL DEFAULT now()
+);
+-- handler, one transaction:
+BEGIN;
+INSERT INTO provider_events (event_id, order_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING event_id;
+-- 0 rows: already processed → COMMIT and return 200
+UPDATE orders SET status = 'paid', paid_at = now() WHERE id = $2 AND status = 'pending';
+COMMIT;
+```
+
+The event id is the idempotency key; the guarded UPDATE (`status = 'pending'`) also makes a second, different event for the same order harmless. Return 200 for duplicates so the provider stops retrying.
+
+> **Common mistake:** keying on the order id alone, which drops legitimate later events (refunds) for the same order.
+
+## Q8. Pick the pattern
+
+**Question:** which pattern would you use for each case?
+
+| Case | Pattern |
+|---|---|
+| (a) Like counter | Atomic `UPDATE … SET likes = likes + 1` / `$inc`; for very hot posts, bucketed counters or an append-only likes table |
+| (b) Admin edits a product for 10 minutes | Optimistic locking with a version (or ETag); never a lock across think time |
+| (c) One nightly billing run across 4 servers | `pg_try_advisory_lock` / `GET_LOCK('billing', 0)` (on a dedicated, non-pooled connection), or a lease row with a unique key and expiry; plus idempotent billing per customer |
+| (d) Order-confirmation emails from a table | Queue with `FOR UPDATE SKIP LOCKED` (claim-commit-work with `locked_at` for slow SMTP), plus an idempotency key per email |
+
+> **Common mistake:** using one pattern everywhere; each has a cost profile that suits different contention and duration.

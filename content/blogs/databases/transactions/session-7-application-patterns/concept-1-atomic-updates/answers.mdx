@@ -1,0 +1,80 @@
+---
+title: "Answers: Read-then-write vs one atomic statement"
+description: "Worked answers to the Session 7 Concept 1 check questions."
+companion: "answers"
+tags: ["transactions", "lost-update", "atomic-update", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html"
+---
+
+<Tldr>
+Keep the read, the decision and the write in one statement whenever you can. When you cannot, the database must be told (a lock or a version check), because a value computed in the application is just a constant to it.
+</Tldr>
+
+## Q1. Lost without an error
+
+**Question:** why did read-then-write lose updates in all three engines without any error?
+
+Each statement was correct on its own. `SELECT` returned the committed balance; `UPDATE … SET balance = 999.00` wrote a constant. The database cannot know the constant was derived from a value that changed in between, so there is nothing to detect. Under READ COMMITTED (PostgreSQL default), MySQL's REPEATABLE READ and MongoDB single-document writes, no rule forbids two transactions from writing the same row one after the other. 8 workers produced 347–350 lost withdrawals out of 400.
+
+> **Common mistake:** expecting a constraint or the isolation level "default" to catch it. 947.00 is a valid balance, and the default levels allow this interleaving.
+
+## Q2. The second atomic UPDATE in PostgreSQL
+
+**Question:** in PostgreSQL READ COMMITTED, what happens to the second `UPDATE … SET balance = balance - 1` while the first is uncommitted, and after it commits?
+
+While T1 is uncommitted, T2 finds the row locked and **waits**. When T1 commits, T2 does not fail and does not use the old value: it takes the **new row version**, re-evaluates its `WHERE` clause on it (EvalPlanQual: still `id = 1 AND balance >= 1`), and computes `balance - 1` from 999.00. Result 998.00. If T1 had rolled back, T2 would proceed on the original version.
+
+> **Common mistake:** "T2 gets a serialization error". That happens only in REPEATABLE READ or SERIALIZABLE.
+
+## Q3. InnoDB REPEATABLE READ: snapshot read, then UPDATE
+
+**Question:** under InnoDB REPEATABLE READ, a transaction reads balance 1000.00 with a plain SELECT, then runs `UPDATE … SET balance = balance - 1`. Which version does the UPDATE use, and why?
+
+The **latest committed version**, not the snapshot. A plain SELECT is a consistent (non-locking) read from the transaction's read view; UPDATE, DELETE and `SELECT … FOR UPDATE` are locking reads that must lock the current record, so they read it. If another transaction committed 990.00 meanwhile, the UPDATE writes 989.00, while the earlier SELECT in the same transaction said 1000.00. With `balance - 1` that is what you want; with a value computed from the snapshot (`SET balance = 999.00`) it is a lost update. In the lab, read-then-write inside `START TRANSACTION … COMMIT` under REPEATABLE READ still ended at 950.00: InnoDB's RR does **not** detect lost updates.
+
+> **Common mistake:** assuming MySQL's REPEATABLE READ protects read-modify-write. PostgreSQL's does (Q5); InnoDB's does not.
+
+## Q4. Sell one unit, one statement
+
+**Question:** rewrite "sell one unit if in stock" as a single statement for each engine and say how the application knows whether it sold.
+
+| Engine | Statement | Sold if |
+|---|---|---|
+| PostgreSQL | `UPDATE inventory SET stock = stock - 1 WHERE sku = $1 AND stock > 0` (optionally `RETURNING stock`) | Row count 1 (or a row returned) |
+| MySQL | `UPDATE inventory SET stock = stock - 1 WHERE sku = ? AND stock > 0` | `affectedRows` = 1 |
+| MongoDB | `inventory.updateOne({ _id: sku, stock: { $gt: 0 } }, { $inc: { stock: -1 } })` (or `findOneAndUpdate` to get the new stock) | `modifiedCount` = 1 |
+
+0 means "sold out"; there is no separate read to go stale.
+
+> **Common mistake:** reading `stock` again after the update to decide; use the row count of the update itself.
+
+## Q5. Does BEGIN … COMMIT help?
+
+**Question:** does wrapping the read-then-write in `BEGIN … COMMIT` fix the lost update in PostgreSQL's default isolation level? Why?
+
+**No.** Measured: inside transactions under READ COMMITTED the balance still ended at **949.00** (351 lost). The SELECT takes no lock and sees the latest committed value; the UPDATE writes a constant. Under **REPEATABLE READ** PostgreSQL does detect it: the second writer fails with `40001 could not serialize access due to concurrent update`. In the lab 348 of 400 attempts failed that way and 52 committed, final 948.00: no withdrawal was silently lost, but the application must **retry** the failed ones (Concept 3).
+
+> **Common mistake:** "it's in a transaction, so it's atomic". Atomic means all-or-nothing, not isolated from other writers.
+
+## Q6. What the CHECK constraint does
+
+**Question:** what does `CHECK (balance >= 0)` protect against, and what does it not protect against?
+
+It rejects any write that would make the balance negative, from any code path: a buggy computation, a missing guard, a manual fix. It cannot detect a lost update, a double charge or a wrong amount, as long as the result is non-negative. It is a last line of defence for one invariant, not a concurrency control.
+
+> **Common mistake:** relying on the constraint instead of the guard: the guarded UPDATE gives a clean "0 rows", the constraint gives an exception after work was done.
+
+## Q7. Fixing the Ecto service
+
+**Question:** an Ecto service does `Repo.get`, changes `balance`, `Repo.update`. Name two ways to make it safe.
+
+Any two of:
+- **Atomic update:** `from(a in Account, where: a.id == ^id and a.balance >= ^amt) |> Repo.update_all(inc: [balance: -amt])`, and check the returned count.
+- **Optimistic locking:** add a `version` field and `Ecto.Changeset.optimistic_lock(:version)`; a stale update raises `Ecto.StaleEntryError`, and you retry (Concept 2).
+- **Pessimistic locking:** inside `Repo.transaction`, load with `lock: "FOR UPDATE"`, then update (Concept 2).
+- **Stronger isolation + retry:** run the transaction at REPEATABLE READ or SERIALIZABLE in PostgreSQL and retry on 40001 (Concept 3).
+
+> **Common mistake:** adding `Repo.transaction` around the original code and calling it fixed.

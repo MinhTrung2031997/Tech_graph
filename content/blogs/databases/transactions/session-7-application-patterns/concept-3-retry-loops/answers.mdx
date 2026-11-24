@@ -1,0 +1,92 @@
+---
+title: "Answers: Retry loops"
+description: "Worked answers to the Session 7 Concept 3 check questions."
+companion: "answers"
+tags: ["transactions", "retries", "deadlock", "serializable", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/mvcc-serialization-failure-handling.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-error-handling.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-in-applications/"
+---
+
+<Tldr>
+Know exactly what the database undid before you retry: the whole transaction (40001, 40P01, 1213, transient), only one statement (1205), or maybe nothing (unknown commit result).
+</Tldr>
+
+## Q1. Retryable errors and what was undone
+
+**Question:** which errors would you retry in each engine, and what has the database already undone in each case?
+
+| Engine | Retry | Already undone |
+|---|---|---|
+| PostgreSQL | `40001` serialization_failure, `40P01` deadlock_detected (and `55P03` lock_not_available if you use NOWAIT / lock_timeout and want to wait again) | The transaction is aborted: every later statement fails until ROLLBACK, and nothing will commit |
+| MySQL | `1213` deadlock | The whole transaction was rolled back |
+| MySQL | `1205` lock wait timeout | **Only the timed-out statement** (`innodb_rollback_on_timeout = OFF`); you must ROLLBACK |
+| MongoDB | `TransientTransactionError` label | The transaction was aborted; re-run it |
+| MongoDB | `UnknownTransactionCommitResult` label | Unknown: retry `commitTransaction` only |
+
+> **Common mistake:** matching on error message text. Use the SQLSTATE / error number / error label.
+
+## Q2. Why PostgreSQL deadlocks were so expensive
+
+**Question:** why did 3–6 deadlocks make the PostgreSQL run 10–20× slower, while 5–6 deadlocks barely affected MySQL?
+
+PostgreSQL does not check for deadlocks when a wait starts: a waiting backend sleeps for `deadlock_timeout` (1 s) and only then searches the wait-for graph. Each deadlock therefore held two transfers (and everything queued behind their row locks) for a full second; the captured one reported after 1,000 ms. InnoDB checks the graph as soon as a transaction starts waiting (`innodb_deadlock_detect = ON`) and rolled back the victim after 1 ms. The fix in both is the same: lock rows in a consistent order (0 deadlocks, ≈ 0.3 s in PostgreSQL).
+
+> **Common mistake:** lowering `deadlock_timeout` to make deadlocks cheaper. It makes every lock wait run the detector sooner; remove the cycle instead.
+
+## Q3. Half a transfer
+
+**Question:** in the 1205 experiment, why did account 12 lose 5.00? Write the handler that prevents it.
+
+The debit of 12 succeeded; the credit of 11 timed out with 1205, and InnoDB rolled back **only that statement**. The transaction stayed open with one modified row (`innodb_trx`: RUNNING, 1 row modified), and the COMMIT that followed persisted the debit alone. Handler:
+
+```js
+try {
+  await c.query('START TRANSACTION');
+  await c.query('UPDATE accounts SET balance = balance - 5 WHERE id = 12');
+  await c.query('UPDATE accounts SET balance = balance + 5 WHERE id = 11');
+  await c.query('COMMIT');
+} catch (e) {
+  await c.query('ROLLBACK');                 // always, for every error
+  if (e.errno === 1213 || e.errno === 1205) return retry();
+  throw e;
+}
+```
+
+Alternatively set `innodb_rollback_on_timeout = ON` (server startup option), which makes 1205 roll back the whole transaction.
+
+> **Common mistake:** a generic "on error, log and continue" in a unit of work that later commits.
+
+## Q4. The check belongs inside
+
+**Question:** why must the balance check be inside the retried function rather than before it?
+
+The retry exists because another transaction changed the data your attempt depended on. A balance read **before** the loop is the stale value that caused the failure; re-running only the writes would apply them on the basis of that old decision (for example withdrawing from an account that is now empty). Everything the decision depends on must be re-read in each attempt.
+
+> **Common mistake:** retrying only the failing statement.
+
+## Q5. Ordering helps locks, not conflicts
+
+**Question:** why did ordering the updates by id remove deadlocks in PostgreSQL and MySQL but not reduce MongoDB's retries?
+
+A deadlock needs a **cycle** of waits: T1 holds 7 and waits for 8 while T2 holds 8 and waits for 7. If every transaction locks the smaller id first, the cycle is impossible. MongoDB transactions do not wait for each other at all: a write to a document modified by another open transaction fails immediately with WriteConflict, whatever the order. Retries depend only on how often two transactions touch the same document at the same time (188–195 ordered, 220–230 unordered: the difference is noise).
+
+> **Common mistake:** applying deadlock advice to MongoDB transactions; reduce contention (fewer, shorter transactions, atomic `$inc` without a transaction) instead.
+
+## Q6. Two MongoDB labels
+
+**Question:** what is the difference between `TransientTransactionError` and `UnknownTransactionCommitResult`, and what do you retry for each?
+
+`TransientTransactionError`: the transaction did not commit (write conflict, primary stepped down, transaction aborted); re-run the **whole** transaction. `UnknownTransactionCommitResult`: the commit was sent but its outcome is unknown (network error, write concern timeout); retry **commitTransaction** only, which is safe because committing an already committed transaction returns success without applying it again. `withTransaction` implements both.
+
+> **Common mistake:** re-running the callback after an unknown commit result, which can apply the transfer twice.
+
+## Q7. SERIALIZABLE deadlocks in MySQL
+
+**Question:** why does MySQL SERIALIZABLE produce deadlocks for the read-check-update transfer?
+
+Under SERIALIZABLE (with autocommit off) InnoDB turns plain SELECTs into `SELECT … FOR SHARE`. Two transfers from the same account both read it: both hold a **shared** lock. Then both try to UPDATE it, which needs an **exclusive** lock; each waits for the other's shared lock to go: a cycle, 53–71 times in the lab. Read with `FOR UPDATE` when you intend to update (no S→X upgrade), or use an atomic guarded UPDATE.
+
+> **Common mistake:** "SERIALIZABLE means no concurrency problems". It converts anomalies into errors you must retry.
