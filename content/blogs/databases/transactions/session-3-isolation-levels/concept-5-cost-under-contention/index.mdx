@@ -1,0 +1,290 @@
+---
+title: "Concept 5: The cost of each level under contention"
+description: "Stronger isolation turns waiting into aborting. 8 clients transferring money among 10 hot accounts: PostgreSQL READ COMMITTED had 0 failures, REPEATABLE READ and SERIALIZABLE about 70% without retries and 4–6% even after 10 tries; MySQL SERIALIZABLE deadlocked on 29% of transfers; MongoDB transactions hit WriteConflict on 47%. Spread over 10,000 accounts, the failure rates fell below 0.3%."
+type: "concept"
+tags: ["transactions", "isolation", "contention", "retries", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/mvcc-serialization-failure-handling.html"
+  - "https://www.postgresql.org/docs/current/pgbench.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-deadlocks-handling.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-in-applications/"
+---
+
+<Tldr>
+The same transfer (read one balance, move 1.00 between two accounts in one `UPDATE`) was run by **8 concurrent clients** at each level. On **10 hot accounts**, PostgreSQL READ COMMITTED committed every transaction (**0** failures): conflicting transactions simply **waited** for row locks. REPEATABLE READ and SERIALIZABLE **aborted** about **70%** of attempts with 40001, and even with up to 10 tries per transaction **3.8–5.7%** still failed and ≈ 60% needed at least one retry. MySQL READ COMMITTED and REPEATABLE READ: **0** failures; SERIALIZABLE: **2,302 of 8,000** transfers deadlocked. MongoDB transactions: **3,743 of 8,000** hit WriteConflict; with `withTransaction()` all 8,000 committed after **12,194** attempts, in about twice the time. Spread over **10,000** accounts the same workload had **0.2–0.3%** failures in PostgreSQL, **0** deadlocks in MySQL and **7** conflicts in MongoDB. Contention, not the level alone, sets the price.
+</Tldr>
+
+## Waiting vs aborting
+
+| Level | When two transactions touch the same row | Application must |
+|---|---|---|
+| PostgreSQL READ COMMITTED, MySQL READ COMMITTED / REPEATABLE READ | The second waits for the row lock, then continues on the newest version | Nothing (but beware lost updates, Concept 2) |
+| PostgreSQL REPEATABLE READ / SERIALIZABLE | The second waits, then **aborts** with 40001 if the first committed | Retry the whole transaction |
+| MySQL SERIALIZABLE | Shared locks from reads make writers wait on each other: deadlock | Retry on 1213 |
+| MongoDB transaction | The second **aborts at once** with WriteConflict | Retry (`withTransaction()` does it) |
+
+| Term | Meaning |
+|---|---|
+| Hot rows | A few rows that most transactions touch (popular product, central account, counter) |
+| Failure rate | Aborted attempts / all attempts, with no retries |
+| `--max-tries` | pgbench option: retry a transaction up to N times on serialization failures and deadlocks |
+| **✓ Committed** | The transfer was applied |
+| **✗ Aborted** | 40001, deadlock 1213 or WriteConflict |
+
+The workload ([lab](/blogs/databases/transactions/session-3-isolation-levels/lab) has the scripts): pick account `a` at random and a different account `b`, then `BEGIN; SELECT balance … WHERE id = a; UPDATE … WHERE id IN (a, b); COMMIT`. A single `UPDATE` touches both rows in primary-key order, so transfers never deadlock each other by lock order: every failure below is caused by the isolation level. The total balance stayed exactly 10,000.00 after every run. Timings are from a laptop shared with other workloads: compare the failure counts, not the throughput.
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: a transfer on hot rows at each level"
+  height={260}
+  nodes={[
+    { id: 'tx', label: 'Transfer', sub: '8 clients, 10 hot rows', x: 20, y: 20, w: 200 },
+    { id: 'hot', label: 'Hot row', sub: 'changed by another client?', x: 300, y: 20, w: 200 },
+    { id: 'wait', label: 'Lock wait', sub: 'until the other commits', x: 580, y: 20, w: 200 },
+    { id: 'retry', label: 'Retry', sub: 'whole transaction', x: 20, y: 180, w: 200 },
+    { id: 'err', label: '✗ Aborted', sub: '40001', x: 300, y: 180, w: 200 },
+    { id: 'ok', label: '✓ Committed', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 'tx-hot', from: 'tx', to: 'hot', label: 'UPDATE' },
+    { id: 'hot-wait', from: 'hot', to: 'wait', label: 'busy' },
+    { id: 'wait-ok', from: 'wait', to: 'ok' },
+    { id: 'hot-err', from: 'hot', to: 'err' },
+    { id: 'err-retry', from: 'err', to: 'retry', label: 'retry' },
+    { id: 'retry-tx', from: 'retry', to: 'tx' },
+    { id: 'hot-ok', from: 'hot', to: 'ok', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'READ COMMITTED',
+      path: 'row busy → wait → continue on the newest version → ✓ commit; 0 failures',
+      summary: '13,451 and 25,827 transfers committed in two 10 s runs, none failed.',
+      steps: [
+        {
+          title: 'Conflicts become waits',
+          note: 'With 8 clients on 10 rows, most transactions find a row locked by another. They wait for its commit, then the UPDATE runs on the newest version (Concept 2).',
+          code: 'pgbench -n -c 8 -j 4 -T 10 --max-tries=1 -f transfer-read-committed.sql',
+          active: ['tx', 'hot', 'wait'],
+          edges: ['tx-hot', 'hot-wait'],
+        },
+        {
+          title: 'Everything commits',
+          note: 'failed transactions: 0 (0.000%) in both runs. Throughput was ≈ 1,300–2,600 transfers/s, varying with the laptop\'s other load.',
+          active: ['wait', 'ok'],
+          edges: ['wait-ok'],
+          subs: { ok: '0 failures' },
+        },
+      ],
+    },
+    {
+      title: 'REPEATABLE READ / SERIALIZABLE',
+      path: 'row busy → wait → other committed → ✗ 40001 → retry; ≈ 70% of attempts aborted',
+      summary: 'The wait is the same, but it usually ends in an abort.',
+      steps: [
+        {
+          title: 'Wait, then abort',
+          note: 'The waiting transaction\'s snapshot is older than the other\'s commit, so its UPDATE raises 40001 (Concept 2). Without retries: RR 51,125 of 73,693 attempts failed (69.4%), SERIALIZABLE 38,967 of 55,620 (70.1%). A second run gave 69.5% and 70.0%.',
+          code: 'pgbench … --max-tries=1 --failures-detailed -f transfer-repeatable-read.sql\n# number of serialization failures: 51125 (69.376%)',
+          active: ['tx', 'hot', 'wait', 'err'],
+          edges: ['tx-hot', 'hot-err'],
+          subs: { err: '≈ 70% of attempts' },
+        },
+        {
+          title: 'Retries help, but not always',
+          note: 'With --max-tries=10: RR committed 19,419, 12,196 of them (60%) after at least one retry, 39,321 retries in total, and 765 (3.8%) still failed after 10 tries. SERIALIZABLE: 61% retried, 1,365 (5.7%) gave up. On hot rows a retry is likely to meet another conflict.',
+          active: ['err', 'retry', 'tx'],
+          edges: ['err-retry', 'retry-tx'],
+          subs: { retry: '≈ 60% retried, 4–6% fail ×10' },
+        },
+        {
+          title: 'The same at low contention',
+          note: 'Spread over all 10,000 accounts, 8 clients and no retries: RC 0 failures, RR 142 of 63,006 (0.23%), SERIALIZABLE 163 of 62,484 (0.26%), all at ≈ 6,200–6,400 transfers/s.',
+          active: ['tx', 'hot', 'ok'],
+          edges: ['tx-hot', 'hot-ok'],
+          subs: { hot: 'rarely busy (10,000 rows)', ok: '99.7%+ commit first time' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL InnoDB
+
+<Flow
+  title="MySQL: a transfer on hot rows at each level"
+  height={260}
+  nodes={[
+    { id: 'tx', label: 'Transfer', sub: '8 clients × 1,000', x: 20, y: 20, w: 200 },
+    { id: 'hot', label: 'Hot row', sub: 'locked by another client?', x: 300, y: 20, w: 200 },
+    { id: 'wait', label: 'Lock wait', sub: 'until the other commits', x: 580, y: 20, w: 200 },
+    { id: 'retry', label: 'Retry', sub: 'whole transaction', x: 20, y: 180, w: 200 },
+    { id: 'err', label: '✗ Deadlock', sub: '1213', x: 300, y: 180, w: 200 },
+    { id: 'ok', label: '✓ Committed', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 'tx-hot', from: 'tx', to: 'hot', label: 'UPDATE' },
+    { id: 'hot-wait', from: 'hot', to: 'wait', label: 'busy' },
+    { id: 'wait-ok', from: 'wait', to: 'ok' },
+    { id: 'hot-err', from: 'hot', to: 'err' },
+    { id: 'err-retry', from: 'err', to: 'retry', label: 'retry' },
+    { id: 'retry-tx', from: 'retry', to: 'tx' },
+    { id: 'hot-ok', from: 'hot', to: 'ok', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'READ COMMITTED / REPEATABLE READ',
+      path: 'row locked → wait → UPDATE on the newest row → ✓ 8,000 of 8,000',
+      summary: 'InnoDB never aborts for a stale snapshot (Concept 2), so hot rows only cost waiting.',
+      steps: [
+        {
+          title: 'Wait and continue',
+          note: 'A stored procedure ran 1,000 transfers per client, catching errors 1213 (deadlock) and 1205 (lock wait timeout). READ COMMITTED: 8,000 committed in 7.9 s; REPEATABLE READ: 8,000 in 8.7 s; no failures.',
+          code: "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;\nCALL transfer_bench(1000, 10);   -- ok 1000, deadlocks 0, timeouts 0 per client",
+          active: ['tx', 'hot', 'wait', 'ok'],
+          edges: ['tx-hot', 'hot-wait', 'wait-ok'],
+          subs: { ok: '8,000 / 8,000' },
+        },
+      ],
+    },
+    {
+      title: 'SERIALIZABLE',
+      path: 'SELECT takes an S lock → two clients S-lock the same row → both need X → ✗ deadlock on 29%',
+      summary: 'The read before the write is what deadlocks.',
+      steps: [
+        {
+          title: 'Shared locks meet',
+          note: 'The SELECT balance in each transfer becomes SELECT … FOR SHARE (Concept 3). Two clients holding S on the same hot row both request X for the UPDATE: a deadlock, and InnoDB rolls one back immediately.',
+          active: ['tx', 'hot', 'err'],
+          edges: ['tx-hot', 'hot-err'],
+          subs: { err: '2,302 of 8,000' },
+        },
+        {
+          title: 'Retry, or avoid the shared read',
+          note: '5,698 committed, 2,302 deadlocked (28.8%) in 10.3 s, without retries. Spread over 10,000 accounts, SERIALIZABLE had 0 deadlocks in 8,000 transfers (2.7 s). Reading with FOR UPDATE instead of a shared read removes this deadlock at every level.',
+          active: ['err', 'retry', 'tx', 'hot', 'ok'],
+          edges: ['err-retry', 'retry-tx', 'tx-hot', 'hot-ok'],
+          subs: { hot: 'rarely locked (10,000 rows)', ok: 'spread: 8,000 / 8,000' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: a transfer on hot documents"
+  height={260}
+  nodes={[
+    { id: 'tx', label: 'Transfer', sub: '8 clients × 1,000', x: 20, y: 20, w: 200 },
+    { id: 'hot', label: 'Hot document', sub: 'written by an open txn?', x: 300, y: 20, w: 200 },
+    { id: 'wait', label: 'No waiting', sub: 'conflict is immediate', x: 580, y: 20, w: 200 },
+    { id: 'retry', label: 'withTransaction', sub: 'retries the callback', x: 20, y: 180, w: 200 },
+    { id: 'err', label: '✗ WriteConflict', sub: 'TransientTransactionError', x: 300, y: 180, w: 200 },
+    { id: 'ok', label: '✓ Committed', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 'tx-hot', from: 'tx', to: 'hot', label: '$inc' },
+    { id: 'hot-wait', from: 'hot', to: 'wait', label: 'busy' },
+    { id: 'hot-err', from: 'hot', to: 'err' },
+    { id: 'err-retry', from: 'err', to: 'retry', label: 'retry' },
+    { id: 'retry-tx', from: 'retry', to: 'tx' },
+    { id: 'hot-ok', from: 'hot', to: 'ok' },
+  ]}
+  cases={[
+    {
+      title: 'No retries',
+      path: 'document written by another open transaction → ✗ WriteConflict at once; 3,743 of 8,000',
+      summary: 'MongoDB aborts instead of queueing.',
+      steps: [
+        {
+          title: 'Conflicts abort immediately',
+          note: 'Each client ran 1,000 transfers in transactions (readConcern snapshot, writeConcern majority) and counted errors: 4,257 committed, 3,743 WriteConflict (46.8%), 4.5 s.',
+          code: "s.startTransaction({ readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } });\na.findOne({ _id: x });\na.updateOne({ _id: x }, { $inc: { balance: NumberDecimal('-1') } });\na.updateOne({ _id: y }, { $inc: { balance: NumberDecimal('1') } });\ns.commitTransaction();",
+          active: ['tx', 'hot', 'wait', 'err'],
+          edges: ['tx-hot', 'hot-wait', 'hot-err'],
+          subs: { err: '3,743 of 8,000' },
+        },
+        {
+          title: 'Few conflicts when spread out',
+          note: 'Over 10,000 accounts: 7,993 committed, 7 WriteConflicts, 4.2 s.',
+          active: ['tx', 'hot', 'ok'],
+          edges: ['tx-hot', 'hot-ok'],
+          subs: { hot: 'rarely busy (10,000 docs)', ok: '7,993 / 8,000' },
+        },
+      ],
+    },
+    {
+      title: 'withTransaction()',
+      path: 'WriteConflict → callback runs again → ✓ 8,000 committed after 12,194 attempts',
+      summary: 'The driver helper retries on TransientTransactionError.',
+      steps: [
+        {
+          title: 'Every transfer commits eventually',
+          note: 'Same workload wrapped in session.withTransaction(): 8,000 of 8,000 committed, 12,194 callback runs (52% extra work), 8.6 s instead of 4.5 s. The callback must be safe to run more than once: no external side effects inside it.',
+          code: "s.withTransaction(() => {\n  a.findOne({ _id: x });\n  a.updateOne({ _id: x }, { $inc: { balance: NumberDecimal('-1') } });\n  a.updateOne({ _id: y }, { $inc: { balance: NumberDecimal('1') } });\n}, { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } });",
+          active: ['err', 'retry', 'tx', 'hot', 'ok'],
+          edges: ['err-retry', 'retry-tx', 'tx-hot', 'hot-ok'],
+          subs: { retry: '12,194 attempts', ok: '8,000 / 8,000' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## All results
+
+| Engine, level | Hot (10 accounts): committed / failed, no retry | Spread (10,000 accounts) |
+|---|---|---|
+| PostgreSQL READ COMMITTED | all / 0 | all / 0 |
+| PostgreSQL REPEATABLE READ | 30.6% / **69.4%** (40001); with 10 tries 3.8% still fail | 0.23% fail |
+| PostgreSQL SERIALIZABLE | 29.9% / **70.1%** (40001); with 10 tries 5.7% still fail | 0.26% fail |
+| MySQL READ COMMITTED | 8,000 / 0 | – |
+| MySQL REPEATABLE READ | 8,000 / 0 | 8,000 / 0 |
+| MySQL SERIALIZABLE | 5,698 / **2,302** (deadlock) | 8,000 / 0 |
+| MongoDB transaction | 4,257 / **3,743** (WriteConflict); `withTransaction`: 8,000 after 12,194 attempts | 7,993 / 7 |
+
+<Pitfall>
+Moving a hot workload from READ COMMITTED to REPEATABLE READ or SERIALIZABLE "for safety" without retry code turns waits into errors: in this test, 7 of 10 transfers started failing. Raise the level where a rule needs it (Concept 3), keep hot-row updates short and relative, and put a bounded retry loop with backoff around every transaction that can get 40001, 1213 or TransientTransactionError.
+</Pitfall>
+
+## Real-world scenario: the flash sale
+
+A flash sale sends thousands of orders at one product row.
+
+| Choice | Effect at the hot row |
+|---|---|
+| `UPDATE inventory SET stock = stock - 1 WHERE sku = ? AND stock > 0` in READ COMMITTED | Orders queue on the row lock and each re-checks `stock > 0` (Concept 2): correct, no retries |
+| Same at REPEATABLE READ / SERIALIZABLE (PostgreSQL) or in a MongoDB transaction | Most attempts abort and retry; retries add load exactly when the row is hottest |
+| Split the counter (e.g. 10 stock buckets per SKU) | Fewer conflicts per row; reads sum the buckets |
+
+## Why this matters for transactions
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 5: locks and indexes | What the waiting transactions are queued on |
+| Session 6: deadlocks | Deadlocks from lock order, not isolation |
+| Session 7: application patterns | Retry loops, backoff, idempotency |
+| Session 8: when transactions hurt | Long transactions make every conflict window wider |
+
+## Key takeaways
+
+1. Under contention, READ COMMITTED waits; snapshot-based levels and MongoDB abort.
+2. On 10 hot rows: PostgreSQL RR/SERIALIZABLE ≈ 70% aborts, MySQL SERIALIZABLE 29% deadlocks, MongoDB 47% WriteConflicts; READ COMMITTED and MySQL RR: 0.
+3. Retries recover most failures but multiply work (MongoDB: 12,194 attempts for 8,000 transfers), and some still fail after 10 tries.
+4. Spread over 10,000 rows, the same levels failed on under 0.3% of transactions.
+5. Choose the level per transaction: the strongest level only where a multi-row rule needs it.
+
+## Check questions
+
+1. Why did PostgreSQL READ COMMITTED have zero failures on the hot rows, while REPEATABLE READ aborted 69%?
+2. Why did MySQL REPEATABLE READ have zero failures where PostgreSQL REPEATABLE READ had 69%?
+3. What turned MySQL SERIALIZABLE transfers into deadlocks, and which change to the transfer removes it?
+4. With `--max-tries=10`, 3.8% of REPEATABLE READ transactions still failed. Why don't retries always succeed on hot rows?
+5. What does `withTransaction()` cost in the MongoDB test, and what must the callback avoid?
+6. Why did the failure rates drop below 0.3% when the same workload was spread over 10,000 accounts?
+7. A team wants SERIALIZABLE everywhere. What would you ask them to measure first?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-3-isolation-levels/concept-5-cost-under-contention/answers">Worked answers to Q1–Q7</DeepDive>

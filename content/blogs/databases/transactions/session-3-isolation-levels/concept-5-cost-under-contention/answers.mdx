@@ -1,0 +1,74 @@
+---
+title: "Answers: The cost of each level under contention"
+description: "Worked answers to the Session 3 Concept 5 check questions."
+companion: "answers"
+tags: ["transactions", "isolation", "contention", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/mvcc-serialization-failure-handling.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-in-applications/"
+---
+
+<Tldr>
+Weak levels wait, strong levels abort, and contention decides how often. Measure the failure rate on your hottest rows before raising a level.
+</Tldr>
+
+## Q1. 0% vs 69%
+
+**Question:** why did PostgreSQL READ COMMITTED have zero failures on the hot rows, while REPEATABLE READ aborted 69%?
+
+Both levels wait for the row lock when another transfer holds it. In READ COMMITTED the waiting `UPDATE` then continues on the newest version (re-check, Concept 2). In REPEATABLE READ the newest version was committed after the transaction's snapshot, so the `UPDATE` raises 40001. With 8 clients on 10 rows almost every transfer meets a recent commit: 51,125 of 73,693 attempts failed.
+
+> **Common mistake:** expecting the abort rate to be "a few percent" because conflicts feel rare; on hot rows they are the norm.
+
+## Q2. MySQL RR vs PostgreSQL RR
+
+**Question:** why did MySQL REPEATABLE READ have zero failures where PostgreSQL REPEATABLE READ had 69%?
+
+InnoDB never aborts because a row is newer than the read view: `UPDATE` reads and locks the newest version and applies the relative change. The transfers waited for each other and all 8,000 committed. The price is the lost-update risk for absolute writes (Concept 2), which PostgreSQL's abort protects against.
+
+> **Common mistake:** concluding MySQL "handles concurrency better"; it gives a weaker guarantee.
+
+## Q3. MySQL SERIALIZABLE deadlocks
+
+**Question:** what turned MySQL SERIALIZABLE transfers into deadlocks, and which change to the transfer removes it?
+
+The `SELECT balance` before the update became `SELECT … FOR SHARE`. Two transfers share-locked the same hot row, then both requested an exclusive lock on it for the `UPDATE`; neither could proceed, and InnoDB rolled one back (2,302 of 8,000). Reading with `SELECT … FOR UPDATE` (exclusive from the start) makes the second transfer wait at the read instead, which removes this deadlock; dropping the read when it is not needed removes it too.
+
+> **Common mistake:** "shared locks are harmless because readers don't conflict". They conflict with the upgrade to exclusive.
+
+## Q4. Retries still failing
+
+**Question:** with `--max-tries=10`, 3.8% of REPEATABLE READ transactions still failed. Why don't retries always succeed on hot rows?
+
+A retry starts a new snapshot, but the other 7 clients keep committing to the same 10 rows, so the retried transaction is likely to meet another newer commit. With ≈ 70% of attempts failing, ten failures in a row is not rare for an unlucky client. Retries need backoff (and jitter), and hot rows need fewer conflicts, not just more attempts.
+
+> **Common mistake:** an unbounded retry loop without backoff, which adds load exactly when contention is worst.
+
+## Q5. withTransaction cost
+
+**Question:** what does `withTransaction()` cost in the MongoDB test, and what must the callback avoid?
+
+All 8,000 transfers committed, but the callback ran **12,194** times (52% extra work) and the run took 8.6 s instead of 4.5 s. Because the callback can run several times, it must avoid side effects outside the database (sending emails, calling payment APIs, incrementing in-memory counters) and must recompute everything from what it reads inside the transaction.
+
+> **Common mistake:** calling an external API inside the callback, which then runs once per attempt.
+
+## Q6. Spread-out workload
+
+**Question:** why did the failure rates drop below 0.3% when the same workload was spread over 10,000 accounts?
+
+Conflicts need two concurrent transactions on the **same row**. With 8 clients choosing among 10,000 accounts the chance that a row was changed during a transaction's short lifetime is tiny: 142 of 63,006 attempts at RR, 7 of 8,000 in MongoDB, 0 deadlocks in MySQL SERIALIZABLE. The level is the same; the contention is not.
+
+> **Common mistake:** choosing a level from a benchmark on uniform random data, then deploying it on a workload with hot rows.
+
+## Q7. SERIALIZABLE everywhere
+
+**Question:** a team wants SERIALIZABLE everywhere. What would you ask them to measure first?
+
+- The **failure rate** on the hottest tables (40001 / 1213 / WriteConflict per minute), with production-like skew, not uniform data.
+- Whether every transaction path has a correct **retry loop** with backoff, and no external side effects inside it.
+- **Latency** with retries included (p95/p99), since aborted work is repeated.
+- For PostgreSQL, **false positives** from sequential scans and page-level locks: plans of the transactions' reads.
+- Which business rules actually span several rows. Often only a few transactions need SERIALIZABLE; the rest can use READ COMMITTED with relative updates or locking reads.
+
+> **Common mistake:** raising the level globally instead of per transaction.

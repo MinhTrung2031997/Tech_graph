@@ -1,0 +1,82 @@
+---
+title: "Answers: Writing a row that changed after your snapshot"
+description: "Worked answers to the Session 3 Concept 2 check questions."
+companion: "answers"
+tags: ["transactions", "isolation", "lost-update", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-consistent-read.html"
+---
+
+<Tldr>
+Writes always target the newest version. PostgreSQL RC and MySQL write on it, PostgreSQL RR and MongoDB abort, and only relative or conditional writes are correct everywhere.
+</Tldr>
+
+## Q1. 850 in READ COMMITTED
+
+**Question:** why did `UPDATE … SET balance = balance − 50` give 850 in PostgreSQL READ COMMITTED, although T1 had read 1000?
+
+The `UPDATE` does not reuse T1's earlier `SELECT`. It finds the row through its own snapshot, locks it and applies `balance − 50` to the newest committed version, 900. The earlier read of 1000 only lived in the application.
+
+> **Common mistake:** thinking the update "uses" the transaction's earlier read.
+
+## Q2. Waiting UPDATE
+
+**Question:** what does PostgreSQL READ COMMITTED do when an UPDATE waits for a row lock and the row changes meanwhile?
+
+After the lock holder commits, PostgreSQL takes the **new version** of the row and re-evaluates the statement's `WHERE` on it (EvalPlanQual). If it still matches, the update is applied to the new version; if not, the row is skipped. In the lab, T2's `WHERE id = 1 AND balance >= 1000` was false on 900, so T2 updated 0 rows.
+
+> **Common mistake:** expecting the waiting UPDATE to fail, or to overwrite the committed change.
+
+## Q3. Why REPEATABLE READ aborts
+
+**Question:** why does PostgreSQL REPEATABLE READ abort T1 instead of applying its update to 900?
+
+T1 promised to work on one snapshot, in which the balance is 1000. Updating 900 would mix a version it cannot see into its work; updating as if it were 1000 would discard T2's committed change. Neither keeps snapshot isolation correct, so PostgreSQL raises `could not serialize access due to concurrent update` (40001) and the application retries with a new snapshot.
+
+> **Common mistake:** catching 40001 and continuing the same transaction; it is aborted and must be restarted from `BEGIN`.
+
+## Q4. Same code, two engines
+
+**Question:** the same code runs on PostgreSQL REPEATABLE READ and MySQL REPEATABLE READ. In which does it lose an update, and why?
+
+In **MySQL**. InnoDB's REPEATABLE READ applies the snapshot only to plain reads; `UPDATE` reads and locks the newest version and never checks whether it is newer than the read view. An absolute write computed from the stale read (`SET balance = 950`) overwrote T2's −100 with no error. PostgreSQL REPEATABLE READ detected the newer version and raised 40001.
+
+> **Common mistake:** assuming isolation level names mean the same thing across engines.
+
+## Q5. 1,000 counted, 1,001 updated
+
+**Question:** a MySQL REPEATABLE READ transaction counted 1,000 rows and then updated 1,001. Explain.
+
+The `COUNT(*)` was a consistent read from the read view, created before T2 inserted account 10001 into B01. `UPDATE … WHERE branch = 'B01'` is a locking operation that reads the newest committed rows, so it found 1,001 and changed them all. A transaction sees its own changes, so the next count showed 1,001.
+
+> **Common mistake:** "the snapshot protects the UPDATE from new rows". It protects only plain SELECTs.
+
+## Q6. 7 ms vs 2 seconds
+
+**Question:** why did T2's transaction get WriteConflict after 7 ms, while a plain `updateOne` waited 2 s and succeeded?
+
+Inside a transaction, a write to a document with another transaction's uncommitted write conflicts immediately (the lock request timeout for transactions is only 5 ms), and the transaction is aborted with `TransientTransactionError` for the application to retry. A single-document write outside a transaction is retried **by the server** until the other transaction finishes: it returned after 2,086 ms with the correct result.
+
+> **Common mistake:** expecting a transactional write to queue behind another transaction like a SQL row lock.
+
+## Q7. Correct stock update
+
+**Question:** rewrite "read stock, check, write stock − qty" so that it is correct at every level in all three engines.
+
+Make the check and the write one atomic, relative statement and inspect its result:
+
+```sql
+UPDATE inventory SET stock = stock - :qty WHERE sku = :sku AND stock >= :qty;
+-- 1 row: reserved; 0 rows: not enough stock
+```
+
+```js
+db.inventory.updateOne({ _id: sku, stock: { $gte: qty } }, { $inc: { stock: -qty } })
+// modifiedCount 1: reserved; 0: not enough stock
+```
+
+In PostgreSQL REPEATABLE READ the statement can still raise 40001 under contention, so keep a retry.
+
+> **Common mistake:** keeping the check in application code and adding a transaction around it, which does not help in READ COMMITTED or MySQL REPEATABLE READ.

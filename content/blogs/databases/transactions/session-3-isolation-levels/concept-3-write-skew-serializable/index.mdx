@@ -1,0 +1,348 @@
+---
+title: "Concept 3: Write skew and SERIALIZABLE"
+description: "Snapshot isolation stops two transactions from writing the same row, but not from each writing a different row based on what both read. PostgreSQL SERIALIZABLE (SSI) detects that with predicate locks and aborts one transaction, sometimes falsely; MySQL SERIALIZABLE turns reads into shared locks and gets a deadlock instead; MongoDB has no serializable level, so the conflict must be written down. Measured with the joint-account rule in all three engines."
+type: "concept"
+tags: ["transactions", "isolation", "serializable", "write-skew", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html#XACT-SERIALIZABLE"
+  - "https://wiki.postgresql.org/wiki/SSI"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html#isolevel_serializable"
+  - "https://www.mongodb.com/docs/manual/core/transactions-production-consideration/"
+---
+
+<Tldr>
+Rule: accounts 1 and 2 are a joint pair whose **combined balance must stay ≥ 1000**. T1 and T2 both read the sum (**2000**), each decides a 900 withdrawal is fine, and each withdraws from a **different** account. No row is written twice, so snapshot isolation sees no conflict: in PostgreSQL REPEATABLE READ, MySQL REPEATABLE READ and MongoDB transactions both committed and the sum ended at **200**. **PostgreSQL SERIALIZABLE** aborted T1 at commit (`could not serialize access due to read/write dependencies among transactions`, sum **1100**). It tracks reads with **SIRead locks** (tuples, index pages, or the whole table after a sequential scan), and coarse locks produce **false positives**: two transactions reading disjoint id ranges failed once three of their rows shared a heap page. **MySQL SERIALIZABLE** makes every `SELECT` in a transaction a shared lock, so the two withdrawals **deadlocked** (error 1213) instead. **MongoDB** has no serializable level: making each transaction also write the document it read turned the skew into a WriteConflict.
+</Tldr>
+
+## Why snapshot isolation misses it
+
+| Term | Meaning |
+|---|---|
+| Write skew | Two transactions read overlapping data, then write **different** rows; each write is valid alone, together they break a rule |
+| Serializable | The result equals some order of running the transactions one after another |
+| SSI | Serializable Snapshot Isolation (PostgreSQL): snapshot isolation plus tracking of read/write dependencies; aborts a transaction that could make the order impossible |
+| SIRead lock | PostgreSQL's record of "this transaction read here"; never blocks anyone, only used to detect conflicts |
+| Pivot | A transaction with a dependency in and out (T_in → pivot → T_out); SSI aborts one transaction of such a pattern |
+| Materialize the conflict | Make the transactions write a common row/document, so ordinary write-conflict detection catches them |
+| **✓ Rule holds** | Combined balance ≥ 1000 (one withdrawal rejected) |
+| **✗ Rule broken** | Combined balance 200 |
+
+Neither transaction overwrote the other's row, so "first updater wins" (Concept 2) has nothing to catch. In any serial order the second transaction would have seen 1100 and refused, so the concurrent result (200) matches no serial order.
+
+## PostgreSQL: SSI
+
+<Flow
+  title="PostgreSQL: write skew under REPEATABLE READ and SERIALIZABLE"
+  height={360}
+  nodes={[
+    { id: 't1', label: 'T1', sub: 'sum(1, 2), withdraw 900 from 1', x: 20, y: 20, w: 240 },
+    { id: 't2', label: 'T2', sub: 'sum(1, 2), withdraw 900 from 2', x: 540, y: 20, w: 240 },
+    { id: 'a1', label: 'Account 1', sub: '1000', x: 120, y: 150, w: 200 },
+    { id: 'a2', label: 'Account 2', sub: '1000', x: 480, y: 150, w: 200 },
+    { id: 'ok', label: '✓ Rule holds', sub: '', x: 60, y: 290, w: 260 },
+    { id: 'bad', label: '✗ Rule broken', sub: '', x: 480, y: 290, w: 260 },
+  ]}
+  edges={[
+    { id: 't1-a1', from: 't1', to: 'a1', label: 'write' },
+    { id: 't2-a2', from: 't2', to: 'a2', label: 'write' },
+    { id: 't1-a2', from: 't1', to: 'a2', quiet: true },
+    { id: 't2-a1', from: 't2', to: 'a1', quiet: true },
+    { id: 'a1-ok', from: 'a1', to: 'ok' },
+    { id: 'a2-bad', from: 'a2', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'REPEATABLE READ',
+      path: 'both read 2000 → T1 writes 1, T2 writes 2 → no common row → ✗ both commit, sum 200',
+      summary: 'Snapshot isolation has nothing to compare: the write sets do not overlap.',
+      steps: [
+        {
+          title: 'Both read the pair',
+          note: 'T2 starts at 0.5 s, T1 at 0 s; both read sum = 2000 from their snapshots.',
+          code: "BEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT sum(balance) FROM accounts WHERE id IN (1, 2);   -- 2000.00",
+          active: ['t1', 't2', 'a1', 'a2'],
+          edges: ['t1-a2', 't2-a1'],
+        },
+        {
+          title: 'Each writes its own account',
+          note: 'T1 withdraws 900 from account 1, T2 from account 2. Different rows: no lock waits, no 40001.',
+          code: 'UPDATE accounts SET balance = balance - 900 WHERE id = 1;   -- T1\nUPDATE accounts SET balance = balance - 900 WHERE id = 2;   -- T2',
+          active: ['t1', 't2', 'a1', 'a2'],
+          edges: ['t1-a1', 't2-a2'],
+          subs: { a1: '100', a2: '100' },
+        },
+        {
+          title: 'Both commit',
+          note: 'Final sum 200. Each transaction was correct for the data it saw.',
+          active: ['a2', 'bad'],
+          edges: ['a2-bad'],
+          subs: { bad: 'sum 200' },
+        },
+      ],
+    },
+    {
+      title: 'SERIALIZABLE',
+      path: 'both read (SIRead locks) → each writes a row the other read → rw-conflicts both ways → ✓ T1 aborted at commit, sum 1100',
+      summary: 'Same SQL, one keyword different.',
+      steps: [
+        {
+          title: 'Reads leave SIRead locks',
+          note: 'Reading ids 1 and 2 through the primary key left three SIRead locks: the index leaf page (accounts_pkey page 1) and the two heap tuples. They block nobody.',
+          code: "BEGIN ISOLATION LEVEL SERIALIZABLE;\nSELECT sum(balance) FROM accounts WHERE id IN (1, 2);\nSELECT locktype, relation::regclass, page, tuple FROM pg_locks\nWHERE mode = 'SIReadLock' AND pid = pg_backend_pid();\n-- page  | accounts_pkey | 1 |\n-- tuple | accounts      | 73 | 83\n-- tuple | accounts      | 73 | 84",
+          active: ['t1', 't2', 'a1', 'a2'],
+          edges: ['t1-a2', 't2-a1'],
+        },
+        {
+          title: 'Writes hit the other\'s SIRead locks',
+          note: 'T2 writes account 2, which T1 read: T1 →rw T2. T1 writes account 1, which T2 read: T2 →rw T1. A cycle of read/write dependencies means no serial order exists.',
+          active: ['t1', 't2', 'a1', 'a2'],
+          edges: ['t1-a1', 't2-a2'],
+          subs: { a1: '100 (T1, uncommitted)', a2: '100 (T2, committed)' },
+        },
+        {
+          title: 'One transaction is aborted',
+          note: 'T2 committed first; T1 failed at COMMIT. Final sum 1100: the rule holds. The error is SQLSTATE 40001, the same code as Concept 2, and the hint says to retry.',
+          code: "COMMIT;\n-- ERROR:  could not serialize access due to read/write dependencies among transactions\n-- DETAIL:  Reason code: Canceled on identification as a pivot, during commit attempt.\n-- HINT:  The transaction might succeed if retried.",
+          active: ['a1', 'ok'],
+          edges: ['a1-ok'],
+          subs: { a1: '1000 (T1 rolled back)', ok: 'sum 1100' },
+        },
+      ],
+    },
+    {
+      title: 'False positive: shared heap page',
+      path: 'T1 reads ids 1–50, T2 reads ids 5001–5050 → 3 rows each on heap page 73 → T2 holds a page lock → ✗ T2 aborted',
+      summary: 'No logical conflict, but the locks were coarser than the data.',
+      steps: [
+        {
+          title: 'Disjoint data, usually fine',
+          note: 'On a freshly loaded table, T1 summed ids 1–50 and updated id 1, T2 summed ids 5001–5050 and updated id 5001, both SERIALIZABLE: both committed.',
+          active: ['t1', 't2', 'a1', 'a2', 'ok'],
+          edges: ['t1-a1', 't2-a2', 'a1-ok'],
+          subs: { a1: 'ids 1–50', a2: 'ids 5001–5050', ok: 'both committed' },
+        },
+        {
+          title: 'Rows moved onto one page',
+          note: 'Earlier updates had moved ids 1, 2, 3 and 5001, 5002, 5003 to heap page 73 (new versions go where there is free space). T2 read three tuples on that page; max_pred_locks_per_page is 2, so its tuple locks were promoted to a lock on the whole page 73. Its SIRead locks: pages 36, 37 and 73.',
+          code: "-- T2: SELECT locktype, page, tuple FROM pg_locks WHERE mode = 'SIReadLock' …\n-- page | 37 |\n-- page | 36 |\n-- page | 73 |",
+          active: ['t2', 'a2'],
+          subs: { a2: 'SIRead: page 73' },
+        },
+        {
+          title: 'T1\'s write on page 73 counts as a conflict',
+          note: 'T1 updated id 1, whose version lived on page 73: PostgreSQL saw a write under T2\'s page lock. T2 was cancelled "as a pivot, during write". Same with a sequential scan: summing branch B01 (no usable index) took a SIRead lock on the whole table, and an update in branch B02 then aborted the other transaction.',
+          code: "-- ERROR:  could not serialize access due to read/write dependencies among transactions\n-- DETAIL:  Reason code: Canceled on identification as a pivot, during write.",
+          active: ['t1', 'a1', 'a2', 'bad'],
+          edges: ['t1-a1', 'a2-bad'],
+          subs: { bad: 'T2 aborted, no real conflict' },
+        },
+      ],
+    },
+  ]}
+/>
+
+Granularity of SIRead locks, measured:
+
+| Read | SIRead locks held |
+|---|---|
+| `WHERE id IN (1, 2)` via primary key | 1 index page + 2 tuples |
+| `WHERE id BETWEEN 5001 AND 5050` (50 rows, three on a shared page) | 3 heap pages |
+| `WHERE branch = 'B01'` (sequential scan, 1,000 of 10,000 rows) | the whole relation |
+
+Indexes matter for SERIALIZABLE: the narrower the read, the fewer false aborts.
+
+## MySQL: SERIALIZABLE = shared locks
+
+<Flow
+  title="MySQL: write skew becomes a deadlock"
+  height={360}
+  nodes={[
+    { id: 't1', label: 'T1', sub: 'sum(1, 2), withdraw 900 from 1', x: 20, y: 20, w: 240 },
+    { id: 't2', label: 'T2', sub: 'sum(1, 2), withdraw 900 from 2', x: 540, y: 20, w: 240 },
+    { id: 'a1', label: 'Account 1', sub: '1000', x: 120, y: 150, w: 200 },
+    { id: 'a2', label: 'Account 2', sub: '1000', x: 480, y: 150, w: 200 },
+    { id: 'ok', label: '✓ Rule holds', sub: '', x: 60, y: 290, w: 260 },
+    { id: 'bad', label: '✗ Rule broken', sub: '', x: 480, y: 290, w: 260 },
+  ]}
+  edges={[
+    { id: 't1-a1', from: 't1', to: 'a1', label: 'write' },
+    { id: 't2-a2', from: 't2', to: 'a2', label: 'write' },
+    { id: 't1-a2', from: 't1', to: 'a2', quiet: true },
+    { id: 't2-a1', from: 't2', to: 'a1', quiet: true },
+    { id: 'a1-ok', from: 'a1', to: 'ok' },
+    { id: 'a2-bad', from: 'a2', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'REPEATABLE READ',
+      path: 'consistent reads (no locks) → different rows written → ✗ sum 200',
+      summary: 'Same result as PostgreSQL REPEATABLE READ.',
+      steps: [
+        {
+          title: 'Plain SELECTs take no locks',
+          note: 'Both read 2000 from their read views; T1 updates 1, T2 updates 2; both commit. Final sum 200.',
+          code: "START TRANSACTION;\nSELECT SUM(balance) FROM accounts WHERE id IN (1, 2);   -- 2000.00\nUPDATE accounts SET balance = balance - 900 WHERE id = 1;\nCOMMIT;",
+          active: ['t1', 't2', 'a1', 'a2', 'bad'],
+          edges: ['t1-a2', 't2-a1', 't1-a1', 't2-a2', 'a2-bad'],
+          subs: { a1: '100', a2: '100', bad: 'sum 200' },
+        },
+      ],
+    },
+    {
+      title: 'SERIALIZABLE',
+      path: 'each SELECT takes S locks on 1 and 2 → each UPDATE needs X on a row the other has S-locked → ✓ deadlock, T2 rolled back, sum 1100',
+      summary: 'InnoDB SERIALIZABLE is REPEATABLE READ with SELECT … FOR SHARE.',
+      steps: [
+        {
+          title: 'Reads take shared locks',
+          note: 'With autocommit off (inside START TRANSACTION), every plain SELECT becomes SELECT … FOR SHARE. Both transactions now hold S locks on rows 1 and 2.',
+          code: "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;\nSTART TRANSACTION;\nSELECT SUM(balance) FROM accounts WHERE id IN (1, 2);   -- S locks on 1, 2",
+          active: ['t1', 't2', 'a1', 'a2'],
+          edges: ['t1-a2', 't2-a1'],
+          subs: { a1: 'S: T1, T2', a2: 'S: T1, T2' },
+        },
+        {
+          title: 'Writes wait for each other',
+          note: 'T2 wants X on row 2 (T1 holds S): wait. T1 wants X on row 1 (T2 holds S): wait. A cycle: InnoDB\'s deadlock detector rolls back one transaction immediately.',
+          active: ['t1', 't2', 'a1', 'a2'],
+          edges: ['t1-a1', 't2-a2'],
+        },
+        {
+          title: 'T2 is the victim',
+          note: 'T2: ERROR 1213 (40001) Deadlock found when trying to get lock. T1 committed; final sum 1100. Writing SELECT … FOR SHARE yourself under REPEATABLE READ gave exactly the same deadlock.',
+          code: '-- ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction',
+          active: ['a1', 'ok'],
+          edges: ['a1-ok'],
+          subs: { a1: '100 (T1)', a2: '1000 (T2 rolled back)', ok: 'sum 1100' },
+        },
+      ],
+    },
+    {
+      title: 'Autocommit reads stay lock-free',
+      path: 'SERIALIZABLE + autocommit SELECT → no S lock → writer waited 0.003 s (vs 2.5 s inside a transaction)',
+      summary: 'Only SELECTs inside an explicit transaction are converted.',
+      steps: [
+        {
+          title: 'Inside a transaction',
+          note: 'T1 (SERIALIZABLE) read account 1 inside START TRANSACTION and slept 3 s. A plain UPDATE of account 1 waited 2.48 s for T1\'s S lock.',
+          active: ['t1', 'a1'],
+          edges: ['t2-a1'],
+          subs: { a1: 'S: T1 → writer waits 2.48 s' },
+        },
+        {
+          title: 'In autocommit',
+          note: 'The same SELECT in autocommit mode is a single-statement transaction that uses a consistent read: the UPDATE finished in 0.003 s.',
+          active: ['t1', 'a1', 'ok'],
+          edges: ['a1-ok'],
+          subs: { a1: 'no lock → 0.003 s', ok: 'no blocking' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: no serializable level
+
+<Flow
+  title="MongoDB: write skew, and writing the conflict down"
+  height={360}
+  nodes={[
+    { id: 't1', label: 'T1 (transaction)', sub: 'sum(1, 2), withdraw from 1', x: 20, y: 20, w: 240 },
+    { id: 't2', label: 'T2 (transaction)', sub: 'sum(1, 2), withdraw from 2', x: 540, y: 20, w: 240 },
+    { id: 'a1', label: 'Account 1', sub: '1000', x: 120, y: 150, w: 200 },
+    { id: 'a2', label: 'Account 2', sub: '1000', x: 480, y: 150, w: 200 },
+    { id: 'ok', label: '✓ Rule holds', sub: '', x: 60, y: 290, w: 260 },
+    { id: 'bad', label: '✗ Rule broken', sub: '', x: 480, y: 290, w: 260 },
+  ]}
+  edges={[
+    { id: 't1-a1', from: 't1', to: 'a1', label: 'write' },
+    { id: 't2-a2', from: 't2', to: 'a2', label: 'write' },
+    { id: 't1-a2', from: 't1', to: 'a2', quiet: true },
+    { id: 't2-a1', from: 't2', to: 'a1', quiet: true },
+    { id: 'a1-ok', from: 'a1', to: 'ok' },
+    { id: 'a2-bad', from: 'a2', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'Snapshot transactions',
+      path: 'both aggregate 2000 → different documents written → ✗ both commit, sum 200',
+      summary: 'MongoDB transactions are snapshot isolation; there is nothing stronger to switch on.',
+      steps: [
+        {
+          title: 'Both commit',
+          note: 'Each transaction summed accounts 1 and 2 with $group (2000), then $inc −900 on its own account, with readConcern "snapshot" and writeConcern "majority". Final sum 200.',
+          code: "s.startTransaction({ readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } });\na.aggregate([{ $match: { _id: { $in: [1, 2] } } }, { $group: { _id: null, s: { $sum: '$balance' } } }]);\na.updateOne({ _id: 1 }, { $inc: { balance: NumberDecimal('-900') } });\ns.commitTransaction();",
+          active: ['t1', 't2', 'a1', 'a2', 'bad'],
+          edges: ['t1-a2', 't2-a1', 't1-a1', 't2-a2', 'a2-bad'],
+          subs: { a1: '100', a2: '100', bad: 'sum 200' },
+        },
+      ],
+    },
+    {
+      title: 'Materialize the conflict',
+      path: 'each transaction also writes the document it only read → write sets overlap → ✓ T1 WriteConflict, sum 1100',
+      summary: 'Turn the read dependency into a write, and snapshot isolation catches it.',
+      steps: [
+        {
+          title: 'Touch what you read',
+          note: 'Right after the sum, T1 increments version on account 2 and T2 on account 1. Each transaction has now written both documents it depends on.',
+          code: "a.updateOne({ _id: 2 }, { $inc: { version: 1 } });   // T1 (T2 does the same on _id 1)",
+          active: ['t1', 't2', 'a1', 'a2'],
+          edges: ['t1-a2', 't2-a1'],
+          subs: { a1: 'written by T2', a2: 'written by T1' },
+        },
+        {
+          title: 'One transaction loses',
+          note: 'T1\'s withdrawal from account 1 hit T2\'s uncommitted write: WriteConflict, transaction aborted. T2 committed; final sum 1100. In SQL the same trick is SELECT … FOR UPDATE on both rows (Concept 4) or a row that represents the rule (a "pair" row both transactions update).',
+          active: ['t1', 'a1', 'ok'],
+          edges: ['t1-a1', 'a1-ok'],
+          subs: { a1: '1000 (T1 aborted)', ok: 'sum 1100' },
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+SERIALIZABLE in PostgreSQL never blocks, but it **aborts**, and not only for real conflicts: sequential scans lock whole tables and more than two reads on one page lock the page. Every transaction at this level needs a retry loop, and the abort can arrive at `COMMIT`, after all the work is done. MySQL's SERIALIZABLE trades those aborts for lock waits and deadlocks.
+</Pitfall>
+
+## Real-world scenario: on-call doctors
+
+A hospital rule says at least one doctor must stay on call per shift. Two doctors, both on call, each open the app and go off call at the same moment. Each transaction checks "count on call ≥ 2", sees 2, and updates **its own** row.
+
+| Engine | Fix |
+|---|---|
+| PostgreSQL | Run the transaction at SERIALIZABLE and retry on 40001; or lock the shift's rows with `SELECT … FOR UPDATE` |
+| MySQL | `SELECT … FOR UPDATE` on the shift's doctor rows (writers queue instead of deadlocking); SERIALIZABLE works but deadlocks |
+| MongoDB | Update a shift document (e.g. `onCallCount` with `$inc` and a `$gte` filter) in the same transaction, so both transactions write it |
+
+## Why this matters for transactions
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 4: locking reads | `FOR UPDATE` is the portable way to materialize a conflict |
+| Concept 5: cost under contention | SERIALIZABLE abort rates and deadlock rates, measured |
+| Session 5: locks and indexes | Lock granularity depends on the access path in InnoDB too |
+| Session 7: application patterns | Retry loops and constraint rows |
+
+## Key takeaways
+
+1. Write skew breaks a rule spread over several rows; snapshot isolation does not detect it (sum 200 in all three engines).
+2. PostgreSQL SERIALIZABLE tracks reads with SIRead locks and aborts with 40001, possibly at commit.
+3. SIRead locks are tuples, index pages, heap pages or whole tables; coarse locks cause false aborts, so good indexes help.
+4. MySQL SERIALIZABLE converts in-transaction SELECTs to shared locks; write skew becomes a deadlock (1213).
+5. MongoDB has no serializable level; make the transactions write a common document.
+
+## Check questions
+
+1. Why did both REPEATABLE READ transactions commit, although the result broke the rule?
+2. What is an SIRead lock, and why does it never make another transaction wait?
+3. Two SERIALIZABLE transactions read and wrote disjoint id ranges, yet one failed. What made their locks overlap?
+4. Why can a sequential scan make SERIALIZABLE abort more transactions?
+5. How does MySQL SERIALIZABLE prevent write skew, and what error does the application see?
+6. Why did the SERIALIZABLE autocommit SELECT not block the writer, while the one in a transaction did?
+7. Fix the joint-account rule in MongoDB without SERIALIZABLE.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-3-isolation-levels/concept-3-write-skew-serializable/answers">Worked answers to Q1–Q7</DeepDive>

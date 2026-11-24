@@ -1,0 +1,381 @@
+---
+title: "Concept 1: When the snapshot starts"
+description: "An isolation level is mostly a rule about snapshots: one per statement (READ COMMITTED) or one per transaction (REPEATABLE READ, snapshot isolation). The same two-session test in PostgreSQL, MySQL and MongoDB, and the surprise that the snapshot starts at the first read, not at BEGIN."
+type: "concept"
+tags: ["transactions", "isolation", "postgresql", "mysql", "mongodb", "snapshot", "mvcc"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-consistent-read.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions/"
+  - "https://www.mongodb.com/docs/manual/reference/read-concern-snapshot/"
+---
+
+<Tldr>
+All three engines use MVCC, so an isolation level is mostly a rule about **which snapshot a read uses**. In **READ COMMITTED** every statement takes a fresh snapshot: T1 read balance 1000, T2 committed −100, T1's next read returned **900**. In **REPEATABLE READ** (PostgreSQL, MySQL) and in a **MongoDB transaction**, the whole transaction reads one snapshot: the second read returned **1000** again, and a new row inserted by T2 stayed invisible (count 1000, not 1001). The snapshot starts at the transaction's **first read**, not at `BEGIN`: a transaction that waited 2 s before its first `SELECT` saw T2's change (900) in all three engines, unless MySQL is told `START TRANSACTION WITH CONSISTENT SNAPSHOT` (1000).
+</Tldr>
+
+[Session 2](/blogs/databases/transactions/session-2-anomalies) reproduced the anomalies. This session asks which **level** prevents each one, engine by engine. The first rule to learn is when the snapshot is taken.
+
+## The levels each engine really has
+
+| Level (SQL standard name) | PostgreSQL 17 | MySQL 8.4 InnoDB | MongoDB 8.0 |
+|---|---|---|---|
+| READ UNCOMMITTED | Accepted, behaves as READ COMMITTED | Reads the newest version, even uncommitted | No equivalent |
+| READ COMMITTED | **Default.** New snapshot per statement | New snapshot per consistent read | Single operations outside a transaction (`readConcern: "local"` / `"majority"`) |
+| REPEATABLE READ | Snapshot isolation: one snapshot per transaction | **Default.** One snapshot for plain `SELECT`s; locking reads and writes see the newest committed row (Concept 4) | Every multi-document transaction: snapshot isolation |
+| SERIALIZABLE | Snapshot isolation + conflict detection (SSI, Concept 3) | REPEATABLE READ + every plain `SELECT` becomes `FOR SHARE` (Concept 3) | No equivalent |
+
+| Term | Meaning |
+|---|---|
+| Snapshot | The set of transactions whose changes a read can see: everything committed before the snapshot was taken, plus the transaction's own changes |
+| Statement-level snapshot | READ COMMITTED: each statement takes a new snapshot, so two reads in one transaction can disagree |
+| Transaction-level snapshot | REPEATABLE READ / snapshot isolation: the first read takes the snapshot and every later read reuses it |
+| Consistent read | MySQL's name for a plain `SELECT` that reads from a snapshot (no locks) |
+| **✓ Stable read** | The second read returns what the first returned |
+| **✗ Value changed** | The second read sees another transaction's commit (non-repeatable read or phantom) |
+
+The test in every engine: T1 reads account 1 (balance 1000), sleeps 2 s and reads again; T2 starts 1 s later and commits `balance − 100`.
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: one snapshot per statement, or one per transaction"
+  height={260}
+  nodes={[
+    { id: 't1', label: 'T1 (reader)', sub: 'reads account 1 twice', x: 20, y: 20, w: 200 },
+    { id: 'row', label: 'accounts id 1', sub: 'balance 1000', x: 300, y: 20, w: 200 },
+    { id: 't2', label: 'T2 (writer)', sub: 'balance − 100, commit', x: 580, y: 20, w: 200 },
+    { id: 'ok', label: '✓ Stable read', sub: '', x: 120, y: 180, w: 220 },
+    { id: 'bad', label: '✗ Value changed', sub: '', x: 460, y: 180, w: 220 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row', label: 'read' },
+    { id: 't2-row', from: 't2', to: 'row', label: 'write' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-bad', from: 'row', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'READ COMMITTED',
+      path: 'T1 read 1000 → T2 commits 900 → T1 new snapshot → ✗ 900',
+      summary: 'The default level: every statement sees everything committed before it started.',
+      steps: [
+        {
+          title: 't0: T1 reads',
+          note: 'BEGIN (READ COMMITTED is the default) and SELECT balance: the statement takes a snapshot and sees 1000.',
+          code: "BEGIN;\nSELECT balance FROM accounts WHERE id = 1;   -- 1000.00",
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+        },
+        {
+          title: 't1: T2 commits',
+          note: 'T2 runs in autocommit and commits balance − 100. The row now has a newer committed version, 900.',
+          code: 'UPDATE accounts SET balance = balance - 100 WHERE id = 1;',
+          active: ['t2', 'row'],
+          edges: ['t2-row'],
+          subs: { row: 'v1 1000 · v2 900 (committed)' },
+        },
+        {
+          title: 't2: T1 reads again',
+          note: 'The second SELECT takes a new snapshot, which includes T2\'s commit: 900. Same transaction, two different answers (a non-repeatable read). A count of branch B01 went from 1000 to 1001 the same way when T2 inserted a row (a phantom).',
+          code: "SELECT balance FROM accounts WHERE id = 1;   -- 900.00",
+          active: ['t1', 'row', 'bad'],
+          edges: ['t1-row', 'row-bad'],
+          subs: { bad: 'read 2 = 900' },
+        },
+      ],
+    },
+    {
+      title: 'REPEATABLE READ',
+      path: 'T1 read 1000 → T2 commits 900 → T1 same snapshot → ✓ 1000',
+      summary: 'Snapshot isolation: the first read fixes what the whole transaction sees.',
+      steps: [
+        {
+          title: 't0: T1 reads',
+          note: 'The first statement of a REPEATABLE READ transaction takes the snapshot: 1000.',
+          code: "BEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT balance FROM accounts WHERE id = 1;   -- 1000.00",
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+        },
+        {
+          title: 't1: T2 commits',
+          note: 'T2 commits 900. Its transaction id is not in T1\'s snapshot, so the new version is invisible to T1.',
+          active: ['t2', 'row'],
+          edges: ['t2-row'],
+          subs: { row: 'v1 1000 (T1 sees) · v2 900' },
+        },
+        {
+          title: 't2: T1 reads again',
+          note: 'Same snapshot: 1000. Phantoms are also prevented: the B01 count stayed 1000 after T2 inserted account 10001 in B01. (The SQL standard allows phantoms at this level; PostgreSQL\'s snapshot rules them out.)',
+          code: "SELECT balance FROM accounts WHERE id = 1;   -- 1000.00",
+          active: ['t1', 'row', 'ok'],
+          edges: ['t1-row', 'row-ok'],
+          subs: { ok: 'read 2 = 1000' },
+        },
+      ],
+    },
+    {
+      title: 'Snapshot starts at the first statement',
+      path: 'BEGIN → 2 s of nothing → T2 commits 900 → first SELECT → ✗ 900',
+      summary: 'REPEATABLE READ does not freeze the database at BEGIN.',
+      steps: [
+        {
+          title: 'BEGIN takes no snapshot',
+          note: 'T1 runs BEGIN ISOLATION LEVEL REPEATABLE READ and then waits 2 s without a statement (psql \\! sleep 2). T2 commits 900 meanwhile.',
+          active: ['t1', 't2', 'row'],
+          edges: ['t2-row'],
+          subs: { row: 'v2 900 committed' },
+        },
+        {
+          title: 'The first SELECT does',
+          note: 'The snapshot is taken by the first statement, after T2\'s commit: 900. When the wait was a SELECT pg_sleep(2), that statement took the snapshot and the read returned 1000.',
+          code: "SELECT balance FROM accounts WHERE id = 1;   -- 900.00",
+          active: ['t1', 'row', 'bad'],
+          edges: ['t1-row', 'row-bad'],
+          subs: { bad: 'first read = 900' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL InnoDB
+
+<Flow
+  title="MySQL: consistent reads under READ COMMITTED and REPEATABLE READ"
+  height={260}
+  nodes={[
+    { id: 't1', label: 'T1 (reader)', sub: 'reads account 1 twice', x: 20, y: 20, w: 200 },
+    { id: 'row', label: 'accounts id 1', sub: 'balance 1000', x: 300, y: 20, w: 200 },
+    { id: 't2', label: 'T2 (writer)', sub: 'balance − 100, commit', x: 580, y: 20, w: 200 },
+    { id: 'ok', label: '✓ Stable read', sub: '', x: 120, y: 180, w: 220 },
+    { id: 'bad', label: '✗ Value changed', sub: '', x: 460, y: 180, w: 220 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row', label: 'read' },
+    { id: 't2-row', from: 't2', to: 'row', label: 'write' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-bad', from: 'row', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'REPEATABLE READ (default)',
+      path: 'T1 read 1000 → T2 commits 900 → T1 read view reused → ✓ 1000',
+      summary: 'The first consistent read creates a read view; later plain SELECTs reuse it.',
+      steps: [
+        {
+          title: 't0: T1 reads',
+          note: 'START TRANSACTION, then a plain SELECT. InnoDB creates the transaction\'s read view at this first consistent read: 1000.',
+          code: "START TRANSACTION;\nSELECT balance FROM accounts WHERE id = 1;   -- 1000.00",
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+        },
+        {
+          title: 't1: T2 commits',
+          note: 'T2 commits 900. The old value stays reachable through the undo log (Session 4).',
+          active: ['t2', 'row'],
+          edges: ['t2-row'],
+          subs: { row: '900 · undo: 1000' },
+        },
+        {
+          title: 't2: T1 reads again',
+          note: 'Same read view: 1000. The count of B01 also stayed 1000 after T2 inserted a B01 account. But a locking read (FOR UPDATE) in the same transaction returned 900: Concept 4.',
+          code: "SELECT balance FROM accounts WHERE id = 1;   -- 1000.00",
+          active: ['t1', 'row', 'ok'],
+          edges: ['t1-row', 'row-ok'],
+          subs: { ok: 'read 2 = 1000' },
+        },
+      ],
+    },
+    {
+      title: 'READ COMMITTED',
+      path: 'T1 read 1000 → T2 commits 900 → T1 new read view → ✗ 900',
+      summary: 'Each consistent read builds a new read view.',
+      steps: [
+        {
+          title: 't0: T1 reads',
+          note: 'The session level is changed for this test only.',
+          code: "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;\nSTART TRANSACTION;\nSELECT balance FROM accounts WHERE id = 1;   -- 1000.00",
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+        },
+        {
+          title: 't1: T2 commits',
+          note: 'T2 commits 900.',
+          active: ['t2', 'row'],
+          edges: ['t2-row'],
+          subs: { row: '900 · undo: 1000' },
+        },
+        {
+          title: 't2: T1 reads again',
+          note: 'A new read view includes the commit: 900.',
+          code: "SELECT balance FROM accounts WHERE id = 1;   -- 900.00",
+          active: ['t1', 'row', 'bad'],
+          edges: ['t1-row', 'row-bad'],
+          subs: { bad: 'read 2 = 900' },
+        },
+      ],
+    },
+    {
+      title: 'START TRANSACTION vs WITH CONSISTENT SNAPSHOT',
+      path: 'START TRANSACTION → wait → first read ✗ 900; WITH CONSISTENT SNAPSHOT → wait → ✓ 1000',
+      summary: 'Only the explicit form creates the read view at the start.',
+      steps: [
+        {
+          title: 'Plain START TRANSACTION',
+          note: 'T1 starts, waits 2 s (DO SLEEP(2) is not a consistent read), T2 commits 900, then T1\'s first SELECT creates the read view: 900.',
+          code: "START TRANSACTION; DO SLEEP(2);\nSELECT balance FROM accounts WHERE id = 1;   -- 900.00",
+          active: ['t1', 't2', 'row', 'bad'],
+          edges: ['t2-row', 't1-row', 'row-bad'],
+          subs: { bad: 'first read = 900' },
+        },
+        {
+          title: 'WITH CONSISTENT SNAPSHOT',
+          note: 'The read view is created by the START statement itself, before T2\'s commit: 1000. mysqldump --single-transaction uses this form to get one consistent backup.',
+          code: "START TRANSACTION WITH CONSISTENT SNAPSHOT; DO SLEEP(2);\nSELECT balance FROM accounts WHERE id = 1;   -- 1000.00",
+          active: ['t1', 'row', 'ok'],
+          edges: ['t1-row', 'row-ok'],
+          subs: { ok: 'first read = 1000' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: a transaction reads one snapshot"
+  height={260}
+  nodes={[
+    { id: 't1', label: 'T1 (transaction)', sub: 'reads account 1 twice', x: 20, y: 20, w: 200 },
+    { id: 'row', label: 'accounts _id 1', sub: 'balance 1000', x: 300, y: 20, w: 200 },
+    { id: 't2', label: 'T2 (single write)', sub: '$inc −100', x: 580, y: 20, w: 200 },
+    { id: 'ok', label: '✓ Stable read', sub: '', x: 120, y: 180, w: 220 },
+    { id: 'bad', label: '✗ Value changed', sub: '', x: 460, y: 180, w: 220 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row', label: 'read' },
+    { id: 't2-row', from: 't2', to: 'row', label: 'write' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-bad', from: 'row', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'Inside a transaction',
+      path: 'T1 read 1000 → T2 commits 900 → T1 same snapshot → ✓ 1000',
+      summary: 'Multi-document transactions use snapshot isolation (replica set required).',
+      steps: [
+        {
+          title: 't0: T1 reads',
+          note: 'The first operation in the transaction picks the snapshot (a point in the oplog timeline): 1000.',
+          code: "const s = db.getMongo().startSession();\nconst a = s.getDatabase('bank').accounts;\ns.startTransaction({ readConcern: { level: 'snapshot' } });\na.findOne({ _id: 1 }).balance   // 1000.00",
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+        },
+        {
+          title: 't1: T2 commits',
+          note: 'A single-document update outside any transaction commits 900.',
+          code: "db.accounts.updateOne({ _id: 1 }, { $inc: { balance: NumberDecimal('-100') } })",
+          active: ['t2', 'row'],
+          edges: ['t2-row'],
+          subs: { row: '900 · history: 1000' },
+        },
+        {
+          title: 't2: T1 reads again',
+          note: 'Same snapshot: 1000. After commitTransaction(), a read outside the transaction returned 900. With readConcern "local" instead of "snapshot" the transaction still read 1000 twice: every transaction reads one snapshot; "snapshot" additionally guarantees it is majority-committed.',
+          code: "a.findOne({ _id: 1 }).balance   // 1000.00",
+          active: ['t1', 'row', 'ok'],
+          edges: ['t1-row', 'row-ok'],
+          subs: { ok: 'read 2 = 1000' },
+        },
+      ],
+    },
+    {
+      title: 'Outside a transaction',
+      path: 'two separate findOne calls → T2 commits between them → ✗ 900',
+      summary: 'Without a transaction each operation reads the latest data on its own.',
+      steps: [
+        {
+          title: 'Each read stands alone',
+          note: 'Two findOne calls without a session transaction behave like READ COMMITTED: the second one sees T2\'s commit. Read concern ("local", "majority") controls durability of what you read, not repeatability.',
+          active: ['t1', 't2', 'row', 'bad'],
+          edges: ['t2-row', 't1-row', 'row-bad'],
+          subs: { bad: 'read 2 = 900' },
+        },
+      ],
+    },
+    {
+      title: 'Snapshot starts at the first operation',
+      path: 'startTransaction → wait 2 s → T2 commits 900 → first findOne → ✗ 900',
+      summary: 'startTransaction() only marks the session; nothing is read yet.',
+      steps: [
+        {
+          title: 'The first read picks the snapshot',
+          note: 'startTransaction(), sleep(2000), then findOne: 900, because the snapshot was chosen by the first operation, after T2\'s commit.',
+          active: ['t1', 't2', 'row', 'bad'],
+          edges: ['t2-row', 't1-row', 'row-bad'],
+          subs: { bad: 'first read = 900' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## What each level prevents (measured)
+
+| Anomaly ([Session 2](/blogs/databases/transactions/session-2-anomalies)) | PG RC | PG RR | PG SERIALIZABLE | MySQL RC | MySQL RR | MySQL SERIALIZABLE | MongoDB transaction |
+|---|---|---|---|---|---|---|---|
+| Dirty read | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Non-repeatable read | ✗ (900) | ✓ (1000) | ✓ | ✗ (900) | ✓ for plain reads (1000); ✗ for locking reads (900) | ✓ | ✓ (1000) |
+| Phantom | ✗ (1001) | ✓ (1000) | ✓ | ✗ | ✓ for plain reads; ✗ for UPDATE (1,001 rows updated, Concept 2) | ✓ | ✓ |
+| Lost update (read, then write) | ✗ | ✓ error 40001 (Concept 2) | ✓ | ✗ | ✗ applied to the newer row (Concept 2) | ✓ deadlock (Concept 3) | ✓ WriteConflict (Concept 2) |
+| Write skew | ✗ | ✗ (sum 200) | ✓ error 40001 (Concept 3) | ✗ | ✗ (sum 200) | ✓ deadlock 1213 | ✗ (sum 200) |
+
+✓ = prevented, ✗ = allowed. Only the two SERIALIZABLE levels stopped write skew; every "prevented" in the bottom two rows works by **aborting** a transaction, which the application must retry (Concept 5).
+
+<Pitfall>
+`BEGIN` does not freeze the data. In all three engines the snapshot is taken by the first read, so code that opens a transaction, calls another service, and only then reads, sees the database as it was **after** the call. If several reads must reflect one moment, issue them all inside the transaction and, in MySQL, use `START TRANSACTION WITH CONSISTENT SNAPSHOT` when the read view must exist from the start.
+</Pitfall>
+
+## Real-world scenario: the monthly statement
+
+A report job builds a customer statement with three queries: opening balance, list of movements, closing balance. Under READ COMMITTED a transfer committed between the queries makes the statement not add up (opening + movements ≠ closing).
+
+| Option | Effect |
+|---|---|
+| Run the three queries in one REPEATABLE READ transaction (PostgreSQL, MySQL) | All three see one snapshot; the statement is consistent |
+| `START TRANSACTION WITH CONSISTENT SNAPSHOT` (MySQL) | Same, with the snapshot fixed at the start |
+| MongoDB: one transaction with `readConcern: "snapshot"` (60 s limit, Session 8) or one aggregation | One snapshot; very long reports belong on a secondary or in a nightly export |
+| `READ ONLY` transaction (PostgreSQL `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`) | Documents intent; a read-only transaction can never fail with a serialization error at this level |
+
+## Why this matters for transactions
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 2: writing a changed row | A snapshot read can be stale by the time you write; each engine resolves that differently |
+| Concept 4: locking reads | MySQL's RR mixes snapshot reads with newest-row reads |
+| Session 4: MVCC internals | How the old version (1000) is kept and found for an old snapshot |
+| Session 8: when transactions hurt | A snapshot held open keeps old versions alive |
+
+## Key takeaways
+
+1. READ COMMITTED: a new snapshot per statement (PostgreSQL default). REPEATABLE READ / snapshot isolation: one snapshot per transaction (MySQL default, every MongoDB transaction).
+2. In the lab: RC read 1000 then 900; RR and MongoDB transactions read 1000 twice and did not see a newly inserted row.
+3. The snapshot starts at the first read, not at `BEGIN`; MySQL's `WITH CONSISTENT SNAPSHOT` is the exception.
+4. Snapshot isolation prevents non-repeatable reads and phantoms for plain reads, but not write skew.
+5. Outside a transaction, every MongoDB operation reads on its own; read concern is about durability, not repeatability.
+
+## Check questions
+
+1. In READ COMMITTED, T1 reads a balance twice and gets 1000 then 900. Explain which snapshot each read used.
+2. Why did the PostgreSQL REPEATABLE READ transaction that ran `SELECT pg_sleep(2)` first still read 1000, while the one that slept with `\! sleep 2` read 900?
+3. A MySQL REPEATABLE READ transaction reads 1000 with a plain `SELECT`, 900 with `SELECT … FOR UPDATE`, then 1000 again. How is that possible?
+4. Which anomalies does snapshot isolation prevent, and which one does it still allow?
+5. Why does MongoDB not need a "REPEATABLE READ" setting inside transactions?
+6. A report runs three queries and must be consistent. Write the opening statement for PostgreSQL, MySQL and MongoDB.
+7. The SQL standard allows phantoms at REPEATABLE READ. Why did PostgreSQL's REPEATABLE READ not show one?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-3-isolation-levels/concept-1-when-the-snapshot-starts/answers">Worked answers to Q1–Q7</DeepDive>

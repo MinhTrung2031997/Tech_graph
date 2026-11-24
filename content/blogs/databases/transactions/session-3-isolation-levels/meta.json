@@ -1,0 +1,13 @@
+{
+  "title": "Session 3: Isolation levels per engine",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-when-the-snapshot-starts/index",
+    "concept-2-writing-a-changed-row/index",
+    "concept-3-write-skew-serializable/index",
+    "concept-4-locking-reads/index",
+    "concept-5-cost-under-contention/index",
+    "lab/index"
+  ]
+}
