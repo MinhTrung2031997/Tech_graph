@@ -1,0 +1,82 @@
+---
+title: "Answers: Idle in transaction"
+description: "Worked answers to the Session 8 Concept 1 check questions."
+companion: "answers"
+tags: ["transactions", "idle-in-transaction", "timeouts", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/runtime-config-client.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html#sysvar_wait_timeout"
+---
+
+<Tldr>
+An idle transaction is a lock holder with no deadline. Give it a deadline in the database, and remove the code path that creates it.
+</Tldr>
+
+## Q1. The SELECT that waited
+
+**Question:** why did D, a SELECT of a different row, wait, although it does not conflict with A?
+
+Lock requests on a table are granted in order. C (ALTER TABLE) requested an AccessExclusiveLock and was waiting for A. D's AccessShareLock is compatible with A's RowExclusiveLock, but **conflicts with C's pending request**; granting D first could starve C forever, so D queues behind C. `pg_blocking_pids(D)` returned C, not A. The idle session plus a DDL statement turned into an outage for all reads of the table. MySQL's metadata locks behave the same way.
+
+> **Common mistake:** looking only at who holds a lock on the row D reads; the blocker is a queued lock on the table.
+
+## Q2. ClientRead
+
+**Question:** what does `state = 'idle in transaction'` with `wait_event = 'ClientRead'` tell you about where the problem is?
+
+The backend has finished the last statement and is waiting for the **client** to send the next one. Nothing inside the database is slow: the application (or a person) opened a transaction and is doing something else. The `query` column shows the last statement it ran, which points to the code path; `application_name`, `client_addr` and `backend_start` identify the process.
+
+> **Common mistake:** tuning the database (more memory, indexes) for a problem that sits in application code.
+
+## Q3. Three PostgreSQL timeouts
+
+**Question:** what is the difference between `statement_timeout`, `idle_in_transaction_session_timeout` and `transaction_timeout`?
+
+| Setting | Measures | On expiry |
+|---|---|---|
+| `statement_timeout` | One running statement | That statement is cancelled; the session and (aborted) transaction stay |
+| `idle_in_transaction_session_timeout` | Time idle **between** statements inside a transaction | The session is terminated (lab: at 5.01 s) |
+| `transaction_timeout` (17+) | Total time since the transaction began, active or idle | The session is terminated (lab: 2.00 s while `pg_sleep(5)` ran) |
+
+A transaction made of many short statements with short pauses escapes the first two; only `transaction_timeout` caps it.
+
+> **Common mistake:** setting only `statement_timeout` and assuming long transactions are covered.
+
+## Q4. Invisible in processlist
+
+**Question:** why does MySQL's processlist make the blocking session easy to miss, and which view shows it?
+
+The idle connection shows `command = Sleep` with an empty state and no query: it looks exactly like every healthy pooled connection. The transaction is only visible in `information_schema.innodb_trx` (`trx_state RUNNING`, `trx_started`, `trx_query NULL`), and its effects in `sys.innodb_lock_waits` (row locks, `blocking_pid`) and `sys.schema_table_lock_waits` / `performance_schema.metadata_locks` (metadata locks). Join `innodb_trx` to processlist on the thread id to find old transactions on sleeping connections.
+
+> **Common mistake:** killing the queries in "Waiting for table metadata lock" state; they are victims, the blocker is asleep.
+
+## Q5. A low global wait_timeout
+
+**Question:** why is a low global `wait_timeout` a risky way to fix idle transactions in MySQL?
+
+`wait_timeout` closes **any** idle connection, inside a transaction or not. Connection pools keep idle connections open on purpose; a server-side close leaves the pool with dead connections, and the next request using one fails (or the pool must validate every checkout). It also cannot tell a forgotten transaction from a healthy idle connection. Use it per session for risky tools and jobs, make sure application transactions are short, monitor `innodb_trx`, and keep the pool's idle timeout below the server's `wait_timeout`.
+
+> **Common mistake:** a global `wait_timeout` of 60 s with a pool that keeps connections for 5 minutes.
+
+## Q6. 80 s instead of 60 s
+
+**Question:** the transaction's limit was 60 s, but the waiting write finished at ≈ 80 s. Why?
+
+`transactionLifetimeLimitSeconds` sets the transaction's **expiry time** (start + 60 s, shown as `expiryTime` in `$currentOp`). Expired transactions are aborted by a background job that runs periodically, not at the exact second. In both lab runs it ran about 20 s after expiry (80.5 s and 79.9 s). Plan for "60 s plus the job's interval", and do not rely on the limit as a fine-grained timeout: end transactions in the application.
+
+> **Common mistake:** raising `transactionLifetimeLimitSeconds` to let long transactions finish, which keeps old snapshots pinned longer (Concept 2).
+
+## Q7. Three patterns and their fixes
+
+**Question:** list three application patterns that produce idle-in-transaction sessions, and the fix for each.
+
+| Pattern | Fix |
+|---|---|
+| A transaction around an external call (HTTP, payment, email) | Do the call outside the transaction; record intent in an outbox (Concept 4) |
+| Transaction-per-request middleware (opened on first query, committed at the end of the request, including rendering and slow I/O) | Open transactions explicitly around the database work only |
+| An error path that does not roll back, returning the connection to a pool that does not reset it | `try … finally ROLLBACK`; pool configured to roll back on return |
+| Interactive sessions (psql, a SQL IDE in manual-commit mode) | Role-level `idle_in_transaction_session_timeout` for humans; autocommit in IDEs |
+| Long-running batch loops that commit only at the end | Commit per batch (Concept 3) |
+
+> **Common mistake:** relying only on the database timeout; the code path will keep producing failures (now as terminated connections).

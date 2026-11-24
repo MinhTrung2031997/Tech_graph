@@ -1,0 +1,288 @@
+---
+title: "Concept 3: Big transactions"
+description: "Updating 100,000 rows in one transaction: every row stays locked until the end (a single-row update waited 1.5–1.7 s in all three engines), the WAL arrives as one 37.6 MB burst in PostgreSQL, rollback is instant in PostgreSQL (3 ms) but replays undo in InnoDB (184 ms, proportional to the work), and MongoDB writes the transaction to the oplog in 16 MB pieces. Why batching in small transactions is the default for bulk changes."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "batching", "rollback", "wal", "oplog"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-explain.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-performance-ro-txn.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-undo-logs.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-production-consideration/"
+---
+
+<Tldr>
+A bulk change ("set every job's `locked_by`", "recalculate all prices") is tempting as one statement in one transaction. In the lab, updating **100,000 jobs** took 0.2–0.4 s in each engine, but while the transaction stayed open a **single-row update of job 50 waited the whole time** (1.5–1.7 s: as long as we kept it open). In PostgreSQL the statement produced **37.6 MB of WAL** (309,262 records) at once, which a replica must receive and replay before it catches up. Rolling back differs sharply: PostgreSQL's `ROLLBACK` took **3 ms** (the new versions are simply never visible), InnoDB's took **184 ms** for one pass and **347 ms** for four, because it applies the undo log row by row. MongoDB committed 100,000 documents in one transaction, writing **one oplog entry** of 100,000 operations; with 200 bytes more per document it needed **two** entries of 15.9 and 15.4 MB (the 16 MB document limit). The default for bulk work is **batches** of a few thousand rows, each its own transaction: 20 batches of 5,000 took 0.27–0.57 s, and each held its locks for milliseconds.
+</Tldr>
+
+## What one big transaction costs
+
+| Cost | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| Locks | Every updated row locked until COMMIT | Every updated row: 100,465 rows locked in 466 lock structures | Every modified document |
+| A writer that needs one of those rows | Waits for the whole transaction (1,508 ms) | Waits (1,686 ms), or 1205 after `innodb_lock_wait_timeout` | A plain write waits (1,600 ms) |
+| Log | WAL written as it goes: 37.6 MB, 1,480 full-page images | Redo as it goes; the **binlog** is written at commit, in one piece | One oplog entry per 16 MB, all at commit |
+| Rollback | **3 ms**: the aborted xid is marked, versions stay invisible and are vacuumed later | **184 ms** (1 pass), **347 ms** (4 passes): undo applied row by row | Aborted in memory |
+| Cleanup | Old versions kept until the transaction ends (Concept 2) | Undo kept until purge | Pinned history |
+| Replicas | Receive WAL continuously; replay can lag behind a burst | Receive the whole binlog event group at commit: a 10-minute transaction can arrive as a 10-minute replay | Receive the oplog entries at commit |
+
+Not measured in the lab: replica lag (single-node containers). The rows about replicas describe each engine's documented replication design.
+
+| Term | Meaning |
+|---|---|
+| Batch | A slice of the bulk change (e.g. 5,000 rows by primary-key range), committed as its own transaction |
+| Full-page image (FPI) | PostgreSQL writes a whole 8 kB page to the WAL the first time it is modified after a checkpoint |
+| Undo | InnoDB's record of how to reverse each change; used for rollback and for old versions |
+| `partialTxn` | MongoDB oplog flag on all but the last entry of a transaction split into several entries |
+| **✓ Short locks / ✗ Long locks** | Other writers wait milliseconds, or the length of the whole bulk job |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: one big UPDATE vs batches"
+  height={320}
+  nodes={[
+    { id: 'big', label: 'Bulk job', sub: '100,000 jobs', x: 20, y: 20, w: 220 },
+    { id: 'other', label: 'Other writer', sub: 'UPDATE job 50', x: 20, y: 200, w: 220 },
+    { id: 'rows', label: 'jobs rows', sub: '', x: 300, y: 110, w: 220 },
+    { id: 'wal', label: 'WAL', sub: '', x: 590, y: 20, w: 190 },
+    { id: 'wait', label: '✗ Waits', sub: '', x: 590, y: 200, w: 190 },
+    { id: 'ok', label: '✓ Waits ms', sub: '', x: 590, y: 110, w: 190 },
+  ]}
+  edges={[
+    { id: 'big-rows', from: 'big', to: 'rows' },
+    { id: 'other-rows', from: 'other', to: 'rows' },
+    { id: 'rows-wal', from: 'rows', to: 'wal' },
+    { id: 'rows-wait', from: 'rows', to: 'wait' },
+    { id: 'rows-ok', from: 'rows', to: 'ok' },
+  ]}
+  cases={[
+    {
+      title: '✗ One transaction',
+      path: 'UPDATE 100,000 rows (all locked) → job 50 waits until the end → 37.6 MB WAL in one burst → ROLLBACK 3 ms',
+      summary: 'The transaction stayed open 1.5 s; the single-row update waited 1,508 ms.',
+      steps: [
+        {
+          title: 'One statement, 100,000 row locks',
+          note: 'EXPLAIN (ANALYZE, WAL) reports this statement\'s WAL: records=309262 fpi=1480 bytes=37586982. Row locks in PostgreSQL live in the tuple header (xmax), so there is no lock-table limit, but every row is locked until COMMIT.',
+          code: "BEGIN;\nEXPLAIN (ANALYZE, WAL) UPDATE jobs SET locked_by = 'big';",
+          active: ['big', 'rows', 'wal'],
+          edges: ['big-rows', 'rows-wal'],
+          subs: { wal: '37.6 MB, 1,480 FPI' },
+        },
+        {
+          title: '✗ Any other writer waits for all of it',
+          note: 'UPDATE jobs … WHERE id = 50 waited 1,508 ms: the whole time the bulk transaction remained open. In production that is the whole runtime of the job, plus whatever the application does before COMMIT.',
+          active: ['other', 'rows', 'wait'],
+          edges: ['other-rows', 'rows-wait'],
+          subs: { wait: '1,508 ms' },
+        },
+        {
+          title: 'Rollback is cheap',
+          note: 'ROLLBACK took 3 ms: PostgreSQL only marks the transaction aborted in the commit log. The 100,000 new tuple versions remain in the table as dead tuples for VACUUM to remove: the cost of the aborted work shows up later as bloat.',
+          code: 'ROLLBACK;   -- 3 ms',
+          active: ['big', 'rows'],
+          edges: ['big-rows'],
+        },
+      ],
+    },
+    {
+      title: '✓ Batches',
+      path: '20 transactions × 5,000 rows by id range → other writers wait at most one batch → ✓',
+      summary: '20 batches: 270 ms in total, 25.9 MB of WAL spread over 20 commits.',
+      steps: [
+        {
+          title: '✓ Short transactions',
+          note: 'Each batch locks 5,000 rows for ≈ 13 ms. The total WAL is of the same order (25.9 MB here; full-page images depend on checkpoint timing), but a replica receives and replays it in small steps, and a failure loses one batch, not the whole job.',
+          code: "-- repeat for lo = 1, 5001, 10001, …\nUPDATE jobs SET locked_by = 'batch' WHERE id BETWEEN :lo AND :lo + 4999;",
+          active: ['big', 'other', 'rows', 'ok'],
+          edges: ['big-rows', 'other-rows', 'rows-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL
+
+<Flow
+  title="MySQL: locks and rollback of a big transaction"
+  height={320}
+  nodes={[
+    { id: 'big', label: 'Bulk job', sub: '100,000 jobs', x: 20, y: 20, w: 220 },
+    { id: 'other', label: 'Other writer', sub: 'UPDATE job 50', x: 20, y: 200, w: 220 },
+    { id: 'rows', label: 'Record locks', sub: '', x: 300, y: 110, w: 220 },
+    { id: 'undo', label: 'Undo log', sub: '', x: 590, y: 20, w: 190 },
+    { id: 'wait', label: '✗ Waits', sub: '', x: 590, y: 200, w: 190 },
+    { id: 'ok', label: '✓ Waits ms', sub: '', x: 590, y: 110, w: 190 },
+  ]}
+  edges={[
+    { id: 'big-rows', from: 'big', to: 'rows' },
+    { id: 'other-rows', from: 'other', to: 'rows' },
+    { id: 'rows-undo', from: 'rows', to: 'undo' },
+    { id: 'rows-wait', from: 'rows', to: 'wait' },
+    { id: 'rows-ok', from: 'rows', to: 'ok' },
+  ]}
+  cases={[
+    {
+      title: '✗ One transaction',
+      path: 'UPDATE 100,000 rows (100,465 locked) → job 50 waits → ROLLBACK replays undo: 184 ms',
+      summary: 'Rollback cost grows with the work done: 347 ms after four passes over the table.',
+      steps: [
+        {
+          title: 'Locks and undo for every row',
+          note: 'information_schema.innodb_trx: trx_rows_modified 100,000, trx_rows_locked 100,465, trx_lock_structs 466. Each change also wrote an undo record.',
+          code: "START TRANSACTION;\nUPDATE jobs SET locked_by = 'big';   -- 396 ms",
+          active: ['big', 'rows', 'undo'],
+          edges: ['big-rows', 'rows-undo'],
+          subs: { rows: '100,465 rows locked', undo: '100,000 records' },
+        },
+        {
+          title: '✗ The other writer waits',
+          note: 'UPDATE … WHERE id = 50 waited 1,686 ms, until the bulk transaction ended.',
+          active: ['other', 'rows', 'wait'],
+          edges: ['other-rows', 'rows-wait'],
+        },
+        {
+          title: '✗ Rollback replays the undo',
+          note: 'ROLLBACK took 184 ms: InnoDB applies every undo record in reverse to restore the old versions. After 4 passes (491 ms of updates) rollback took 347 ms. A crash during a multi-hour transaction means a long rollback during crash recovery too.',
+          code: 'ROLLBACK;   -- 184 ms',
+          active: ['rows', 'undo'],
+          edges: ['rows-undo'],
+        },
+      ],
+    },
+    {
+      title: '✓ Batches',
+      path: '20 × UPDATE … WHERE id BETWEEN … (autocommit) → ✓ locks held per batch only',
+      summary: '566 ms in total; a failure rolls back one batch.',
+      steps: [
+        {
+          title: '✓ One binlog event group per batch',
+          note: 'Batching also keeps each binlog transaction small, so a replica applies the change in many short steps instead of one long one, and a big transaction does not spill the binlog cache to disk.',
+          code: "UPDATE jobs SET locked_by = 'batch' WHERE id BETWEEN ? AND ? + 4999;   -- 20 times",
+          active: ['big', 'other', 'rows', 'ok'],
+          edges: ['big-rows', 'other-rows', 'rows-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: a 100,000-document transaction"
+  height={320}
+  nodes={[
+    { id: 'big', label: 'Bulk job', sub: 'withTransaction', x: 20, y: 20, w: 220 },
+    { id: 'other', label: 'Other writer', sub: 'updateOne _id 50', x: 20, y: 200, w: 220 },
+    { id: 'docs', label: 'jobs documents', sub: '', x: 300, y: 110, w: 220 },
+    { id: 'oplog', label: 'Oplog', sub: '', x: 590, y: 20, w: 190 },
+    { id: 'wait', label: '✗ Waits', sub: '', x: 590, y: 200, w: 190 },
+    { id: 'ok', label: '✓ Waits ms', sub: '', x: 590, y: 110, w: 190 },
+  ]}
+  edges={[
+    { id: 'big-docs', from: 'big', to: 'docs' },
+    { id: 'other-docs', from: 'other', to: 'docs' },
+    { id: 'docs-oplog', from: 'docs', to: 'oplog' },
+    { id: 'docs-wait', from: 'docs', to: 'wait' },
+    { id: 'docs-ok', from: 'docs', to: 'ok' },
+  ]}
+  cases={[
+    {
+      title: '✗ One transaction',
+      path: 'updateMany 100,000 docs in a transaction → _id 50 writer waits → commit writes the oplog: 1 entry (small changes) or 2 × ≈ 16 MB (with 200 bytes each)',
+      summary: 'updateMany 309 ms, commit 97 ms; the plain write waited 1,600 ms.',
+      steps: [
+        {
+          title: 'Nothing reaches the oplog until commit',
+          note: 'The transaction\'s writes stay in the WiredTiger cache (5,495 MB here) until commit. Very large transactions can fail with TransactionTooLargeForCache; the lab did not reach that limit.',
+          code: "await session.withTransaction(() =>\n  jobs.updateMany({}, { $set: { locked_by: 'big' } }, { session }));",
+          active: ['big', 'docs'],
+          edges: ['big-docs'],
+        },
+        {
+          title: '✗ Writers to those documents wait',
+          note: 'updateOne({ _id: 50 }) outside the transaction waited 1,600 ms, until commit.',
+          active: ['other', 'docs', 'wait'],
+          edges: ['other-docs', 'docs-wait'],
+        },
+        {
+          title: 'The oplog gets it all at once',
+          note: 'At commit the transaction is written as applyOps oplog entries of at most 16 MB. Setting a 200-byte field on 100,000 documents produced 2 entries: 50,839 operations (15.9 MB, partialTxn: true) and 49,161 (15.4 MB). Secondaries apply them only after the commit.',
+          code: "db.getSiblingDB('local').oplog.rs.find({ 'lsid.id': <session id>, op: 'c' })",
+          active: ['docs', 'oplog'],
+          edges: ['docs-oplog'],
+          subs: { oplog: '2 entries, 31 MB' },
+        },
+      ],
+    },
+    {
+      title: '✓ Batches without a transaction',
+      path: '20 × updateMany on _id ranges of 5,000 → ✓ each write is atomic per document',
+      summary: '558 ms in total. Each document update is atomic on its own; most bulk changes need no transaction at all.',
+      steps: [
+        {
+          title: '✓ Batches',
+          note: 'A bulk change that is correct document by document (recalculate a field, backfill a value) needs no multi-document transaction. Make each batch idempotent and resumable (filter on "not yet migrated").',
+          code: "for (let lo = 1; lo <= 100000; lo += 5000)\n  await jobs.updateMany({ _id: { $gte: lo, $lt: lo + 5000 } }, { $set: { locked_by: 'batch' } });",
+          active: ['big', 'other', 'docs', 'ok'],
+          edges: ['big-docs', 'other-docs', 'docs-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Writing a good batch job
+
+| Rule | Why |
+|---|---|
+| Slice by an indexed key range (`id BETWEEN …`), not `LIMIT` + `OFFSET` | Each batch is an index range scan; OFFSET re-reads everything before it (Indexing Session 10) |
+| Commit each batch | Locks, undo and snapshots held for milliseconds |
+| Make batches idempotent (`WHERE … AND NOT migrated`) | A rerun after a failure skips finished work |
+| Pause between batches if replicas lag | Lets replication and VACUUM/purge keep up |
+| Size by time, not rows (≈ 100–500 ms per batch) | Rows differ in cost; time is what blocks others |
+| Do not wrap the loop in an outer transaction | ORMs and migration tools sometimes do; it turns batches back into one big transaction |
+
+<Pitfall>
+"All or nothing" is a real requirement only sometimes. A price recalculation that must switch atomically is better done by writing the new values to a new column or table in batches, then switching with one small transaction (rename, flag, or pointer update). That gives atomic visibility without holding 100,000 row locks for the whole computation.
+</Pitfall>
+
+## Real-world scenario: the nightly cleanup that stalled checkouts
+
+`DELETE FROM sessions WHERE expires_at < now()` runs every night and removes ≈ 5 million rows in one statement. For 15 minutes logins are slow, replicas fall behind and the next morning the table is still bloated.
+
+| Problem | Fix |
+|---|---|
+| 5M rows locked for 15 minutes | Delete in batches of 5,000 by primary key, committing each |
+| Replica lag after the burst | Batches with a short pause; monitor lag between batches |
+| Bloat afterwards | Batches let autovacuum keep up; or partition by day and drop old partitions (Indexing Session 7) |
+
+## Why this matters
+
+| Next concept | Why this concept matters |
+|---|---|
+| Concept 4: distributed transactions | A transaction spanning systems is long by construction |
+| Concept 5: checklist | "Keep transactions short" includes bulk jobs |
+
+## Key takeaways
+
+1. A big transaction locks every row it touches until the end: a single-row update waited 1.5–1.7 s in each engine.
+2. PostgreSQL wrote 37.6 MB of WAL for one 100,000-row UPDATE; replicas get it as a burst.
+3. Rollback is cheap in PostgreSQL (3 ms, the cost moves to VACUUM) and proportional to the work in InnoDB (184–347 ms here, hours for hour-long transactions).
+4. MongoDB writes a transaction to the oplog at commit, split into ≈ 16 MB entries; most bulk changes need no transaction there.
+5. Batch bulk changes by key range, commit each batch, make them idempotent, and switch atomically at the end if needed.
+
+## Check questions
+
+1. Why did the single-row update of job 50 wait about 1.5 s in every engine?
+2. Why is PostgreSQL's ROLLBACK of a 100,000-row update almost free, and where does the cost go?
+3. Why did InnoDB's rollback take longer after four passes than after one?
+4. How did MongoDB write the 100,000-document transaction to the oplog, and what changed when each document grew by 200 bytes?
+5. Why do replicas fall behind more with one big transaction than with the same work in batches?
+6. Write a batched version of "delete sessions that expired" for PostgreSQL that is safe to rerun.
+7. A migration must make 1M new prices visible at once. How do you avoid one huge transaction?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-8-when-transactions-hurt/concept-3-big-transactions/answers">Worked answers to Q1–Q7</DeepDive>

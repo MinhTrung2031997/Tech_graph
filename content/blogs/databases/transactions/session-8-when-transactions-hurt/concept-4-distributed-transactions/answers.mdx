@@ -1,0 +1,88 @@
+---
+title: "Answers: Distributed transactions: two-phase commit vs the outbox"
+description: "Worked answers to the Session 8 Concept 4 check questions."
+companion: "answers"
+tags: ["transactions", "outbox", "two-phase-commit", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-prepare-transaction.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/xa-restrictions.html"
+  - "https://www.mongodb.com/docs/manual/changeStreams/"
+---
+
+<Tldr>
+Keep each transaction inside one database. Cross the boundary with durable, retried, idempotent messages, written in the same transaction as the change.
+</Tldr>
+
+## Q1. BEGIN does not cover the broker
+
+**Question:** why does wrapping "INSERT order; publish event" in `BEGIN … COMMIT` not make it atomic?
+
+The transaction belongs to the database; the broker knows nothing about it. If you publish inside the transaction and it later rolls back, the event is already out (phantom). If you publish after COMMIT and crash, the event is never sent (lost). The publish cannot be rolled back with the database, and the database commit cannot wait for the broker's. Holding the transaction open during the publish also adds a network call to the transaction's lifetime, with its locks (Concept 1).
+
+> **Common mistake:** "it's inside the @Transactional method, so it's atomic".
+
+## Q2. Lost and phantom events
+
+**Question:** explain the two failure modes of dual writes and their effects in the simulation.
+
+- **Database first:** the order commits, the process dies before publishing. The order exists but downstream services never hear about it: **62** of 1,000 orders had no event.
+- **Publish first:** the event goes out, then the insert fails (crash, constraint, deadlock). Downstream services act on an order that does not exist: **52** phantom events.
+
+Both rates track the 5% crash probability; in production the window is small but deploys, OOM kills and network partitions hit it regularly.
+
+> **Common mistake:** adding retries around the publish; they do not help when the process itself is gone.
+
+## Q3. PREPARE and in-doubt transactions
+
+**Question:** what does a participant promise at `PREPARE`, and why does an in-doubt transaction hurt the database?
+
+At PREPARE the participant writes everything needed to commit durably and promises it will commit if told to, even after a crash or restart; until it hears the decision it can neither commit nor roll back on its own. So it **keeps every lock** and (in PostgreSQL) its xmin, holding back VACUUM (Concept 2). Measured in MySQL: after the coordinator disconnected, the prepared branch still held row 40 (another UPDATE got 1205 after 2 s) and `innodb_trx` showed it with thread id 0. If the coordinator is lost, an operator must find it (`XA RECOVER`, `pg_prepared_xacts`) and decide.
+
+> **Common mistake:** enabling `max_prepared_transactions` "just in case" without monitoring `pg_prepared_xacts`.
+
+## Q4. At least once
+
+**Question:** why does the outbox deliver at least once rather than exactly once, and where did the 377 duplicates come from?
+
+Publishing and marking the row sent are again two systems. The relay publishes, then marks; if it crashes in between, the row is still unsent and will be published again. In the simulation a crash rolled back the relay's whole batch of up to 100 rows, so every event already published in that batch was sent again: 31 crashes produced 377 extra deliveries. Losing an event is impossible (the row stays until it is marked), duplicating one is possible, hence at least once. Smaller batches or marking each row right after its publish reduce duplicates; idempotent consumers make them harmless.
+
+> **Common mistake:** promising "exactly-once delivery" from the relay; exactly-once **effect** comes from the consumer's deduplication.
+
+## Q5. Publish, then mark
+
+**Question:** why must the relay publish before marking a row sent, and not the other way round?
+
+If it marks first and crashes before publishing, the row says "sent" but the broker never got it: the event is lost forever, and the outbox has become at-most-once, no better than a dual write. Publishing first means the worst case is a duplicate, which consumers can absorb.
+
+> **Common mistake:** marking in a separate early transaction "so other relays don't pick it up"; use `FOR UPDATE SKIP LOCKED` for that instead.
+
+## Q6. Change streams as the outbox
+
+**Question:** how does a MongoDB change stream play the role of the outbox, and what does the resume token guarantee?
+
+The oplog already records every committed change in order, and only committed ones (no phantoms). A change stream reads it as a stream of events; each event's `_id` is a resume token. After a crash, `watch([], { resumeAfter: token })` continues right after the last event you processed: in the lab, 400 events then 600 more, 1,000 distinct, in order. The guarantee holds as long as the token is still inside the oplog window; save the token durably, after publishing, for at-least-once. PostgreSQL logical decoding (with Debezium or a slot) and MySQL binlog readers play the same role.
+
+> **Common mistake:** storing the token only in memory, or letting the relay stay down longer than the oplog window.
+
+## Q7. Idempotent consumer
+
+**Question:** design the consumer side so that duplicate events have no effect.
+
+```sql
+CREATE TABLE processed_events (
+  event_id     text PRIMARY KEY,
+  processed_at timestamptz NOT NULL DEFAULT now()
+);
+-- per event, one transaction:
+BEGIN;
+INSERT INTO processed_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING RETURNING event_id;
+-- 0 rows → duplicate: COMMIT and acknowledge
+-- 1 row  → apply the effect (create the invoice, …)
+COMMIT;
+-- acknowledge the message to the broker after COMMIT
+```
+
+The event id is the idempotency key (Session 7 Concept 5), recorded in the same transaction as the effect. Acknowledge after commit, so a crash before commit leads to redelivery rather than loss.
+
+> **Common mistake:** deduplicating in memory or in a cache with a short TTL, which forgets keys before the broker stops redelivering.

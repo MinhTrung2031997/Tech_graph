@@ -1,0 +1,97 @@
+---
+title: "Answers: A transaction-design checklist"
+description: "Worked answers to the Session 8 Concept 5 check questions."
+companion: "answers"
+tags: ["transactions", "checklist", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/runtime-config-client.html"
+  - "https://www.mongodb.com/docs/manual/core/data-model-operations/#atomicity"
+---
+
+<Tldr>
+Name the invariant, protect it in as few statements as possible, retry safely, keep it short, and keep other systems out.
+</Tldr>
+
+## Q1. Reserve a seat
+
+**Question:** apply the six questions to "reserve a seat": write the transaction and justify each answer.
+
+```sql
+BEGIN;
+UPDATE seats SET status = 'held', held_by = $user, held_until = now() + interval '10 minutes'
+WHERE event_id = $event AND seat_no = $seat AND status = 'free';     -- 1 row = yours, 0 = taken
+INSERT INTO bookings (event_id, seat_no, user_id, idem_key) VALUES (…)  -- UNIQUE (event_id, seat_no), UNIQUE (idem_key)
+ON CONFLICT DO NOTHING RETURNING id;
+INSERT INTO outbox (event_id, payload) VALUES (…);                     -- "SeatHeld"
+COMMIT;
+```
+
+1. **Scope:** the seat row, the booking and the event, nothing else (no payment).
+2. **Isolation:** the invariant "one holder per seat" lives in one row plus a unique key, so READ COMMITTED suffices.
+3. **Concurrency:** the guarded UPDATE; the second user gets 0 rows. No version needed.
+4. **Retries:** 40P01/40001 re-run the function; the idempotency key makes a client retry return the same booking.
+5. **Duration:** milliseconds; the 10-minute hold is a **column** (`held_until`), not an open transaction; a sweeper frees expired holds.
+6. **Boundaries:** email/notification through the outbox.
+
+> **Common mistake:** holding `FOR UPDATE` on the seat while the user fills in the payment form.
+
+## Q2. When READ COMMITTED is enough
+
+**Question:** when is READ COMMITTED enough for a transaction that protects an invariant, and when is it not?
+
+Enough when the invariant is enforced **by a single statement or a constraint**: a guarded UPDATE on one row (`stock >= qty`), a unique key, a foreign key, a CHECK. The database evaluates those on the latest data. Not enough when the decision depends on **reading several rows and writing others**: "at least one doctor on call", "total exposure below a limit", "no overlapping bookings" without an exclusion constraint. That is write skew (Session 2): use SERIALIZABLE (PostgreSQL) with retries, lock the rows the decision reads (`FOR UPDATE`), materialise the invariant into one row you can lock, or a constraint (PostgreSQL exclusion constraints).
+
+> **Common mistake:** raising the isolation level for every transaction instead of the few with cross-row invariants.
+
+## Q3. Safety nets on the PostgreSQL application role
+
+**Question:** which safety-net settings would you put on the application role in PostgreSQL, and what does each catch?
+
+```sql
+ALTER ROLE app SET idle_in_transaction_session_timeout = '10s';  -- forgotten / stuck transactions (Concept 1)
+ALTER ROLE app SET transaction_timeout = '30s';                  -- transactions that keep working too long (17+)
+ALTER ROLE app SET statement_timeout = '5s';                     -- one runaway query
+ALTER ROLE app SET lock_timeout = '2s';                          -- waiting in a lock queue (fail fast, retry)
+```
+
+Each firing is a bug report: log and alert on them. Migration and batch roles get their own, looser values (with a short `lock_timeout` for DDL).
+
+> **Common mistake:** setting them in `postgresql.conf` for everybody, including the replication and maintenance roles.
+
+## Q4. One document first
+
+**Question:** why do MongoDB designs ask "can it be one document?" before "which transaction settings?"
+
+A single-document write is atomic without a transaction, needs no retry loop beyond the server's own, cannot hit the 60 s lifetime, and does not pin a snapshot. MongoDB's data model lets you put an order and its lines, or a counter and its limit, in one document, which turns many multi-row invariants into single-document updates (a guarded `$inc` was the fastest withdrawal pattern in Session 7). Transactions are the tool for what genuinely spans documents (a transfer between two accounts), not the default.
+
+> **Common mistake:** porting a normalised SQL schema to MongoDB and wrapping every operation in a transaction.
+
+## Q5. SERIALIZABLE everywhere in MySQL
+
+**Question:** a colleague proposes switching the whole MySQL application to SERIALIZABLE to fix a write-skew bug. What do you answer?
+
+InnoDB's SERIALIZABLE works by turning every plain SELECT into a shared locking read (when autocommit is off). Every read now blocks writers and can deadlock with them: the read-check-update transfer in Session 7 went from 5–6 to 53–71 deadlocks, and read-heavy pages start waiting on writes. Instead, fix the one transaction: read the rows its decision depends on with `FOR UPDATE` (or `FOR SHARE` plus an update of a common row), or materialise the invariant into a row or unique key, and keep the rest at REPEATABLE READ or READ COMMITTED.
+
+> **Common mistake:** expecting MySQL SERIALIZABLE to behave like PostgreSQL's SSI (optimistic detection); it is lock-based.
+
+## Q6. What frameworks add
+
+**Question:** name three things a framework can add to a transaction without appearing in your SQL.
+
+Any three of: transaction-per-request middleware (the transaction spans rendering and outgoing calls); lazy loading that runs extra SELECTs inside it; `@Transactional` / `Repo.transaction` propagation that silently joins an outer transaction (so your "small" transaction is part of a big one); automatic `SAVEPOINT`s; an implicit transaction opened by the driver when autocommit is off; ORM flushes that reorder writes (changing lock order); callbacks/hooks that send email or publish events inside the transaction; a pool that does not roll back on release.
+
+> **Common mistake:** reviewing only the repository code and never the statement log of a real request.
+
+## Q7. Four metrics
+
+**Question:** which four metrics would you put on a dashboard to see transaction problems early?
+
+1. **Age of the oldest open transaction / snapshot** (PostgreSQL `xact_start` and `backend_xmin` age; MySQL oldest `trx_started`; MongoDB `$currentOp` transactions): catches idle and long transactions (Concepts 1–2).
+2. **Lock waits and deadlocks per minute** (`pg_stat_database.deadlocks`, `log_lock_waits`; `Innodb_row_lock_waits`, deadlock count; MongoDB write conflicts): catches hot rows and lock-order bugs (Sessions 5–6).
+3. **Retry rate per transaction type** (from the application's retry helper): catches contention before users see errors (Session 7).
+4. **Cleanup backlog** (dead tuples and autovacuum lag; history list length; WiredTiger pinned range): catches the cost of long transactions (Concept 2).
+
+Add **outbox lag** (age of the oldest unsent row) if you use one (Concept 4).
+
+> **Common mistake:** monitoring only query latency; transaction problems show up as waiting and retrying, often with fast individual queries.

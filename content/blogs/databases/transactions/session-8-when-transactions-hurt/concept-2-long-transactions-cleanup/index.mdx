@@ -1,0 +1,314 @@
+---
+title: "Concept 2: Long transactions stop cleanup"
+description: "Every engine keeps old row versions for as long as some transaction might still read them. One old snapshot made PostgreSQL's VACUUM keep 50,000 dead tuples and let the table grow from 439 to 1,545 pages, made InnoDB's history list grow from ≈ 200 to 5,020 undo logs and its reader 5.7× slower, and pinned 50,019 transaction IDs in WiredTiger. Which transactions hold the horizon back, and how each engine limits the damage."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "mvcc", "vacuum", "purge", "history-list"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html"
+  - "https://www.postgresql.org/docs/current/sql-vacuum.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-purge-configuration.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html"
+  - "https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.minSnapshotHistoryWindowInSeconds"
+---
+
+<Tldr>
+MVCC (Session 4) keeps the old version of a row as long as **any** transaction might still need to read it. One long transaction therefore stops cleanup for everybody. In the lab, an open REPEATABLE READ snapshot in PostgreSQL made `VACUUM` report **"50000 are dead but not yet removable"**; repeated over four update cycles the table grew from **439 to 1,545 pages** (3.5×) and its index from 77 to 242, while the same workload without the old snapshot stayed at **439** pages. A subtle case: an idle **READ COMMITTED** transaction that had only read held nothing back, but one that had **written one row** kept **49,995** dead tuples alive. In MySQL an open read view stopped purge: the **history list** grew to **5,020** undo logs instead of ≈ 200, and the old reader's `SUM` went from **5.6 to 32 ms** because it had to rebuild old versions from undo. In MongoDB an open snapshot transaction pinned **50,019** transaction IDs in WiredTiger, released the moment it ended; MongoDB also refuses snapshots older than 300 s (**SnapshotTooOld**) and transactions older than 60 s.
+</Tldr>
+
+[Session 4, Concept 4](/blogs/databases/transactions/session-4-mvcc-internals/concept-4-long-transactions) explains how each engine stores and finds old versions and why the oldest snapshot sets the cleanup horizon. This concept is the operational side: what one long transaction costs on a busy table, which kinds of transaction hold cleanup back, and how to find the one that does.
+
+## Who holds the horizon back
+
+| Engine | Old versions live in | Cleaned by | Held back by |
+|---|---|---|---|
+| PostgreSQL | The table itself (dead tuples) and its indexes | HOT pruning, VACUUM / autovacuum | The oldest `backend_xmin` (snapshot) **or** `backend_xid` (running writer) in the database; also replication slots and prepared transactions |
+| MySQL | Undo logs (history list) | Purge threads | The oldest active **read view**, server-wide |
+| MongoDB | WiredTiger update chains in cache, then the history store | Eviction and checkpoints | The oldest open snapshot (transactions, snapshot reads), capped at `minSnapshotHistoryWindowInSeconds` (300 s) |
+
+| Term | Meaning |
+|---|---|
+| Horizon / removable cutoff | The oldest transaction id whose snapshot might still need old versions; versions dead before it can be removed |
+| Dead but not yet removable | A dead tuple newer than the horizon: VACUUM must keep it |
+| History list length | Number of committed transactions' undo logs that purge has not processed yet (InnoDB) |
+| Pinned range | WiredTiger: how many transaction IDs separate the oldest pinned snapshot from the newest |
+| **✓ Cleaned / ✗ Kept** | Old versions removed and space reused, or kept for a reader |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: VACUUM and an old snapshot"
+  height={320}
+  nodes={[
+    { id: 'a', label: 'A: old snapshot', sub: 'REPEATABLE READ', x: 20, y: 20, w: 220 },
+    { id: 'b', label: 'B: updater', sub: '5 × UPDATE all rows', x: 20, y: 180, w: 220 },
+    { id: 'heap', label: 'accounts heap', sub: '10,000 live tuples', x: 300, y: 100, w: 220 },
+    { id: 'vac', label: 'VACUUM', sub: 'removable cutoff', x: 590, y: 100, w: 190 },
+    { id: 'ok', label: '✓ Removed', sub: '', x: 590, y: 20, w: 190 },
+    { id: 'kept', label: '✗ Dead, not removable', sub: '', x: 590, y: 220, w: 190 },
+  ]}
+  edges={[
+    { id: 'a-heap', from: 'a', to: 'heap' },
+    { id: 'b-heap', from: 'b', to: 'heap' },
+    { id: 'heap-vac', from: 'heap', to: 'vac' },
+    { id: 'vac-ok', from: 'vac', to: 'ok' },
+    { id: 'vac-kept', from: 'vac', to: 'kept' },
+  ]}
+  cases={[
+    {
+      title: '✓ No old snapshot',
+      path: '5 × UPDATE all 10,000 rows → HOT pruning + VACUUM remove every dead version → ✓ table stays 439 pages',
+      summary: 'Over four update cycles the table stayed at 439 pages, the index at 77–81.',
+      steps: [
+        {
+          title: 'B creates 50,000 dead versions',
+          note: 'Each full-table UPDATE writes a new version of every row; the old ones are dead as soon as B commits. Many are pruned on the fly (HOT pruning) by later updates on the same page.',
+          code: 'UPDATE accounts SET version = version + 1;   -- 5 times',
+          active: ['b', 'heap'],
+          edges: ['b-heap'],
+          subs: { heap: '10,000 live + dead versions' },
+        },
+        {
+          title: '✓ VACUUM removes the rest',
+          note: '"tuples: 10007 removed, 10000 remain, 0 are dead but not yet removable"; "removable cutoff … 0 XIDs old". The freed space is reused by the next cycle, so the table does not grow.',
+          code: 'VACUUM (VERBOSE) accounts;',
+          active: ['heap', 'vac', 'ok'],
+          edges: ['heap-vac', 'vac-ok'],
+          subs: { ok: '439 pages after 4 cycles' },
+        },
+      ],
+    },
+    {
+      title: '✗ One old snapshot',
+      path: 'A: BEGIN REPEATABLE READ + one read → B: 5 × UPDATE → VACUUM: 50,000 dead but not yet removable → ✗ table grows',
+      summary: 'Four cycles: 442 → 809 → 1,177 → 1,545 pages; n_dead_tup 200,000; index 111 → 242 pages.',
+      steps: [
+        {
+          title: 'A takes a snapshot and waits',
+          note: 'After its first statement, A\'s backend_xmin is set: every row version that A might see must be kept, including versions B is about to replace.',
+          code: 'BEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT sum(balance) FROM accounts;   -- 74 buffers',
+          active: ['a', 'heap'],
+          edges: ['a-heap'],
+        },
+        {
+          title: '✗ VACUUM must keep everything',
+          note: '"tuples: 0 removed, 60000 remain, 50000 are dead but not yet removable"; "removable cutoff: …, which was 5 XIDs old". Nothing is freed, so the next updates need new pages.',
+          active: ['b', 'heap', 'vac', 'kept'],
+          edges: ['b-heap', 'heap-vac', 'vac-kept'],
+          subs: { kept: '50,000 per cycle', heap: '1,545 pages after 4 cycles' },
+        },
+        {
+          title: '✗ The old reader pays too',
+          note: 'A\'s own SUM went from 74 to 442 buffers: it must visit every page, including the dead versions, to find the ones its snapshot sees.',
+          code: 'SELECT sum(balance) FROM accounts;   -- in A again: 442 buffers',
+          active: ['a', 'heap'],
+          edges: ['a-heap'],
+        },
+        {
+          title: '✓ After COMMIT',
+          note: 'As soon as A ended, VACUUM removed the 50,000 tuples ("0 are dead but not yet removable"). The pages stay allocated, though: the table does not shrink without VACUUM FULL or pg_repack (Indexing Session 1).',
+          active: ['vac', 'ok'],
+          edges: ['vac-ok'],
+        },
+      ],
+    },
+    {
+      title: 'Idle READ COMMITTED transactions',
+      path: 'RC, only read → holds nothing ✓ · RC, wrote one row → backend_xid holds the horizon ✗ 49,995 kept',
+      summary: 'Same 5 updates; VACUUM while A is idle in transaction.',
+      steps: [
+        {
+          title: '✓ Read only: no snapshot kept',
+          note: 'In READ COMMITTED each statement takes its own snapshot and drops it at the end. Idle between statements, A had backend_xmin NULL and backend_xid NULL: VACUUM removed 10,005 tuples, 0 kept.',
+          active: ['a', 'vac', 'ok'],
+          edges: ['vac-ok'],
+        },
+        {
+          title: '✗ Wrote one row: the xid holds the horizon',
+          note: 'After UPDATE … WHERE id = 30, A had a transaction id (backend_xid set) and was still running. Rows deleted or updated after that xid might still be visible to a snapshot that sees A as running: "0 removed, 59995 remain, 49995 are dead but not yet removable".',
+          active: ['a', 'b', 'heap', 'vac', 'kept'],
+          edges: ['b-heap', 'heap-vac', 'vac-kept'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL
+
+<Flow
+  title="MySQL: purge and an old read view"
+  height={320}
+  nodes={[
+    { id: 'a', label: 'A: read view', sub: 'CONSISTENT SNAPSHOT', x: 20, y: 20, w: 220 },
+    { id: 'b', label: 'B: updater', sub: '5,000 small txns', x: 20, y: 180, w: 220 },
+    { id: 'undo', label: 'Undo logs', sub: 'history list', x: 300, y: 100, w: 220 },
+    { id: 'purge', label: 'Purge threads', sub: '', x: 590, y: 100, w: 190 },
+    { id: 'ok', label: '✓ Purged', sub: '', x: 590, y: 20, w: 190 },
+    { id: 'kept', label: '✗ History grows', sub: '', x: 590, y: 220, w: 190 },
+  ]}
+  edges={[
+    { id: 'a-undo', from: 'a', to: 'undo' },
+    { id: 'b-undo', from: 'b', to: 'undo' },
+    { id: 'undo-purge', from: 'undo', to: 'purge' },
+    { id: 'purge-ok', from: 'purge', to: 'ok' },
+    { id: 'purge-kept', from: 'purge', to: 'kept' },
+  ]}
+  cases={[
+    {
+      title: '✓ No old read view',
+      path: '5,000 single-row commits + 20 full-table updates → purge keeps up → ✓ history list ≈ 200',
+      summary: 'trx_rseg_history_len: 8 → 197 → 217.',
+      steps: [
+        {
+          title: '✓ Purge removes undo as it goes',
+          note: 'Every committed UPDATE leaves an undo log in the history list; purge threads remove the ones no read view needs. The list stayed around 200 during the run.',
+          code: "SELECT count FROM information_schema.innodb_metrics WHERE name = 'trx_rseg_history_len';",
+          active: ['b', 'undo', 'purge', 'ok'],
+          edges: ['b-undo', 'undo-purge', 'purge-ok'],
+        },
+      ],
+    },
+    {
+      title: '✗ One old read view',
+      path: 'A: START TRANSACTION WITH CONSISTENT SNAPSHOT → B commits 5,020 transactions → ✗ history list 5,020 → A COMMIT → 1,421 a second later',
+      summary: 'A\'s SUM over 10,000 rows: 5.6 ms before, 32 ms after (it rebuilds old versions from undo).',
+      steps: [
+        {
+          title: 'A opens a read view',
+          code: 'START TRANSACTION WITH CONSISTENT SNAPSHOT;\nSELECT sum(balance) FROM accounts;   -- 5.6 ms',
+          note: 'The read view records which transactions were committed at that moment. Any undo newer than it must stay, server-wide, in every schema.',
+          active: ['a', 'undo'],
+          edges: ['a-undo'],
+        },
+        {
+          title: '✗ Purge stops',
+          note: 'After B\'s 5,000 commits the history list was 5,000; after 20 more full-table updates, 5,020. Every undo log must stay while A\'s read view exists.',
+          active: ['b', 'undo', 'purge', 'kept'],
+          edges: ['b-undo', 'undo-purge', 'purge-kept'],
+          subs: { kept: '5,020 undo logs' },
+        },
+        {
+          title: '✗ The old reader slows down',
+          note: 'For each row, A finds the newest version in the clustered index and follows its undo pointer back to the version its read view may see. SUM took 32 ms instead of 5.6 ms. In production, long-running reports on busy tables get slower the longer they run.',
+          active: ['a', 'undo'],
+          edges: ['a-undo'],
+        },
+        {
+          title: 'After COMMIT',
+          note: 'One second after A committed the history list was 1,421 and stayed at 1,421–1,422 for the next 8 s: purge works in batches and leaves a small tail. A list that keeps growing for hours means a forgotten read view somewhere on the server.',
+          active: ['undo', 'purge', 'ok'],
+          edges: ['undo-purge', 'purge-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: what a snapshot pins"
+  height={320}
+  nodes={[
+    { id: 'a', label: 'A: snapshot txn', sub: "readConcern 'snapshot'", x: 20, y: 20, w: 220 },
+    { id: 'b', label: 'B: updater', sub: '5 × updateMany', x: 20, y: 180, w: 220 },
+    { id: 'wt', label: 'WiredTiger', sub: 'update chains, history store', x: 300, y: 100, w: 220 },
+    { id: 'ok', label: '✓ Released', sub: '0 IDs pinned', x: 590, y: 20, w: 190 },
+    { id: 'kept', label: '✗ Pinned', sub: '', x: 590, y: 180, w: 190 },
+  ]}
+  edges={[
+    { id: 'a-wt', from: 'a', to: 'wt' },
+    { id: 'b-wt', from: 'b', to: 'wt' },
+    { id: 'wt-ok', from: 'wt', to: 'ok' },
+    { id: 'wt-kept', from: 'wt', to: 'kept' },
+  ]}
+  cases={[
+    {
+      title: 'Open snapshot transaction',
+      path: 'A reads in a snapshot txn → B: 50,000 updates → ✗ 50,019 transaction IDs pinned → A aborts → ✓ 0',
+      summary: 'serverStatus().wiredTiger.transaction["transaction range of IDs currently pinned"].',
+      steps: [
+        {
+          title: '✗ Old versions pinned',
+          note: 'While A is open, WiredTiger keeps every version A might read, in the cache (update chains) and, when pages are evicted, in the history store. The pinned range was 50,019 IDs after B\'s 50,000 updates; on an idle server it is 0.',
+          code: "db.serverStatus().wiredTiger.transaction['transaction range of IDs currently pinned']",
+          active: ['a', 'b', 'wt', 'kept'],
+          edges: ['a-wt', 'b-wt', 'wt-kept'],
+          subs: { kept: '50,019 IDs' },
+        },
+        {
+          title: '✓ Released at the end',
+          note: 'Two seconds after A aborted, the pinned range was 0 again.',
+          active: ['wt', 'ok'],
+          edges: ['wt-ok'],
+        },
+      ],
+    },
+    {
+      title: 'MongoDB limits the damage',
+      path: 'transactions > 60 s aborted (Concept 1) · snapshot reads older than 300 s → ✗ SnapshotTooOld',
+      summary: 'Unlike PostgreSQL and MySQL, MongoDB bounds how old a snapshot can get.',
+      steps: [
+        {
+          title: 'Snapshot reads have a window',
+          note: 'A find with readConcern snapshot and atClusterTime 120 s in the past succeeded; 400 s in the past failed: 239 SnapshotTooOld "Read timestamp … is older than the oldest available timestamp". The server keeps history for minSnapshotHistoryWindowInSeconds (300 s) and no longer.',
+          code: "db.runCommand({ find: 'accounts', filter: { _id: 1 },\n  readConcern: { level: 'snapshot', atClusterTime: Timestamp({ t: <now − 400>, i: 0 }) } })",
+          active: ['a', 'wt', 'kept'],
+          edges: ['a-wt', 'wt-kept'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Finding the transaction that holds the horizon
+
+| Engine | Query |
+|---|---|
+| PostgreSQL | `SELECT pid, state, backend_xid, backend_xmin, now() - xact_start AS age, left(query, 60) FROM pg_stat_activity WHERE backend_xid IS NOT NULL OR backend_xmin IS NOT NULL ORDER BY age(backend_xmin) DESC NULLS LAST;` also `pg_replication_slots` (`xmin`, `catalog_xmin`) and `pg_prepared_xacts` |
+| PostgreSQL | `SELECT relname, n_dead_tup, last_autovacuum FROM pg_stat_user_tables ORDER BY n_dead_tup DESC;` and `VACUUM (VERBOSE)` ("dead but not yet removable", "removable cutoff … XIDs old") |
+| MySQL | `SELECT count FROM information_schema.innodb_metrics WHERE name = 'trx_rseg_history_len';` and the oldest `trx_started` in `information_schema.innodb_trx` |
+| MongoDB | `transaction range of IDs currently pinned` and `$currentOp` with `idleSessions: true` for open transactions |
+
+<Pitfall>
+The long transaction is often not in the application at all. In PostgreSQL: a forgotten replication slot (its `xmin`), a prepared transaction nobody committed, a read replica with `hot_standby_feedback = on` running a 3-hour report, or `pg_dump` (which runs one long REPEATABLE READ transaction for the whole dump). In MySQL: a backup tool that holds a consistent snapshot, or an analyst's SQL client in manual-commit mode. All of them hold cleanup back for every table in the database (PostgreSQL) or the whole server (MySQL).
+</Pitfall>
+
+## Real-world scenario: the queue table that grew to 40 GB
+
+A `jobs` table holds about 10,000 rows at any time; rows are inserted, updated twice and deleted within minutes. It is 40 GB on disk and every claim is slow. `n_dead_tup` is in the hundreds of millions; autovacuum runs constantly and removes nothing.
+
+| Finding | Cause | Fix |
+|---|---|---|
+| `VACUUM VERBOSE`: "dead but not yet removable" in the millions | A nightly reporting transaction on the same database runs 6 hours at REPEATABLE READ | Run reports on a replica without `hot_standby_feedback`, or with `transaction_timeout` |
+| Space not returned after the report ends | VACUUM frees space for reuse; it does not shrink the file | `pg_repack` (online) or `VACUUM FULL` in a maintenance window |
+| It will happen again | No alert | Alert on the age of the oldest `backend_xmin` and on `n_dead_tup` growth |
+
+## Why this matters
+
+| Next concept | Why this concept matters |
+|---|---|
+| Concept 3: big transactions | A big transaction is also a long one |
+| Concept 5: checklist | Monitoring the horizon is part of operating any MVCC database |
+| Indexing Session 8 | Bloat (dead tuples in tables and indexes) is the symptom; long transactions are a frequent cause |
+
+## Key takeaways
+
+1. Old versions are kept while any transaction might read them: one snapshot stops cleanup for the whole database (PostgreSQL) or server (MySQL).
+2. PostgreSQL: 50,000 dead tuples "not yet removable", table 439 → 1,545 pages over four cycles; an idle READ COMMITTED transaction that wrote one row did the same.
+3. MySQL: the history list grew to 5,020 instead of ≈ 200, and the old reader slowed down 5.7× rebuilding versions from undo.
+4. MongoDB pinned 50,019 transaction IDs during an open snapshot transaction, but bounds the damage: 60 s transactions, 300 s snapshot history.
+5. Find the holder by its snapshot/xid age (`pg_stat_activity`, `innodb_trx`, `$currentOp`), including non-application sources like replication slots, replicas and dumps.
+
+## Check questions
+
+1. Why did VACUUM remove 0 tuples while A was open, and what does "removable cutoff … 5 XIDs old" mean?
+2. Why did the table keep its size without the old snapshot, but grow 3.5× with it?
+3. An idle READ COMMITTED transaction that only read held nothing back; one that wrote one row held back 49,995 dead tuples. Explain.
+4. Why did A's own `SUM` get slower in both PostgreSQL and MySQL?
+5. What does the InnoDB history list length count, and why did it not drop to ≈ 0 right after A committed?
+6. How does MongoDB bound the cost of old snapshots, and what error shows the bound?
+7. Name three sources of an old horizon in PostgreSQL that are not application transactions.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-8-when-transactions-hurt/concept-2-long-transactions-cleanup/answers">Worked answers to Q1–Q7</DeepDive>

@@ -1,0 +1,134 @@
+---
+title: "Lab and session quiz: When transactions hurt"
+description: "Build a lock queue behind one idle transaction and end it with timeouts, watch an old snapshot stop VACUUM, purge and WiredTiger cleanup, compare the rollback of a big transaction in PostgreSQL and MySQL, strand a prepared XA transaction, and build an outbox relay. The final quiz covers the whole Transactions course."
+type: "how-to"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "lab", "vacuum", "outbox", "timeouts"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/runtime-config-client.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/xa-statements.html"
+  - "https://www.mongodb.com/docs/manual/changeStreams/"
+---
+
+<Tldr>
+Uses the containers and the `bank` database from the [Session 1 lab](/blogs/databases/transactions/session-1-transaction-guarantees/lab). Most exercises need **three or four terminals**: label them A, B, C, D and run the steps in order. Exercise 2 changes many rows; reset with `UPDATE accounts SET version = 1;` afterwards. The last exercise (the quiz) spans the whole course.
+</Tldr>
+
+## Exercise 1: one idle transaction (Concept 1)
+
+**PostgreSQL** (`docker exec -it idx-pg psql -U postgres -d bank` in each terminal):
+
+| Step | Terminal | Statement |
+|---|---|---|
+| 1 | A | `SET idle_in_transaction_session_timeout = '30s'; BEGIN; UPDATE accounts SET balance = balance WHERE id = 21;` |
+| 2 | B | `UPDATE accounts SET balance = balance WHERE id = 21;` (waits) |
+| 3 | C | `ALTER TABLE accounts ADD COLUMN note text;` (waits) |
+| 4 | D | `SELECT balance FROM accounts WHERE id = 50;` (predict: returns or waits?) |
+| 5 | another | the query below, then wait for A's timeout |
+
+```sql
+SELECT pid, state, wait_event_type, wait_event, pg_blocking_pids(pid) AS blocked_by,
+       now() - xact_start AS xact_age, left(query, 40) AS query
+FROM pg_stat_activity WHERE datname = 'bank' AND pid <> pg_backend_pid() ORDER BY xact_start;
+```
+
+Reference (5 s timeout): A `idle in transaction` / `ClientRead`; B `Lock` / `transactionid` blocked by A; C `Lock` / `relation` blocked by A and B; D `Lock` / `relation` blocked by **C**. When A was terminated ("terminating connection due to idle-in-transaction timeout"), B, C and D completed together. Clean up: `ALTER TABLE accounts DROP COLUMN note;`.
+
+Then try `SET transaction_timeout = '2s'; BEGIN; SELECT pg_sleep(5);` (PostgreSQL 17).
+
+**MySQL:** same four steps with `START TRANSACTION`, `SET SESSION wait_timeout = 30` in A and `ALTER TABLE accounts ADD COLUMN note TEXT` in C. Compare what `SHOW PROCESSLIST` shows for A with `SELECT * FROM information_schema.innodb_trx`.
+
+**MongoDB:** in A, `s = db.getMongo().startSession(); s.startTransaction(); s.getDatabase("bank").accounts.updateOne({ _id: 21 }, { $inc: { version: 1 } })`; in B, `db.accounts.updateOne({ _id: 21 }, { $inc: { version: 1 } })` and time how long it waits. Reference: ≈ 80 s (60 s lifetime plus the abort job's interval); A's `s.commitTransaction()` then fails with `NoSuchTransaction`.
+
+## Exercise 2: an old snapshot vs cleanup (Concept 2)
+
+**PostgreSQL:**
+
+| Step | Terminal | Statement |
+|---|---|---|
+| 1 | B | `VACUUM FULL accounts; SELECT pg_relation_size('accounts') / 8192 AS pages;` |
+| 2 | A | `BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT sum(balance) FROM accounts;` |
+| 3 | B | run `UPDATE accounts SET version = version + 1;` five times, then `VACUUM (VERBOSE) accounts;` |
+| 4 | A | `EXPLAIN (ANALYZE, BUFFERS) SELECT sum(balance) FROM accounts;` then `COMMIT;` |
+| 5 | B | `VACUUM (VERBOSE) accounts;` |
+
+Reference: step 3 "tuples: 0 removed, 60000 remain, **50000 are dead but not yet removable**"; step 4 read 442 buffers (74 before); step 5 removed 50,000. Repeat with A in READ COMMITTED: (a) only a SELECT, (b) an `UPDATE … WHERE id = 30`. Reference: (a) nothing kept, (b) 49,995 kept.
+
+**MySQL:** A `START TRANSACTION WITH CONSISTENT SNAPSHOT; SELECT sum(balance) FROM accounts;`, B runs a few thousand single-row updates (a shell loop or a procedure), then compare `SELECT count FROM information_schema.innodb_metrics WHERE name = 'trx_rseg_history_len';` before and after, and A's `SUM` time. Reference: history list ≈ 200 without A, 5,020 with A; A's SUM 5.6 → 32 ms.
+
+**MongoDB:** open a snapshot transaction in A and read one document; in B run `db.accounts.updateMany({}, { $inc: { version: 1 } })` five times; read `db.serverStatus().wiredTiger.transaction["transaction range of IDs currently pinned"]` before and after A aborts. Reference: 50,019 → 0. Then try a `find` with `readConcern: { level: "snapshot", atClusterTime: Timestamp({ t: <now − 400>, i: 0 }) }`. Reference: `SnapshotTooOld`.
+
+## Exercise 3: big transactions (Concept 3)
+
+```sql
+-- PostgreSQL, terminal A
+BEGIN;
+EXPLAIN (ANALYZE, WAL) UPDATE jobs SET locked_by = 'big';   -- note records, fpi, bytes
+-- terminal B: UPDATE jobs SET locked_by = 'other' WHERE id = 50;   (waits)
+\timing on
+ROLLBACK;
+```
+
+```sql
+-- MySQL, terminal A
+START TRANSACTION;
+UPDATE jobs SET locked_by = 'big';
+SELECT trx_rows_modified, trx_rows_locked, trx_lock_structs
+FROM information_schema.innodb_trx WHERE trx_mysql_thread_id = CONNECTION_ID();
+ROLLBACK;   -- note the time
+```
+
+Reference: PostgreSQL WAL 309,262 records, 1,480 FPI, 37.6 MB; ROLLBACK 3 ms. MySQL 100,000 modified, 100,465 locked, 466 lock structs; ROLLBACK 184 ms (347 ms after four passes). Then write the batched version (20 × 5,000 rows by `id BETWEEN`) and compare how long B waits.
+
+**MongoDB:** run a transaction that sets a 200-character field on all 100,000 jobs, commit, and count its oplog entries: `db.getSiblingDB("local").oplog.rs.find({ "lsid.id": <session id>, op: "c" })`. Reference: 2 entries (50,839 and 49,161 operations, ≈ 16 MB each).
+
+## Exercise 4: distributed transactions (Concept 4)
+
+**PostgreSQL 2PC is off:** `BEGIN; UPDATE accounts SET balance = balance WHERE id = 40; PREPARE TRANSACTION 'pay-1';` Reference: `ERROR: prepared transactions are disabled`.
+
+**MySQL in-doubt XA:**
+
+| Step | Terminal | Statement |
+|---|---|---|
+| 1 | A | `XA START 'pay-1'; UPDATE accounts SET balance = balance - 10 WHERE id = 40; XA END 'pay-1'; XA PREPARE 'pay-1';` then quit the client |
+| 2 | B | `XA RECOVER; SELECT trx_state, trx_mysql_thread_id, trx_rows_locked FROM information_schema.innodb_trx;` |
+| 3 | B | `SET SESSION innodb_lock_wait_timeout = 2; UPDATE accounts SET balance = balance + 1 WHERE id = 40;` |
+| 4 | B | `XA COMMIT 'pay-1'; SELECT balance FROM accounts WHERE id = 40;` |
+
+Reference: the branch survived the disconnect (thread id 0, 1 row locked), B's update failed with 1205 after 2 s, `XA COMMIT` from B applied it (990.00).
+
+**Outbox in PostgreSQL:**
+
+```sql
+CREATE TABLE outbox (id bigserial PRIMARY KEY, event_id text NOT NULL UNIQUE, payload jsonb NOT NULL,
+                     created_at timestamptz NOT NULL DEFAULT now(), sent_at timestamptz);
+CREATE INDEX outbox_unsent ON outbox (id) WHERE sent_at IS NULL;
+
+-- the business transaction
+BEGIN;
+UPDATE accounts SET balance = balance - 10 WHERE id = 41 AND balance >= 10;
+INSERT INTO outbox (event_id, payload) VALUES ('debit-41-1', '{"account": 41, "amount": 10}');
+COMMIT;
+
+-- the relay (run in two terminals at once: do they get the same rows?)
+BEGIN;
+SELECT id, event_id FROM outbox WHERE sent_at IS NULL ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED;
+-- "publish" here
+UPDATE outbox SET sent_at = now() WHERE id = ANY('{…}');
+COMMIT;
+```
+
+**MongoDB change stream:** in A, `c = db.accounts.watch(); let e = null; while (!(e = c.tryNext())) sleep(100); token = e._id;` and make one update in B while A waits. Make a second update in B. In A open `db.accounts.watch([], { resumeAfter: token })` and check that only the second update arrives.
+
+## Session quiz (whole course)
+
+1. In Exercise 1, which single setting would have prevented the outage, and which code change would have prevented the idle transaction?
+2. Explain why an idle READ COMMITTED transaction that wrote one row holds back VACUUM, while one that only read does not.
+3. A nightly MySQL report runs 3 hours in one transaction. Name two effects on the rest of the server and a design that avoids them.
+4. Why is a failed big transaction cheap to roll back in PostgreSQL but expensive in InnoDB, and where does PostgreSQL pay instead?
+5. Compare 2PC and the outbox: what does each guarantee, and what does each cost operationally?
+6. Design "transfer money between two accounts" for PostgreSQL using the whole course: isolation level, statements, lock order, retries, idempotency, duration limits and the event.
+7. The same transfer in MongoDB: which parts change, and why?
+8. Pick three measurements from the Transactions course that surprised you, and say which design rule each one supports.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-8-when-transactions-hurt/lab/answers">Answers to the session quiz</DeepDive>
