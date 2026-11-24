@@ -1,0 +1,164 @@
+---
+title: "Concept 1: Hot standby conflicts in PostgreSQL"
+description: "A 60-second report on a PostgreSQL standby, while the primary updated and vacuumed 100,000 rows: with the default max_standby_streaming_delay of 30 s the report was cancelled after 33.5 s with 'User query might have needed to see row versions that must be removed', and replay stood still for 29 s first. With -1 the report finished and replay waited 58 s. With 5 s it was cancelled after 8.4 s. A column added on the primary cancelled a standby query for holding a lock too long."
+type: "concept"
+tags: ["replication", "hot-standby", "conflicts", "postgresql"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/hot-standby.html#HOT-STANDBY-CONFLICT"
+  - "https://www.postgresql.org/docs/17/runtime-config-replication.html#GUC-MAX-STANDBY-STREAMING-DELAY"
+  - "https://www.postgresql.org/docs/17/monitoring-stats.html#MONITORING-PG-STAT-DATABASE-CONFLICTS-VIEW"
+---
+
+<Tldr>
+A PostgreSQL standby must replay the primary's WAL exactly, including VACUUM removing old row versions. A long query on the standby may still need those versions. When the two collide, the standby can either **pause replay** or **cancel the query**. `max_standby_streaming_delay` decides how long it pauses before cancelling. With the default **30 s**, a 60-second report was cancelled after **33.5 s** with `canceling statement due to conflict with recovery` / `User query might have needed to see row versions that must be removed`, and for those 30 s replay stood still: the standby fell **29 s** behind. With **-1** (wait forever) the report finished and replay was blocked for **58 s**. With **5 s** the report died after **8.4 s** and replay barely lagged. DDL on the primary causes the same conflict through locks: adding a column cancelled a standby query with `User was holding a relation lock for too long`. There is no setting that gives both fresh replicas and unlimited queries.
+</Tldr>
+
+## The setup
+
+`rpc-pg1` streams to `rpc-pg2`. Table `orders`, 1,000,000 rows, 73 MB. On the standby a report runs in one `REPEATABLE READ` transaction: count the new orders, `pg_sleep(60)`, count again. Three seconds in, the primary marks 100,000 orders as paid and runs `VACUUM orders`. A loop inserts a row on the primary every second and reads the standby's replay lag.
+
+| Term | Meaning |
+|---|---|
+| Hot standby | A standby that accepts read-only queries while replaying WAL |
+| Recovery conflict | Replaying a WAL record would remove data, or take a lock, that a running standby query still uses |
+| `max_standby_streaming_delay` | How long replay waits for conflicting queries before cancelling them (default 30 s; -1 = forever) |
+| Replay lag | `now() - pg_last_xact_replay_timestamp()`: how old the newest replayed commit is |
+| `pg_stat_database_conflicts` | Per-database counters of cancelled queries by cause (snapshot, lock, buffer pin, deadlock) |
+| **✓ / ✗** | Runs / waits or is cancelled |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: VACUUM on the primary meets a report on the standby"
+  height={340}
+  nodes={[
+    { id: 'pri', label: 'Primary', sub: 'UPDATE 100k + VACUUM', x: 20, y: 20, w: 200 },
+    { id: 'wal', label: 'WAL stream', sub: 'prune records', x: 300, y: 20, w: 200 },
+    { id: 'rep', label: 'Startup process', sub: 'replays WAL', x: 580, y: 20, w: 200 },
+    { id: 'rpt', label: 'Report on standby', sub: 'REPEATABLE READ, 60 s', x: 580, y: 270, w: 200 },
+    { id: 'lag', label: 'Replay lag', sub: 'now() - last replay', x: 20, y: 270, w: 200 },
+  ]}
+  edges={[
+    { id: 'pri-wal', from: 'pri', to: 'wal' },
+    { id: 'wal-rep', from: 'wal', to: 'rep' },
+    { id: 'rep-rpt', from: 'rep', to: 'rpt' },
+    { id: 'rep-lag', from: 'rep', to: 'lag' },
+  ]}
+  cases={[
+    {
+      title: 'Default: max_standby_streaming_delay = 30s',
+      path: 'VACUUM removes old versions → WAL reaches standby → replay ✗ waits 30 s → report ✗ cancelled (33.5 s) → replay ✓ catches up',
+      summary: 'The standby pauses, then sacrifices the query.',
+      steps: [
+        {
+          title: 't0: the report takes its snapshot',
+          note: 'count(*) = 1,000,000 new orders. The snapshot must keep seeing every row version that existed at that moment.',
+          code: "BEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT count(*) FROM orders WHERE status = 'new';\nSELECT pg_sleep(60);",
+          active: ['rpt'],
+          subs: { rpt: '✓ snapshot held' },
+        },
+        {
+          title: 't3 s: UPDATE + VACUUM on the primary',
+          note: 'The primary has no idea a standby query needs the old versions (hot_standby_feedback is off). VACUUM removes the 100,000 dead versions and writes WAL records saying so.',
+          code: "UPDATE orders SET status = 'paid' WHERE id <= 100000;\nVACUUM orders;",
+          active: ['pri', 'wal'],
+          edges: ['pri-wal'],
+        },
+        {
+          title: 'Replay stops',
+          note: 'The startup process reaches the prune records, sees the report\'s snapshot needs those versions, and waits. Everything behind that record waits too: replay lag 6 s, 12 s, … 29 s.',
+          active: ['wal', 'rep', 'lag', 'rpt'],
+          edges: ['wal-rep', 'rep-lag'],
+          subs: { rep: '✗ waiting for the report', lag: '✗ 29 s behind' },
+        },
+        {
+          title: 'After 30 s: cancel',
+          note: 'ERROR: canceling statement due to conflict with recovery. DETAIL: User query might have needed to see row versions that must be removed. Report ended after 33.5 s; replay then caught up at once.',
+          active: ['rep', 'rpt', 'lag'],
+          edges: ['rep-rpt', 'rep-lag'],
+          subs: { rpt: '✗ cancelled', lag: '✓ 0 s again' },
+        },
+      ],
+    },
+    {
+      title: 'max_standby_streaming_delay = -1',
+      path: 'replay ✗ waits as long as the report runs → report ✓ finishes (60.1 s) → replay ✓ catches up',
+      summary: 'The query always wins; the replica goes stale.',
+      steps: [
+        {
+          title: 'Replay waits for the whole report',
+          note: 'Replay lag 41 s, 46 s, 52 s … and back to 0 at 58 s, when the report committed. Both counts returned 1,000,000: the snapshot was intact.',
+          active: ['rep', 'rpt', 'lag'],
+          edges: ['rep-rpt', 'rep-lag'],
+          subs: { rpt: '✓ finished', lag: '✗ up to 58 s behind' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Measured
+
+Same report and the same UPDATE + VACUUM each time; only the standby's setting changed.
+
+| `max_standby_streaming_delay` | Report | Report ended after | Worst replay lag during the report |
+|---|---|---|---|
+| 30 s (default) | ✗ cancelled | 33.5 s | 29 s |
+| 5 s | ✗ cancelled | 8.4 s | under 1 s (as sampled) |
+| -1 | ✓ finished | 60.1 s | 58 s |
+
+The replay lag is in **seconds of commits**, not bytes: the WAL waiting behind the conflict was only about 1.1 MB, because the primary was nearly idle. On a busy primary everything written during the pause waits: in Concept 2, five update rounds left the standby **122 MB** behind.
+
+## Locks conflict too
+
+Any command that takes an ACCESS EXCLUSIVE lock on the primary (ALTER TABLE, DROP, TRUNCATE, VACUUM truncating the end of a table) is replayed by taking the same lock on the standby. With the delay at 5 s, a 30-second standby query on `orders` and `ALTER TABLE orders ADD COLUMN note2 text` on the primary:
+
+```
+ERROR:  canceling statement due to conflict with recovery
+DETAIL:  User was holding a relation lock for too long.
+```
+
+after 7.1 s. `pg_stat_database_conflicts` on the standby afterwards: `confl_snapshot = 2`, `confl_lock = 1`.
+
+<Pitfall>
+`max_standby_streaming_delay` is not a per-query timeout. It is the total time replay may fall behind **since the last WAL it received**, shared by every conflicting query. And a standby used for failover should not have -1: a standby that is far behind must replay everything it has received before it can serve as primary (from the documentation: WAL available locally is replayed before promotion completes), and WAL it has not received is the loss window from Session 5. Use separate replicas for long reports and for failover.
+</Pitfall>
+
+## Real-world scenario: the monthly seller report
+
+A marketplace runs its monthly seller statements (a 40-minute query) on the only standby, which is also the failover target. It is cancelled every month with "conflict with recovery".
+
+| Option | Effect |
+|---|---|
+| Raise `max_standby_streaming_delay` to 60 min | The report finishes; for 40 minutes the standby is up to 40 minutes stale, and failover would replay all of it first |
+| `hot_standby_feedback = on` | No snapshot cancels; the primary keeps dead rows for 40 minutes (Concept 2). Lock conflicts still cancel |
+| A second standby only for reports, with `-1` and no failover role | The report is safe and the failover standby stays fresh; costs one more server |
+| Run the report from a logical replica or a nightly copy | No conflict with the primary at all; data is as old as the copy |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 2 | `hot_standby_feedback` moves the cost from the standby to the primary |
+| [Session 5, Concept 3](/blogs/databases/replication/session-5-failover/concept-3-promoting-postgresql) | Replay lag at promotion time is lost or waited for |
+| [Transactions Session 4, Concept 4](/blogs/databases/transactions/session-4-mvcc-internals/concept-4-long-transactions) | The same snapshot horizon on a single server |
+| [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) | The primary/standby setup |
+
+## Key takeaways
+
+1. A standby must replay VACUUM's removals; a query whose snapshot still needs those versions conflicts with replay.
+2. Replay waits up to `max_standby_streaming_delay`, then cancels the query: 33.5 s with the default 30 s, 8.4 s with 5 s.
+3. With -1 the query always finishes and replay can fall behind without limit (58 s here).
+4. ACCESS EXCLUSIVE locks replayed from the primary cancel standby queries the same way.
+5. Fresh replicas and long queries pull in opposite directions; separate the roles.
+
+## Check questions
+
+1. Why does the standby have to choose between pausing replay and cancelling the query? Why can it not do both work in parallel?
+2. With the default setting, why did the report end after 33.5 s and not 30 s?
+3. With -1 the report finished. What did that cost, and who noticed?
+4. Why did `ALTER TABLE … ADD COLUMN` on the primary cancel a plain SELECT on the standby?
+5. Your only standby is the failover target and also runs a 40-minute report. What would you change?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-6-queries-on-replicas/concept-1-hot-standby-conflicts/answers">Worked answers to Q1–Q5</DeepDive>

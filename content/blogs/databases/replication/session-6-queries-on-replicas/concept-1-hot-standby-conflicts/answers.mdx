@@ -1,0 +1,53 @@
+---
+title: "Answers: Hot standby conflicts in PostgreSQL"
+description: "Worked answers to the Session 6 Concept 1 check questions."
+companion: "answers"
+tags: ["replication", "hot-standby", "postgresql", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/hot-standby.html#HOT-STANDBY-CONFLICT"
+---
+
+<Tldr>
+A standby replays the primary's history in order. When the next step of that history would destroy what a query is reading, one of the two has to give way.
+</Tldr>
+
+## Q1. Why pause or cancel
+
+**Question:** why does the standby have to choose between pausing replay and cancelling the query? Why can it not do both work in parallel?
+
+Replay is strictly sequential: WAL record N+1 can only be applied after record N. The prune records written by VACUUM physically remove row versions from pages, and the report's snapshot still needs those versions. Applying them would make the report return wrong results, so the standby either waits before that record (and therefore before **every** later record) or removes the query that needs the old versions. It cannot skip ahead past the conflicting record.
+
+> **Common mistake:** thinking only the conflicting table falls behind. Replay of the whole cluster stops.
+
+## Q2. 33.5 s, not 30 s
+
+**Question:** with the default setting, why did the report end after 33.5 s and not 30 s?
+
+The 30 s count from when the conflicting WAL arrived on the standby, not from when the report started. The report started 3 s before the UPDATE and VACUUM ran, the WAL arrived within a fraction of a second after that, and cancelling the query and the client noticing took the rest.
+
+> **Common mistake:** treating `max_standby_streaming_delay` as a query timeout. A query can run for hours without trouble if nothing conflicts with it.
+
+## Q3. What -1 cost
+
+**Question:** with -1 the report finished. What did that cost, and who noticed?
+
+Replay stood still for 58 s, so every other reader of the standby saw data up to 58 s old, and a failover in that window would have started from a stale standby. With a busier primary the backlog is larger: five update rounds left the standby 122 MB of WAL behind (Concept 2). The report's author noticed nothing; the users of the other queries on the standby and the on-call engineer watching replication lag did.
+
+> **Common mistake:** setting -1 on a standby that also serves the application's "read from replica" traffic.
+
+## Q4. ALTER TABLE cancels a SELECT
+
+**Question:** why did `ALTER TABLE … ADD COLUMN` on the primary cancel a plain SELECT on the standby?
+
+ALTER TABLE takes an ACCESS EXCLUSIVE lock on the primary, and that lock is WAL-logged so the standby takes it too while replaying the change. The SELECT on the standby held an ACCESS SHARE lock on `orders`, which conflicts with ACCESS EXCLUSIVE. Replay waited the configured 5 s, then cancelled the query: `User was holding a relation lock for too long`, after 7.1 s. `hot_standby_feedback` does not help here; it only prevents snapshot conflicts.
+
+> **Common mistake:** running schema migrations during the reporting window and blaming the reports.
+
+## Q5. One standby, two jobs
+
+**Question:** your only standby is the failover target and also runs a 40-minute report. What would you change?
+
+Separate the roles. Add a second standby used only for reporting, with `max_standby_streaming_delay = -1` (or a large value) and no failover role, so its lag does not matter for availability. Keep the failover standby at a low delay with no long queries on it. If a second server is not possible, `hot_standby_feedback = on` keeps the report from being cancelled for snapshot reasons, at the cost of bloat on the primary while it runs (Concept 2), and the migration schedule must avoid the report window.
+
+> **Common mistake:** "fixing" the cancellations by raising the delay on the failover standby, which quietly turns it into a stale one.

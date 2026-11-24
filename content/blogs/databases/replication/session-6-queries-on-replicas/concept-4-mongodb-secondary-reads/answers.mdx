@@ -1,0 +1,54 @@
+---
+title: "Answers: Reads on MongoDB secondaries"
+description: "Worked answers to the Session 6 Concept 4 check questions."
+companion: "answers"
+tags: ["replication", "secondary-reads", "mongodb", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.minSnapshotHistoryWindowInSeconds"
+  - "https://www.mongodb.com/docs/manual/core/replica-set-hidden-member/"
+---
+
+<Tldr>
+MongoDB secondaries keep reads and replication apart through snapshots with a limited history. The costs are shared hardware and a time limit on consistent reads.
+</Tldr>
+
+## Q1. No pause-or-cancel choice
+
+**Question:** why does a MongoDB secondary not need PostgreSQL's choice between pausing replay and cancelling the query?
+
+A PostgreSQL standby replays the primary's physical changes, including VACUUM's removal of old versions, so replay can destroy what a query reads. A MongoDB secondary applies logical oplog entries through its own storage engine; WiredTiger keeps the versions that open reads still use (within its history window), and cleanup of old versions happens locally on each member, not by replaying the primary's cleanup. Nothing in the oplog says "remove the version a reader still needs", so there is nothing to conflict with. Lag stayed 0–2 s with an aggregation running.
+
+> **Common mistake:** concluding secondaries are free for analytics. They are free of conflicts, not of load.
+
+## Q2. 3× slower without lag
+
+**Question:** lag did not change, but the aggregation was 3× slower under write load. What was it competing with?
+
+With the hardware. The secondary was applying about 6,300–7,000 updates per second from the oplog: CPU for applying them, cache space for the updated documents and their history, and disk writes for journaling and checkpoints. On this laptop the primary, the other secondary and the writer processes shared the same cores too. The aggregation went from 151–182 ms to 418–577 ms.
+
+> **Common mistake:** sending dashboard traffic to secondaries during a sale, when they are busiest applying the sale's writes.
+
+## Q3. 300 s vs 5 s
+
+**Question:** why did the same snapshot read succeed with a 300 s window and fail with a 5 s window?
+
+A snapshot cursor reads every batch at the timestamp of its first batch. Later batches (`getMore`) need the versions of documents as they were at that timestamp, but the writers had updated many of them during the 15-second pause. WiredTiger keeps those older versions for at least `minSnapshotHistoryWindowInSeconds`. With 300 s they were still there and the read finished in 28 s. With 5 s they had been discarded, and the `getMore` failed with `SnapshotTooOld: Read timestamp … is older than the oldest available timestamp`.
+
+> **Common mistake:** raising the window to an hour to make long exports work, and then wondering why the cache fills under write load.
+
+## Q4. A consistent 20-minute export
+
+**Question:** a 20-minute export must be consistent to one point in time. How do you run it on MongoDB?
+
+Read with `readConcern: "snapshot"` and one fixed `atClusterTime` for every query of the export, and make sure the member serving it keeps history for the whole 20 minutes: raise `minSnapshotHistoryWindowInSeconds` above 1,200 s on a hidden member reserved for exports, so the extra cache pressure stays off the members that serve users. Alternatively take a consistent backup or filesystem snapshot of a hidden member and export from that copy. A plain query without snapshot read concern is not consistent, whatever member it runs on.
+
+> **Common mistake:** assuming `readPreference: secondary` makes a read consistent because "the secondary is a copy".
+
+## Q5. Hidden member vs secondary read preference
+
+**Question:** when would you use a hidden member instead of `readPreference: secondary`?
+
+When the reads are heavy and not part of serving users: exports, analytics, backups. Reads with `readPreference: secondary` go to the same members that serve the application's secondary reads and that may become primary, so a heavy export slows them down (as measured) and competes with failover readiness. A hidden member (priority 0, `hidden: true`) still replicates everything but receives no normal client reads; the export connects to it directly. Hidden members still vote by default and count towards write-concern majorities (from the documentation), so a slow hidden member can still slow down `w: "majority"` writes in small sets.
+
+> **Common mistake:** adding a hidden member to a 2-member set and expecting no effect on majority writes.

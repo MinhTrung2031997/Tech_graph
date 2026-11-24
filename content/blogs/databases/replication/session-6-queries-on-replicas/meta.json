@@ -1,0 +1,12 @@
+{
+  "title": "Session 6: Queries on replicas",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-hot-standby-conflicts/index",
+    "concept-2-hot-standby-feedback/index",
+    "concept-3-mysql-replica-apply/index",
+    "concept-4-mongodb-secondary-reads/index",
+    "lab/index"
+  ]
+}

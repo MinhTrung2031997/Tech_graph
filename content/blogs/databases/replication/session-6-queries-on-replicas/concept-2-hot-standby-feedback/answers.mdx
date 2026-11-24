@@ -1,0 +1,53 @@
+---
+title: "Answers: hot_standby_feedback and the bloat it moves to the primary"
+description: "Worked answers to the Session 6 Concept 2 check questions."
+companion: "answers"
+tags: ["replication", "hot-standby", "vacuum", "postgresql", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/runtime-config-replication.html#GUC-HOT-STANDBY-FEEDBACK"
+---
+
+<Tldr>
+Feedback turns a standby query into a long transaction on the primary, as far as VACUUM is concerned.
+</Tldr>
+
+## Q1. What the standby sends
+
+**Question:** what exactly does the standby send to the primary when feedback is on, and where can you see it?
+
+The oldest transaction id (xmin, and catalog xmin) that any query on the standby still needs, in the status messages the WAL receiver sends every `wal_receiver_status_interval` (10 s by default). The primary treats it like the xmin of one of its own sessions. With a replication slot it is stored in the slot: `pg_replication_slots.xmin` showed 885 during the report. Without a slot it appears as `pg_stat_replication.backend_xmin`, which was empty in this setup because the slot holds it.
+
+> **Common mistake:** checking only `backend_xmin` and concluding the standby holds nothing back.
+
+## Q2. 37 MB vs 7 MB
+
+**Question:** why did the table grow by 37 MB in the feedback run but only 7 MB in the other run?
+
+Each round updates 100,000 rows, and each update writes a new version. If VACUUM can remove the previous round's dead versions, the next round reuses that space: after the first round the table stayed at 80 MB. With feedback on, VACUUM could remove nothing (`0 removed, … 500000 are dead but not yet removable`), so every round needed fresh space: 80, 88, 95, 102, 110 MB.
+
+> **Common mistake:** expecting autovacuum to keep up by running more often. It runs, finds everything still needed, and removes nothing.
+
+## Q3. Space not returned
+
+**Question:** after the report ended, VACUUM removed all 500,000 rows. Why did the table stay 110 MB?
+
+Plain VACUUM marks the space of removed versions as free for reuse inside the table; it only gives pages back to the operating system when they are at the very end of the file and completely empty. The freed space here was spread across the table, so the file stayed 110 MB. Future updates will fill it, or `VACUUM FULL` / `pg_repack` can rewrite the table.
+
+> **Common mistake:** expecting disk usage to fall after the cause of the bloat is removed.
+
+## Q4. Bloat without an old transaction
+
+**Question:** a primary bloats but `pg_stat_activity` shows no old transactions. Where do you look next?
+
+At everything outside `pg_stat_activity` that can hold the xmin horizon: `pg_replication_slots.xmin` and `catalog_xmin` (physical slots with feedback, and logical slots), `pg_stat_replication.backend_xmin` (standbys with feedback but no slot), and `pg_prepared_xacts` (forgotten prepared transactions). VACUUM VERBOSE's "dead but not yet removable" count confirms the horizon is the cause.
+
+> **Common mistake:** restarting autovacuum workers or raising their limits when the horizon is the problem.
+
+## Q5. Settings for an analytics standby
+
+**Question:** choose settings for a standby that serves 2-hour analytics queries and is not a failover target.
+
+`hot_standby_feedback = off`, so the analytics queries never hold back the primary's VACUUM, and `max_standby_streaming_delay = -1` (or a few hours), so they are not cancelled. The standby will then fall behind while long queries run and catch up afterwards: acceptable for analytics, and it must not be used for failover or for the application's fresh reads. Add a `statement_timeout` for the analytics role as an upper bound, and monitor its replay lag separately from the failover standby's.
+
+> **Common mistake:** turning feedback on for the analytics standby to "stop the cancellations", which trades a reporting annoyance for bloat on the production primary.

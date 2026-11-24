@@ -5,6 +5,7 @@
     "session-2-sync-vs-async",
     "session-3-replica-lag",
     "session-4-read-write-concerns",
-    "session-5-failover"
+    "session-5-failover",
+    "session-6-queries-on-replicas"
   ]
 }

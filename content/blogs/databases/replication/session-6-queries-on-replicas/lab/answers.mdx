@@ -1,0 +1,79 @@
+---
+title: "Answers: Queries on replicas session quiz"
+description: "Worked answers to the Session 6 quiz, with the lab's measured values."
+companion: "answers"
+tags: ["replication", "replica", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/hot-standby.html#HOT-STANDBY-CONFLICT"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-options-replica.html#sysvar_replica_parallel_workers"
+  - "https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.minSnapshotHistoryWindowInSeconds"
+---
+
+<Tldr>
+Each engine resolves "long read on a replica vs incoming changes" differently: PostgreSQL pauses or cancels, MySQL lets rows pass and stops at DDL, MongoDB keeps history for a while. In all three, a replica that serves heavy reads is a worse failover target.
+</Tldr>
+
+## Q1. Pause or cancel
+
+**Question:** why must a PostgreSQL standby either pause replay or cancel a query when the primary vacuums rows the query still needs?
+
+The standby replays the primary's WAL record by record, including VACUUM's records that physically remove dead row versions. A query whose snapshot still needs those versions would read wrong results if they disappeared. Replay is sequential, so it cannot skip the conflicting record: it either waits (stalling all later replay) or cancels the query.
+
+> **Common mistake:** expecting MVCC on the standby to protect its queries as it does on the primary. On the standby, cleanup is decided by the primary.
+
+## Q2. 30 s vs -1
+
+**Question:** with `max_standby_streaming_delay = 30s` the report was cancelled after 33.5 s; with -1 it finished. What did each choice cost?
+
+30 s: the report was lost (`canceling statement due to conflict with recovery`), and for its last 30 s replay stood still, the standby falling 29 s behind. -1: the report finished, but replay waited for it the whole time, 58 s behind at worst, and with more write traffic the backlog grows (122 MB in Exercise 2). Every other reader of that standby saw stale data, and a failover to it would start from a stale state.
+
+> **Common mistake:** treating -1 as "no downside" because nothing errors.
+
+## Q3. What feedback changes
+
+**Question:** what does `hot_standby_feedback = on` change, and how big was its cost on the primary in the lab?
+
+The standby tells the primary the oldest xmin its queries need (seen as `pg_replication_slots.xmin`), and the primary's VACUUM keeps every row version newer than that. Snapshot conflicts no longer happen: the report finished and replay stayed current. The cost: during one 75-second report, VACUUM removed nothing, 500,000 dead rows were "not yet removable" after five rounds, and the table grew from 73 MB to 110 MB.
+
+> **Common mistake:** expecting feedback to prevent lock conflicts from DDL. It does not.
+
+## Q4. Space kept after the report
+
+**Question:** why did the primary's table stay at 110 MB after the report ended and VACUUM removed the dead rows?
+
+VACUUM frees space for reuse inside the table but only truncates empty pages at the end of the file. The freed space was spread through the table, so the file stayed 110 MB; later updates reuse it. Getting the space back needs a rewrite (`VACUUM FULL` or `pg_repack`).
+
+> **Common mistake:** measuring the impact of feedback only while the report runs.
+
+## Q5. UPDATE passes, ALTER stops
+
+**Question:** on a MySQL replica, why did a long SELECT not delay a 100,000-row UPDATE, but stop an ALTER TABLE and every transaction after it?
+
+Row changes need only a shared metadata lock and row locks; InnoDB's MVCC gives the SELECT its own read view, so the UPDATE was applied at once (lag 0). ALTER TABLE needs the metadata lock exclusively, which conflicts with the SELECT's shared lock, so the applier waited ("Waiting for table metadata lock"). Because the replica commits in source order and DDL is applied on its own, every later transaction, even inserts into `lab.ev`, waited behind it: lag grew to 25–26 s until the SELECT ended.
+
+> **Common mistake:** expecting parallel workers to keep other tables flowing during a blocked DDL.
+
+## Q6. A slow single applier
+
+**Question:** a single applier thread took a median 73.4 s for a backlog the source wrote in 13–20 s. Why, and what helped?
+
+The source wrote with 8 concurrent sessions sharing log flushes; one applier replayed the same 40,000 transactions one at a time, each with its own commit and log flushes on the replica (`sync_binlog = 1`, `innodb_flush_log_at_trx_commit = 1`, `log_replica_updates = 1`). Parallel workers helped: 4 workers (the 8.4 default) took a median 28.3 s; 8 were not better on this laptop (35.7 s), because the machine's cores and disk were shared.
+
+> **Common mistake:** setting `replica_parallel_workers = 1` to "keep things simple" on a busy replica.
+
+## Q7. MongoDB secondaries
+
+**Question:** why does a MongoDB secondary neither cancel long reads nor pause replication, and what did a long aggregation still cost?
+
+The secondary applies logical oplog entries through its own storage engine, and WiredTiger keeps the versions open reads need; nothing in the oplog removes data a reader is using. Lag stayed 0–2 s with and without an aggregation running. The cost is shared hardware: the aggregation over 1,000,000 orders took 151–182 ms on an idle secondary and 418–577 ms while the secondary applied about 6,300–7,000 updates per second.
+
+> **Common mistake:** routing heavy reports to the same secondaries that serve the application's reads.
+
+## Q8. SnapshotTooOld
+
+**Question:** why did a snapshot read on a secondary fail with SnapshotTooOld when the history window was 5 s, and what is the trade-off in raising the window?
+
+A snapshot cursor reads every batch at its first batch's timestamp. After a 15 s pause, during which writers changed documents, the old versions it needed had been discarded because only 5 s of history were kept: `Read timestamp … is older than the oldest available timestamp`. With the default 300 s the read completed in 28 s. Raising the window lets longer snapshot reads work but makes every member keep more old versions in cache, which increases cache pressure and eviction under heavy writes; do it on a hidden member reserved for exports.
+
+> **Common mistake:** raising the window on all members for one nightly export.

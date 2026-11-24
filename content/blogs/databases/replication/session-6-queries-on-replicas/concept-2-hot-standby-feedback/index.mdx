@@ -1,0 +1,163 @@
+---
+title: "Concept 2: hot_standby_feedback and the bloat it moves to the primary"
+description: "With hot_standby_feedback = on, a 75-second report on the standby was never cancelled and replay stayed current, but the primary's VACUUM could not remove a single dead row while it ran: 500,000 dead but not yet removable after five rounds, and the table grew from 73 MB to 110 MB for good. With feedback off and max_standby_streaming_delay = -1 the primary stayed at 80 MB, and the standby fell 122 MB of WAL behind instead."
+type: "concept"
+tags: ["replication", "hot-standby", "vacuum", "bloat", "postgresql"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/runtime-config-replication.html#GUC-HOT-STANDBY-FEEDBACK"
+  - "https://www.postgresql.org/docs/17/hot-standby.html#HOT-STANDBY-CONFLICT"
+  - "https://www.postgresql.org/docs/17/view-pg-replication-slots.html"
+---
+
+<Tldr>
+`hot_standby_feedback = on` makes the standby tell the primary the oldest transaction its queries still need, and the primary's VACUUM then keeps those row versions. Snapshot conflicts disappear, so a long report is no longer cancelled and replay does not pause. The price is paid **on the primary**: during one 75-second report, five rounds of updating 100,000 rows left **500,000 dead rows "not yet removable"**, and the table grew from **73 MB to 110 MB**. It did not shrink after the report ended: VACUUM then removed the 500,000 rows but kept the space. The alternative trade, feedback off with `max_standby_streaming_delay = -1`, kept the primary at **80 MB** and left the **standby 122 MB of WAL behind**. Feedback is a bloat setting as much as a replication setting.
+</Tldr>
+
+## The setup
+
+`orders` recreated before each run (1,000,000 rows, 73 MB). On the standby, a report holds a `REPEATABLE READ` snapshot for 75 s. On the primary, five rounds, 5 s apart: `UPDATE orders SET status = 'rN' WHERE id <= 100000; VACUUM (VERBOSE) orders;`. Two standby configurations:
+
+| Run | `hot_standby_feedback` | `max_standby_streaming_delay` | Who waits |
+|---|---|---|---|
+| feedback | on | 30 s | the primary's VACUUM |
+| delay | off | -1 | the standby's replay |
+
+| Term | Meaning |
+|---|---|
+| `hot_standby_feedback` | The standby regularly reports the oldest xmin its queries need to the primary (every `wal_receiver_status_interval`, 10 s by default) |
+| xmin horizon | The oldest transaction id any snapshot still needs; VACUUM cannot remove row versions newer than it |
+| Dead but not yet removable | VACUUM's count of dead row versions it had to keep because of the horizon |
+| Bloat | Space in the table taken by dead versions or left empty after they are removed |
+| **✓ / ✗** | Works / pays the cost |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: who pays for a long standby report"
+  height={340}
+  nodes={[
+    { id: 'rpt', label: 'Report on standby', sub: 'snapshot held 75 s', x: 580, y: 20, w: 200 },
+    { id: 'stb', label: 'Standby', sub: 'replays WAL', x: 580, y: 270, w: 200 },
+    { id: 'pri', label: 'Primary', sub: 'UPDATE + VACUUM x5', x: 20, y: 270, w: 200 },
+    { id: 'slot', label: 'Slot xmin', sub: 'pg_replication_slots', x: 20, y: 20, w: 200 },
+  ]}
+  edges={[
+    { id: 'rpt-stb', from: 'rpt', to: 'stb' },
+    { id: 'stb-slot', from: 'stb', to: 'slot' },
+    { id: 'slot-pri', from: 'slot', to: 'pri' },
+    { id: 'pri-stb', from: 'pri', to: 'stb' },
+  ]}
+  cases={[
+    {
+      title: 'hot_standby_feedback = on',
+      path: 'report holds xmin → standby sends it ✓ → slot xmin on primary → VACUUM keeps 500,000 dead rows ✗ → table 73 → 110 MB ✗ → replay current ✓ → report ✓',
+      summary: 'The standby stays fresh; the primary bloats.',
+      steps: [
+        {
+          title: 'The standby reports its horizon',
+          note: 'With a physical slot, the standby\'s xmin appears in pg_replication_slots.xmin on the primary (885 in the run), not in pg_stat_replication.backend_xmin, which stayed empty.',
+          code: 'SELECT slot_name, xmin FROM pg_replication_slots;   -- standby1 | 885',
+          active: ['rpt', 'stb', 'slot'],
+          edges: ['rpt-stb', 'stb-slot'],
+          subs: { slot: 'xmin 885' },
+        },
+        {
+          title: 'VACUUM cannot remove anything',
+          note: 'Round 1: tuples: 0 removed, 100000 are dead but not yet removable. Round 5: 500000 are dead but not yet removable. Each round\'s new versions need new space: 80, 88, 95, 102, 110 MB.',
+          code: 'VACUUM (VERBOSE) orders;',
+          active: ['slot', 'pri'],
+          edges: ['slot-pri'],
+          subs: { pri: '✗ 110 MB, 500k dead kept' },
+        },
+        {
+          title: 'Replay and the report are fine',
+          note: 'Replay lag 0–168 bytes after each round. The report committed normally.',
+          active: ['pri', 'stb', 'rpt'],
+          edges: ['pri-stb', 'rpt-stb'],
+          subs: { stb: '✓ lag 0', rpt: '✓ finished' },
+        },
+      ],
+    },
+    {
+      title: 'Feedback off, max_standby_streaming_delay = -1',
+      path: 'primary VACUUM removes 100,000 per round ✓ → table 80 MB ✓ → standby replay waits for the report ✗ → 122 MB behind ✗ → report ✓',
+      summary: 'The primary stays clean; the standby goes stale.',
+      steps: [
+        {
+          title: 'VACUUM removes everything',
+          note: 'Every round: tuples: 100000 removed, 0 are dead but not yet removable. The table stays at 80 MB.',
+          active: ['pri'],
+          subs: { pri: '✓ 80 MB' },
+        },
+        {
+          title: 'The standby cannot replay it',
+          note: 'The prune records conflict with the report, and with -1 replay waits for it: 25, 49, 74, 98, 122 MB of WAL received but not replayed.',
+          active: ['pri', 'stb', 'rpt'],
+          edges: ['pri-stb', 'rpt-stb'],
+          subs: { stb: '✗ 122 MB behind', rpt: '✓ finished' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Measured
+
+| | feedback on, delay 30 s | feedback off, delay -1 |
+|---|---|---|
+| Dead rows VACUUM had to keep, after round 1 → round 5 | 100,000 → 500,000 | 0 |
+| Primary table size, before → after round 5 | 73 MB → 110 MB | 73 MB → 80 MB |
+| Standby replay backlog after round 5 | 0 bytes | 122 MB |
+| Report | ✓ finished | ✓ finished |
+| After the report ended, VACUUM | removed 500,000; table **stayed 110 MB** | nothing left to remove; 80 MB |
+
+The extra 30 MB is permanent until something rewrites the table (`VACUUM FULL`, `pg_repack`, or a dump and reload). Later inserts and updates reuse the free space inside it.
+
+<Pitfall>
+Feedback also travels through **cascading** standbys and survives short disconnects through the slot: a slot's `xmin` keeps holding back VACUUM even while the standby is down, until the standby reconnects with a newer horizon or the slot is dropped (from the documentation). A forgotten standby with feedback on and a slot is one of the classic causes of a primary that bloats without any long transaction visible in its own `pg_stat_activity`. Check `pg_replication_slots.xmin` and `pg_stat_replication.backend_xmin` whenever `n_dead_tup` keeps climbing.
+</Pitfall>
+
+## Real-world scenario: an analytics team on the standby
+
+The analytics team runs 2-hour queries on the standby, and turned on `hot_standby_feedback` because their queries kept being cancelled. Three weeks later the primary's `orders` table is 3× its normal size and checkout queries are slower.
+
+| Finding | From this concept |
+|---|---|
+| `n_dead_tup` on `orders` in the millions, VACUUM logs "dead but not yet removable" | The standby's xmin, visible in `pg_replication_slots.xmin`, holds the horizon for 2 hours at a time |
+| No long transaction on the primary | The holder is on the standby |
+| Table does not shrink after the queries stop | VACUUM frees space for reuse but does not return it |
+
+| Fix | Effect |
+|---|---|
+| A separate analytics replica with feedback **off** and delay -1 | The primary is unaffected; only the analytics replica lags during long queries |
+| Logical replication into an analytics database | Long queries there do not touch the primary's horizon at all (Session 7) |
+| `statement_timeout` for the analytics role | Bounds how long the horizon can be held |
+| `pg_repack` once the cause is gone | Gets the space back without a long ACCESS EXCLUSIVE lock (from the documentation) |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 1 | The conflict this setting avoids |
+| [Transactions Session 4, Concept 4](/blogs/databases/transactions/session-4-mvcc-internals/concept-4-long-transactions) | A long transaction on the primary holds the horizon the same way |
+| [Indexing Session 6, Concept 1](/blogs/databases/indexing/session-6-engine-differences/concept-1-postgres-mvcc) | Why dead versions also take space in every index on the table |
+| [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) | The setup, including the slot `standby1` |
+
+## Key takeaways
+
+1. `hot_standby_feedback = on` prevents snapshot conflicts by making the primary keep row versions that standby queries need.
+2. The cost lands on the primary: 500,000 dead rows kept and 73 → 110 MB in one 75-second report.
+3. The space stays allocated after the report ends.
+4. The alternative (-1 without feedback) keeps the primary clean and lets the standby fall behind: 122 MB of WAL.
+5. With a slot, the standby's horizon shows in `pg_replication_slots.xmin` and persists while the standby is away.
+
+## Check questions
+
+1. What exactly does the standby send to the primary when feedback is on, and where can you see it?
+2. Why did the table grow by 37 MB in the feedback run but only 7 MB in the other run?
+3. After the report ended, VACUUM removed all 500,000 rows. Why did the table stay 110 MB?
+4. A primary bloats but `pg_stat_activity` shows no old transactions. Where do you look next?
+5. Choose settings for a standby that serves 2-hour analytics queries and is not a failover target.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-6-queries-on-replicas/concept-2-hot-standby-feedback/answers">Worked answers to Q1–Q5</DeepDive>
