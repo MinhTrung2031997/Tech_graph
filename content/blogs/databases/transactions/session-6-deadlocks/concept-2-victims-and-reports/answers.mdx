@@ -1,0 +1,74 @@
+---
+title: "Answers: Who gets killed, and how to read the report"
+description: "Worked answers to the Session 6 Concept 2 check questions."
+companion: "answers"
+tags: ["transactions", "deadlocks", "monitoring", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-deadlock-detection.html"
+  - "https://www.postgresql.org/docs/current/runtime-config-locks.html"
+  - "https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-DATABASE-VIEW"
+---
+
+<Tldr>
+InnoDB weighs the victims; PostgreSQL does not. Both reports show waiting statements, not the lock-taking ones.
+</Tldr>
+
+## Q1. Victims in the big-vs-small experiment
+
+**Question:** in the big-vs-small experiment, which transaction did each SQL engine roll back, and by what rule?
+
+| Engine | Victim | Rule |
+|---|---|---|
+| MySQL InnoDB | T2, the small one (1 undo entry, 2 row locks) | Roll back the transaction that is cheapest to undo (rows modified and locked) |
+| PostgreSQL | T1, the big one (51 rows; afterwards 0 accounts had `version > 1`) | The waiter whose `deadlock_timeout` check discovers the cycle aborts itself |
+
+> **Common mistake:** "the transaction that closes the cycle is always the victim". In InnoDB T1 closed it and survived.
+
+## Q2. T2's check came too early
+
+**Question:** why did T2's own deadlock check in PostgreSQL not find the cycle?
+
+T2 began waiting at 0.5 s, so its check ran at 1.5 s. At that moment T1 was not yet waiting for anything (it starts waiting at 2.0 s), so the wait-for graph had one edge and no cycle. PostgreSQL runs the check once per wait, at `deadlock_timeout`; T2 was not checked again. T1's check at 3.0 s found the completed cycle.
+
+> **Common mistake:** expecting the longest waiter to be the one that detects the deadlock.
+
+## Q3. The client error vs the server log
+
+**Question:** what does the client see for a PostgreSQL deadlock, and where are the statements?
+
+The client gets `ERROR: deadlock detected` with a DETAIL naming process ids and transaction ids ("Process 54428 waits for ShareLock on transaction 1731673; blocked by process 54440 …"), `HINT: See server log for query details.` and a CONTEXT with the tuple. The statements (for each process, the statement it was running) are only in the **server log**, because they may belong to other users. Per-database totals are in `pg_stat_database.deadlocks` (245 for the lab database after the throughput tests).
+
+> **Common mistake:** searching application logs for the other query; it is in the database server's log.
+
+## Q4. Finding the crossing records
+
+**Question:** in an InnoDB deadlock report, how do you tell which records the two transactions cross on?
+
+For each transaction the report has `HOLDS THE LOCK(S)` and `WAITING FOR THIS LOCK TO BE GRANTED`, each with `index … of table …`, `lock_mode …` and `Record lock, heap no N` plus the record's field dump. Transaction (1) holds heap no 2 and waits for heap no 3; transaction (2) holds heap no 3 and waits for heap no 2: those two records (here PRIMARY ids 1 and 2) are the crossing. The `lock_mode` tells you the kind (record, gap, next-key, insert intention), which matters for Concept 3's deadlocks.
+
+> **Common mistake:** reading only the two statements and ignoring the lock modes; gap-lock deadlocks look harmless at the statement level.
+
+## Q5. Why STATUS is unreliable
+
+**Question:** why is `SHOW ENGINE INNODB STATUS` unreliable for counting or auditing deadlocks?
+
+It keeps only the **latest** deadlock for the whole server. Any later deadlock, from any schema or application, overwrites it; in the lab other databases on the same server deadlocked concurrently, so each report had to be captured immediately and checked for the table name. For an audit trail use `innodb_print_all_deadlocks = ON` (error log); for counting, deltas of `INNODB_METRICS.lock_deadlocks`.
+
+> **Common mistake:** assuming "the deadlock in STATUS" is the one your application just hit.
+
+## Q6. Missing statements
+
+**Question:** which statements do both SQL reports show, and which important ones do they leave out?
+
+They show the statement each transaction was **executing and waiting on** when the cycle closed. They leave out the **earlier** statements of each transaction that acquired the locks now held (in the transfer: the first UPDATE of each). To know why T1 already held account 1, you need the transaction's code path or statement history (`performance_schema.events_statements_history`, application logs, `pg_stat_activity` snapshots).
+
+> **Common mistake:** adding an index or rewriting the reported statement, when the real cause is the order of the statements before it.
+
+## Q7. Measuring MongoDB conflicts
+
+**Question:** how would you measure how often MongoDB transactions are conflicting in production?
+
+Sample `db.serverStatus()` periodically and compute deltas of `transactions.totalAborted`, `transactions.totalCommitted` and `metrics.operation.writeConflicts`. Abort rate = Δaborted / Δstarted. Add application-side counters of `withTransaction` callback attempts per commit (Concept 4 measured ≈ 0.5 retries per commit for 10 hot accounts). For individual slow writes, `$currentOp` shows `writeConflicts` per operation.
+
+> **Common mistake:** looking for a deadlock log in MongoDB; contention shows up as aborts and retries, not reports.

@@ -1,0 +1,233 @@
+---
+title: "Concept 4: Preventing deadlocks"
+description: "Eight clients moving money between 10 hot accounts, with accounts locked in random order vs in id order. PostgreSQL: 27 vs 2,689 transactions/s, because every deadlock holds two hot rows for deadlock_timeout. MySQL: 791–1,112 vs 949–1,293/s with hundreds of cheap deadlocks removed. MongoDB: no difference, because conflicts are not waits. Plus retries, shorter transactions and what each fix costs."
+type: "concept"
+tags: ["transactions", "deadlocks", "performance", "pgbench", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pgbench.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-deadlocks-handling.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-in-applications/"
+---
+
+<Tldr>
+The standard cure for opposite-order deadlocks is to **lock rows in one global order** (lowest account id first). Measured with 8 clients doing random transfers between 10 hot accounts: **PostgreSQL** went from **27 to 2,689 transactions/s** (4.1% deadlocks → 0). The deadlocks themselves were few; the damage came from `deadlock_timeout`: each one held two of the 10 hot rows for a full second while everyone else queued (latency 285 ms vs 3 ms). Lowering `deadlock_timeout` to 100 ms gave 169/s; retries hid the errors but not the cost (25/s). **MySQL**, which detects deadlocks instantly, ran 791–1,112/s with 211–438 deadlocks per run and 949–1,293/s with none: ordering removes the errors, throughput barely moves. **MongoDB** ran ≈ 1,050–1,100/s **either way**, with about one retry per two commits: transactions conflict instead of waiting, so ordering cannot help; less contention does. Whatever you do, keep a **retry loop**: some deadlocks (Concept 3) cannot be ordered away.
+</Tldr>
+
+## The workload
+
+```sql
+-- One transfer: debit a, credit b (a ≠ b), both among accounts 1–10.
+BEGIN;
+UPDATE accounts SET balance = balance - 1 WHERE id = :a;
+UPDATE accounts SET balance = balance + 1 WHERE id = :b;
+COMMIT;
+-- Ordered version: update least(a, b) first, then greatest(a, b), with the right sign.
+```
+
+| Term | Meaning |
+|---|---|
+| Hot rows | Few rows that many transactions update (10 accounts, 8 clients) |
+| Lock ordering | Every transaction acquires locks in the same global order (ascending id), so no cycle can form |
+| Retry loop | On `40P01` / `1213` / `TransientTransactionError`, run the whole transaction again |
+| **✓ Throughput / ✗ Stalls** | |
+
+Every run kept the total of the 10 balances at 10,000.00: no money was lost by the victims.
+
+## PostgreSQL (pgbench, 15 s, 8 clients)
+
+<Flow
+  title="PostgreSQL: random vs ordered locking"
+  height={330}
+  nodes={[
+    { id: 'w', label: '8 clients', sub: '10 hot accounts', x: 20, y: 110, w: 200 },
+    { id: 'rand', label: 'Random order', sub: 'a then b', x: 300, y: 20, w: 200 },
+    { id: 'ord', label: 'Id order', sub: 'least then greatest', x: 300, y: 200, w: 200 },
+    { id: 'bad', label: '✗ 27 txn/s', sub: '18 deadlocks', x: 580, y: 20, w: 200 },
+    { id: 'good', label: '✓ 2,689 txn/s', sub: '0 deadlocks', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'w-rand', from: 'w', to: 'rand' },
+    { id: 'w-ord', from: 'w', to: 'ord' },
+    { id: 'rand-bad', from: 'rand', to: 'bad' },
+    { id: 'ord-good', from: 'ord', to: 'good' },
+  ]}
+  cases={[
+    {
+      title: 'Random order',
+      path: 'transfers lock a then b → occasional cycles → ✗ each cycle stalls 2 hot rows for 1 s → 27 txn/s',
+      summary: '418 transactions in 15 s, 18 deadlock failures (4.1%), average latency 285 ms.',
+      steps: [
+        {
+          title: 'Few deadlocks, huge cost',
+          note: 'pgbench --failures-detailed: 418 processed, 18 deadlock failures, 26.9 tps. A deadlock in PostgreSQL is only noticed after deadlock_timeout (1 s). For that second, both transactions hold one of the 10 hot accounts, and every other client that touches either account queues behind them.',
+          code: "pgbench -n -c 8 -j 4 -T 15 --failures-detailed --max-tries=1 -f transfer_random.sql bank",
+          active: ['w', 'rand', 'bad'],
+          edges: ['w-rand', 'rand-bad'],
+        },
+        {
+          title: 'Tuning the timeout helps a little',
+          note: 'Same workload with PGOPTIONS="-c deadlock_timeout=100ms": 169 tps, but 180 deadlock failures (6.6%). With --max-tries=10 at the default timeout: 0 failures, 16 retried, 24.8 tps: retries hide the errors, not the stalls.',
+          code: "PGOPTIONS='-c deadlock_timeout=100ms' pgbench … -f transfer_random.sql bank\npgbench … --max-tries=10 -f transfer_random.sql bank",
+          subs: { bad: '✗ 169 txn/s (100 ms)' },
+          active: ['rand', 'bad'],
+          edges: ['rand-bad'],
+        },
+      ],
+    },
+    {
+      title: 'Id order',
+      path: 'every transfer locks the lower id first → no cycle possible → ✓ 2,689 txn/s, 0 deadlocks',
+      summary: '40,361 transactions in 15 s, average latency 3.0 ms.',
+      steps: [
+        {
+          title: 'Same work, no cycles',
+          note: 'Transactions still wait for each other on hot accounts, but a waiter always holds only lower ids than what it waits for, so the wait-for graph cannot close. 100 times the throughput of the random version.',
+          code: "\\set lo least(:a, :b)\n\\set hi greatest(:a, :b)\nBEGIN;\nUPDATE accounts SET balance = balance + CASE WHEN :lo = :a THEN -1 ELSE 1 END WHERE id = :lo;\nUPDATE accounts SET balance = balance + CASE WHEN :hi = :a THEN -1 ELSE 1 END WHERE id = :hi;\nEND;",
+          active: ['w', 'ord', 'good'],
+          edges: ['w-ord', 'ord-good'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL InnoDB (stored procedure loop, 8 sessions)
+
+<Flow
+  title="InnoDB: random vs ordered locking"
+  height={330}
+  nodes={[
+    { id: 'w', label: '8 sessions', sub: '10 hot accounts', x: 20, y: 110, w: 200 },
+    { id: 'rand', label: 'Random order', sub: 'a then b', x: 300, y: 20, w: 200 },
+    { id: 'ord', label: 'Id order', sub: 'least then greatest', x: 300, y: 200, w: 200 },
+    { id: 'bad', label: '791–1,112 txn/s', sub: '211–438 deadlocks', x: 580, y: 20, w: 200 },
+    { id: 'good', label: '✓ 949–1,293 txn/s', sub: '0 deadlocks', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'w-rand', from: 'w', to: 'rand' },
+    { id: 'w-ord', from: 'w', to: 'ord' },
+    { id: 'rand-bad', from: 'rand', to: 'bad' },
+    { id: 'ord-good', from: 'ord', to: 'good' },
+  ]}
+  cases={[
+    {
+      title: 'Random order',
+      path: 'cycles form → ✗ detected at once (1213) → victim rolled back → loop continues → 791–1,112 txn/s',
+      summary: 'Three runs (10–15 s each): hundreds of deadlocks, each costing microseconds.',
+      steps: [
+        {
+          title: 'Cheap deadlocks',
+          note: 'A CONTINUE HANDLER FOR 1213 counted victims. Runs: 1,112 tps with 438 deadlocks (15 s); 920 tps with 211 and 791 tps with 229 (10 s). Because InnoDB finds the cycle when it closes, the victim releases its lock almost immediately; nobody waits a second.',
+          code: "DECLARE CONTINUE HANDLER FOR 1213 BEGIN SET v_dead = v_dead + 1; SET v_failed = TRUE; END;\n-- the deadlock already rolled the transaction back; just start the next one",
+          active: ['w', 'rand', 'bad'],
+          edges: ['w-rand', 'rand-bad'],
+        },
+      ],
+    },
+    {
+      title: 'Id order',
+      path: 'every transfer locks the lower id first → ✓ 0 deadlocks → 949–1,293 txn/s',
+      summary: 'No errors; throughput in the same range (other databases on the server added noise).',
+      steps: [
+        {
+          title: 'Errors gone, speed similar',
+          note: 'Runs: 949 tps (15 s), 1,293 and 1,027 tps (10 s), 0 deadlocks each. On MySQL the main benefit of ordering is correctness and simpler code paths, not throughput.',
+          active: ['w', 'ord', 'good'],
+          edges: ['w-ord', 'ord-good'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB (mongosh withTransaction, 8 shells, 2 × 10 s)
+
+<Flow
+  title="MongoDB: random vs ordered writes"
+  height={330}
+  nodes={[
+    { id: 'w', label: '8 shells', sub: '10 hot accounts', x: 20, y: 110, w: 200 },
+    { id: 'rand', label: 'Random order', sub: 'a then b', x: 300, y: 20, w: 200 },
+    { id: 'ord', label: 'Id order', sub: 'least then greatest', x: 300, y: 200, w: 200 },
+    { id: 'bad', label: '1,052 commits/s', sub: '0.51 retries/commit', x: 580, y: 20, w: 200 },
+    { id: 'good', label: '1,105 commits/s', sub: '0.49 retries/commit', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'w-rand', from: 'w', to: 'rand' },
+    { id: 'w-ord', from: 'w', to: 'ord' },
+    { id: 'rand-bad', from: 'rand', to: 'bad' },
+    { id: 'ord-good', from: 'ord', to: 'good' },
+  ]}
+  cases={[
+    {
+      title: 'Ordering does not matter',
+      path: 'any two transactions touching the same account → WriteConflict for the later writer → retry → same rate either way',
+      summary: 'Random: 21,035 commits, 10,757 retries. Ordered: 22,108 commits, 10,873 retries.',
+      steps: [
+        {
+          title: 'Conflicts, not waits',
+          note: 'A conflict happens whenever two concurrent transactions write the same document, in whatever order; there is no waiting, so there is no cycle to prevent. withTransaction retried about one attempt for every two commits in both versions.',
+          code: "s.withTransaction(() => {\n  attempts++;\n  acc.updateOne({ _id: first },  { $inc: { balance: NumberDecimal(first === a ? '-1' : '1') } });\n  acc.updateOne({ _id: second }, { $inc: { balance: NumberDecimal(second === a ? '-1' : '1') } });\n});",
+          active: ['w', 'rand', 'ord', 'bad', 'good'],
+          edges: ['w-rand', 'w-ord', 'rand-bad', 'ord-good'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Measured summary
+
+| Engine | Random order | Id order | What ordering changes |
+|---|---|---|---|
+| PostgreSQL | 27 txn/s, 4.1% deadlocks, 285 ms | 2,689 txn/s, 0, 3.0 ms | Everything: removes 1 s stalls on hot rows |
+| PostgreSQL, `deadlock_timeout = 100ms` | 169 txn/s, 6.6% deadlocks | | Shorter stalls, more victims |
+| MySQL | 791–1,112 txn/s, 211–438 deadlocks per run | 949–1,293 txn/s, 0 | Removes errors; throughput similar |
+| MongoDB | 1,052 commits/s, 0.51 retries per commit | 1,105 commits/s, 0.49 | Nothing; contention is the issue |
+
+## Other prevention tools
+
+| Technique | Prevents | Cost |
+|---|---|---|
+| Lock in a global order (sort ids; `SELECT … WHERE id IN (…) ORDER BY id FOR UPDATE` first) | Opposite-order cycles | Code discipline; you must know all rows up front |
+| Lock the parent first (Concept 3) | FK / upgrade cycles | One more statement |
+| Upserts instead of check-then-insert (Concept 3) | Gap-lock insert cycles | None |
+| Shorter transactions (no network calls inside) | Fewer overlapping lock windows | Restructure code |
+| Single-statement updates (`UPDATE … SET balance = balance - 1 WHERE id = ? AND balance >= 1`) | Read-then-write races, fewer locks held | Only for simple cases (Session 7) |
+| Fewer hot rows (shard a counter into N rows) | Contention itself (helps MongoDB too) | More complex reads |
+| Retry loop | Turns any remaining deadlock or conflict into a delay | Must be idempotent; keep a retry cap |
+
+<Pitfall>
+Sorting the statements is not enough if the **engine** decides the lock order. `UPDATE accounts SET … WHERE id IN (7, 3)` locks rows in the order the plan visits them, which is usually index order but can be physical order (a sequential or bitmap scan). If two statements can each lock several rows, lock explicitly first: `SELECT id FROM accounts WHERE id IN (3, 7) ORDER BY id FOR UPDATE`.
+</Pitfall>
+
+## Real-world scenario: the payout batch
+
+A nightly payout updates 50,000 merchant balances in one transaction, while daytime-style traffic (refunds) continues. On PostgreSQL the batch fails with a deadlock after 40 minutes, every few nights, and restarts from zero (Concept 2: PostgreSQL does not spare the bigger transaction).
+
+| Change | Effect |
+|---|---|
+| Process merchants in id order, the same order refunds use | No cycles between batch and refunds |
+| Commit every 500 merchants (idempotent: mark each payout row as paid) | A failure loses one chunk, not the night |
+| Retry a failed chunk | Remaining deadlocks become delays |
+
+## Key takeaways
+
+1. Locking rows in one global order makes opposite-order deadlocks impossible.
+2. In PostgreSQL each deadlock stalls its rows for `deadlock_timeout`; with hot rows that cut throughput from 2,689 to 27 transactions/s.
+3. In MySQL deadlocks are detected instantly and are cheap; ordering removes the errors more than it adds speed.
+4. MongoDB transactions conflict instead of waiting, so ordering does not help; reducing contention does.
+5. Keep a retry loop anyway: some deadlocks (gap locks, FK upgrades) are not about statement order.
+
+## Check questions
+
+1. Why does locking accounts in ascending id order make a deadlock impossible?
+2. PostgreSQL had only 18 deadlocks in 15 s, yet throughput fell by a factor of 100. Explain.
+3. Why did lowering `deadlock_timeout` to 100 ms raise throughput but also raise the number of deadlocks?
+4. Why did ordering barely change MySQL's throughput?
+5. Why did ordering not change MongoDB's retry rate at all? What would?
+6. `UPDATE accounts SET balance = balance + 1 WHERE id IN (7, 3)` runs in two sessions with different id lists. Can it deadlock? How do you make the order explicit?
+7. Retries made PostgreSQL's failure count 0. Why is that not a fix?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-6-deadlocks/concept-4-preventing-deadlocks/answers">Worked answers to Q1–Q7</DeepDive>

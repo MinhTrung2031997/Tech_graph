@@ -1,0 +1,249 @@
+---
+title: "Concept 1: How a deadlock happens"
+description: "Two transfers that lock the same two accounts in opposite order, reproduced in PostgreSQL (detected after deadlock_timeout, 1 s), MySQL (detected immediately, error 1213) and MongoDB (no deadlock: the second transaction gets a WriteConflict instead of waiting). What each engine rolls back and what the other transaction sees."
+type: "concept"
+tags: ["transactions", "deadlocks", "locking", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-DEADLOCKS"
+  - "https://www.postgresql.org/docs/current/runtime-config-locks.html#GUC-DEADLOCK-TIMEOUT"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-deadlocks.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-deadlock-detection.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-in-applications/"
+---
+
+<Tldr>
+A **deadlock** is a cycle of waits: T1 holds account 1 and waits for account 2, T2 holds account 2 and waits for account 1. Neither can finish, so the database must kill one. **PostgreSQL** does not look for cycles until a session has waited `deadlock_timeout` (1 s): T1's second UPDATE returned `ERROR: deadlock detected` after **1,001 ms**, and T2's waiting UPDATE went through 647 ms later. **MySQL** checks the moment a lock request would wait: T2 got `ERROR 1213 (40001) Deadlock found` **immediately** and its whole transaction was rolled back; T1 committed. **MongoDB** transactions never wait for documents, so no cycle can form: T1's second write failed at once with `WriteConflict` (`TransientTransactionError`) and T2 committed. In every engine the result is the same: one transfer applied, one must be **retried by the application**.
+</Tldr>
+
+## The cycle
+
+Transfer A moves 100 from account 1 to account 2; transfer B moves 50 from account 2 to account 1. Each updates its source first.
+
+| t | T1 (A: 1 → 2) | T2 (B: 2 → 1) |
+|---|---|---|
+| 0.0 s | UPDATE account 1 ✓ (locks 1) | |
+| 0.3 s | | UPDATE account 2 ✓ (locks 2) |
+| 1.0 s | UPDATE account 2 → waits for T2 | |
+| 1.3 s | | UPDATE account 1 → waits for T1: **cycle** |
+
+| Term | Meaning |
+|---|---|
+| Wait-for graph | Who waits for whom; a cycle in it is a deadlock |
+| Deadlock detection | Searching the graph for a cycle; PostgreSQL after `deadlock_timeout`, InnoDB on every wait (`innodb_deadlock_detect = ON`) |
+| Victim | The transaction the engine aborts to break the cycle |
+| **✓ Committed / ✗ Victim** | Outcome per transaction |
+
+## PostgreSQL: detected after deadlock_timeout
+
+<Flow
+  title="PostgreSQL: opposite-order transfers"
+  height={330}
+  nodes={[
+    { id: 't1', label: 'T1: 1 → 2', sub: 'pid 54428', x: 20, y: 20, w: 220 },
+    { id: 't2', label: 'T2: 2 → 1', sub: 'pid 54440', x: 20, y: 200, w: 220 },
+    { id: 'a1', label: 'Account 1', sub: 'held by T1', x: 300, y: 20, w: 200 },
+    { id: 'a2', label: 'Account 2', sub: 'held by T2', x: 300, y: 200, w: 200 },
+    { id: 'dead', label: '✗ T1 victim', sub: 'deadlock detected', x: 580, y: 20, w: 200 },
+    { id: 'ok', label: '✓ T2 commits', sub: 'waited 647 ms', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-a1', from: 't1', to: 'a1' },
+    { id: 't2-a2', from: 't2', to: 'a2' },
+    { id: 't1-a2', from: 't1', to: 'a2', quiet: true },
+    { id: 't2-a1', from: 't2', to: 'a1', quiet: true },
+    { id: 'a1-dead', from: 'a1', to: 'dead' },
+    { id: 'a2-ok', from: 'a2', to: 'ok' },
+  ]}
+  cases={[
+    {
+      title: 'Transfers 1 → 2 and 2 → 1',
+      path: 'both hold their first row → both wait → 1 s later T1 runs the check → ✗ T1 aborted → ✓ T2 continues',
+      summary: 'Nobody looks for the cycle until a waiter has waited deadlock_timeout.',
+      steps: [
+        {
+          title: 'Each locks its source',
+          note: 'T1 updates account 1, T2 (0.3 s later) updates account 2. No conflict yet.',
+          code: "-- T1\nBEGIN; UPDATE accounts SET balance = balance - 100 WHERE id = 1;\n-- T2\nBEGIN; UPDATE accounts SET balance = balance - 50 WHERE id = 2;",
+          active: ['t1', 't2', 'a1', 'a2'],
+          edges: ['t1-a1', 't2-a2'],
+        },
+        {
+          title: 'Each waits for the other',
+          note: 'T1 updates account 2 and waits for T2\'s transaction id; 0.3 s later T2 updates account 1 and waits for T1\'s. Both are ordinary lock waits: PostgreSQL does not check for cycles on every wait, because almost all waits end by themselves.',
+          active: ['t1', 't2', 'a1', 'a2'],
+          edges: ['t1-a2', 't2-a1'],
+        },
+        {
+          title: 'T1\'s timer fires first',
+          note: 'After waiting deadlock_timeout (1 s), T1 searches the wait-for graph, finds the cycle and aborts itself: its UPDATE returned after 1,001 ms with ERROR: deadlock detected, DETAIL: Process 54428 waits for ShareLock on transaction 1731673; blocked by process 54440. Process 54440 waits for ShareLock on transaction 1731672; blocked by process 54428.',
+          code: 'ERROR:  deadlock detected\nHINT:  See server log for query details.\nCONTEXT:  while updating tuple (0,2) in relation "accounts"',
+          active: ['t1', 'a1', 'dead'],
+          edges: ['a1-dead'],
+        },
+        {
+          title: 'T2 finishes',
+          note: 'T1\'s rollback released account 1; T2\'s UPDATE completed after 647 ms of waiting and T2 committed. Result: account 1 = +50, account 2 = −50. Transfer A was not applied and must be retried.',
+          active: ['t2', 'a2', 'ok'],
+          edges: ['a2-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL InnoDB: detected on the spot
+
+<Flow
+  title="InnoDB: opposite-order transfers"
+  height={330}
+  nodes={[
+    { id: 't1', label: 'T1: 1 → 2', sub: 'trx 251125', x: 20, y: 20, w: 220 },
+    { id: 't2', label: 'T2: 2 → 1', sub: 'trx 251126', x: 20, y: 200, w: 220 },
+    { id: 'a1', label: 'PRIMARY record 1', sub: 'X held by T1', x: 300, y: 20, w: 200 },
+    { id: 'a2', label: 'PRIMARY record 2', sub: 'X held by T2', x: 300, y: 200, w: 200 },
+    { id: 'ok', label: '✓ T1 commits', sub: 'waited 0.33 s', x: 580, y: 20, w: 200 },
+    { id: 'dead', label: '✗ T2 victim', sub: 'ERROR 1213', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-a1', from: 't1', to: 'a1' },
+    { id: 't2-a2', from: 't2', to: 'a2' },
+    { id: 't1-a2', from: 't1', to: 'a2', quiet: true },
+    { id: 't2-a1', from: 't2', to: 'a1', quiet: true },
+    { id: 'a1-ok', from: 'a1', to: 'ok' },
+    { id: 'a2-dead', from: 'a2', to: 'dead' },
+  ]}
+  cases={[
+    {
+      title: 'Transfers 1 → 2 and 2 → 1',
+      path: 'T1 waits for record 2 → T2 requests record 1 → cycle found at once → ✗ T2 rolled back (1213) → ✓ T1',
+      summary: 'innodb_deadlock_detect = ON: every new wait is checked for a cycle.',
+      steps: [
+        {
+          title: 'Each locks its source record',
+          note: 'Same timeline: X,REC_NOT_GAP on PRIMARY 1 for T1, on PRIMARY 2 for T2.',
+          active: ['t1', 't2', 'a1', 'a2'],
+          edges: ['t1-a1', 't2-a2'],
+        },
+        {
+          title: 'The request that closes the cycle fails',
+          note: 'T1 waits for record 2. When T2 asks for record 1, InnoDB sees that the wait would close a cycle and picks a victim right away: T2 got ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction, with no waiting.',
+          code: 'ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction',
+          active: ['t1', 't2', 'a1', 'a2', 'dead'],
+          edges: ['t1-a2', 't2-a1', 'a2-dead'],
+        },
+        {
+          title: 'The whole victim is undone',
+          note: 'Unlike a lock wait timeout (Session 5, Concept 4), a deadlock rolls back T2\'s entire transaction, including its first UPDATE. T1\'s wait ended and its UPDATE took 0.33 s; it committed. Result: account 1 = 900, account 2 = 1,100: only transfer A.',
+          active: ['t1', 'a1', 'ok'],
+          edges: ['a1-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: no waiting, no deadlock
+
+<Flow
+  title="MongoDB: opposite-order transactions"
+  height={330}
+  nodes={[
+    { id: 't1', label: 'T1: 1 → 2', sub: 'transaction', x: 20, y: 20, w: 220 },
+    { id: 't2', label: 'T2: 2 → 1', sub: 'transaction', x: 20, y: 200, w: 220 },
+    { id: 'd1', label: 'Document 1', sub: 'changed by T1', x: 300, y: 20, w: 200 },
+    { id: 'd2', label: 'Document 2', sub: 'changed by T2', x: 300, y: 200, w: 200 },
+    { id: 'conf', label: '✗ T1 WriteConflict', sub: 'at 1,014 ms', x: 580, y: 20, w: 200 },
+    { id: 'ok', label: '✓ T2 commits', sub: 'at 1,026 ms', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-d1', from: 't1', to: 'd1' },
+    { id: 't2-d2', from: 't2', to: 'd2' },
+    { id: 't1-d2', from: 't1', to: 'd2', quiet: true },
+    { id: 'd1-conf', from: 'd1', to: 'conf' },
+    { id: 'd2-ok', from: 'd2', to: 'ok' },
+  ]}
+  cases={[
+    {
+      title: 'Transfers 1 → 2 and 2 → 1',
+      path: 'T1 writes doc 2 → ✗ WriteConflict at once (no wait) → T1 aborted → T2 writes doc 1 ✓ → commits',
+      summary: 'A cycle needs two waiters; MongoDB transactions never wait for a document.',
+      steps: [
+        {
+          title: 'Each changes its source',
+          note: 'Both transactions update their first document; each holds an uncommitted version.',
+          code: 'acc.updateOne({ _id: 1 }, { $inc: { balance: NumberDecimal("-100") } })',
+          active: ['t1', 't2', 'd1', 'd2'],
+          edges: ['t1-d1', 't2-d2'],
+        },
+        {
+          title: 'The second write conflicts',
+          note: 'T1 writes document 2, which has T2\'s uncommitted change: WriteConflict, label TransientTransactionError, returned at 1,014 ms (its 1 s sleep plus 14 ms). There is no wait, so no cycle.',
+          code: 'MongoServerError: WriteConflict  errorLabels: ["TransientTransactionError"]',
+          active: ['t1', 'd2', 'd1', 'conf'],
+          edges: ['t1-d2', 'd1-conf'],
+        },
+        {
+          title: 'T2 succeeds',
+          note: 'T1 aborted, so its change to document 1 is gone; T2 wrote document 1 and committed at 1,026 ms. Result: 1 = 1,050, 2 = 950. Had both reached their second write at the same instant, both could have failed; the driver\'s withTransaction retries them.',
+          active: ['t2', 'd2', 'ok'],
+          edges: ['d2-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Comparison
+
+| | PostgreSQL | MySQL InnoDB | MongoDB |
+|---|---|---|---|
+| When the cycle is found | After a waiter waits `deadlock_timeout` (1 s) | When the wait would start | Never forms |
+| Error | `40P01 deadlock detected` | `1213 (40001) Deadlock found` | `112 WriteConflict` (`TransientTransactionError`) |
+| What is rolled back | The victim's whole transaction | The victim's whole transaction | The conflicting transaction |
+| Cost while it lasts | Both hold their locks for ≥ 1 s; others queue behind them | Microseconds | None (but retries) |
+| Application must | Retry | Retry | Retry (`withTransaction` does it) |
+
+<Pitfall>
+A deadlock is not a bug in the database, and it does not corrupt data: the engine always picks a victim and the other transaction completes. The bug is an application that does not **retry** the victim. Every code path that writes more than one row in a transaction needs a retry loop for `40P01`, `1213` and `TransientTransactionError` (Session 7).
+</Pitfall>
+
+## Real-world scenario: two users pay each other
+
+Users A and B send money to each other within the same second. The payment service runs "debit sender, credit receiver" in one transaction. Logs show occasional "deadlock detected" and failed payments.
+
+| Engine | What users see without retries | With a retry loop |
+|---|---|---|
+| PostgreSQL | One payment fails after a 1 s stall | One payment takes ≈ 1 s longer |
+| MySQL | One payment fails at once | One payment retries in milliseconds |
+| MongoDB | One payment fails at once | `withTransaction` retries it |
+
+Concept 4 shows how to remove the cycle entirely (lock both accounts in id order).
+
+## Why this matters for the next concepts
+
+| Next | Connection |
+|---|---|
+| Concept 2 | Which transaction each engine picks as the victim, and how to read the reports |
+| Concept 3 | Deadlocks that involve only one statement per transaction (gap locks, duplicate keys) |
+| Concept 4 | Ordering, short transactions and retries, with throughput measured |
+
+## Key takeaways
+
+1. A deadlock is a cycle of lock waits; the engine must abort one transaction to break it.
+2. PostgreSQL detects it only after `deadlock_timeout` (1 s); MySQL detects it the moment the cycle closes.
+3. The victim's whole transaction is rolled back in both SQL engines (error `40P01` / `1213`).
+4. MongoDB transactions do not wait on documents, so they cannot deadlock; they fail with `WriteConflict` instead.
+5. In every engine the fix on the application side is the same: retry the failed transaction.
+
+## Check questions
+
+1. Draw the wait-for graph at t = 1.3 s for the two transfers.
+2. Why did PostgreSQL report the deadlock only after about 1 s, while MySQL reported it immediately?
+3. In the PostgreSQL run, why was T1 the victim and not T2?
+4. After MySQL's 1213, what happened to T2's first UPDATE (account 2 − 50)?
+5. Why can two MongoDB transactions not deadlock on documents? What do you get instead?
+6. What would the balances be if the application simply ignored the deadlock error and moved on?
+7. A colleague proposes raising `deadlock_timeout` to 10 s "so fewer transactions are killed". What happens?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-6-deadlocks/concept-1-how-deadlocks-happen/answers">Worked answers to Q1–Q7</DeepDive>

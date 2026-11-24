@@ -1,0 +1,70 @@
+---
+title: "Answers: Preventing deadlocks"
+description: "Worked answers to the Session 6 Concept 4 check questions."
+companion: "answers"
+tags: ["transactions", "deadlocks", "performance", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-DEADLOCKS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-deadlocks-handling.html"
+---
+
+<Tldr>
+Order removes cycles; retries absorb what is left; and in PostgreSQL every remaining deadlock costs `deadlock_timeout` on hot rows.
+</Tldr>
+
+## Q1. Why ordering works
+
+**Question:** why does locking accounts in ascending id order make a deadlock impossible?
+
+In a cycle T1 → T2 → … → T1, each transaction holds a lock and waits for one held by the next. With a global order, a transaction only ever waits for a row with a **higher** id than every row it holds. Following the cycle, the ids would have to keep increasing and yet come back to the start: impossible. Waits still happen (queues on hot rows), but they always end.
+
+> **Common mistake:** ordering only within one code path. Every path that locks these rows must use the same order.
+
+## Q2. 18 deadlocks, 100× slower
+
+**Question:** PostgreSQL had only 18 deadlocks in 15 s, yet throughput fell by a factor of 100. Explain.
+
+Each deadlock is noticed only after `deadlock_timeout` (1 s). During that second, the two transactions in the cycle hold two of the 10 hot accounts, and any of the other 6 clients that needs either account waits behind them, often holding another hot account itself. 18 deadlocks × ≥ 1 s spread over 15 s means the system spent most of the run stalled: 418 transactions (27/s, 285 ms average latency) instead of 40,361 (2,689/s, 3 ms).
+
+> **Common mistake:** judging the impact of deadlocks by their count or percentage (4.1%) instead of by the time they hold locks.
+
+## Q3. Shorter deadlock_timeout
+
+**Question:** why did lowering `deadlock_timeout` to 100 ms raise throughput but also raise the number of deadlocks?
+
+Each stall now lasts 100 ms instead of 1 s, so far more transactions complete (169/s), and with more transactions running, more of them collide into cycles (180 failures, 6.6%). It treats the symptom: the ordered version had no deadlocks and 16× more throughput. A low `deadlock_timeout` also makes the detector run on many ordinary short waits, which costs CPU.
+
+> **Common mistake:** setting `deadlock_timeout` to a few milliseconds globally.
+
+## Q4. MySQL's small gain
+
+**Question:** why did ordering barely change MySQL's throughput?
+
+InnoDB detects the cycle at the moment the closing lock request is made and rolls the victim back immediately, so a deadlock costs about as much as one extra short transaction, not a stall. Removing them saves little time (791–1,112 vs 949–1,293 transactions/s, overlapping ranges with noise from other activity on the server). The benefit is fewer errors and no retry path for this case.
+
+> **Common mistake:** expecting the same 100× effect on every engine.
+
+## Q5. MongoDB and ordering
+
+**Question:** why did ordering not change MongoDB's retry rate at all? What would?
+
+MongoDB transactions do not wait for documents; any two concurrent transactions that write the same document conflict, and the later writer retries, whichever order they write in. Retry rate depends on how often transactions overlap on a document: 10 hot accounts × 8 shells gave about 0.5 retries per commit in both versions. To lower it: spread the hot data (more accounts, or split a hot counter into several documents), shorten transactions, or replace the transaction by a single-document atomic update where possible.
+
+> **Common mistake:** porting SQL lock-ordering rules to MongoDB and expecting fewer conflicts.
+
+## Q6. Multi-row UPDATE
+
+**Question:** `UPDATE accounts SET balance = balance + 1 WHERE id IN (7, 3)` runs in two sessions with different id lists. Can it deadlock? How do you make the order explicit?
+
+Yes, it can: one statement locks its rows one after another in the order the plan visits them. With an index scan both sessions usually go in id order, but a different plan (sequential scan, bitmap scan, or different lists processed in different orders) can lock them in another order, and two such statements can cross. Make it explicit by locking first: `SELECT id FROM accounts WHERE id IN (3, 7) ORDER BY id FOR UPDATE;` then run the updates.
+
+> **Common mistake:** assuming the order of values inside `IN (…)` is the locking order.
+
+## Q7. Retries are not a fix
+
+**Question:** retries made PostgreSQL's failure count 0. Why is that not a fix?
+
+With `--max-tries=10` every deadlocked transaction was eventually committed (0 failures, 16 retried), but throughput stayed at 25/s: each deadlock still stalled hot rows for a second before the retry. Retries are needed for correctness (no lost transfers), but they do not remove the cost; ordering does.
+
+> **Common mistake:** declaring victory because the error rate is zero while latency is 100× higher.

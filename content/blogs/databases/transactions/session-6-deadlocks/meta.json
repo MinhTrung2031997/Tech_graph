@@ -1,0 +1,12 @@
+{
+  "title": "Session 6: Deadlocks",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-how-deadlocks-happen/index",
+    "concept-2-victims-and-reports/index",
+    "concept-3-hidden-deadlocks/index",
+    "concept-4-preventing-deadlocks/index",
+    "lab/index"
+  ]
+}

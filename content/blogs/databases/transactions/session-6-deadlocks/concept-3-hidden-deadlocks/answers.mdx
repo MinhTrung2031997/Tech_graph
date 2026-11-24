@@ -1,0 +1,87 @@
+---
+title: "Answers: Deadlocks without opposite order"
+description: "Worked answers to the Session 6 Concept 3 check questions."
+companion: "answers"
+tags: ["transactions", "deadlocks", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locks-set.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/insert-on-duplicate.html"
+  - "https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT"
+---
+
+<Tldr>
+Two compatible locks (S + S, gap + gap) that both need to become exclusive form a cycle. Avoid the shared step or take the exclusive lock first.
+</Tldr>
+
+## Q1. Different ids, same gap
+
+**Question:** two sessions check different missing ids (20001, 20002) and then insert them. Why do they deadlock in InnoDB although the ids differ?
+
+Both ids are above 10000, the largest key, so both fall into the **same gap**: the one before the supremum pseudo-record. Each `SELECT … FOR UPDATE` takes a next-key lock on the supremum; gap-type locks are compatible, so both are granted. Each INSERT then needs an insert-intention lock in that gap, which conflicts with the **other** session's gap lock. T1 waits for T2 and T2 waits for T1: InnoDB rolled back T2 (1213).
+
+> **Common mistake:** "they lock different keys, so they cannot conflict". Gap locks cover ranges, and both keys were in one range.
+
+## Q2. Why only after the rollback
+
+**Question:** in the three-session duplicate insert, why does the deadlock appear only **after** T1 rolls back?
+
+While T1's uncommitted row 20005 exists, T2 and T3 both wait for an `S` lock on it, and T1 holds `X`: a queue, not a cycle. When T1 rolls back, both `S` requests are granted at the same time (they are compatible). Now each needs `X` (insert intention) to insert 20005 itself, and each is blocked by the other's `S`. That is the cycle; InnoDB rolled back T3, and T2 inserted.
+
+> **Common mistake:** blaming T1 for the deadlock. T1 only rolled back; the two shared locks caused it.
+
+## Q3. PostgreSQL's outcome
+
+**Question:** what did PostgreSQL do with the same three sessions, and why is that error easier to handle?
+
+T2 and T3 waited on T1's transaction (not on shared row locks). After T1's rollback, T2 inserted (1,656 ms); T3 then waited for T2 and, when T2 committed, got `duplicate key value violates unique constraint "accounts_pkey"` (2,378 ms). A unique violation says exactly what happened ("this key is taken"); the application can read the existing row. A deadlock says only "try again", and retrying T3 would then hit the duplicate anyway.
+
+> **Common mistake:** catching both errors with one generic retry.
+
+## Q4. Child then parent
+
+**Question:** why does "insert child, then update parent" deadlock in InnoDB but not in PostgreSQL?
+
+InnoDB's FK check takes an `S` lock on the parent record; two transactions both get it, and both UPDATEs then need `X` on the same record: each waits for the other's `S`. PostgreSQL's FK check takes `FOR KEY SHARE`, and an UPDATE of a non-key column takes `FOR NO KEY UPDATE`, which is compatible with `KEY SHARE`: T1's update proceeds, T2's update simply queues behind T1, and both commit (balance 970).
+
+> **Common mistake:** concluding PostgreSQL "has no FK locking". It does; its lock modes are finer.
+
+## Q5. Fixing order items on MySQL
+
+**Question:** give two ways to change the order-items code so it cannot deadlock on MySQL.
+
+1. Take the exclusive lock first: `SELECT id FROM orders WHERE id = ? FOR UPDATE` at the start of the transaction, then insert items, then update the total. The second transaction waits at the first statement and never holds an `S` lock that blocks the first.
+2. Reorder: `UPDATE orders SET total = total + ? WHERE id = ?` first (takes `X`), then insert the item (its FK check is satisfied by your own `X`).
+
+Also possible: stop updating the parent in the same transaction (compute totals on read, or asynchronously).
+
+> **Common mistake:** adding retries only. They hide the deadlock but keep paying for it under load.
+
+## Q6. Check-then-insert as one statement
+
+**Question:** rewrite "SELECT … FOR UPDATE; if missing, INSERT" as one statement for each SQL engine.
+
+```sql
+-- MySQL
+INSERT INTO accounts (id, owner, branch, balance, version)
+VALUES (20001, 'new', 'B01', 0, 1)
+ON DUPLICATE KEY UPDATE id = id;               -- no-op if it exists
+
+-- PostgreSQL
+INSERT INTO accounts (id, owner, branch, balance, version)
+VALUES (20001, 'new', 'B01', 0, 1)
+ON CONFLICT (id) DO NOTHING                     -- or DO UPDATE SET …
+RETURNING id;                                  -- no row returned = already existed
+```
+
+The unique index arbitrates; there is no separate check that takes a gap lock.
+
+> **Common mistake:** `INSERT IGNORE` in MySQL, which also silences other errors (truncation, NOT NULL violations).
+
+## Q7. MongoDB duplicate insert in progress
+
+**Question:** a MongoDB transaction inserts an `_id` that another transaction has inserted but not committed. What happens, and what should the application do?
+
+The second transaction fails at once with `WriteConflict` and the label `TransientTransactionError` (6 ms in the lab). The application should retry the whole transaction (`withTransaction` does this automatically). On retry, if the first transaction committed, the insert fails with a duplicate key error (E11000), which is not transient: handle it as "already exists".
+
+> **Common mistake:** treating E11000 as transient and retrying it forever.

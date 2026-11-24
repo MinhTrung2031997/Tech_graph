@@ -5,6 +5,7 @@
     "session-2-anomalies",
     "session-3-isolation-levels",
     "session-4-mvcc-internals",
-    "session-5-locks-and-indexes"
+    "session-5-locks-and-indexes",
+    "session-6-deadlocks"
   ]
 }

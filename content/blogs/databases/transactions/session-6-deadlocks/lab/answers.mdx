@@ -1,0 +1,97 @@
+---
+title: "Answers: Deadlocks session quiz"
+description: "Worked answers to the Session 6 quiz, with the lab's measured values."
+companion: "answers"
+tags: ["transactions", "deadlocks", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-DEADLOCKS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-deadlocks.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-in-applications/"
+---
+
+<Tldr>
+Detection differs (1 s vs instant vs none), victims differ (checker vs cheapest vs conflicting), the cure is the same: remove cycles, retry the rest.
+</Tldr>
+
+## Q1. 1 s vs instant
+
+**Question:** in PostgreSQL, the deadlocked statement returned after about 1 s; in MySQL, at once. Which setting explains each?
+
+PostgreSQL: `deadlock_timeout` (default 1 s). A waiting session searches for a cycle only after waiting that long (the lab's victim returned after 1,001 ms). MySQL: `innodb_deadlock_detect = ON` (default): InnoDB checks the wait-for graph whenever a lock request is about to wait, so the request that closes the cycle fails immediately with 1213.
+
+> **Common mistake:** confusing `deadlock_timeout` with `lock_timeout`; the first only delays detection, the second gives up waiting.
+
+## Q2. Who loses the batch
+
+**Question:** in the big-vs-small experiment, which transaction lost its work in each engine? Which policy would you prefer for a nightly batch, and how do you protect the batch either way?
+
+MySQL rolled back the small transaction (1 undo entry) and kept the 51-row one; PostgreSQL aborted the big one (all 50 version updates lost) because its check found the cycle. InnoDB's policy is kinder to batches, but you should not depend on either: make the batch commit in chunks (each chunk idempotent), process rows in the same order as the online traffic, and retry a failed chunk. Then a deadlock costs one chunk, not the night.
+
+> **Common mistake:** relying on "MySQL will kill the other one"; with two batches, one of them still loses.
+
+## Q3. The log entry
+
+**Question:** a PostgreSQL deadlock error says "See server log for query details". What exactly is in the log entry, and what is still missing from it?
+
+The log has `ERROR: deadlock detected`, the DETAIL with pids and transaction ids ("Process 54428 waits for ShareLock on transaction 1731673; blocked by process 54440 …"), and for each process the statement it was running ("Process 54428: UPDATE accounts SET balance = balance + 100 WHERE id = 2"), plus CONTEXT (tuple and relation) and STATEMENT. Missing: the earlier statements in each transaction that took the locks now held (each transfer's first UPDATE), and the application context. Those come from code or statement logging.
+
+> **Common mistake:** debugging only the two statements in the log.
+
+## Q4. Different keys, deadlock
+
+**Question:** why can InnoDB deadlock on two `INSERT`s of **different** keys?
+
+When each transaction first holds a gap lock on the gap the keys fall into (from a `SELECT … FOR UPDATE` on the missing key, or from scanning that range), the gap locks are compatible and both are granted. An INSERT needs an insert-intention lock in the gap, which conflicts with **other** transactions' gap locks. Two such inserts wait for each other: in the lab, ids 20001 and 20002 above the last row both fell into the supremum gap, and one got 1213.
+
+> **Common mistake:** "INSERTs never deadlock". In InnoDB RR they do whenever gap locks are involved.
+
+## Q5. Duplicate key race
+
+**Question:** three sessions insert the same primary key and the first rolls back. What do the other two get in MySQL, and in PostgreSQL?
+
+MySQL: both waiters were holding (granted, after the rollback) `S` locks on the key and both requested `X` to insert: a deadlock. One (T3) got 1213; the other inserted. PostgreSQL: the waiters queue on T1's transaction; after the rollback T2 inserted (after 1,656 ms), and T3, now waiting on T2, got `duplicate key value violates unique constraint` when T2 committed (after 2,378 ms).
+
+> **Common mistake:** retrying the MySQL victim blindly: on retry it will usually get a duplicate-key error, which needs a different handling path.
+
+## Q6. Order items without deadlocks
+
+**Question:** rewrite the order-items flow (insert item, update order total) so that it cannot deadlock on MySQL.
+
+```sql
+START TRANSACTION;
+SELECT id FROM orders WHERE id = ? FOR UPDATE;             -- X on the parent first
+INSERT INTO order_items (order_id, sku, qty, price) VALUES (?, ?, ?, ?);
+UPDATE orders SET total = total + ? WHERE id = ?;
+COMMIT;
+```
+
+The second transaction for the same order waits at the first statement, before taking any shared lock. Alternatives: run the UPDATE of the total first, or stop maintaining the total in the write path.
+
+> **Common mistake:** wrapping the original two statements in a retry loop and calling it fixed.
+
+## Q7. Ordering's effect per engine
+
+**Question:** lock ordering raised PostgreSQL's throughput by 100× in the lab but barely changed MySQL's and not at all MongoDB's. Explain all three.
+
+| Engine | Random → ordered | Why |
+|---|---|---|
+| PostgreSQL | 27 → 2,689 txn/s | Each deadlock held two of 10 hot rows for `deadlock_timeout` (1 s) while others queued; ordering removed those stalls |
+| MySQL | 791–1,112 → 949–1,293 txn/s | Deadlocks are detected and resolved instantly, so they were cheap; ordering removed 211–438 errors per run |
+| MongoDB | 1,052 → 1,105 commits/s, ≈ 0.5 retries per commit both ways | Transactions conflict on any shared document, whatever the order; there are no waits to order |
+
+> **Common mistake:** generalizing one engine's benchmark to the others.
+
+## Q8. What to retry
+
+**Question:** list the errors a retry loop must handle in each engine, and one error it must **not** retry.
+
+| Engine | Retry (whole transaction) | Do not retry blindly |
+|---|---|---|
+| PostgreSQL | `40P01` deadlock_detected, `40001` serialization_failure | `23505` unique_violation (the key exists: handle it) |
+| MySQL | `1213` deadlock (transaction already rolled back); `1205` lock wait timeout **after an explicit ROLLBACK** (Session 5) | `1062` duplicate entry |
+| MongoDB | Errors labelled `TransientTransactionError` (e.g. `WriteConflict`); commit errors labelled `UnknownTransactionCommitResult` (retry the commit) | `E11000` duplicate key |
+
+Cap the number of attempts and add a short random back-off; make the transaction's side effects outside the database (emails, HTTP calls) happen after commit.
+
+> **Common mistake:** retrying only the failing statement instead of the whole transaction.
