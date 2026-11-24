@@ -1,0 +1,75 @@
+---
+title: "Answers: Postgres heap and MVCC"
+description: "Worked answers to the Session 6 Concept 1 check questions."
+companion: "answers"
+tags: ["indexing", "postgresql", "mvcc", "hot", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/storage-hot.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html"
+---
+
+<Tldr>
+New version, new ctid, new entry in every index, unless HOT. HOT needs room on the page and no indexed column changed.
+</Tldr>
+
+## Q1. Why customer_id doubled
+
+**Question:** updating only `balance` doubled the `customer_id` index. Why?
+
+With fill factor 100 there was no room on the pages, so every update was non-HOT: each new version landed on another page with a **new ctid**. PostgreSQL indexes point at ctids, so every index, `customer_id` included, needed a new entry for each of the 200,000 new versions (191 → 381 pages). The old entries stayed until VACUUM.
+
+> **Common mistake:** "only indexes on changed columns are updated". That is true in InnoDB and MongoDB, and in PostgreSQL only for HOT updates.
+
+## Q2. HOT conditions
+
+**Question:** what two conditions make an update HOT?
+
+1. **No indexed column changes** (including `INCLUDE` columns and columns used in expression or partial-index predicates).
+2. **The new version fits on the same heap page** as the old one.
+
+> **Common mistake:** forgetting condition 2, which is what fill factor controls.
+
+## Q3. 100% vs 11%
+
+**Question:** why was the fill-factor-90 table 100% HOT for a 5% update but only 11% HOT when every row was updated?
+
+Fill factor 90 leaves ≈ 10% of each page free: about 12 new versions of these rows per page. A 5% update changes ≈ 6 rows per page, which all fit: 100% HOT. Updating all ≈ 122 rows on each page needs room for 122 new versions; only the first ≈ 12 fit, the rest go elsewhere: 11% HOT. Fill factor absorbs steady trickles of updates, not full-table rewrites.
+
+> **Common mistake:** expecting a lower fill factor to make bulk updates HOT.
+
+## Q4. status update grows customer_id
+
+**Question:** why does updating `status` (indexed) add entries to the `customer_id` index?
+
+Changing an indexed column rules out HOT, so the new version gets a new ctid, and **every** index must point at it, not just the `status` index. The `customer_id` index grew from 381 to 542 pages for a change it does not contain.
+
+> **Common mistake:** "the status index gets one new entry; nothing else changes".
+
+## Q5. Where old versions live
+
+**Question:** where does each engine keep the old version of an updated row?
+
+| Engine | Old version |
+|---|---|
+| PostgreSQL | In the heap, as a dead tuple, until VACUUM |
+| InnoDB | In the undo log, until purge |
+| MongoDB | In WiredTiger's in-memory update chain (and the history store when evicted), until no snapshot needs it |
+
+> **Common mistake:** "all three use the same MVCC". They all provide snapshot reads, with very different storage.
+
+## Q6. InnoDB and non-indexed columns
+
+**Question:** why doesn't an InnoDB update of a non-indexed column touch secondary indexes?
+
+InnoDB updates the clustered record in place and writes the old value to undo. Secondary entries hold `(indexed columns, primary key)`; neither changed, so they remain correct. Only indexes whose columns change are modified (delete-mark the old entry, insert the new one), which is why updating the indexed `status` doubled page writes in the lab.
+
+> **Common mistake:** "InnoDB rewrites the row and its indexes like PostgreSQL".
+
+## Q7. HOT ratio drops to 0%
+
+**Question:** a table's HOT ratio dropped to 0% after a new index was added. What probably happened?
+
+The new index covers a column that **every** update changes, typically `updated_at`, `last_seen`, `status` or a counter. Since any change to an indexed column rules out HOT, all updates became non-HOT, adding an entry to every index on every update. Check which columns the updates set, and reconsider the index (or stop updating that column on every write).
+
+> **Common mistake:** blaming fill factor; it cannot help when an indexed column changes.

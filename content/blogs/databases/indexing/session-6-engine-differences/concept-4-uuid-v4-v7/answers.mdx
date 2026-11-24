@@ -1,0 +1,70 @@
+---
+title: "Answers: UUIDv4 vs UUIDv7 as primary key"
+description: "Worked answers to the Session 6 Concept 4 check questions."
+companion: "answers"
+tags: ["indexing", "primary-key", "uuid", "answers"]
+status: "draft"
+sources:
+  - "https://www.rfc-editor.org/rfc/rfc9562.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/miscellaneous-functions.html#function_uuid-to-bin"
+---
+
+<Tldr>
+Order decides how full pages stay; width decides how many entries fit. Random order costs most where the B-tree being split is the table itself (InnoDB, clustered collections).
+</Tldr>
+
+## Q1. 38 MB vs 30 MB
+
+**Question:** why was the UUIDv4 primary-key index 38 MB and the sub-millisecond UUIDv7 one 30 MB, with the same 16-byte keys?
+
+Same width, different order. UUIDv7 keys increase, so every insert goes to the rightmost leaf and rightmost splits leave pages at the 90% fill factor (3,832 leaves). UUIDv4 keys land anywhere, middle splits leave pages ≈ half full, and the index settles at 71% fill (4,847 leaves). 90 / 71 ≈ 1.27 ≈ 38 / 30.
+
+> **Common mistake:** "UUIDv7 is smaller". The values are the same size; the pages are fuller.
+
+## Q2. Millisecond-only UUIDv7
+
+**Question:** why did a UUIDv7 ordered only to the millisecond fill pages to just 73%?
+
+At ≈ 600 inserts per millisecond, all keys generated in one millisecond share the 48-bit timestamp and differ only in random bits. Within that group they sort randomly, so they are inserted at random positions among the newest leaves, causing middle splits there. Ordering across milliseconds keeps the "hot" area small, but within it the pattern is random. Sub-millisecond ordering (12 more bits of time, as PostgreSQL 18 does) makes the keys monotonic again: 90%.
+
+> **Common mistake:** assuming any UUIDv7 implementation is strictly increasing; check whether yours adds sub-millisecond precision or a counter.
+
+## Q3. The remaining gap
+
+**Question:** why is the remaining gap between UUIDv7 (30 MB) and `bigint` (21 MB) not about order?
+
+Both fill pages to 90%. A `bigint` entry is 16 bytes (8-byte header with the ctid + 8-byte key); a UUID entry is 24 bytes (8 + 16). 24 / 16 = 1.5, close to 3,832 / 2,733 leaves = 1.4. The difference is the key's width.
+
+> **Common mistake:** expecting an ordered UUID to match an integer key exactly.
+
+## Q4. InnoDB vs PostgreSQL
+
+**Question:** why do random keys hurt InnoDB more than PostgreSQL?
+
+In InnoDB the primary-key B-tree **is** the table: random inserts split pages holding whole rows (70 → 128 MB for the table in the lab, 2.3× slower), and the wide key is also copied into every secondary index. In PostgreSQL the heap appends regardless of key order; only the primary-key index splits (21 → 38 MB), and other indexes point at ctids.
+
+> **Common mistake:** applying PostgreSQL measurements to MySQL decisions.
+
+## Q5. UUID_TO_BIN(UUID(), 1)
+
+**Question:** what does `UUID_TO_BIN(UUID(), 1)` do, and why was it 79 MB instead of 128 MB?
+
+MySQL's `UUID()` generates a version-1 UUID whose time fields are stored low-order first, so as text or plain binary it does not sort by time. `UUID_TO_BIN(uuid, 1)` converts it to 16 bytes **and** swaps the time-high and time-low parts, putting the most significant time bits first. The binary values then increase over time, inserts append to the clustered index, and pages stay full: 79 MB vs 128 MB for random bytes (and 70 MB for `BIGINT`, the rest being width).
+
+> **Common mistake:** `UUID_TO_BIN(UUID())` without the swap flag, which keeps the unordered layout.
+
+## Q6. ObjectId
+
+**Question:** why is MongoDB's default ObjectId a good `_id`, and why was the UUIDv4 collection itself also bigger?
+
+An ObjectId is 12 bytes starting with a 4-byte timestamp: roughly increasing (appends to the `_id` index) and compact, with repetitive prefixes that compress well. UUIDv4 is 16 random bytes: inserts scatter across the index, and random data does not compress, so both the `_id` index (25 vs 10 MB) and the documents that contain the `_id` (collection 24.6 vs 9.9 MB on disk) are larger.
+
+> **Common mistake:** replacing ObjectId with UUIDs "for portability" without measuring the cost.
+
+## Q7. Hiding creation time
+
+**Question:** your API exposes order ids publicly and the business does not want creation times visible. How do you combine that with an ordered primary key?
+
+Keep an internal ordered primary key (`bigint` identity or UUIDv7) for storage, joins and foreign keys, and add a separate **random** public identifier (UUIDv4 or a random token) with a **unique secondary index**. APIs accept and return only the public id. The random index is small (one entry per row, used only for lookups), while the clustered index or heap and every foreign key stay ordered.
+
+> **Common mistake:** making the random public id the primary key, which brings back every cost measured above.

@@ -1,0 +1,70 @@
+---
+title: "Answers: MongoDB WiredTiger and multikey indexes"
+description: "Worked answers to the Session 6 Concept 3 check questions."
+companion: "answers"
+tags: ["indexing", "mongodb", "multikey", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/indexes/index-types/index-multikey/"
+  - "https://www.postgresql.org/docs/current/gin.html"
+---
+
+<Tldr>
+One entry per element. Everything else (no covering, one array per compound index, per-document checks for $all) follows from that.
+</Tldr>
+
+## Q1. Entries for 4 tags
+
+**Question:** how many index entries does `{ tags: 1 }` create for a document with 4 tags, and what does each point at?
+
+**4** (one per distinct element; duplicates inside one array produce one entry). Each entry is `tag value → RecordId` of the same document.
+
+> **Common mistake:** "one entry holding the array". The array is split into its elements.
+
+## Q2. No covering
+
+**Question:** why can't `find({ tags: 'sale' }, { _id: 0, tags: 1 })` be covered by `{ tags: 1 }`?
+
+The query must return the **whole** `tags` array, but each index entry contains a single element. Reconstructing the array would need all of the document's entries, so MongoDB fetches the document (PROJECTION_SIMPLE ← FETCH ← IXSCAN, 40,000 documents). Multikey indexes never cover the array field.
+
+> **Common mistake:** expecting `_id: 0` to make every projection covered.
+
+## Q3. $all reads 12× more than it returns
+
+**Question:** why did `$all: ['sale', 'eco']` examine 40,000 documents to return 3,333?
+
+The index can seek on one element at a time. MongoDB scanned the 40,000 `'sale'` entries, fetched each document and tested whether it also contains `'eco'`: 3,333 did. There is no step that intersects the two sets of RecordIds inside the index.
+
+> **Common mistake:** "MongoDB looks up both tags and intersects". That is what PostgreSQL's GIN does.
+
+## Q4. Parallel arrays
+
+**Question:** why does MongoDB refuse an index on `{ tags: 1, sizes: 1 }` when both are arrays?
+
+A compound entry combines one value from each field. With two arrays, every combination of elements would need an entry (5 tags × 3 sizes = 15 per document), growing multiplicatively with array lengths. MongoDB forbids it: `CannotIndexParallelArrays`. Only one field per compound index may be an array in any given document.
+
+> **Common mistake:** splitting it into two single-field indexes and expecting them to combine like a compound index.
+
+## Q5. The efficient compound multikey index
+
+**Question:** `{ tags: 1, price: 1 }` examined exactly 4,000 keys for `tags: 'sale', price < 50`. Why was it efficient here?
+
+Only `tags` is an array; `price` is a scalar. Each entry is `(one tag, the document's price)`, so for `tag = 'sale'` the entries are sorted by price, and the bounds `tags ['sale','sale'], price [-inf, 50)` select exactly the matches: one stretch, 4,000 keys, 4,000 results. It is the normal compound index behaviour (Session 4), with the array field leading.
+
+> **Common mistake:** thinking any multikey index loses compound bounds; the limitations concern multiple conditions on the same array field.
+
+## Q6. GIN vs multikey
+
+**Question:** how does a PostgreSQL GIN index answer `tags @> '{sale,eco}'` differently from MongoDB's multikey index?
+
+GIN stores, per element, a compressed posting list of rows containing it. For containment it fetches the lists for `sale` and `eco`, **intersects** them, and visits only the rows in both. MongoDB's multikey B-tree seeks on one element and checks the others on each fetched document. For multi-element filters, GIN reads far fewer rows.
+
+> **Common mistake:** "both are inverted indexes, so they behave the same". The intersection step is the difference.
+
+## Q7. 10,000-element arrays
+
+**Question:** what happens to a multikey index if documents have arrays of 10,000 elements?
+
+Each such document contributes 10,000 entries to every multikey index on that field: large indexes, slow inserts, and every update that changes the array rewrites the document and inserts or removes entries. MongoDB also limits document size (16 MB), and large arrays make documents grow and move. Model large one-to-many relations as separate documents (one per follower, comment, etc.) with a normal index on the parent id.
+
+> **Common mistake:** treating arrays as free because they are "inside one document".

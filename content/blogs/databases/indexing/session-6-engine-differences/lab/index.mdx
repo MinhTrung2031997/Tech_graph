@@ -1,0 +1,188 @@
+---
+title: "Lab and session quiz: Postgres vs MySQL vs MongoDB"
+description: "Measure how each engine pays for updates, wide keys, arrays and random primary keys: HOT updates and fill factor, InnoDB secondary index width, MongoDB multikey indexes, 1M-insert key comparisons, and reading MongoDB explain and profiler output."
+type: "how-to"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/storage-hot.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-index-types.html"
+  - "https://www.mongodb.com/docs/manual/core/indexes/index-types/index-multikey/"
+  - "https://www.mongodb.com/docs/manual/reference/explain-results/"
+---
+
+<Tldr>
+Uses the containers from the [Session 1 lab](/blogs/databases/indexing/session-1-storage-basics/lab). Every exercise builds its own small table or collection, so `orders` is untouched except in Exercise 5. Drop the experiment tables at the end of each exercise.
+</Tldr>
+
+## Exercise 1: HOT updates and fill factor (Concept 1)
+
+```sql
+-- pg: run once with fillfactor 100 and once with 90
+CREATE TABLE acct (id bigint PRIMARY KEY, customer_id int, status text, balance numeric(12,2), updated_at timestamptz)
+  WITH (fillfactor = 90);
+INSERT INTO acct SELECT g, g % 10000, 'active', 0, now() FROM generate_series(1, 200000) g;
+CREATE INDEX ON acct (customer_id);
+CREATE INDEX ON acct (status);
+VACUUM ANALYZE acct;
+
+UPDATE acct SET balance = balance + 1 WHERE id % 20 = 0;      -- 5% of rows
+SELECT pg_stat_force_next_flush();
+SELECT n_tup_upd, n_tup_hot_upd FROM pg_stat_user_tables WHERE relname = 'acct';
+SELECT pg_relation_size('acct') / 8192 AS heap_pages, pg_relation_size('acct_customer_id_idx') / 8192 AS cust_idx_pages;
+```
+
+| Fill factor | 5% update: HOT | Heap pages | `customer_id` index |
+|---|---|---|---|
+| 100 | 0 of 10,000 | 1,471 → 1,545 | 191 |
+| 90 | 10,000 of 10,000 | 1,640 → 1,640 | 191 |
+
+```sql
+-- then: an indexed column
+UPDATE acct SET status = 'closed' WHERE id % 2 = 0;   -- n_tup_hot_upd stays 0; customer_id index grows
+DROP TABLE acct;
+```
+
+## Exercise 2: InnoDB secondary index width and update cost (Concept 2)
+
+```sql
+-- my: the same secondary index under three primary keys (repeat with BINARY(16) / UUID_TO_BIN(UUID(), 1) and CHAR(36) / UUID())
+CREATE TABLE w (id BIGINT PRIMARY KEY, c INT NOT NULL);
+SET SESSION cte_max_recursion_depth = 1000;
+INSERT INTO w WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM s WHERE n < 999)
+  SELECT a.n * 1000 + b.n + 1, (a.n * 1000 + b.n) % 100000 FROM s a, s b ORDER BY 1;
+CREATE INDEX c_idx ON w (c);            -- built after the load, so its fill is comparable
+ANALYZE TABLE w;
+SELECT stat_value FROM mysql.innodb_index_stats WHERE table_name = 'w' AND index_name = 'c_idx' AND stat_name = 'n_leaf_pages';
+DROP TABLE w;
+```
+
+| Primary key | `c_idx` leaves |
+|---|---|
+| `BIGINT` | 1,078 |
+| `BINARY(16)` | 1,570 |
+| `CHAR(36)` | 2,866 |
+
+Update cost, with the page-write counter:
+
+```sql
+-- my: acct with indexes on customer_id and status, 200,000 rows
+SELECT VARIABLE_VALUE INTO @w FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Innodb_buffer_pool_write_requests';
+UPDATE acct SET balance = balance + 1 WHERE id % 10 = 0;
+SELECT VARIABLE_VALUE - @w FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Innodb_buffer_pool_write_requests';  -- ≈ 40,000
+-- repeat with SET status = 'closed' …                                                                                    -- ≈ 81,000
+```
+
+## Exercise 3: multikey indexes (Concept 3)
+
+```js
+// mg
+const pool = ['red', 'blue', 'green', 'sale', 'new', 'eco', 'kids', 'sport', 'home', 'gift'];
+const docs = [];
+for (let i = 1; i <= 100000; i++) {
+  const n = 3 + (i % 3), tags = [];
+  for (let j = 0; j < n; j++) tags.push(pool[(i * 7 + j * 3) % 10]);
+  docs.push({ _id: i, price: (i % 500) + 0.99, tags, sizes: ['S', 'M', 'L'].slice(0, 1 + i % 3) });
+}
+db.products.insertMany(docs);
+db.products.createIndex({ tags: 1 });
+db.products.createIndex({ tags: 1, price: 1 });
+db.products.createIndex({ tags: 1, sizes: 1 });        // CannotIndexParallelArrays
+
+const s = q => db.products.find(q).explain('executionStats').executionStats;
+s({ tags: 'sale' });                                   // keys 40000, docs 40000, nReturned 40000
+s({ tags: { $all: ['sale', 'eco'] } });                // keys 40000, docs 40000, nReturned 3333
+db.products.find({ tags: 'sale' }, { _id: 0, tags: 1 }).explain('executionStats').executionStats.totalDocsExamined;  // 40000: not covered
+db.products.drop();
+```
+
+## Exercise 4: primary keys, 1M inserts (Concept 4)
+
+```sql
+-- pg: UUIDv7 for PostgreSQL 17 (PostgreSQL 18 has uuidv7() built in)
+CREATE OR REPLACE FUNCTION uuidv7_lab() RETURNS uuid LANGUAGE sql VOLATILE AS $$
+  WITH t AS (SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint AS us)
+  SELECT (lpad(to_hex(us / 1000), 12, '0')
+          || '7' || lpad(to_hex(((us % 1000) * 4096 / 1000)::int), 3, '0')
+          || to_hex(8 + floor(random() * 4)::int)
+          || substr(md5(random()::text), 1, 15))::uuid
+  FROM t
+$$;
+-- repeat for: bigint GENERATED ALWAYS AS IDENTITY · uuid DEFAULT gen_random_uuid() · uuid DEFAULT uuidv7_lab()
+CREATE TABLE pk_test (id uuid DEFAULT gen_random_uuid() PRIMARY KEY, payload text);
+INSERT INTO pk_test (payload) SELECT 'x' FROM generate_series(1, 1000000);
+SELECT pg_size_pretty(pg_relation_size('pk_test_pkey')), leaf_pages, avg_leaf_density FROM pgstatindex('pk_test_pkey');
+DROP TABLE pk_test;
+```
+
+| PostgreSQL key | PK index | Fill |
+|---|---|---|
+| `bigint` | 21 MB | 90% |
+| UUIDv4 | 38 MB | 71% |
+| UUIDv7 (sub-ms ordered) | 30 MB | 90% |
+
+```sql
+-- my: repeat with BIGINT AUTO_INCREMENT / NULL, BINARY(16) / RANDOM_BYTES(16), BINARY(16) / UUID_TO_BIN(UUID(), 1)
+CREATE TABLE pk_test (id BINARY(16) PRIMARY KEY, payload CHAR(40) NOT NULL DEFAULT '');
+SET SESSION cte_max_recursion_depth = 1000;
+INSERT INTO pk_test (id) WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM s WHERE n < 999)
+  SELECT RANDOM_BYTES(16) FROM s a, s b;
+ANALYZE TABLE pk_test;
+SELECT ROUND(data_length / 1024 / 1024) AS mb FROM information_schema.tables WHERE table_name = 'pk_test';
+-- BIGINT 70 · random 128 · time-ordered 79
+DROP TABLE pk_test;
+```
+
+```js
+// mg: ObjectId vs UUIDv4 _id
+for (const kind of ['objectid', 'uuid4']) {
+  db.pk_test.drop();
+  for (let b = 0; b < 100; b++) {
+    const docs = [];
+    for (let i = 0; i < 10000; i++) docs.push(kind === 'uuid4' ? { _id: UUID(), payload: 'x' } : { payload: 'x' });
+    db.pk_test.insertMany(docs, { ordered: false });
+  }
+  db.adminCommand({ fsync: 1 });
+  print(kind, (db.pk_test.stats().indexSizes._id_ / 1048576).toFixed(1), 'MB');   // ≈ 10.2 · ≈ 25.0
+}
+db.pk_test.drop();
+```
+
+## Exercise 5: reading explain and the profiler (Concept 5)
+
+Uses the indexes created in the Session 4 lab (`es`, `esr`, `ers`) on `orders`.
+
+```js
+// mg
+const tree = e => { const s = []; let x = e.executionStats.executionStages; while (x) { s.push(x.stage); x = x.inputStage; } return s.join(' <- '); };
+for (const h of ['esr', 'es', 'ers']) {
+  const e = db.orders.find({ status: 'paid', amount: { $gt: 400 } }).sort({ created_at: -1 }).limit(20).hint(h).explain('executionStats');
+  print(h, tree(e), 'keys', e.executionStats.totalKeysExamined, 'docs', e.executionStats.totalDocsExamined, 'n', e.executionStats.nReturned);
+}
+// esr LIMIT <- FETCH <- IXSCAN keys 114 docs 20 · es … keys 114 docs 114 · ers FETCH <- SORT <- IXSCAN keys 70000 docs 20
+
+db.orders.explain('executionStats').aggregate([
+  { $match: { status: 'paid', amount: { $gt: 400 } } }, { $sort: { created_at: -1 } }, { $limit: 5 },
+  { $project: { _id: 0, created_at: 1, amount: 1 } }]);
+// one pushed-down plan: LIMIT <- PROJECTION_COVERED <- IXSCAN (esr), keysExamined 30
+
+db.setProfilingLevel(1, { slowms: 0 });
+db.orders.find({ status: 'delivered', channel: 'app' }).limit(3).toArray();
+db.system.profile.find({ ns: 'lab.orders' }).sort({ ts: -1 }).limit(1)
+  .map(d => ({ plan: d.planSummary, keys: d.keysExamined, docs: d.docsExamined, n: d.nreturned }));
+// IXSCAN { status: 1, created_at: -1 }, keys 9, docs 9, n 3
+db.setProfilingLevel(0);
+```
+
+## Session quiz
+
+1. In Exercise 1, updating 5% of rows was 100% HOT with fill factor 90. Predict the HOT ratio for a 30% update and explain.
+2. Why did updating `status` grow the `customer_id` index in PostgreSQL, and would the same happen in InnoDB and MongoDB?
+3. In Exercise 2, a table has a `CHAR(36)` primary key and four secondary indexes. Roughly how much extra space does the key cost compared with `BIGINT`, using the lab's leaf counts?
+4. Why does `$all: ['sale', 'eco']` read 40,000 documents, and what would a PostgreSQL GIN index do differently?
+5. A UUIDv7 library you use is ordered only to the millisecond, and you insert 50,000 rows per second into PostgreSQL. Should you expect the 90% or the 73% result from Exercise 4? Why?
+6. Why did random primary keys cost InnoDB more (70 → 128 MB) than PostgreSQL (21 → 38 MB in the index only)?
+7. In Exercise 5, the profiler showed keys 9, docs 9, nreturned 3 for `{ status: 'delivered', channel: 'app' }`. What does that tell you, and what index would make docs ≈ nreturned?
+8. Rank the three engines by how many indexes an update of one non-indexed column touches, and explain.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-6-engine-differences/lab/answers">Answers to the session quiz</DeepDive>

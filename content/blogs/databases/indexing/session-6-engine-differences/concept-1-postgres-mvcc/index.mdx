@@ -1,0 +1,277 @@
+---
+title: "Concept 1: Postgres heap and MVCC"
+description: "What PostgreSQL's 'never overwrite a row' design costs indexes: every non-HOT update adds an entry to every index, dead versions wait for VACUUM, and fill factor decides how often updates stay HOT. Measured on a 200,000-row table, compared with InnoDB's undo log and WiredTiger's update chains."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "mvcc", "vacuum", "hot"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/mvcc-intro.html"
+  - "https://www.postgresql.org/docs/current/storage-hot.html"
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html"
+  - "https://www.postgresql.org/docs/current/btree.html#BTREE-DELETION"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html"
+  - "https://source.wiredtiger.com/develop/arch-transaction.html"
+---
+
+<Tldr>
+Session 1 introduced the rule: PostgreSQL never updates a row in place, it writes a **new version**. This concept measures what that does to indexes. Updating every row of a 200,000-row table **doubled** the heap (1,471 → 2,942 pages) and the `customer_id` index (191 → 381 pages), although no customer id changed: each non-HOT version needs its own entry in **every** index. With fill factor 90, a 5% update was **100% HOT**, with no index entries and no heap growth; with fill factor 100 it was 0% HOT. Changing an indexed column is never HOT. InnoDB (undo log) and MongoDB (update chains in memory) keep old versions elsewhere, so their indexes only change when indexed values change.
+</Tldr>
+
+## The life of a row version
+
+| Step | Heap | Indexes |
+|---|---|---|
+| INSERT | Version 1 written | Entry in every index → version 1 |
+| UPDATE, page has room, no indexed column changed (HOT) | Version 2 on the **same page**, chained from version 1 | Untouched: entries still point at version 1, which leads to version 2 |
+| UPDATE otherwise (non-HOT) | Version 2 on any page with room | **New entry in every index** → version 2; old entries stay |
+| Old version no longer visible to anyone | Dead tuple, still occupying space | Dead entries, still in the index |
+| VACUUM | Space marked reusable, VM bits set | Dead entries removed (unless bypassed, Session 5) |
+
+| Term | Meaning |
+|---|---|
+| Dead tuple | A row version no transaction can see any more (`n_dead_tup`) |
+| HOT update | Heap-Only Tuple: new version on the same page, no index changes (Session 1) |
+| Fill factor | How full INSERTs pack heap pages; the rest is kept for future HOT updates |
+| Bottom-up deletion | PostgreSQL 14+: before splitting a leaf, the B-tree removes entries it can prove point to dead versions |
+| **✓ HOT / ✗ Not HOT** | Same page and no indexed column changed, or not |
+
+## Measured: one table, three kinds of update
+
+Table `acct (id, customer_id, status, balance, updated_at)`, 200,000 rows, indexes on `id`, `customer_id`, `status`.
+
+| Experiment | HOT | Heap pages | `customer_id` index pages |
+|---|---|---|---|
+| Fill factor 100, update `balance` on **every** row | 0% | 1,471 → **2,942** | 191 → **381** |
+| Fill factor 90, update `balance` on every row | 11% | 1,640 → 3,091 | 191 → 381 |
+| Fill factor 100, update `balance` on **5%** of rows | 0% | 1,471 → 1,545 | 191 |
+| Fill factor 90, update `balance` on 5% of rows | **100%** | 1,640 (unchanged) | 191 |
+| Fill factor 90, update `status` (indexed) on 50% of rows | 0% | — | 381 → **542** |
+
+Three lessons: the `customer_id` index grows when **unrelated** columns change (non-HOT); fill factor 90 only absorbs as many updates as the reserved 10% can hold (≈ 12 rows per page here, so 11% when every row changes); and an update to an indexed column is never HOT, adding entries to **every** index, not just that column's.
+
+<Flow
+  title="PostgreSQL: what an UPDATE does to indexes"
+  height={340}
+  nodes={[
+    { id: 'upd', label: 'UPDATE', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'chk', label: 'Indexed column changed?', sub: 'room on the page?', x: 310, y: 20, w: 240 },
+    { id: 'hot', label: '✓ HOT', sub: 'no index work', x: 620, y: 20, w: 160 },
+    { id: 'nohot', label: '✗ Not HOT', sub: 'new ctid', x: 310, y: 150, w: 240 },
+    { id: 'idx', label: 'Every index', sub: '+1 entry each', x: 620, y: 150, w: 160 },
+    { id: 'dead', label: 'Old version dead', sub: 'until VACUUM', x: 20, y: 150, w: 220 },
+    { id: 'vac', label: 'VACUUM', sub: 'reclaims heap + entries', x: 310, y: 270, w: 240 },
+  ]}
+  edges={[
+    { id: 'upd-chk', from: 'upd', to: 'chk' },
+    { id: 'chk-hot', from: 'chk', to: 'hot' },
+    { id: 'chk-nohot', from: 'chk', to: 'nohot' },
+    { id: 'nohot-idx', from: 'nohot', to: 'idx' },
+    { id: 'upd-dead', from: 'upd', to: 'dead' },
+    { id: 'dead-vac', from: 'dead', to: 'vac' },
+  ]}
+  cases={[
+    {
+      title: 'HOT update',
+      path: 'balance changes, page has room ✓ HOT → no index touched',
+      summary: 'Fill factor 90, 5% of rows: 10,000 updates, 10,000 HOT.',
+      subs: { upd: 'SET balance = balance + 1' },
+      steps: [
+        {
+          title: 'Check the two conditions',
+          note: 'balance is not indexed, and fill factor 90 left ≈ 800 bytes free per page for new versions.',
+          code: "CREATE TABLE acct (…) WITH (fillfactor = 90);\nUPDATE acct SET balance = balance + 1 WHERE id % 20 = 0;",
+          active: ['upd', 'chk'],
+          edges: ['upd-chk'],
+        },
+        {
+          title: '✓ HOT',
+          note: 'The new version goes on the same page, linked from the old one. Indexes still point at the old slot, which leads to the new version (Session 2, Concept 4). n_tup_hot_upd = n_tup_upd = 10,000; heap still 1,640 pages; customer_id index still 191 pages.',
+          active: ['chk', 'hot'],
+          edges: ['chk-hot'],
+        },
+        {
+          title: 'The old version is dead',
+          note: 'It stays until pruned. HOT chains can be pruned during normal page access, even before VACUUM.',
+          active: ['upd', 'dead'],
+          edges: ['upd-dead'],
+        },
+      ],
+    },
+    {
+      title: 'Page full',
+      path: 'fill factor 100, no room ✗ not HOT → new version elsewhere → +1 entry in every index',
+      summary: 'Every row updated: heap and customer_id index both doubled.',
+      subs: { upd: 'SET balance = balance + 1 (all)' },
+      steps: [
+        {
+          title: '✗ No room on the page',
+          note: 'Fill factor 100 packed pages full at INSERT time, so the new version cannot stay on its page.',
+          code: 'UPDATE acct SET balance = balance + 1;   -- fill factor 100',
+          active: ['upd', 'chk', 'nohot'],
+          edges: ['upd-chk', 'chk-nohot'],
+        },
+        {
+          title: 'Every index gets an entry',
+          note: 'The new version has a new ctid, so id, customer_id and status indexes each get an entry pointing at it, although only balance changed: customer_id index 191 → 381 pages, status index 191 → 353.',
+          active: ['nohot', 'idx'],
+          edges: ['nohot-idx'],
+        },
+        {
+          title: 'Dead versions everywhere',
+          note: '200,000 dead tuples (n_dead_tup) and 200,000 dead index entries per index, until VACUUM removes them. The heap file stays at 2,942 pages; the space is reused by later inserts.',
+          active: ['dead', 'vac'],
+          edges: ['upd-dead', 'dead-vac'],
+        },
+      ],
+    },
+    {
+      title: 'Indexed column changed',
+      path: 'status changes ✗ never HOT → every index, including customer_id, gets an entry',
+      summary: 'Fill factor 90, 100,000 rows: 0 HOT; customer_id index 381 → 542 pages.',
+      subs: { upd: "SET status = 'closed' (50%)" },
+      steps: [
+        {
+          title: '✗ An indexed column changed',
+          note: 'status is indexed, so the status index needs a new entry anyway; PostgreSQL then gives up HOT entirely.',
+          code: "UPDATE acct SET status = 'closed' WHERE id % 2 = 0;",
+          active: ['upd', 'chk', 'nohot'],
+          edges: ['upd-chk', 'chk-nohot'],
+        },
+        {
+          title: 'All indexes pay',
+          note: 'n_tup_hot_upd = 0. The customer_id index grew from 381 to 542 pages for a change it does not even contain. Every extra index on a frequently updated table multiplies this cost (Session 8).',
+          active: ['nohot', 'idx'],
+          edges: ['nohot-idx'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## The other engines keep old versions elsewhere
+
+| | PostgreSQL | MySQL InnoDB | MongoDB WiredTiger |
+|---|---|---|---|
+| Where the new version goes | A new heap tuple | In place, in the clustered index | In memory, on the key's update chain |
+| Where the old version goes | Stays in the heap as a dead tuple | Undo log | Older entries of the update chain (and history store if evicted) |
+| Index entries on an update of a non-indexed column | New entry in every index, unless HOT | None | None |
+| Index entries on an update of an indexed column | New entry in every index | Old entry delete-marked, new entry inserted, in that index only | Old key removed, new key inserted, in that index only |
+| Cleanup | VACUUM | Purge thread | Checkpoints / history store pruning |
+
+<Flow
+  title="InnoDB: an UPDATE of a non-indexed column"
+  height={260}
+  nodes={[
+    { id: 'upd', label: 'UPDATE balance', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'row', label: 'Clustered record', sub: 'changed in place', x: 310, y: 20, w: 220 },
+    { id: 'undo', label: 'Undo log', sub: 'old balance', x: 600, y: 20, w: 180 },
+    { id: 'sec', label: '✓ Secondary indexes', sub: 'untouched', x: 310, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'upd-row', from: 'upd', to: 'row' },
+    { id: 'row-undo', from: 'row', to: 'undo', label: 'old value' },
+    { id: 'row-sec', from: 'row', to: 'sec', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Non-indexed column',
+      path: 'row changed in place → old value to undo → ✓ secondary indexes untouched',
+      summary: 'Measured on a 200,000-row copy: 40,356 page write requests for 20,000 rows; updating the indexed status instead: 80,892.',
+      steps: [
+        {
+          title: 'In place, old value to undo',
+          note: 'The clustered record is changed where it is; the previous balance goes to the undo log for readers that still need it.',
+          code: 'UPDATE acct SET balance = balance + 1 WHERE id % 10 = 0;',
+          active: ['upd', 'row', 'undo'],
+          edges: ['upd-row', 'row-undo'],
+        },
+        {
+          title: '✓ No secondary index work',
+          note: 'Secondary entries hold the primary key, which did not change. Changing the indexed status column instead doubled the page write requests (80,892 vs 40,356): delete-mark the old status entry, insert the new one.',
+          active: ['row', 'sec'],
+          edges: ['row-sec'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Flow
+  title="MongoDB: an update of a non-indexed field"
+  height={260}
+  nodes={[
+    { id: 'upd', label: 'updateOne balance', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'chain', label: 'Update chain', sub: 'new version in memory', x: 310, y: 20, w: 220 },
+    { id: 'disk', label: 'Checkpoint', sub: 'writes the page', x: 600, y: 20, w: 180 },
+    { id: 'idx', label: '✓ Indexes', sub: 'untouched', x: 310, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'upd-chain', from: 'upd', to: 'chain' },
+    { id: 'chain-disk', from: 'chain', to: 'disk' },
+    { id: 'chain-idx', from: 'chain', to: 'idx', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Non-indexed field',
+      path: 'new document version on the update chain → ✓ indexes untouched (RecordId unchanged)',
+      summary: 'Indexes point at the RecordId, which does not change on update.',
+      steps: [
+        {
+          title: 'New version in memory',
+          note: 'WiredTiger adds the new document version to the record\'s update chain; older readers still see older entries in the chain.',
+          code: 'db.acct.updateOne({ _id: 7 }, { $inc: { balance: 1 } })',
+          active: ['upd', 'chain'],
+          edges: ['upd-chain'],
+        },
+        {
+          title: '✓ No index change',
+          note: 'Every index maps keys to the RecordId, which stays the same; only indexes on changed fields are updated. The page is written out at the next checkpoint or eviction.',
+          active: ['chain', 'idx', 'disk'],
+          edges: ['chain-idx', 'chain-disk'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+On PostgreSQL, "add an index on `updated_at`" for a table where every write sets `updated_at` makes **every** update non-HOT, so every index on the table gets a new entry on every update. Check `n_tup_hot_upd / n_tup_upd` before and after adding indexes to hot-update tables.
+</Pitfall>
+
+## Real-world scenario: a counters table
+
+A `product_stats` table is updated thousands of times per minute (`views = views + 1`). It has indexes on `product_id` (primary key), `category_id` and `updated_at`.
+
+| Setting | HOT ratio | Effect |
+|---|---|---|
+| Fill factor 100, index on `updated_at`, every update sets `updated_at` | 0% | Three index entries per update; indexes and heap bloat; heavy VACUUM |
+| Fill factor 80, drop the `updated_at` index (or stop updating it) | ≈ 100% | No index writes; dead versions pruned on the page |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 2: InnoDB secondary indexes | The opposite design: fewer index writes, two-step reads |
+| Session 8: write amplification | Every index costs every non-HOT update |
+| Session 8: bloat | Dead entries and half-empty pages from churn |
+
+## Key takeaways
+
+1. PostgreSQL writes a new row version for every update; old versions stay in the heap until VACUUM.
+2. A non-HOT version gets a new entry in every index, including indexes on columns that did not change.
+3. HOT requires room on the same page and no change to any indexed column.
+4. Fill factor 90 made a 5% update 100% HOT; fill factor 100 made it 0% HOT; when every row changes, 10% free space covers only ≈ 11%.
+5. Updating an indexed column is never HOT and grows every index.
+6. InnoDB updates in place with undo; WiredTiger keeps versions on update chains; neither touches unrelated indexes.
+
+## Check questions
+
+1. Updating only `balance` doubled the `customer_id` index. Why?
+2. What two conditions make an update HOT?
+3. Why was the fill-factor-90 table 100% HOT for a 5% update but only 11% HOT when every row was updated?
+4. Why does updating `status` (indexed) add entries to the `customer_id` index?
+5. Where does each engine keep the old version of an updated row?
+6. Why doesn't an InnoDB update of a non-indexed column touch secondary indexes?
+7. A table's HOT ratio dropped to 0% after a new index was added. What probably happened?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-6-engine-differences/concept-1-postgres-mvcc/answers">Worked answers to Q1–Q7</DeepDive>

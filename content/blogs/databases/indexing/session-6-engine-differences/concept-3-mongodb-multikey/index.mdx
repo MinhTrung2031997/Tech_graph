@@ -1,0 +1,256 @@
+---
+title: "Concept 3: MongoDB WiredTiger and multikey indexes"
+description: "MongoDB indexes arrays by giving every element its own index entry: 100,000 products with 3–5 tags produced 400,000 entries. What multikey indexes can and cannot do (no covered queries, no two array fields in one compound index, $all checks per document), and how PostgreSQL and MySQL index arrays instead."
+type: "concept"
+tags: ["indexing", "mongodb", "postgresql", "mysql", "multikey", "arrays", "wiredtiger"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/indexes/index-types/index-multikey/"
+  - "https://www.mongodb.com/docs/manual/core/indexes/index-types/index-multikey/multikey-index-bounds/"
+  - "https://www.mongodb.com/docs/manual/core/wiredtiger/"
+  - "https://www.postgresql.org/docs/current/gin.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/create-index.html#create-index-multi-valued"
+---
+
+<Tldr>
+A document can hold an array, and MongoDB indexes it by creating **one index entry per element**: an index on `tags` over 100,000 products with 3–5 tags each holds **400,000 entries**. `find({ tags: 'sale' })` then becomes an ordinary B-tree lookup (40,000 keys, 40,000 documents). The index is flagged **multikey**, which brings restrictions: it can never cover a query on the array field, a compound index may contain **at most one** array field (`CannotIndexParallelArrays`), and `$all: ['sale', 'eco']` seeks on one value and checks the rest per document (40,000 keys for 3,333 results). PostgreSQL indexes arrays with GIN (Session 7) and MySQL with multi-valued indexes on JSON arrays.
+</Tldr>
+
+## One document, many entries
+
+| Document | Entries in `{ tags: 1 }` |
+|---|---|
+| `{ _id: 1, tags: ['red', 'sale', 'eco'] }` | `'eco' → 1`, `'red' → 1`, `'sale' → 1` |
+| `{ _id: 2, tags: ['sale', 'kids'] }` | `'kids' → 2`, `'sale' → 2` |
+
+| Lab collection `products` (100,000 docs) | Value |
+|---|---|
+| Tag elements in total | 400,000 |
+| `{ tags: 1 }` index | 2.0 MB (10 distinct values, prefix-compressed) |
+| `{ price: 1 }` index (scalar) | 0.8 MB |
+| `{ tags: 1, price: 1 }` | 5.6 MB: one entry per tag, each with the document's price |
+
+| Term | Meaning |
+|---|---|
+| Multikey index | An index where some document contributed more than one key; `isMultiKey: true` in explain |
+| Parallel arrays | Two array fields in one compound index: would need every combination of elements, so it is refused |
+| Covered query | Not possible on an array field: an entry holds one element, not the whole array |
+| **✓ One array field / ✗ Two array fields** | Compound multikey index allowed or refused |
+
+<Flow
+  title="MongoDB: indexing and querying an array field"
+  height={340}
+  nodes={[
+    { id: 'doc', label: 'Document', sub: "tags: ['red','sale','eco']", x: 20, y: 20, w: 240 },
+    { id: 'keys', label: 'Index entries', sub: 'one per element', x: 330, y: 20, w: 220 },
+    { id: 'ok', label: '✓ One array field', sub: 'multikey index', x: 610, y: 20, w: 170 },
+    { id: 'bad', label: '✗ Two array fields', sub: 'build refused', x: 610, y: 150, w: 170 },
+    { id: 'q', label: 'Query', sub: '', x: 20, y: 150, w: 240 },
+    { id: 'ix', label: 'IXSCAN', sub: '', x: 330, y: 150, w: 220 },
+    { id: 'fetch', label: 'FETCH', sub: 'always: no covering', x: 330, y: 270, w: 220 },
+  ]}
+  edges={[
+    { id: 'doc-keys', from: 'doc', to: 'keys' },
+    { id: 'keys-ok', from: 'keys', to: 'ok' },
+    { id: 'keys-bad', from: 'keys', to: 'bad', quiet: true },
+    { id: 'q-ix', from: 'q', to: 'ix' },
+    { id: 'ix-fetch', from: 'ix', to: 'fetch' },
+  ]}
+  cases={[
+    {
+      title: 'Build the index',
+      path: 'each element → its own entry → ✓ multikey index (400,000 entries)',
+      summary: '{ tags: 1 } on 100,000 products: 2.0 MB.',
+      steps: [
+        {
+          title: 'One entry per element',
+          note: 'Document 1 has three tags, so the index gets three entries, each pointing at the same RecordId.',
+          code: 'db.products.createIndex({ tags: 1 })',
+          active: ['doc', 'keys'],
+          edges: ['doc-keys'],
+        },
+        {
+          title: '✓ Marked multikey',
+          note: 'As soon as one document has an array in an indexed field, the index is flagged multikey; explain shows isMultiKey: true and multiKeyPaths: { tags: ["tags"] }.',
+          active: ['keys', 'ok'],
+          edges: ['keys-ok'],
+        },
+      ],
+    },
+    {
+      title: "find({ tags: 'sale' })",
+      path: "IXSCAN bounds ['sale','sale'] → 40,000 keys → FETCH 40,000 documents",
+      summary: 'Measured: keys 40,000, docs 40,000, returned 40,000.',
+      subs: { q: "{ tags: 'sale' }" },
+      steps: [
+        {
+          title: 'An ordinary seek',
+          note: "All 'sale' entries are adjacent; each points at a product that has 'sale' among its tags.",
+          code: 'db.products.find({ tags: "sale" })',
+          active: ['q', 'ix'],
+          edges: ['q-ix'],
+        },
+        {
+          title: 'FETCH, even for a covering projection',
+          note: 'With { _id: 0, tags: 1 } MongoDB still fetches: the entry knows one tag, but the query must return the whole array. Multikey indexes cannot cover array fields (PROJECTION_SIMPLE ← FETCH ← IXSCAN, 40,000 documents).',
+          code: 'db.products.find({ tags: "sale" }, { _id: 0, tags: 1 })',
+          active: ['ix', 'fetch'],
+          edges: ['ix-fetch'],
+        },
+      ],
+    },
+    {
+      title: "$all: ['sale','eco']",
+      path: "seek on 'sale' (40,000 keys) → FETCH → check 'eco' per document → 3,333 results",
+      summary: 'Measured: keys 40,000, docs 40,000, returned 3,333.',
+      subs: { q: "{ tags: { $all: ['sale','eco'] } }" },
+      steps: [
+        {
+          title: 'Seek on one element',
+          note: 'An index entry holds one tag, so it cannot say "this document has both". MongoDB seeks on one value.',
+          code: 'db.products.find({ tags: { $all: ["sale", "eco"] } })',
+          active: ['q', 'ix'],
+          edges: ['q-ix'],
+        },
+        {
+          title: 'Check the rest on the document',
+          note: 'Each of the 40,000 sale documents is fetched and tested for eco: 3,333 match. 12× more documents read than returned. PostgreSQL\'s GIN index can intersect both values before touching the table (Session 7).',
+          active: ['ix', 'fetch'],
+          edges: ['ix-fetch'],
+        },
+      ],
+    },
+    {
+      title: 'Two array fields',
+      path: 'index { tags, sizes }, both arrays → ✗ CannotIndexParallelArrays',
+      summary: 'Measured: the index build failed.',
+      subs: { doc: "tags + sizes arrays" },
+      steps: [
+        {
+          title: 'Every combination would be needed',
+          note: 'A document with 5 tags and 3 sizes would need 15 entries, and the combinations explode with longer arrays. MongoDB refuses a compound index where more than one field is an array in the same document.',
+          code: 'db.products.createIndex({ tags: 1, sizes: 1 })',
+          active: ['doc', 'keys', 'bad'],
+          edges: ['doc-keys', 'keys-bad'],
+        },
+      ],
+    },
+  ]}
+/>
+
+### Compound multikey bounds
+
+`{ tags: 1, price: 1 }` works (only `tags` is an array): `find({ tags: 'sale', price: { $lt: 50 } })` had bounds `tags: ['sale','sale'], price: [-inf, 50)` and examined exactly **4,000** keys for 4,000 results. Bounds on two conditions over the **same** array field are more subtle: `tags: { $gt: 'a', $lt: 'c' }` may match a document whose elements satisfy each condition separately, so MongoDB cannot always combine the bounds; `$elemMatch` asks for one element satisfying all conditions.
+
+## Arrays in PostgreSQL and MySQL
+
+| | MongoDB | PostgreSQL | MySQL 8.0.17+ |
+|---|---|---|---|
+| Array storage | Native arrays in documents | `text[]` arrays or `jsonb` | JSON arrays |
+| Index | Multikey B-tree (one entry per element) | GIN: one entry per element, posting lists of rows (Session 7) | Multi-valued index: `INDEX ((CAST(tags->'$' AS CHAR(10) ARRAY)))` |
+| Query | `{ tags: 'sale' }`, `$all`, `$elemMatch` | `tags @> ARRAY['sale','eco']` (GIN intersects both values) | `'sale' MEMBER OF (tags)`, `JSON_CONTAINS`, `JSON_OVERLAPS` |
+| Normalised alternative | — | A `product_tags (product_id, tag)` table with a B-tree on `(tag, product_id)` | Same |
+
+<Flow
+  title="PostgreSQL: the same tags as an array with GIN"
+  height={250}
+  nodes={[
+    { id: 'row', label: "tags = {red,sale,eco}", sub: 'text[] column', x: 20, y: 20, w: 240 },
+    { id: 'gin', label: 'GIN index', sub: 'element → list of rows', x: 330, y: 20, w: 220 },
+    { id: 'and', label: '✓ Intersect lists', sub: "@> '{sale,eco}'", x: 610, y: 20, w: 170 },
+  ]}
+  edges={[
+    { id: 'row-gin', from: 'row', to: 'gin' },
+    { id: 'gin-and', from: 'gin', to: 'and' },
+  ]}
+  cases={[
+    {
+      title: 'Containment',
+      path: "GIN: posting list for 'sale' ∩ posting list for 'eco' → only matching rows fetched",
+      summary: 'Session 7 measures GIN in detail.',
+      steps: [
+        {
+          title: 'One entry per element, rows in posting lists',
+          note: "Like a multikey index, GIN has an entry per distinct element; each entry holds a compressed list of the rows containing it. For tags @> '{sale,eco}' it intersects the two lists before visiting the heap.",
+          code: "CREATE INDEX ON products USING gin (tags);\nSELECT * FROM products WHERE tags @> ARRAY['sale','eco'];",
+          active: ['row', 'gin', 'and'],
+          edges: ['row-gin', 'gin-and'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Flow
+  title="MySQL: a multi-valued index on a JSON array"
+  height={250}
+  nodes={[
+    { id: 'row', label: 'tags JSON', sub: "['red','sale','eco']", x: 20, y: 20, w: 240 },
+    { id: 'mv', label: 'Multi-valued index', sub: 'one entry per element', x: 330, y: 20, w: 220 },
+    { id: 'hit', label: '✓ MEMBER OF', sub: 'index lookup', x: 610, y: 20, w: 170 },
+  ]}
+  edges={[
+    { id: 'row-mv', from: 'row', to: 'mv' },
+    { id: 'mv-hit', from: 'mv', to: 'hit' },
+  ]}
+  cases={[
+    {
+      title: 'MEMBER OF',
+      path: "multi-valued index: one entry per array element → 'sale' MEMBER OF (tags) uses it",
+      summary: 'The same idea as MongoDB multikey, on JSON columns.',
+      steps: [
+        {
+          title: 'Index the array elements',
+          note: 'A multi-valued index casts the JSON array to a typed array and stores one entry per element; MEMBER OF, JSON_CONTAINS and JSON_OVERLAPS can use it.',
+          code: "CREATE INDEX tags_mv ON products ((CAST(tags->'$' AS CHAR(10) ARRAY)));\nSELECT * FROM products WHERE 'sale' MEMBER OF (tags);",
+          active: ['row', 'mv', 'hit'],
+          edges: ['row-mv', 'mv-hit'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+Unbounded arrays make unbounded index entries. A document with a 10,000-element `followers` array creates 10,000 entries in every multikey index on it, and every update that adds one element rewrites the document and adds an entry. Keep indexed arrays small and bounded; model large one-to-many relations as separate documents.
+</Pitfall>
+
+## Real-world scenario: product filters
+
+A shop filters products by several tags at once ("sale" AND "eco" AND "kids"). With a multikey index on `tags`, each filter seeks on the rarest tag MongoDB picks and fetches every product with it to check the others.
+
+| Option | Work for 3 tags |
+|---|---|
+| Multikey `{ tags: 1 }` + `$all` | All products with one tag, checked per document |
+| Multikey `{ tags: 1, price: 1 }` + price range | Seek on tag + price range, then check other tags |
+| PostgreSQL GIN on `tags` | Intersect three posting lists, then fetch only matches |
+| Search engine (Atlas Search, Elasticsearch) | Built for many-facet intersection |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 5: reading explain() | `isMultiKey`, `multiKeyPaths` and keys/docs ratios |
+| Session 7: GIN | PostgreSQL's answer to array and JSON indexing |
+| Session 8: write amplification | Every array element is an index write |
+
+## Key takeaways
+
+1. A multikey index has one entry per array element: 400,000 entries for 100,000 products with 3–5 tags.
+2. Equality on an element is an ordinary seek; `$all` seeks on one element and checks the others per document.
+3. Multikey indexes cannot cover queries on the array field.
+4. A compound index may contain at most one array field per document (`CannotIndexParallelArrays`).
+5. PostgreSQL indexes arrays with GIN (posting lists that can be intersected); MySQL with multi-valued indexes on JSON arrays.
+6. Keep indexed arrays small: every element is an entry and every change an index write.
+
+## Check questions
+
+1. How many index entries does `{ tags: 1 }` create for a document with 4 tags, and what does each point at?
+2. Why can't `find({ tags: 'sale' }, { _id: 0, tags: 1 })` be covered by `{ tags: 1 }`?
+3. Why did `$all: ['sale', 'eco']` examine 40,000 documents to return 3,333?
+4. Why does MongoDB refuse an index on `{ tags: 1, sizes: 1 }` when both are arrays?
+5. `{ tags: 1, price: 1 }` examined exactly 4,000 keys for `tags: 'sale', price < 50`. Why was it efficient here?
+6. How does a PostgreSQL GIN index answer `tags @> '{sale,eco}'` differently from MongoDB's multikey index?
+7. What happens to a multikey index if documents have arrays of 10,000 elements?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-6-engine-differences/concept-3-mongodb-multikey/answers">Worked answers to Q1–Q7</DeepDive>

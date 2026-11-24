@@ -1,0 +1,284 @@
+---
+title: "Concept 5: Reading explain() in MongoDB"
+description: "How to read MongoDB's explain output: verbosity modes, the stage tree, and the four numbers that diagnose most problems (nReturned, totalKeysExamined, totalDocsExamined, executionTimeMillis). Real outputs from the lab for a healthy covered query, a loose regex, a blocking SORT and an aggregation, mapped to their PostgreSQL and MySQL equivalents."
+type: "concept"
+tags: ["indexing", "mongodb", "postgresql", "mysql", "explain", "profiler"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/reference/explain-results/"
+  - "https://www.mongodb.com/docs/manual/reference/method/cursor.explain/"
+  - "https://www.mongodb.com/docs/manual/tutorial/manage-the-database-profiler/"
+  - "https://www.postgresql.org/docs/current/using-explain.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/explain-output.html"
+---
+
+<Tldr>
+MongoDB's `explain()` comes in three verbosities: `queryPlanner` (the chosen plan, nothing executed), `executionStats` (runs the winner and counts), `allPlansExecution` (also shows the trial of every candidate). Read the **stage tree** bottom-up (IXSCAN or COLLSCAN at the leaf, then FETCH, SORT, PROJECTION, LIMIT), then compare four numbers: **nReturned**, **totalKeysExamined**, **totalDocsExamined**, **executionTimeMillis**. A healthy indexed query has keys ≈ docs ≈ returned. Keys ≫ returned means loose bounds (an unanchored regex: 1,000,000 keys for 200 results). Docs ≫ returned means filtering after FETCH (114 docs for 20). A `SORT` stage means the index does not provide the order (70,000 keys for 20 results). Docs = 0 means covered.
+</Tldr>
+
+## The three verbosities
+
+| Mode | Runs the query? | Shows |
+|---|---|---|
+| `explain()` / `"queryPlanner"` | No | `winningPlan` stage tree, `rejectedPlans`, index bounds |
+| `"executionStats"` | Yes, the winning plan | Plus counts and time per stage and in total |
+| `"allPlansExecution"` | Yes, plus every candidate's trial | Plus `works`, `advanced` and `score` of each candidate (Session 3) |
+
+## The fields that matter
+
+| Field | Meaning | Healthy |
+|---|---|---|
+| Stage tree (`executionStages`, nested `inputStage`) | The plan, leaf first: IXSCAN / COLLSCAN → FETCH → SORT → PROJECTION → LIMIT | No COLLSCAN on big collections, no SORT for `sort()+limit()` queries |
+| `nReturned` | Documents returned | — |
+| `totalKeysExamined` | Index keys read | ≈ nReturned |
+| `totalDocsExamined` | Documents fetched | ≈ nReturned (0 if covered) |
+| `executionTimeMillis` | Server time | Compare runs in the same cache state |
+| `indexBounds` | The ranges scanned per field | Tight ranges, not `[MinKey, MaxKey]` |
+| `isMultiKey`, `multiKeyPaths` | Array fields in the index (Concept 3) | — |
+| `works`, `advanced`, `needTime`, `isEOF` | Per-stage work units, results produced, units spent without a result, finished | `advanced` close to `works` |
+
+| Term | Meaning |
+|---|---|
+| Blocking stage | `SORT` (and `GROUP`): consumes all input before producing output |
+| **✓ Healthy / ✗ Red flag** | Ratios close to 1 vs a large gap |
+
+## Four real outputs
+
+<Flow
+  title="MongoDB: reading an explain() output"
+  height={340}
+  nodes={[
+    { id: 'tree', label: 'Stage tree', sub: '', x: 20, y: 20, w: 260 },
+    { id: 'nums', label: 'keys / docs / returned', sub: '', x: 340, y: 20, w: 240 },
+    { id: 'ok', label: '✓ Healthy', sub: 'ratios ≈ 1', x: 640, y: 20, w: 140 },
+    { id: 'keys', label: '✗ keys ≫ returned', sub: 'loose bounds', x: 20, y: 150, w: 240 },
+    { id: 'docs', label: '✗ docs ≫ returned', sub: 'filter after FETCH', x: 300, y: 150, w: 220 },
+    { id: 'sort', label: '✗ SORT stage', sub: 'index lacks the order', x: 560, y: 150, w: 220 },
+    { id: 'fix', label: 'Fix', sub: '', x: 270, y: 270, w: 260 },
+  ]}
+  edges={[
+    { id: 'tree-nums', from: 'tree', to: 'nums' },
+    { id: 'nums-ok', from: 'nums', to: 'ok' },
+    { id: 'nums-keys', from: 'nums', to: 'keys', quiet: true },
+    { id: 'nums-docs', from: 'nums', to: 'docs', quiet: true },
+    { id: 'nums-sort', from: 'nums', to: 'sort', quiet: true },
+    { id: 'keys-fix', from: 'keys', to: 'fix', quiet: true },
+    { id: 'docs-fix', from: 'docs', to: 'fix', quiet: true },
+    { id: 'sort-fix', from: 'sort', to: 'fix', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Healthy: a covered aggregation',
+      path: 'LIMIT ← PROJECTION_COVERED ← IXSCAN(esr) → keys 30, docs 0, returned 5 ✓',
+      summary: '$match + $sort + $limit + $project, pushed down to one index scan.',
+      subs: { tree: 'LIMIT ← PROJ_COVERED ← IXSCAN', nums: '30 keys / 0 docs / 5' },
+      steps: [
+        {
+          title: 'The whole pipeline is pushed down',
+          note: 'The aggregation\'s explain shows a single query plan instead of separate $sort/$limit stages: the query layer handles $match, $sort, $limit and $project with the esr index.',
+          code: 'db.orders.explain("executionStats").aggregate([\n  { $match: { status: "paid", amount: { $gt: 400 } } },\n  { $sort: { created_at: -1 } }, { $limit: 5 },\n  { $project: { _id: 0, created_at: 1, amount: 1 } }])',
+          active: ['tree', 'nums'],
+          edges: ['tree-nums'],
+        },
+        {
+          title: '✓ Ratios close to 1',
+          note: 'IXSCAN works 30, keysExamined 30, advanced 5 (25 keys had amount ≤ 400, needTime 25); PROJECTION_COVERED: no documents fetched. 30 keys for 5 results is fine for a range checked per key (Session 4, ESR).',
+          active: ['nums', 'ok'],
+          edges: ['nums-ok'],
+        },
+      ],
+    },
+    {
+      title: 'keys ≫ returned',
+      path: 'FETCH ← IXSCAN, bounds ["", {}) → 1,000,000 keys for 200 results ✗',
+      summary: 'find({ sku: /00123$/ }): an unanchored regex scans the whole index.',
+      subs: { tree: 'FETCH ← IXSCAN(sku)', nums: '1,000,000 keys / 200 / 200' },
+      steps: [
+        {
+          title: 'Read the bounds',
+          note: 'indexBounds: sku ["", {}) plus the regex: the entire string range. The index is used, but as a full scan.',
+          code: 'db.orders.find({ sku: /00123$/ }).explain("executionStats")',
+          active: ['tree', 'nums'],
+          edges: ['tree-nums'],
+        },
+        {
+          title: '✗ keys ≫ returned',
+          note: 'totalKeysExamined 1,000,000 vs nReturned 200: the index narrows nothing. Fix: give the query a prefix (anchored regex, stored suffix field) or use text search (Session 3, Concept 5).',
+          active: ['nums', 'keys', 'fix'],
+          edges: ['nums-keys', 'keys-fix'],
+          subs: { fix: 'anchored regex / stored field' },
+        },
+      ],
+    },
+    {
+      title: 'docs ≫ returned',
+      path: 'LIMIT ← FETCH ← IXSCAN(es) → keys 114, docs 114, returned 20 ✗',
+      summary: 'The amount condition is checked after fetching each document.',
+      subs: { tree: 'LIMIT ← FETCH ← IXSCAN(es)', nums: '114 keys / 114 docs / 20' },
+      steps: [
+        {
+          title: 'The filter lives on FETCH',
+          note: 'The FETCH stage shows a filter on amount: the index { status, created_at } does not contain amount, so each candidate document is loaded to test it.',
+          code: 'db.orders.find({ status: "paid", amount: { $gt: 400 } }).sort({ created_at: -1 }).limit(20).hint("es").explain("executionStats")',
+          active: ['tree', 'nums'],
+          edges: ['tree-nums'],
+        },
+        {
+          title: '✗ docs ≫ returned',
+          note: '114 documents fetched for 20 results. Fix: add amount to the index after the sort field (ESR): the esr index examined 114 keys but only 20 documents.',
+          active: ['nums', 'docs', 'fix'],
+          edges: ['nums-docs', 'docs-fix'],
+          subs: { fix: 'add the field to the index' },
+        },
+      ],
+    },
+    {
+      title: 'SORT stage',
+      path: 'FETCH ← SORT ← IXSCAN(ers) → 70,000 keys for 20 results ✗',
+      summary: 'The index gives a tight range but the wrong order.',
+      subs: { tree: 'FETCH ← SORT ← IXSCAN(ers)', nums: '70,000 keys / 20 / 20' },
+      steps: [
+        {
+          title: 'A blocking SORT in the tree',
+          note: 'SORT sits above IXSCAN: every matching key is read and sorted before the first result. Its stats show the memory used (memLimit: 100 MB by default).',
+          code: 'db.orders.find({ status: "paid", amount: { $gt: 400 } }).sort({ created_at: -1 }).limit(20).hint("ers").explain("executionStats")',
+          active: ['tree', 'nums'],
+          edges: ['tree-nums'],
+        },
+        {
+          title: '✗ Index lacks the order',
+          note: '70,000 keys for 20 results, and the cost does not shrink with a smaller limit. Fix: put the sort field before the range field (ESR).',
+          active: ['nums', 'sort', 'fix'],
+          edges: ['nums-sort', 'sort-fix'],
+          subs: { fix: 'ESR order' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## The profiler: explain for production
+
+`db.setProfilingLevel(1, { slowms: 100 })` records slow operations in `system.profile` with the same signals, without running explain by hand:
+
+| Field | Lab example (two queries) |
+|---|---|
+| `planSummary` | `IXSCAN { status: 1, created_at: -1 }` · `IXSCAN { amount: 1, status: 1, created_at: -1 }` |
+| `keysExamined` / `docsExamined` / `nreturned` | 9 / 9 / 3 (channel filtered after FETCH) · 20 / 20 / 20 |
+| `millis` | 1 · 0 |
+
+A `planSummary` of `COLLSCAN`, or `docsExamined` far above `nreturned`, in the profiler is the cue to run a full `explain("executionStats")`.
+
+## The same signals in PostgreSQL and MySQL
+
+| Signal | MongoDB | PostgreSQL | MySQL |
+|---|---|---|---|
+| Full scan | `COLLSCAN` | `Seq Scan` | `type: ALL` |
+| Read much, return little | `totalKeysExamined` / `totalDocsExamined` ≫ `nReturned` | `Rows Removed by Filter` ≫ `rows`; Buffers | `rows` × `filtered` ≪ `rows` |
+| Sort not from the index | `SORT` stage | `Sort` node | `Using filesort` |
+| Covered | `PROJECTION_COVERED`, docs 0 | `Index Only Scan`, `Heap Fetches: 0` | `Using index` |
+| Candidate plans | `rejectedPlans`, `allPlansExecution` | Not shown (one cheapest plan) | `EXPLAIN FORMAT=JSON` costs |
+
+<Flow
+  title="PostgreSQL: the same red flag in EXPLAIN"
+  height={240}
+  nodes={[
+    { id: 'plan', label: 'EXPLAIN (ANALYZE, BUFFERS)', sub: '', x: 20, y: 20, w: 260 },
+    { id: 'rm', label: 'Rows Removed by Filter', sub: '≫ rows returned', x: 340, y: 20, w: 240 },
+    { id: 'flag', label: '✗ Wasted reads', sub: 'most rows dropped', x: 620, y: 20, w: 160 },
+  ]}
+  edges={[
+    { id: 'plan-rm', from: 'plan', to: 'rm' },
+    { id: 'rm-flag', from: 'rm', to: 'flag' },
+  ]}
+  cases={[
+    {
+      title: 'Filter after the scan',
+      path: 'Seq Scan, Rows Removed by Filter 950,000 vs rows 50,000 ✗',
+      summary: 'Session 1, Concept 3: the PostgreSQL version of docs ≫ returned.',
+      steps: [
+        {
+          title: 'Look for removed rows',
+          note: 'Rows Removed by Filter: 950,000 for 50,000 returned is MongoDB\'s totalDocsExamined 1,000,000 vs nReturned 50,000 in another form.',
+          code: "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE status = 'shipped';",
+          active: ['plan', 'rm', 'flag'],
+          edges: ['plan-rm', 'rm-flag'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Flow
+  title="MySQL: the same red flag in EXPLAIN"
+  height={240}
+  nodes={[
+    { id: 'plan', label: 'EXPLAIN', sub: '', x: 20, y: 20, w: 260 },
+    { id: 'rf', label: 'rows × filtered', sub: '≪ rows', x: 340, y: 20, w: 240 },
+    { id: 'flag', label: '✗ Wasted reads', sub: 'most rows dropped', x: 620, y: 20, w: 160 },
+  ]}
+  edges={[
+    { id: 'plan-rf', from: 'plan', to: 'rf' },
+    { id: 'rf-flag', from: 'rf', to: 'flag' },
+  ]}
+  cases={[
+    {
+      title: 'Low filtered',
+      path: 'type: ALL, rows 996,111, filtered 10% ✗',
+      summary: 'Most rows read are discarded by Using where.',
+      steps: [
+        {
+          title: 'Read rows and filtered together',
+          note: 'rows is what the access method reads; filtered is the share kept. 996,111 rows × 10% means ≈ 900,000 rows read for nothing. EXPLAIN ANALYZE shows the actual numbers.',
+          code: "EXPLAIN SELECT * FROM orders WHERE status = 'shipped';   -- without an index on status",
+          active: ['plan', 'rf', 'flag'],
+          edges: ['plan-rf', 'rf-flag'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+`explain()` without arguments does not run the query: it shows the plan, not the work. Use `explain("executionStats")` to see keys and documents examined; for reads it executes the query, so mind expensive queries on production. For writes (`db.orders.explain("executionStats").updateMany(…)`), MongoDB reports what the operation would do without applying the changes.
+</Pitfall>
+
+## Real-world scenario: a slow endpoint
+
+An endpoint `GET /orders?status=paid&min=400` takes 900 ms. The profiler shows `planSummary: IXSCAN { status: 1 }`, `keysExamined: 350000`, `docsExamined: 350000`, `nreturned: 20`.
+
+| Reading | Conclusion |
+|---|---|
+| IXSCAN on `{ status: 1 }` | The index matches only the equality |
+| keys = docs = 350,000 ≫ 20 | Every paid order is fetched to test `amount` and to sort |
+| (explain) SORT stage | `created_at` order not provided |
+| Fix | `{ status: 1, created_at: -1, amount: 1 }` (ESR): ≈ 114 keys, 20 docs, no SORT |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 7: specialist indexes | Text, TTL, wildcard and hashed plans appear as their own stages |
+| Session 8: unused indexes | `$indexStats` and the profiler show which indexes plans actually use |
+
+## Key takeaways
+
+1. `queryPlanner` shows the plan without running it; `executionStats` runs it and counts; `allPlansExecution` adds every candidate's trial.
+2. Read the stage tree from the leaf: IXSCAN or COLLSCAN, then FETCH, SORT, PROJECTION, LIMIT.
+3. Compare nReturned with totalKeysExamined and totalDocsExamined: both close to nReturned is healthy.
+4. keys ≫ returned: loose index bounds; docs ≫ returned: filtering after FETCH; SORT: wrong index order; docs = 0: covered.
+5. `indexBounds` shows whether each field narrows the scan.
+6. The profiler records the same counts for slow production operations.
+7. PostgreSQL and MySQL show the same signals under different names.
+
+## Check questions
+
+1. What is the difference between `explain()`, `explain("executionStats")` and `explain("allPlansExecution")`?
+2. In what order should you read a stage tree, and what does each of IXSCAN, FETCH, SORT and PROJECTION_COVERED tell you?
+3. An explain shows `totalKeysExamined: 1000000`, `nReturned: 200`. What is the likely cause, and where in the output would you confirm it?
+4. Another shows keys 114, docs 114, returned 20. What is happening, and how do you fix it?
+5. Why is a `SORT` stage a red flag for a `sort().limit(20)` query, even when keys examined equal documents returned?
+6. Which profiler fields would you watch to find queries that need better indexes?
+7. Map MongoDB's "docs ≫ returned" signal to its PostgreSQL and MySQL equivalents.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-6-engine-differences/concept-5-mongodb-explain/answers">Worked answers to Q1–Q7</DeepDive>

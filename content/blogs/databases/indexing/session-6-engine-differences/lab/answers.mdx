@@ -1,0 +1,84 @@
+---
+title: "Answers: Postgres vs MySQL vs MongoDB session quiz"
+description: "Worked answers to the Session 6 quiz."
+companion: "answers"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/storage-hot.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-index-types.html"
+---
+
+<Tldr>
+The same workload costs each engine differently because each points its indexes at something different: a ctid, a primary key, or a RecordId.
+</Tldr>
+
+## Q1. HOT for a 30% update
+
+**Question:** in Exercise 1, updating 5% of rows was 100% HOT with fill factor 90. Predict the HOT ratio for a 30% update and explain.
+
+Fill factor 90 leaves room for ≈ 12 new versions per page (≈ 10% of ≈ 122 rows). A 30% update changes ≈ 37 rows per page: the first ≈ 12 fit (HOT), the rest go elsewhere. Expect roughly **30–35% HOT** (≈ 12 / 37), not 100%. Pruning of earlier HOT chains during the update can free a little more room, so the exact figure varies.
+
+> **Common mistake:** assuming fill factor 90 makes every update HOT.
+
+## Q2. status grows customer_id
+
+**Question:** why did updating `status` grow the `customer_id` index in PostgreSQL, and would the same happen in InnoDB and MongoDB?
+
+In PostgreSQL, changing an indexed column rules out HOT; the new version has a new ctid, so **every** index gets an entry pointing at it. In InnoDB and MongoDB, no: their `customer_id` entries point at the primary key or RecordId, which did not change, so only the `status` index is modified.
+
+> **Common mistake:** generalising PostgreSQL's behaviour to all engines.
+
+## Q3. CHAR(36) with four secondary indexes
+
+**Question:** in Exercise 2, a table has a `CHAR(36)` primary key and four secondary indexes. Roughly how much extra space does the key cost compared with `BIGINT`, using the lab's leaf counts?
+
+Per secondary index: 2,866 − 1,078 ≈ 1,790 extra leaves ≈ 28 MB (16 KB pages) for 1M rows. Four indexes: ≈ 112 MB extra, plus the larger clustered index itself. For 100M rows, ≈ 11 GB of extra secondary-index space.
+
+> **Common mistake:** counting the width only once, in the primary key.
+
+## Q4. $all and GIN
+
+**Question:** why does `$all: ['sale', 'eco']` read 40,000 documents, and what would a PostgreSQL GIN index do differently?
+
+The multikey index seeks on one element (`sale`, 40,000 entries) and MongoDB fetches each document to check for `eco` (3,333 match). GIN would read the posting lists for `sale` and `eco`, intersect them in the index, and fetch only the ≈ 3,333 rows in both.
+
+> **Common mistake:** "MongoDB uses both index entries"; it uses one bound and filters.
+
+## Q5. Millisecond-only UUIDv7 at 50,000 rows/s
+
+**Question:** a UUIDv7 library you use is ordered only to the millisecond, and you insert 50,000 rows per second into PostgreSQL. Should you expect the 90% or the 73% result from Exercise 4? Why?
+
+Closer to **73%**. 50,000 rows per second is 50 per millisecond; those 50 share a timestamp and sort randomly within it, so they cause middle splits among the newest leaves. Fewer per millisecond than the lab's ≈ 600 means smaller damage, but still below the 90% of a strictly increasing key. Use a library with sub-millisecond precision or a monotonic counter (RFC 9562 methods 1 or 3), or PostgreSQL 18's `uuidv7()`.
+
+> **Common mistake:** assuming "UUIDv7" always means monotonic.
+
+## Q6. InnoDB vs PostgreSQL
+
+**Question:** why did random primary keys cost InnoDB more (70 → 128 MB) than PostgreSQL (21 → 38 MB in the index only)?
+
+InnoDB's primary-key B-tree is the table: random inserts split pages containing whole rows (≈ 100 bytes each), so the whole table ends up ≈ ⅔ full. PostgreSQL's heap appends regardless of key; only the primary-key index (small entries) splits. Secondary indexes in InnoDB also carry the 16-byte key.
+
+> **Common mistake:** comparing only index sizes across engines; in InnoDB the "index" is the table.
+
+## Q7. keys 9, docs 9, nreturned 3
+
+**Question:** in Exercise 5, the profiler showed keys 9, docs 9, nreturned 3 for `{ status: 'delivered', channel: 'app' }`. What does that tell you, and what index would make docs ≈ nreturned?
+
+The plan used `{ status, created_at }`: it seeked on `delivered`, but `channel` is not in that index, so each candidate document was fetched and two of every three were discarded (only one in three orders is `app`). An index containing both, `{ status: 1, channel: 1 }` (or `{ status: 1, channel: 1, created_at: -1 }` if a sort is added), checks `channel` on the key: keys ≈ docs ≈ returned. At `limit(3)` the waste is tiny; without a limit it is 2× the work.
+
+> **Common mistake:** ignoring a 3× ratio on small numbers; it is the same ratio at production scale.
+
+## Q8. Indexes touched by a non-indexed update
+
+**Question:** rank the three engines by how many indexes an update of one non-indexed column touches, and explain.
+
+| Engine | Indexes touched |
+|---|---|
+| InnoDB | 0: in-place update, secondary entries hold the unchanged primary key |
+| MongoDB | 0: RecordId unchanged, no indexed field changed |
+| PostgreSQL | 0 if the update is HOT; **all of them** if not (no room on the page) |
+
+InnoDB and MongoDB tie at zero; PostgreSQL depends on HOT, which depends on free space on the page (fill factor).
+
+> **Common mistake:** "PostgreSQL always rewrites indexes on update"; HOT updates touch none.

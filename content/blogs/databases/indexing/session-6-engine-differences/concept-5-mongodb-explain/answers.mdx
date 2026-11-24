@@ -1,0 +1,85 @@
+---
+title: "Answers: Reading explain() in MongoDB"
+description: "Worked answers to the Session 6 Concept 5 check questions."
+companion: "answers"
+tags: ["indexing", "mongodb", "explain", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/reference/explain-results/"
+  - "https://www.mongodb.com/docs/manual/tutorial/manage-the-database-profiler/"
+---
+
+<Tldr>
+Tree from the leaf up, then three numbers against nReturned: keys, docs, and whether a SORT sits in the tree.
+</Tldr>
+
+## Q1. Three verbosities
+
+**Question:** what is the difference between `explain()`, `explain("executionStats")` and `explain("allPlansExecution")`?
+
+| Mode | Executes? | Adds |
+|---|---|---|
+| `explain()` (`queryPlanner`) | No | Winning plan, rejected plans, index bounds |
+| `executionStats` | Yes (reads); writes report without applying | Counts and timings per stage and overall |
+| `allPlansExecution` | Yes | The trial statistics (works, advanced, score) of every candidate plan |
+
+> **Common mistake:** diagnosing performance with `queryPlanner` only; it never shows keys or documents examined.
+
+## Q2. Reading the tree
+
+**Question:** in what order should you read a stage tree, and what does each of IXSCAN, FETCH, SORT and PROJECTION_COVERED tell you?
+
+From the **innermost** stage (the leaf) outwards, the order data flows.
+
+| Stage | Meaning |
+|---|---|
+| IXSCAN | Reads index keys within `indexBounds` |
+| FETCH | Loads documents for the keys; may apply a filter (conditions the index could not check) |
+| SORT | Blocking in-memory sort: the index did not provide the requested order |
+| PROJECTION_COVERED | Results built from index keys only: no documents fetched |
+
+> **Common mistake:** reading top-down and concluding LIMIT did most of the work.
+
+## Q3. 1,000,000 keys for 200
+
+**Question:** an explain shows `totalKeysExamined: 1000000`, `nReturned: 200`. What is the likely cause, and where in the output would you confirm it?
+
+The index is being scanned with **loose bounds**: almost the whole index is read and most keys rejected. Typical causes: an unanchored or case-insensitive regex, `$ne`/`$nin`, or a hinted index whose leading field the query does not constrain. Confirm in the IXSCAN's `indexBounds`, which will show ranges like `["", {})` or `[MinKey, MaxKey]` for the fields you expected to narrow it.
+
+> **Common mistake:** "the index is used, so it is fine". An IXSCAN over the whole index is a full scan of the index.
+
+## Q4. 114 / 114 / 20
+
+**Question:** another shows keys 114, docs 114, returned 20. What is happening, and how do you fix it?
+
+The index narrows the candidates to 114, but a condition the index does not contain is evaluated in the FETCH stage, so 114 documents are loaded and 94 discarded. Add that field to the index (after equality and sort fields, per ESR) so it is checked on the key: the lab's ESR index read the same 114 keys but fetched only 20 documents.
+
+> **Common mistake:** adding a separate single-field index for the filtered field; the query uses one index.
+
+## Q5. SORT with sort().limit()
+
+**Question:** why is a `SORT` stage a red flag for a `sort().limit(20)` query, even when keys examined equal documents returned?
+
+A SORT stage is **blocking**: it must read every matching key before it can return the first 20, so the work is proportional to all matches (70,000 keys in the lab), not to the limit. It also uses memory (up to 100 MB before failing or spilling). An index that provides the order lets LIMIT stop the scan after 20 matches.
+
+> **Common mistake:** judging only "keys ≈ returned" from the SORT's output; look at what fed into it.
+
+## Q6. Profiler fields
+
+**Question:** which profiler fields would you watch to find queries that need better indexes?
+
+`planSummary` (a `COLLSCAN`, or an index that does not match the query's fields), `keysExamined` and `docsExamined` compared with `nreturned` (large ratios), `millis` (to prioritise), and `hasSortStage` / a SORT in the plan for paginated queries. Group by query shape (`queryHash`) to find the patterns that recur.
+
+> **Common mistake:** sorting only by `millis`; a query that is fast today but examines 1,000× what it returns will be slow tomorrow.
+
+## Q7. docs ≫ returned elsewhere
+
+**Question:** map MongoDB's "docs ≫ returned" signal to its PostgreSQL and MySQL equivalents.
+
+| Engine | Same signal |
+|---|---|
+| MongoDB | `totalDocsExamined` ≫ `nReturned` (filter on FETCH or COLLSCAN) |
+| PostgreSQL | `Rows Removed by Filter` ≫ actual `rows` (on a Seq Scan, or as a `Filter` line on an Index/Bitmap Scan) |
+| MySQL | `rows` large and `filtered` small, `Using where`; in `EXPLAIN ANALYZE`, actual rows read ≫ rows returned |
+
+> **Common mistake:** looking only at the access type (index vs scan) and not at how many rows each step throws away.
