@@ -1,0 +1,54 @@
+---
+title: "Answers: Lost writes and rollback in MongoDB"
+description: "Worked answers to the Session 5 Concept 2 check questions."
+companion: "answers"
+tags: ["replication", "rollback", "mongodb", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/replica-set-rollbacks/"
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+---
+
+<Tldr>
+Only writes a majority has seen belong to the history the next primary will continue. Everything else can be cut off.
+</Tldr>
+
+## Q1. Why 9.5 seconds
+
+**Question:** why did the cut-off primary keep accepting `w: 1` writes for 9.5 s instead of stopping at once?
+
+A primary cannot tell a dead network from quiet secondaries straight away. It steps down when it has not been able to reach a majority for about `electionTimeoutMillis` (10 s by default). Until then it still believes it is primary, and a `w: 1` write needs nothing but the primary: the last one was confirmed at 9,478 ms and the first refusal (NotWritablePrimary) came at 9,732 ms, right after the log line "Can't see a majority of the set, relinquishing primary".
+
+> **Common mistake:** assuming a primary checks for a majority on every write. Only writes that ask for `w: "majority"` wait for it.
+
+## Q2. The timed-out majority write
+
+**Question:** the `w: "majority"` write timed out after 3 s. Was it lost at that moment?
+
+No. `WriteConcernFailed` after `wtimeout` means "not yet confirmed by a majority". The document was already applied on the primary and was waiting to replicate. Had the network come back within a few seconds, before an election, the secondaries would have received it and it would have been kept. Here a new primary was elected first, so the write ended up in the rollback (the 19,333rd rolled-back insert).
+
+> **Common mistake:** retrying a timed-out majority write blindly. If the first attempt does replicate, the retry is a duplicate.
+
+## Q3. Which side wins
+
+**Question:** why were the 500 writes on the new primary kept and the 19,332 on the old one removed, rather than the other way round?
+
+The new primary was elected by a majority (mongo2 and mongo3) in a newer term, and its writes reached a majority. The old primary's writes after the cut existed on one member only, in an older term. When the old primary reconnected, it synced from mongo3, found that its oplog contained entries mongo3 did not have, and went back to the last common entry. MongoDB never merges two histories; the majority's history wins.
+
+> **Common mistake:** expecting the two sides' writes to be merged, or the clock to decide. The election term and the majority decide; wall-clock times play no part.
+
+## Q4. Where the documents went
+
+**Question:** where did the rolled-back documents go, and what must happen for them to reach the database again?
+
+`/data/db/rollback/<collection UUID>/removed.<timestamp>.bson` on the old primary, here one 1.18 MB file with 19,333 documents. MongoDB never reapplies them. A person has to inspect them (`bsondump`), decide which still make sense given what happened on the new primary since, and insert those with `mongorestore` or code. Some cannot be reapplied blindly, for example an update to a document that was changed again on the new primary.
+
+> **Common mistake:** finding the rollback directory weeks later, when the data is too stale to reconcile.
+
+## Q5. Which writes may use w:1
+
+**Question:** which writes in a marketplace back end would you allow with `w: 1`, and which not?
+
+`w: 1` only for data that can be lost or rebuilt: page-view counters, recommendation caches, debug logs, a search index that is rebuilt from the source of truth. `w: "majority"` for orders, payments, stock reservations, order status changes, seller payouts and anything another system or a customer acts on after the confirmation. The cost measured on a healthy local set was a 2 ms median per majority write.
+
+> **Common mistake:** choosing `w: 1` for a whole service to speed up a bulk import, and leaving it there.

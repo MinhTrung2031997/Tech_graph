@@ -1,0 +1,174 @@
+---
+title: "Concept 4: Promoting a MySQL replica"
+description: "MySQL promotion is three statements (STOP REPLICA; RESET REPLICA ALL; read_only off), 0.06–0.08 s here. With the replica cut off 2 s before the source was killed, 1,615 of 2,818 committed transactions were missing; even with a healthy network, the one transaction in flight existed only on the old source. Those leftovers are errant GTIDs: when the old source was re-pointed at the new primary, replication stopped with error 1062 because both servers had used ids 1204–1206 for different rows."
+type: "concept"
+tags: ["replication", "failover", "promotion", "gtid", "mysql"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-solutions-switch.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-gtids-concepts.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/gtid-functions.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html#sysvar_super_read_only"
+---
+
+<Tldr>
+Like PostgreSQL, MySQL replication has no automatic failover: promoting a replica is `STOP REPLICA; RESET REPLICA ALL;` and turning off `read_only` (0.06–0.08 s). With asynchronous replication and the replica cut off 2 s before the source was killed, the source had committed **2,818** rows and the replica had **1,203**: **1,615** acknowledged transactions missing. Even with a healthy network the transaction in flight at the kill was committed on the source only. Every such transaction is an **errant GTID**: it carries the old source's server UUID but exists on one server only. Re-pointing the old source at the new primary failed with **error 1062**, `Duplicate entry '1204' for key 'ev.PRIMARY'`: both servers had handed out ids 1204–1206, for different rows. A replica is also **writable by default** (`read_only = 0`), which creates the same kind of conflict without any failover.
+</Tldr>
+
+## The setup
+
+`rpc-my1` (source) replicates to `rpc-my2` with GTID auto-positioning, row-based binlog, `sync_binlog = 1`, `innodb_flush_log_at_trx_commit = 1`. A client container pipes `INSERT INTO lab.ev (client) VALUES (1);` statements into one `mysql` session, each one autocommitted, about 600 per second. At 5 s the source is killed. Then the replica is promoted, the old source is restarted to see what it had committed, and finally re-pointed at the new primary.
+
+| Term | Meaning |
+|---|---|
+| GTID | `server_uuid:number`, a global id given to each transaction by the server that first committed it |
+| `gtid_executed` | The set of GTIDs a server has applied, e.g. `8b1c…:1-2825` |
+| Errant GTID | A GTID present on one server and missing on the server that should be the source of truth |
+| `RESET REPLICA ALL` | Forgets the replication source configuration: the replica no longer replicates from anyone |
+| `super_read_only` | Rejects writes from every user, including those with SUPER; replication threads still apply changes |
+| **✓ / ✗** | Present on the new primary / missing |
+
+## MySQL InnoDB
+
+<Flow
+  title="MySQL: kill the source, promote the replica, re-point the old source"
+  height={340}
+  nodes={[
+    { id: 'cli', label: 'Writer', sub: 'autocommit INSERTs', x: 20, y: 20, w: 200 },
+    { id: 'my1', label: 'rpc-my1', sub: 'source', x: 300, y: 20, w: 200 },
+    { id: 'my2', label: 'rpc-my2', sub: 'replica', x: 580, y: 20, w: 200 },
+    { id: 'gtid', label: 'Errant GTIDs', sub: 'on my1 only', x: 300, y: 270, w: 200 },
+    { id: 'err', label: 'Replication error', sub: '1062 duplicate key', x: 580, y: 270, w: 200 },
+  ]}
+  edges={[
+    { id: 'cli-my1', from: 'cli', to: 'my1' },
+    { id: 'my1-my2', from: 'my1', to: 'my2' },
+    { id: 'my1-gtid', from: 'my1', to: 'gtid' },
+    { id: 'my2-err', from: 'my2', to: 'err' },
+  ]}
+  cases={[
+    {
+      title: 'Replica cut off, then the source dies',
+      path: 'commits on my1 ✓ → replica cut off ✗ → my1 killed → my2 promoted ✓ → 1,615 commits missing ✗ → my1 re-pointed → 1062 ✗',
+      summary: 'The lost transactions do not disappear: they stay on the old source and break it later.',
+      steps: [
+        {
+          title: 't0–3 s: replicating',
+          note: 'Each INSERT commits on my1 (binlog and redo flushed), then the replica I/O thread fetches the event and the applier commits it on my2.',
+          active: ['cli', 'my1', 'my2'],
+          edges: ['cli-my1', 'my1-my2'],
+        },
+        {
+          title: 't3 s: replica cut off; t5 s: source killed',
+          note: 'my1 keeps committing alone. The writer got ERROR 2013 (Lost connection) at statement 2,819, so 2,818 commits had been acknowledged. my2 had 1,203 rows.',
+          active: ['cli', 'my1'],
+          edges: ['cli-my1'],
+          subs: { my1: '✗ killed after 2,818 commits', my2: '1,203 rows' },
+        },
+        {
+          title: 'Promote my2',
+          note: '0.06 s. The next inserts on my2 got ids 1204, 1205, 1206: auto-increment continues from what my2 has, and my2 never saw ids 1204–2818.',
+          code: 'STOP REPLICA;\nRESET REPLICA ALL;\nSET GLOBAL super_read_only = OFF, read_only = OFF;',
+          active: ['my2'],
+          subs: { my2: '✓ new primary, ids 1204–1206' },
+        },
+        {
+          title: 'Restart my1: what it had',
+          note: 'my1 came back with 2,818 rows and gtid_executed 8b1c…:1-2825. GTID_SUBTRACT against my2: 8b1c…:1211-2825 exist only on my1.',
+          code: "SELECT GTID_SUBTRACT(@@gtid_executed, '<gtid_executed of my2>');",
+          active: ['my1', 'gtid'],
+          edges: ['my1-gtid'],
+          subs: { gtid: '✗ 8b1c…:1211-2825' },
+        },
+        {
+          title: 'Re-point my1 at my2',
+          note: 'Auto-positioning sends my1 the transactions it lacks: my2\'s own new ones. The first is the insert of id 1204, which my1 already has as a different row. Replica_SQL_Running: No.',
+          code: "CHANGE REPLICATION SOURCE TO SOURCE_HOST = 'rpc-my2', SOURCE_AUTO_POSITION = 1, …;\nSTART REPLICA;",
+          active: ['my2', 'err', 'my1'],
+          edges: ['my2-err'],
+          subs: { err: "✗ Duplicate entry '1204'" },
+        },
+      ],
+    },
+  ]}
+/>
+
+The worker error, from `performance_schema.replication_applier_status_by_worker`:
+
+```
+Worker 1 failed executing transaction '8b356a6f-…:6' at source log binlog.000003, end_log_pos 3333625;
+Could not execute Write_rows event on table lab.ev; Duplicate entry '1204' for key 'ev.PRIMARY', Error_code: 1062
+```
+
+## Measured
+
+| Run | Source committed (old source after restart) | Writer acknowledged | Rows on promoted replica | Missing | Errant GTIDs on old source |
+|---|---|---|---|---|---|
+| Replica cut off at 3 s, source killed at 5 s | 2,818 | 2,818 | 1,203 | **1,615** | `8b1c…:1211-2825` |
+| Healthy network, source killed at 5 s | 1,780 | 1,779 (one in flight) | 1,779 | 1 | 1 transaction |
+
+The promotion statements took 0.06 s and 0.08 s.
+
+Two details of a fresh setup:
+
+- Each new MySQL container commits a few transactions of its own while it initialises, so the replica started with GTIDs `8b356a6f-…:1-5` of its own. They are harmless here but show up in every `GTID_SUBTRACT` check, so know they are there.
+- On the replica, `@@read_only` and `@@super_read_only` were both **0**: it accepts writes.
+
+## A writable replica breaks replication too
+
+On a fresh pair, a write on the replica succeeded; the next write on the source used the same id and stopped the replica:
+
+```sql
+-- on rpc-my2 (replica)
+INSERT INTO lab.ev (client) VALUES (99);     -- ok, id 1
+-- on rpc-my1 (source)
+INSERT INTO lab.ev (client) VALUES (1);      -- ok, id 1
+-- rpc-my2: Replica_SQL_Running: No, Last_SQL_Errno: 1062, Duplicate entry '1' for key 'ev.PRIMARY'
+-- rpc-my2 after SET GLOBAL super_read_only = ON:
+INSERT INTO lab.ev (client) VALUES (98);
+-- ERROR 1290 (HY000): The MySQL server is running with the --super-read-only option so it cannot execute this statement
+```
+
+<Pitfall>
+Errant transactions do not always fail loudly. Here the new primary reused auto-increment ids, so the conflict was immediate. If the errant transactions had touched rows the new primary never changes again, the old source would replicate happily with **different data**, and the difference would surface only at the next failover, when its errant GTIDs are sent to every replica. Check `GTID_SUBTRACT(old, new)` before re-pointing a former source, and either discard it (re-clone) or reconcile the errant transactions by hand. Set `super_read_only = ON` in the configuration of every server that is not the primary, so it comes back read-only after a restart.
+</Pitfall>
+
+## Real-world scenario: re-using the old source as a replica
+
+After a failover, an engineer wants the old source back as a replica quickly to restore redundancy, and runs `CHANGE REPLICATION SOURCE TO … AUTO_POSITION = 1`.
+
+| What they skip | Consequence |
+|---|---|
+| `GTID_SUBTRACT` check | 1,615 orders exist only on the old source; nobody knows they need reconciling |
+| Comparing auto-increment ranges | New orders on the new primary reuse the same order ids for different customers; replication stops with 1062, or worse, emails and invoices go out with duplicate order numbers |
+| Setting `super_read_only` | The application, still holding connections to the old source, writes to it again |
+
+The safer sequence: keep the old source **stopped**, export its errant transactions (`mysqlbinlog` on its binlog for the errant GTID range), reconcile them on the new primary as new transactions, then re-clone the old source from the new primary (the `CLONE` plugin or a backup).
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 3 | PostgreSQL loses the same commits but prevents silent re-joining through timelines |
+| Concept 5 | A writable old source is one half of a split brain |
+| [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) | The GTID replication setup |
+| [Partitioning and sharding Session 8, Concept 3](/blogs/databases/partitioning-sharding/session-8-operations-across-shards/concept-3-generating-ids) | Ids that cannot collide across servers avoid the 1062 class of conflicts |
+
+## Key takeaways
+
+1. MySQL has no built-in failover: promoting is three statements and takes milliseconds.
+2. With async replication, transactions the replica had not received are missing on the new primary: 1,615 of 2,818 with the replica cut off 2 s before the crash, 1 with a healthy network.
+3. Those transactions remain on the old source as errant GTIDs; `GTID_SUBTRACT` finds them.
+4. Re-pointing the old source failed with 1062 because both servers had issued the same auto-increment ids.
+5. Replicas are writable unless `super_read_only = ON`; one stray write broke replication the same way.
+
+## Check questions
+
+1. Why did the new primary hand out ids 1204–1206 when the old source had already used them?
+2. What is an errant GTID, and how did you find the ones on the old source?
+3. Why did replication from the new primary to the old source fail on its **first** transaction?
+4. Could errant transactions go unnoticed? Give an example.
+5. Why is `super_read_only` better than `read_only` on a replica?
+6. Write the steps you would follow to bring the old source back as a replica safely.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-5-failover/concept-4-promoting-mysql/answers">Worked answers to Q1–Q6</DeepDive>

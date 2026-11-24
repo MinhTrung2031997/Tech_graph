@@ -1,0 +1,182 @@
+---
+title: "Concept 1: MongoDB elections and retryable writes"
+description: "A 3-member replica set under a write loop. rs.stepDown() and a clean shutdown hand over to a caught-up secondary in milliseconds (election reason stepUpRequestSkipDryRun, slowest write 117–216 ms, no errors with retryable writes). A crashed primary is only noticed after electionTimeoutMillis: writes stalled 5.9–11.4 s. Even with retryWrites=true, 5 of 10 crash runs returned one error, connection … closed, and in the run checked that write had in fact been stored."
+type: "concept"
+tags: ["replication", "failover", "elections", "retryable-writes", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/replica-set-elections/"
+  - "https://www.mongodb.com/docs/manual/core/retryable-writes/"
+  - "https://www.mongodb.com/docs/manual/reference/method/rs.stepDown/"
+  - "https://www.mongodb.com/docs/manual/reference/replica-configuration/#mongodb-rsconf-rsconf.settings.electionTimeoutMillis"
+---
+
+<Tldr>
+MongoDB fails over by itself: the members of a replica set elect a new primary. How long writes stop depends on **how** the primary went away. A planned `rs.stepDown()` or a clean shutdown (`docker stop`, SIGTERM) asks a caught-up secondary to take over at once: the new primary was elected **9 ms** after the old one refused a write, and no write took longer than **216 ms**. A **crash** (`docker kill`) is only noticed when heartbeats have been missing for `electionTimeoutMillis` (10 s by default): one write **waited 11.4 s**. Whether the application sees an error depends on **retryable writes**, and on the kind of failure. With `retryWrites=true` (the driver default) planned handovers produced **no errors**. Crashes did: in **5 of 10** crash runs one write still failed with `connection … closed`, and in the run where it was checked, that "failed" write **had been stored**. With `retryWrites=false` the write in flight failed on every failover, stepdowns included.
+</Tldr>
+
+## The setup
+
+`rpc-mongo1`, `rpc-mongo2`, `rpc-mongo3`: one replica set, default settings (`electionTimeoutMillis` 10000, `heartbeatIntervalMillis` 2000). A client in a fourth container inserts one document at a time with `w: "majority"` for 15–30 s, about 600 writes per second, and records every write slower than 50 ms and every error. Five seconds in, the primary is taken away.
+
+| Term | Meaning |
+|---|---|
+| Election | Members vote for a new primary; it needs votes from a majority (2 of 3) |
+| `electionTimeoutMillis` | How long a secondary waits without hearing from the primary before calling an election (10 s) |
+| Step-up request | A primary that is stepping down asks the most caught-up secondary to run for election immediately (`stepUpRequestSkipDryRun`) |
+| Retryable write | The driver tags each write with a session and transaction number and retries it **once** on the new primary after a network or "not primary" error; the server applies it at most once |
+| **✓ / ✗** | Write succeeded / failed or waited |
+
+## MongoDB
+
+<Flow
+  title="MongoDB: the primary goes away during a write loop"
+  height={330}
+  nodes={[
+    { id: 'client', label: 'Client', sub: 'insertOne, w: majority', x: 300, y: 20, w: 200 },
+    { id: 'm1', label: 'mongo1', sub: 'primary', x: 20, y: 160, w: 200 },
+    { id: 'm2', label: 'mongo2', sub: 'secondary', x: 300, y: 160, w: 200 },
+    { id: 'm3', label: 'mongo3', sub: 'secondary', x: 580, y: 160, w: 200 },
+    { id: 'vote', label: 'Election', sub: 'needs 2 of 3 votes', x: 300, y: 270, w: 200 },
+  ]}
+  edges={[
+    { id: 'c-m1', from: 'client', to: 'm1' },
+    { id: 'c-m2', from: 'client', to: 'm2' },
+    { id: 'm1-vote', from: 'm1', to: 'vote' },
+    { id: 'm2-vote', from: 'm2', to: 'vote' },
+    { id: 'm3-vote', from: 'm3', to: 'vote' },
+  ]}
+  cases={[
+    {
+      title: 'Planned: rs.stepDown() or a clean shutdown',
+      path: 'mongo1 steps down ✓ → asks mongo2 to step up ✓ → mongo2 elected in ms ✓ → driver retries on mongo2 ✓',
+      summary: 'A handover, not a timeout: the slowest write took 117–216 ms.',
+      steps: [
+        {
+          title: 't0: writes go to mongo1',
+          note: 'The driver sends every insert to the primary and waits for a majority (mongo1 plus one secondary) to acknowledge it: median 2 ms.',
+          active: ['client', 'm1', 'm2', 'm3'],
+          edges: ['c-m1'],
+        },
+        {
+          title: 't1: rs.stepDown(60) on mongo1',
+          note: 'mongo1 waits for a secondary to catch up, stops accepting writes and interrupts the writes in progress. One write got InterruptedDueToReplStateChange (retryWrites=false). With docker stop, mongod shuts down the same way: step down first.',
+          code: 'rs.stepDown(60)   // mongo1 may not run for election for 60 s',
+          active: ['m1', 'm2'],
+          edges: ['m1-vote'],
+          subs: { m1: '✗ no longer primary' },
+        },
+        {
+          title: 't2: mongo2 is elected at once',
+          note: 'rs.status().electionCandidateMetrics on mongo2: lastElectionReason stepUpRequestSkipDryRun. Elected 9 ms after the interrupted write; w: majority writes possible 11 ms after the election.',
+          active: ['m2', 'm3', 'vote'],
+          edges: ['m2-vote', 'm3-vote'],
+          subs: { m2: '✓ new primary', vote: '✓ 2 of 3 votes' },
+        },
+        {
+          title: 't3: the driver moves to mongo2',
+          note: 'With retryWrites=true the interrupted write is retried once on mongo2: 0 errors, slowest write 117 ms. With retryWrites=false that one write fails and the application must decide what to do.',
+          active: ['client', 'm2'],
+          edges: ['c-m2'],
+          subs: { client: '✓ 0 errors with retry' },
+        },
+      ],
+    },
+    {
+      title: 'Crash: docker kill',
+      path: 'mongo1 gone ✗ → secondaries wait 10 s for heartbeats ✗ → election ✓ → write in flight retried ✓ (11.4 s)',
+      summary: 'Nobody hands over: the set waits for electionTimeoutMillis.',
+      steps: [
+        {
+          title: 't0: mongo1 disappears',
+          note: 'The process is killed. Its TCP connections reset. The write in flight either never reached mongo1 or reached it and was lost with it; the client cannot tell which.',
+          active: ['client', 'm1'],
+          edges: ['c-m1'],
+          subs: { m1: '✗ killed', client: '✗ ECONNRESET (no retry)' },
+        },
+        {
+          title: 't1: secondaries wait',
+          note: 'mongo2 and mongo3 keep sending heartbeats every 2 s. Only after 10 s without an answer from the primary does one of them call an election. Meanwhile the driver has no primary to send writes to and waits (server selection).',
+          active: ['m2', 'm3'],
+          subs: { m2: 'waiting for heartbeats', m3: 'waiting for heartbeats' },
+        },
+        {
+          title: 't2: election by timeout',
+          note: 'lastElectionReason: electionTimeout. The election itself took about 15 ms (elected 15:30:38.944, new term 38.957); the 10 s before it are the cost.',
+          active: ['m2', 'm3', 'vote'],
+          edges: ['m2-vote', 'm3-vote'],
+          subs: { vote: '✓ electionTimeout' },
+        },
+        {
+          title: 't3: writes resume on the new primary',
+          note: 'retryWrites=true, first run: the write that was in flight returned after 11,395 ms, no error. In 5 of 10 such runs one write failed anyway: connection … closed, after a few ms. retryWrites=false: that write failed with ECONNRESET after 4 ms; the next one waited 10,074 ms.',
+          active: ['client', 'm2'],
+          edges: ['c-m2'],
+          subs: { client: '✓ stall 5.9–11.4 s' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Measured
+
+Each run: 15–30 s of single-document inserts with `w: "majority"`; the primary was removed 5 s in.
+
+| How the primary left | Election reason | `retryWrites` | Failed writes | Slowest write |
+|---|---|---|---|---|
+| `rs.stepDown(60)` | stepUpRequestSkipDryRun | true | 0 | 117 ms |
+| `rs.stepDown(60)` | stepUpRequestSkipDryRun | false | 1 (InterruptedDueToReplStateChange) in one run, 0 in another | 24 ms / 216 ms |
+| `docker stop` (SIGTERM) | stepUpRequestSkipDryRun | true | 0 | 134 ms |
+| `docker kill` | electionTimeout | true | 0 in 5 of 10 runs; 1 (`connection … closed`) in the other 5 | **5,856–11,395 ms** |
+| `docker kill` | electionTimeout | false | 1 (`read ECONNRESET`), document not stored in that run | 10,074 ms (the next write) |
+
+Two more things showed up in the write rate:
+
+- After a crash the set has two of three members, and `w: "majority"` needs **both**: writes went from about 600–650 per second to about 200–400 per second until the third member came back. Every write now waited for the one remaining secondary instead of the faster of two.
+- The killed member rejoined as a secondary by itself after `docker start` and caught up from the oplog.
+
+**An error is not a failure.** In one crash run with `retryWrites=true`, write number 3511 returned `connection 1 to 192.168.164.2:27017 closed`. After the failover the collection contained exactly one copy of it. The driver retries a write only once; when that attempt also hits a dead connection, the error reaches the application even though the first attempt may have been applied and replicated. The ECONNRESET write in the `retryWrites=false` run, by contrast, was not stored. Same error class, opposite outcomes.
+
+<Pitfall>
+"The driver retries, so failover is invisible" holds only for **retryable** operations: single-document writes, `insertMany`/`bulkWrite` without multi-document updates, and commit of a transaction. `updateMany`/`deleteMany` with `multi: true` and commands like `aggregate` with `$out` are **not** retried (from the documentation). And a retry happens **once**: if the second attempt also finds no primary within `serverSelectionTimeoutMS` (30 s by default), the application gets the error. A crash costs about `electionTimeoutMillis` + a few hundred ms, so lowering that setting shortens the stall but makes elections more likely on a slow network.
+</Pitfall>
+
+## Real-world scenario: a checkout during a cloud host failure
+
+The host running the primary of the `orders` replica set dies at 20:00:00 during a flash sale. Checkout writes with `w: "majority"`. The secondaries notice at about 20:00:10 and elect a new primary in milliseconds.
+
+| Application setting | What customers see |
+|---|---|
+| `retryWrites=true` (driver default), request timeout 30 s | Checkouts in progress pause for up to about 11 s. Most then succeed with no duplicates; a few still get a network error for an order that **was** saved, so the order code must look it up before retrying |
+| `retryWrites=false`, no retry in code | Every checkout in flight at 20:00:00 fails with a network error. Some of them may or may not have been written, so the support team gets "I was charged but have no order" tickets |
+| `retryWrites=false`, naive retry in code | Same failures, but the retry can create **two** orders when the first write did reach the primary and replicate before the crash |
+| Request timeout 5 s at the load balancer | The 11 s pause turns into HTTP 504 errors even though the database recovers by itself |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) | Builds the replica set used here |
+| Concept 2 | What happens to writes the old primary accepted but never replicated |
+| Concept 5 | Why MongoDB cannot keep two writable primaries for long, while PostgreSQL and MySQL can |
+| [Transactions Session 7, Concept 3](/blogs/databases/transactions/session-7-application-patterns/concept-3-retry-loops) | Retry loops in application code, and why a retry must be idempotent |
+
+## Key takeaways
+
+1. A planned stepdown or clean shutdown hands over to a caught-up secondary: the stall was milliseconds.
+2. A crash is noticed only after `electionTimeoutMillis` (10 s): one write waited 11.4 s.
+3. With retryable writes (the default), planned handovers caused no errors; crashes still returned one error in 5 of 10 runs, for a write that could have been stored. Without them, the write in flight failed on every failover.
+4. After a crash, a failed write's outcome is unknown to the client: one checked "failed" write was stored, another was not.
+5. With one member of three down, `w: "majority"` writes need every remaining member, and throughput dropped by about half.
+
+## Check questions
+
+1. Why did a stepdown stall writes for about 100 ms while a crash stalled them for 11 s?
+2. What does `stepUpRequestSkipDryRun` tell you about how the new primary was chosen?
+3. With `retryWrites=false`, the write in flight during a crash failed with `ECONNRESET`. What can the application conclude about that write?
+4. Why can a retryable write be retried safely when a plain application retry can create a duplicate?
+5. Why did `w: "majority"` throughput fall after the crash even though a primary was available again?
+6. You want failover after a crash to take 3 s instead of 11 s. What would you change, and what is the risk?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-5-failover/concept-1-mongodb-elections/answers">Worked answers to Q1–Q6</DeepDive>

@@ -1,0 +1,157 @@
+---
+title: "Concept 2: Lost writes and rollback in MongoDB"
+description: "The primary of a 3-member set was cut off from the network. For 9.5 s it kept accepting w:1 writes (19,332 of them) before it noticed it had no majority and stepped down; a w:majority write on it failed with WriteConcernFailed after 3 s. A new primary was elected on the other side. When the old primary came back, it rolled back all 19,333 of those writes in 9.2 s and saved them to a rollback file. The 1,000 documents written with w:majority before the cut were all kept."
+type: "concept"
+tags: ["replication", "failover", "rollback", "write-concern", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/replica-set-rollbacks/"
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+  - "https://www.mongodb.com/docs/database-tools/bsondump/"
+---
+
+<Tldr>
+A failover can **remove data the old primary had already confirmed**. With the primary cut off from the other two members, it stayed primary for **9.5 s** and confirmed **19,332** writes made with `w: 1`. The other side elected a new primary and carried on. When the old primary reconnected, it found its history had forked, went back to the last common point and **rolled back all 19,333 writes** it had made alone (the `w: 1` writes plus one `w: "majority"` write that had timed out). They were not merged; MongoDB wrote them to a BSON file under `/data/db/rollback/` and left recovering them to you. Writes confirmed with `w: "majority"` are never rolled back: the 1,000 documents written that way before the cut were all still there.
+</Tldr>
+
+## The setup
+
+1,000 documents written with `w: "majority"` to collection `lab.r`. Then the primary (`rpc-mongo1`) is disconnected from the Docker network. A script running **on** that node keeps writing to it through `localhost` for 20 s:
+
+1. one insert with `w: "majority", wtimeout: 3000`,
+2. then inserts with `w: 1` as fast as possible.
+
+Meanwhile the other two members elect a new primary and take 500 more writes. Then the old primary is reconnected.
+
+| Term | Meaning |
+|---|---|
+| `w: 1` | Confirmed when the primary alone has applied the write |
+| `w: "majority"` | Confirmed when a majority of voting members have it; such a write survives any failover |
+| `wtimeout` | How long to wait for the write concern; on timeout the write is **not undone**, the client just stops waiting |
+| Rollback | A former primary removes the writes that the new primary never received, back to the last common oplog entry |
+| Rollback file | BSON copies of the removed documents, in `<dbpath>/rollback/<collection UUID>/` |
+| **✓ / ✗** | Kept / lost |
+
+## MongoDB
+
+<Flow
+  title="MongoDB: an isolated primary keeps writing"
+  height={340}
+  nodes={[
+    { id: 'app', label: 'Writer on mongo1', sub: 'via localhost', x: 20, y: 20, w: 200 },
+    { id: 'm1', label: 'mongo1', sub: 'old primary, cut off', x: 20, y: 160, w: 200 },
+    { id: 'm2', label: 'mongo2', sub: 'secondary', x: 580, y: 20, w: 200 },
+    { id: 'm3', label: 'mongo3', sub: 'secondary', x: 580, y: 160, w: 200 },
+    { id: 'rb', label: 'Rollback file', sub: 'removed.*.bson', x: 20, y: 280, w: 200 },
+  ]}
+  edges={[
+    { id: 'app-m1', from: 'app', to: 'm1' },
+    { id: 'm2-m3', from: 'm2', to: 'm3' },
+    { id: 'm3-m1', from: 'm3', to: 'm1' },
+    { id: 'm1-rb', from: 'm1', to: 'rb' },
+  ]}
+  cases={[
+    {
+      title: 'Cut off, then reconnected',
+      path: 'w:1 writes on mongo1 ✓ for 9.5 s → mongo1 steps down → mongo3 elected → reconnect → 19,333 writes rolled back ✗ → saved to rollback file',
+      summary: 'Confirmed is not the same as durable across a failover.',
+      steps: [
+        {
+          title: 't0: the cut',
+          note: 'docker network disconnect. mongo1 still believes it is primary. The w: "majority" insert waits for a secondary that cannot hear it: WriteConcernFailed "waiting for replication timed out" after 3,016 ms. The document stays on mongo1.',
+          code: 'db.r.insertOne({ k: "maj-after-cut" }, { writeConcern: { w: "majority", wtimeout: 3000 } })',
+          active: ['app', 'm1'],
+          edges: ['app-m1'],
+          subs: { m1: '✗ majority write timed out' },
+        },
+        {
+          title: 't0 + 0–9.5 s: w:1 writes succeed',
+          note: '19,332 inserts with w: 1 were confirmed. The last one at 9,478 ms.',
+          code: 'db.r.insertOne({ k: "w1-after-cut", i }, { writeConcern: { w: 1 } })   // ok',
+          active: ['app', 'm1'],
+          edges: ['app-m1'],
+          subs: { m1: '✓ 19,332 w:1 writes accepted' },
+        },
+        {
+          title: 't0 + 9.7 s: mongo1 steps down',
+          note: 'Log: "Can\'t see a majority of the set, relinquishing primary". The next insert: NotWritablePrimary. On the other side mongo3 was elected 189 ms later (reason electionTimeout) and took 500 w: majority writes.',
+          active: ['m1', 'm2', 'm3'],
+          edges: ['m2-m3'],
+          subs: { m1: 'secondary, alone', m3: '✓ new primary' },
+        },
+        {
+          title: 'Reconnect: rollback',
+          note: 'mongo1 finds the common point with mongo3, rolls back with the recoverToStableTimestamp method and catches up. Rollback summary: 9.2 s, rollbackCommandCounts insert 19,333, affectedNamespaces lab.r.',
+          active: ['m3', 'm1', 'rb'],
+          edges: ['m3-m1', 'm1-rb'],
+          subs: { m1: '✗ 19,333 writes removed', rb: '1,179,307 bytes' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Measured
+
+| | Count | Fate |
+|---|---|---|
+| Written with `w: "majority"` before the cut | 1,000 | ✓ kept |
+| `w: "majority"` write on the cut-off primary (WriteConcernFailed after 3,016 ms) | 1 | ✗ rolled back |
+| `w: 1` writes confirmed on the cut-off primary in 9,478 ms | 19,332 | ✗ rolled back |
+| Written on the new primary | 500 | ✓ kept |
+| Documents in `lab.r` after the old primary rejoined | 1,500 | on every member |
+
+A second run gave the same picture: 20,327 `w: 1` writes confirmed in 9,389 ms, the majority write timed out after 3,018 ms, and all 20,328 were rolled back, this time in 0.5 s instead of 9.2 s.
+
+In the first run the rollback directory held one file, `removed.2026-11-24T15-33-17.0.bson` (1,179,307 bytes). `bsondump` printed `19333 objects found`, for example:
+
+```json
+{"_id":{"$oid":"6b05ae2489a26a34d6db8519"},"k":"w1-after-cut","i":{"$numberInt":"3613"},"at":{"$date":{"$numberLong":"1795534372227"}}}
+```
+
+<Pitfall>
+A `w: "majority"` write that **times out** is not a failed write. `wtimeout` only stops the client waiting: the document is on the primary and will be kept if a majority eventually receives it, or rolled back if not. Treat it like a network error (Concept 1, Q3): outcome unknown. And rollback files are never applied automatically; if nobody looks in `/data/db/rollback/` after an incident, the data in them is gone for good.
+</Pitfall>
+
+## Real-world scenario: order status updates with `w: 1`
+
+A fulfilment service writes order status changes ("packed", "shipped") with `w: 1` to save a millisecond per write. During a network partition in the data center, the primary in rack A keeps accepting those writes for 10 s while the members in rack B elect a new primary. 3,000 status changes are confirmed to the service and then rolled back.
+
+| What breaks | Why |
+|---|---|
+| Orders shown as "packed" again after being shipped | The "shipped" updates were rolled back; the service believes they succeeded and never resends them |
+| Carrier pickups booked twice | A retry job reads the old status from the new primary and books again |
+| Nobody notices for days | The rolled-back documents sit in a BSON file on one server |
+
+| Fix | Effect |
+|---|---|
+| `w: "majority"` for anything a customer or another system will act on | A confirmed write survives the failover (here: 2 ms median per write on a healthy set) |
+| Alert on the log message "Rollback summary" and on files in the rollback directory | Rollbacks become an incident, not a silent loss |
+| Keep `w: 1` only for data you can rebuild (counters, caches, logs) | The loss is acceptable by design |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 1 | The same 10 s timeout decides how long the old primary keeps accepting writes |
+| Concept 3 | PostgreSQL's equivalent: commits acknowledged by an async primary and missing on the promoted standby |
+| Concept 5 | Why the old primary stepped down by itself: it needs a majority to stay primary |
+| [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) | The replica set setup |
+
+## Key takeaways
+
+1. A primary cut off from the majority keeps accepting `w: 1` writes until it notices, about `electionTimeoutMillis` later: 9.5 s and 19,332 writes here.
+2. When it rejoins, every write the new primary does not have is rolled back: all 19,333.
+3. Rolled-back documents are saved to `/data/db/rollback/`, never reapplied automatically.
+4. Writes confirmed with `w: "majority"` are never rolled back.
+5. A `w: "majority"` write that times out has an unknown outcome; here it was rolled back.
+
+## Check questions
+
+1. Why did the cut-off primary keep accepting `w: 1` writes for 9.5 s instead of stopping at once?
+2. The `w: "majority"` write timed out after 3 s. Was it lost at that moment?
+3. Why were the 500 writes on the new primary kept and the 19,332 on the old one removed, rather than the other way round?
+4. Where did the rolled-back documents go, and what must happen for them to reach the database again?
+5. Which writes in a marketplace back end would you allow with `w: 1`, and which not?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-5-failover/concept-2-lost-writes-and-rollback/answers">Worked answers to Q1–Q5</DeepDive>

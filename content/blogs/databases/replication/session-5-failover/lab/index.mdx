@@ -1,0 +1,322 @@
+---
+title: "Lab and session quiz: Failover"
+description: "Kill and step down a MongoDB primary under a write loop and compare retryable and non-retryable writes; cut a primary off and recover its rolled-back writes; crash a PostgreSQL primary with async and sync replication and count lost commits; rewind the old primary; promote a MySQL replica and find the errant GTIDs on the old source."
+type: "how-to"
+tags: ["replication", "failover", "lab", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/replica-set-elections/"
+  - "https://www.mongodb.com/docs/manual/core/replica-set-rollbacks/"
+  - "https://www.postgresql.org/docs/17/app-pgrewind.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-gtids-concepts.html"
+---
+
+<Tldr>
+Uses `rp-setup.sh` and `rp-teardown.sh` from the [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) with prefix `rp`. Run **one engine at a time** (`rp-setup.sh rp mongo`, finish, `rp-teardown.sh rp`, then `rp-setup.sh rp pg`, …): every exercise kills or isolates containers, and a fresh cluster is the simplest reset. The scripts below take the prefix from `P` (default `rp`). Lab numbers come from the course machine; election and lag timings vary from run to run, so run each exercise more than once.
+</Tldr>
+
+## Setup
+
+Save the helper scripts below into one folder and make them executable (`chmod +x *.sh`). Each needs Docker and nothing else.
+
+`writer.js`, the write loop used in Exercise 1 (runs inside a client container):
+
+```js
+// Insert documents in a loop for DUR ms; report the slowest writes and every failed write.
+// Set before --file: URI, DUR, WC (writeConcern w), TAG.
+const conn = Mongo(URI); const d = conn.getDB('lab');
+let i = 0, ok = 0, errs = 0; const slow = [], fails = []; const t0 = Date.now(); const end = t0 + DUR; const lat = []; const perSec = {};
+while (Date.now() < end) {
+  const s = Date.now();
+  try {
+    d.w.insertOne({ tag: TAG, i: i, at: new Date() }, { writeConcern: { w: WC } }); ok++; const sec = Math.floor((Date.now() - t0) / 1000); perSec[sec] = (perSec[sec] || 0) + 1;
+    const ms = Date.now() - s; lat.push(ms); if (ms > 50) slow.push({ i, at: s - t0, ms });
+  } catch (e) { errs++; fails.push({ i, at: s - t0, ms: Date.now() - s, err: (e.codeName || '') + ' ' + String(e.message).slice(0, 90) }); }
+  i++;
+}
+lat.sort((a, b) => a - b);
+printjson({ TAG, t0, perSec: JSON.stringify(perSec), ok, errs, median: lat[Math.floor(lat.length / 2)], max: lat[lat.length - 1],
+  slow: slow.sort((a, b) => b.ms - a.ms).slice(0, 5), fails: fails.slice(0, 5), nFails: fails.length });
+```
+
+`isolated.js`, run on a cut-off primary in Exercise 2:
+
+```js
+// Runs ON the isolated primary (localhost): keep inserting with w:1 and w:majority until 20 s have passed.
+const d = db.getSiblingDB('lab'); const t0 = Date.now(); let ok1 = 0, lastOk1 = -1, firstErr = null, maj = null;
+// One w:majority write with a 3 s timeout right after isolation.
+try { d.r.insertOne({ k: 'maj-after-cut', at: new Date() }, { writeConcern: { w: 'majority', wtimeout: 3000 } }); maj = 'ok'; }
+catch (e) { maj = (e.codeName || '') + ' ' + String(e.message).slice(0, 120) + ' after ' + (Date.now() - t0) + ' ms'; }
+let i = 0;
+while (Date.now() - t0 < 20000) {
+  try { d.r.insertOne({ k: 'w1-after-cut', i: i++, at: new Date() }, { writeConcern: { w: 1 } }); ok1++; lastOk1 = Date.now() - t0; }
+  catch (e) { if (!firstErr) firstErr = { at: Date.now() - t0, err: (e.codeName || '') + ' ' + String(e.message).slice(0, 100) }; sleep(50); }
+}
+printjson({ maj, ok1, lastOk1, firstErr, stillPrimary: db.hello().isWritablePrimary });
+```
+
+## Exercise 1: elections and retryable writes (Concept 1)
+
+```bash
+bash rp-setup.sh rp mongo
+docker run -d --name rp-client --network rp-net --entrypoint sleep mongo:8.0 infinity
+```
+
+`mg-failover.sh`:
+
+```bash
+#!/bin/bash
+# Remove the MongoDB primary 5 s into a write loop and report what the writer saw.
+# Usage: P=rp ./mg-failover.sh <stepdown|stop|kill> <retryWrites: true|false>
+P=${P:-rp}; ACT=$1; RW=$2
+URI="mongodb://$P-mongo1:27017,$P-mongo2:27017,$P-mongo3:27017/?replicaSet=${P}rs&retryWrites=$RW"
+docker cp writer.js $P-client:/tmp/writer.js
+for n in $P-mongo1 $P-mongo2 $P-mongo3; do
+  PRIM=$(docker exec $n mongosh --quiet --eval 'db.hello().primary || ""' 2>/dev/null | cut -d: -f1) && [ -n "$PRIM" ] && break
+done
+echo "primary: $PRIM"
+docker exec $P-client mongosh --quiet --nodb \
+  --eval "const URI='$URI', DUR=20000, WC='majority', TAG='$ACT-$RW-$(date +%H%M%S)';" --file /tmp/writer.js &
+sleep 5
+case $ACT in
+  stepdown) docker exec $PRIM mongosh --quiet --eval 'rs.stepDown(60)' >/dev/null 2>&1 ;;
+  stop)     docker stop $PRIM >/dev/null ;;
+  kill)     docker kill $PRIM >/dev/null ;;
+esac
+wait
+# Election details from the new primary.
+for n in $P-mongo1 $P-mongo2 $P-mongo3; do
+  docker exec $n mongosh --quiet --eval 'if (db.hello().isWritablePrimary) { const m = rs.status().electionCandidateMetrics;
+    printjson({ newPrimary: db.hello().me, reason: m.lastElectionReason, elected: m.lastElectionDate }) }' 2>/dev/null
+done
+docker start $PRIM >/dev/null 2>&1   # a stopped or killed member rejoins as a secondary
+```
+
+Run each case, waiting 60 s after a stepdown (the stepped-down member may not stand for election for 60 s):
+
+```bash
+./mg-failover.sh stepdown true
+./mg-failover.sh stepdown false
+./mg-failover.sh kill true
+./mg-failover.sh kill false
+```
+
+Compare `errs`, `max` and `reason`. Lab results: stepdown `stepUpRequestSkipDryRun`, slowest write 117–216 ms, 0 errors with retry, 0–1 without; kill `electionTimeout`, stall 5.9–11.4 s; with retry, 5 of 10 runs still returned one `connection … closed` error.
+
+For a failed write, check whether it was stored (use the `TAG` and the `i` from the `fails` list):
+
+```js
+// on the new primary
+db.getSiblingDB('lab').w.countDocuments({ tag: '<TAG>', i: <i> })
+```
+
+## Exercise 2: rollback (Concept 2)
+
+`mg-rollback.sh`:
+
+```bash
+#!/bin/bash
+# Cut the MongoDB primary off from the other members, write to it with w:1 and w:majority, let the others elect
+# a new primary, reconnect, and show the rollback. Usage: P=rp ./mg-rollback.sh
+P=${P:-rp}
+for n in $P-mongo1 $P-mongo2 $P-mongo3; do
+  PRIM=$(docker exec $n mongosh --quiet --eval 'db.hello().primary || ""' 2>/dev/null | cut -d: -f1) && [ -n "$PRIM" ] && break
+done
+echo "primary: $PRIM"
+docker exec $PRIM mongosh --quiet lab --eval 'db.r.drop(); db.r.insertMany(Array.from({ length: 1000 }, (_, i) => ({ k: "before", i })), { writeConcern: { w: "majority" } }); print("before:", db.r.countDocuments())'
+docker cp isolated.js $PRIM:/tmp/isolated.js
+docker network disconnect $P-net $PRIM
+docker exec $PRIM mongosh --quiet lab /tmp/isolated.js            # 20 s of writes on the cut-off primary
+for n in $P-mongo1 $P-mongo2 $P-mongo3; do [ $n = $PRIM ] && continue
+  docker exec $n mongosh --quiet lab --eval 'if (db.hello().isWritablePrimary) { db.r.insertMany(Array.from({ length: 500 }, (_, i) => ({ k: "new-primary", i })), { writeConcern: { w: "majority" } }); print("new primary:", db.hello().me) }'
+done
+docker network connect $P-net $PRIM; sleep 20
+docker exec $PRIM mongosh --quiet lab --eval 'printjson(db.r.aggregate([{ $group: { _id: "$k", n: { $sum: 1 } } }]).toArray())'
+docker logs $PRIM 2>&1 | grep '"Rollback summary"' | tail -1 | cut -c1-400
+docker exec $PRIM sh -c 'ls -l /data/db/rollback/*/; bsondump /data/db/rollback/*/removed.*.bson 2>&1 >/dev/null | tail -1'
+```
+
+Expected: about 20,000 confirmed `w: 1` writes in about 9.5 s, `WriteConcernFailed` for the majority write after 3 s, `NotWritablePrimary` at about 9.7 s, then a "Rollback summary" with every one of them, and the collection back to 1,000 `before` + 500 `new-primary` documents. Inspect the file with `bsondump`. To put rolled-back documents back, the MongoDB documentation uses `mongorestore` on the rollback file; restoring into a separate collection lets you compare before deciding what to keep (this command was not run in the lab):
+
+```bash
+docker exec rp-mongo1 sh -c 'mongorestore --uri="mongodb://rp-mongo2:27017,rp-mongo3:27017/?replicaSet=rprs" \
+  --db=lab --collection=r_recovered /data/db/rollback/*/removed.*.bson'
+```
+
+Replace `rp-mongo1` with the node that was cut off.
+
+```bash
+bash rp-teardown.sh rp
+```
+
+## Exercise 3: crash a PostgreSQL primary (Concept 3)
+
+```bash
+bash rp-setup.sh rp pg
+```
+
+`pg-prepare.sh` (client container and table):
+
+```bash
+#!/bin/bash
+# After rp-setup.sh <prefix> pg: add a client container and the ev table. Usage: P=rp ./pg-prepare.sh
+P=${P:-rp}
+docker run -d --name $P-pgc --network $P-net --entrypoint sleep postgres:17-alpine infinity >/dev/null
+docker exec $P-pg1 psql -U postgres -qc "CREATE TABLE ev (id bigserial PRIMARY KEY, client int NOT NULL, at timestamptz NOT NULL DEFAULT clock_timestamp())"
+docker exec $P-pgc sh -c "echo 'INSERT INTO ev (client) VALUES (:client_id);' > /tmp/ins.sql"
+```
+
+`pg-crash.sh`:
+
+```bash
+#!/bin/bash
+# Crash the PostgreSQL primary under load and count acknowledged commits that survive promotion.
+# Usage: P=rp ./pg-crash.sh [cut]   ("cut" disconnects the standby from the network 2 s before the crash)
+P=${P:-rp}; CUT=$1
+docker exec $P-pgc sh -c 'rm -rf /tmp/pgb && mkdir -p /tmp/pgb'
+docker exec -w /tmp/pgb $P-pgc pgbench -h $P-pg1 -U postgres -n -c 8 -T 15 -f /tmp/ins.sql -l postgres >/dev/null 2>&1 &
+sleep 3; [ "$CUT" = cut ] && docker network disconnect $P-net $P-pg2; sleep 2
+docker exec $P-pg1 psql -U postgres -Atc "SELECT 'standby behind by ' || pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) || ' bytes, ' || sync_state FROM pg_stat_replication"
+docker kill $P-pg1 >/dev/null
+[ "$CUT" = cut ] && docker network connect $P-net $P-pg2
+wait
+ACK=$(docker exec $P-pgc sh -c 'cat /tmp/pgb/pgbench_log.* | wc -l')
+docker exec $P-pg2 psql -U postgres -Atc "SELECT pg_promote(wait => true)" >/dev/null
+ROWS=$(docker exec $P-pg2 psql -U postgres -Atc "SELECT count(*) FROM ev")
+echo "acknowledged=$ACK rows_after_promotion=$ROWS lost=$((ACK - ROWS))"
+```
+
+1. Async, healthy network: `./pg-prepare.sh && ./pg-crash.sh` → lab: 0 or 3 commits lost.
+2. Async, standby cut off 2 s before the crash: tear down, set up again, `./pg-prepare.sh && ./pg-crash.sh cut` → lab: 8,207, 14,491 and 15,883 lost.
+3. Sync: set up again and before the crash run
+
+```bash
+docker exec rp-pg1 psql -U postgres -c "ALTER SYSTEM SET synchronous_standby_names = '*'" -c "SELECT pg_reload_conf()"
+./pg-crash.sh cut
+```
+
+→ lab: 0 lost, and only about 1,900 commits acknowledged in total because commits stopped at the cut.
+
+4. The wait that does not time out (sync again, fresh setup):
+
+```bash
+docker exec rp-pg1 psql -U postgres -c "ALTER SYSTEM SET synchronous_standby_names = '*'" -c "SELECT pg_reload_conf()"
+docker network disconnect rp-net rp-pg2
+docker exec rp-pg1 psql -U postgres -c "SET statement_timeout = '2s'" -c "INSERT INTO ev (client) VALUES (101)"   # hangs
+# in a second terminal:
+docker exec rp-pg1 psql -U postgres -c "SELECT pid, wait_event FROM pg_stat_activity WHERE wait_event = 'SyncRep'"
+docker exec rp-pg1 psql -U postgres -c "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE wait_event = 'SyncRep'"
+docker network connect rp-net rp-pg2
+```
+
+## Exercise 4: rewind the old primary (Concepts 3 and 5)
+
+Fresh setup. `wal_log_hints` must be on **before** the failover:
+
+```bash
+bash rp-teardown.sh rp && bash rp-setup.sh rp pg && ./pg-prepare.sh
+docker exec rp-pg1 psql -U postgres -c "ALTER SYSTEM SET wal_log_hints = on"
+docker restart rp-pg1
+./pg-crash.sh
+# keep WAL on the new primary for the old one, right after promoting
+docker exec rp-pg2 psql -U postgres -c "SELECT pg_create_physical_replication_slot('standby1', true)"
+```
+
+Split brain: start the old primary. It comes back as a primary on timeline 1 and accepts writes:
+
+```bash
+docker start rp-pg1
+docker exec rp-pg1 psql -U postgres -c "SELECT pg_is_in_recovery()" -c "INSERT INTO ev (client) VALUES (201) RETURNING id"
+```
+
+Rewind it and make it a standby of the new primary:
+
+```bash
+docker stop rp-pg1
+docker run --rm --volumes-from rp-pg1 --network rp-net --user postgres postgres:17-alpine \
+  pg_rewind -D /var/lib/postgresql/data --source-server="host=rp-pg2 user=postgres" --progress
+docker run --rm --volumes-from rp-pg1 --user postgres postgres:17-alpine sh -c \
+  "touch /var/lib/postgresql/data/standby.signal && echo \"primary_conninfo = 'host=rp-pg2 user=postgres'\" >> /var/lib/postgresql/data/postgresql.auto.conf"
+docker start rp-pg1
+docker exec rp-pg1 psql -U postgres -c "SELECT pg_is_in_recovery(), count(*) FILTER (WHERE client = 201) FROM ev"   # t, 0
+docker exec rp-pg2 psql -U postgres -c "SELECT application_name, state FROM pg_stat_replication"   # walreceiver, streaming
+```
+
+Variations: skip `ALTER SYSTEM SET wal_log_hints` (pg_rewind refuses), or skip creating the slot and run some writes on `rp-pg2` first (the rewound server cannot find its WAL).
+
+```bash
+bash rp-teardown.sh rp
+```
+
+## Exercise 5: promote a MySQL replica (Concept 4)
+
+```bash
+bash rp-setup.sh rp mysql
+```
+
+`my-prepare.sh`:
+
+```bash
+#!/bin/bash
+# After rp-setup.sh <prefix> mysql: add a client container and lab.ev. Usage: P=rp ./my-prepare.sh
+P=${P:-rp}
+docker run -d --name $P-myc --network $P-net --entrypoint sleep mysql:8.4 infinity >/dev/null
+docker exec $P-my1 mysql -uroot -plab -e "CREATE DATABASE lab; CREATE TABLE lab.ev (id BIGINT AUTO_INCREMENT PRIMARY KEY, client INT NOT NULL, at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6))" 2>/dev/null
+```
+
+`my-failover.sh`:
+
+```bash
+#!/bin/bash
+# MySQL async failover: writer on <P>-my1; optionally cut the replica off at 3 s; kill the source at 5 s; promote
+# <P>-my2; restart the old source and compare. Usage: P=rp ./my-failover.sh [cut]
+P=${P:-rp}; CUT=$1
+m() { docker exec $1 mysql -uroot -plab -N -e "$2" 2>/dev/null; }
+docker exec $P-myc sh -c "yes 'INSERT INTO lab.ev (client) VALUES (1);' | head -n 300000 | mysql -h $P-my1 -uroot -plab 2>&1 | tail -1" &
+sleep 3; [ "$CUT" = cut ] && docker network disconnect $P-net $P-my2; sleep 2
+docker kill $P-my1 >/dev/null; wait
+[ "$CUT" = cut ] && docker network connect $P-net $P-my2; sleep 2
+echo "rows on the replica: $(m $P-my2 'SELECT COUNT(*) FROM lab.ev')"
+m $P-my2 "STOP REPLICA; RESET REPLICA ALL; SET GLOBAL super_read_only = OFF, read_only = OFF;"
+m $P-my2 "INSERT INTO lab.ev (client) VALUES (2), (2), (2)"
+echo "new primary after 3 inserts: $(m $P-my2 'SELECT COUNT(*), MAX(id) FROM lab.ev')"
+docker start $P-my1 >/dev/null; until docker exec $P-my1 mysql -uroot -plab -e "SELECT 1" >/dev/null 2>&1; do sleep 2; done
+echo "old source after restart: $(m $P-my1 'SELECT COUNT(*), MAX(id) FROM lab.ev')"
+NEW=$(m $P-my2 'SELECT @@gtid_executed' | tr -d '\n' | sed 's/\\n//g')
+echo "errant GTIDs on the old source: $(m $P-my1 "SELECT GTID_SUBTRACT(@@gtid_executed, '$NEW')")"
+```
+
+```bash
+./my-prepare.sh && ./my-failover.sh cut
+```
+
+Lab runs: 1,615 and 755 transactions only on the old source, errant GTID ranges `…:1211-2825` and `…:1037-1791`. Now re-point the old source and watch it fail:
+
+```bash
+docker exec rp-my1 mysql -uroot -plab -e "SET GLOBAL super_read_only = ON;
+  CHANGE REPLICATION SOURCE TO SOURCE_HOST='rp-my2', SOURCE_USER='root', SOURCE_PASSWORD='lab',
+  SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1; START REPLICA;"
+docker exec rp-my1 mysql -uroot -plab -e "SELECT LAST_ERROR_MESSAGE FROM performance_schema.replication_applier_status_by_worker WHERE LAST_ERROR_NUMBER <> 0"
+```
+
+Expected: `Duplicate entry '<first id the new primary issued>' for key 'ev.PRIMARY', Error_code: 1062`.
+
+## Reset
+
+```bash
+bash rp-teardown.sh rp
+docker rm -f rp-client rp-pgc rp-myc 2>/dev/null
+```
+
+## Session quiz
+
+1. A planned `rs.stepDown()` stalled writes for about 100 ms; a crash for up to 11.4 s. What decides the difference?
+2. With `retryWrites=true` a write still failed with `connection … closed` after a crash, and the document was in the collection afterwards. Explain both facts.
+3. A cut-off MongoDB primary confirmed about 20,000 `w: 1` writes. What happened to them, and where can you find them?
+4. Why is a `w: "majority"` write that timed out neither "failed" nor "succeeded"?
+5. With async replication, how many acknowledged PostgreSQL commits were lost when the standby was cut off 2 s before the crash, and why does a healthy-network test not show this?
+6. What does a synchronous standby cost when it becomes unreachable, and what happens if you cancel a waiting commit?
+7. Name the two preconditions for `pg_rewind` to bring an old primary back, besides stopping it.
+8. After a MySQL failover, re-pointing the old source failed with error 1062. What are the leftover transactions called, how do you list them, and what should you do with them?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-5-failover/lab/answers">Answers to the session quiz</DeepDive>

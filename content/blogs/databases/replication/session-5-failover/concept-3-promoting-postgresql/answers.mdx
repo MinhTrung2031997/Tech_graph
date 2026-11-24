@@ -1,0 +1,63 @@
+---
+title: "Answers: Promoting a PostgreSQL standby"
+description: "Worked answers to the Session 5 Concept 3 check questions."
+companion: "answers"
+tags: ["replication", "failover", "postgresql", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/warm-standby.html#SYNCHRONOUS-REPLICATION"
+  - "https://www.postgresql.org/docs/17/app-pgrewind.html"
+---
+
+<Tldr>
+The promoted standby's WAL is the new truth. Anything outside it is lost, unless replication was synchronous, and the old primary must be rewound to that truth before it can follow it.
+</Tldr>
+
+## Q1. Acknowledging what the standby never gets
+
+**Question:** why could the async primary acknowledge commits its standby would never receive?
+
+With `synchronous_standby_names` empty (the default), COMMIT returns once the primary has flushed its own WAL. Sending WAL to the standby happens independently, afterwards. Nothing in the commit path checks that the standby is even connected: in the run with the standby cut off, the primary acknowledged 14,578 transactions, 8,207 of them after the standby could no longer receive anything.
+
+> **Common mistake:** reading "replication lag 0" on a dashboard as "no data can be lost". Lag is measured while things work; the loss happens when they do not.
+
+## Q2. One row more than acknowledged
+
+**Question:** in the sync runs the promoted standby had one row more than the client had seen acknowledged. How is that possible?
+
+The commit sequence is: flush locally, wait for the standby's confirmation, then send "COMMIT" to the client. The standby had flushed that transaction, but the primary was killed before the reply reached `pgbench`, so the client logged it as failed. Synchronous replication guarantees that every acknowledged commit is on the standby, not the reverse.
+
+> **Common mistake:** treating a connection error during COMMIT as a rollback. The outcome is unknown; check before retrying.
+
+## Q3. The wait statement_timeout did not end
+
+**Question:** a commit waited 2 min 58 s despite `statement_timeout = '2s'`. Why did the timeout not fire, and what state was the row in?
+
+The INSERT statement itself finished at once; the wait happened at commit, after the statement, where the statement timer no longer applies. The transaction was already **committed locally** (its commit record flushed on the primary) and was waiting only for the standby's confirmation. Cancelling it with `pg_cancel_backend()` returned `WARNING: canceling wait for synchronous replication due to user request` with `DETAIL: The transaction has already committed locally, but might not have been replicated to the standby.` The row was visible on the primary and reached the standby when it reconnected.
+
+> **Common mistake:** expecting a timeout to make synchronous replication "fall back to async" like MySQL's semi-sync. PostgreSQL waits until the standby returns or someone changes the setting.
+
+## Q4. Why rewind
+
+**Question:** why does the old primary need `pg_rewind` before following the new primary?
+
+Both servers share history up to the fork point on timeline 1. After that, the new primary started timeline 2, while the old primary may have written more WAL on timeline 1 (here: a pending insert and update during the split, plus checkpoints). A standby can only replay WAL on top of a state that is a prefix of the source's history. The old primary's state is not, and its log said so: "new timeline 2 forked off current database system timeline 1 before current recovery point". `pg_rewind` copies back every block changed since the fork, so the old primary returns to the fork point and can then replay timeline 2.
+
+> **Common mistake:** deleting `postmaster.pid` and starting the old primary "as a standby" in the hope it catches up. It does not, and if it was promoted again by mistake it would bring back the lost branch.
+
+## Q5. Rewound but not streaming
+
+**Question:** `pg_rewind` succeeded, yet the old primary could not stream. Name the two problems seen and how to avoid each.
+
+1. `replication slot "standby1" does not exist`: slots live on the server where they were created, the old primary. Create the slot on the new primary (`pg_create_physical_replication_slot('standby1', true)`) or drop `primary_slot_name` from the rewound server's configuration.
+2. `requested WAL segment 000000020000000000000014 has already been removed`: the rewound server must replay the new primary's WAL from the fork point, and the new primary had recycled it. Create the slot **immediately after promoting**, or set `wal_keep_size`, or restore from a WAL archive (`restore_command`).
+
+> **Common mistake:** rewinding hours after the failover, when the WAL it needs is long gone. At that point a re-clone is the only option.
+
+## Q6. Sync with one standby
+
+**Question:** your company has one primary and one standby. Argue for or against `synchronous_standby_names = '*'`.
+
+For: no acknowledged commit can be lost by a primary crash (0 lost in both sync runs). Against: the standby becomes part of every commit's path. If it is down, slow or partitioned, **all writes stop** (1,935 commits in the run against 14,578 async), and `statement_timeout` does not help. With exactly one standby that is usually unacceptable. The common answer is two or more standbys with `synchronous_standby_names = 'ANY 1 (s1, s2)'`, so one can fail without stopping writes, plus `synchronous_commit = local` for data that may be lost (sessions, logs).
+
+> **Common mistake:** enabling sync replication with one standby to "be safe", then having the first standby maintenance stop the whole application.

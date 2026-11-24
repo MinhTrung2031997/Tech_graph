@@ -1,0 +1,65 @@
+---
+title: "Answers: Promoting a MySQL replica"
+description: "Worked answers to the Session 5 Concept 4 check questions."
+companion: "answers"
+tags: ["replication", "failover", "gtid", "mysql", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-gtids-concepts.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html#sysvar_super_read_only"
+---
+
+<Tldr>
+After a MySQL failover, the transactions the replica missed are not gone: they sit on the old source as errant GTIDs, waiting to conflict.
+</Tldr>
+
+## Q1. Reused ids
+
+**Question:** why did the new primary hand out ids 1204–1206 when the old source had already used them?
+
+InnoDB's auto-increment counter lives in each server and is derived from the rows that server has. The replica had applied rows up to id 1203; ids 1204–2818 were committed on the old source after the replica was cut off and never arrived. On promotion, the new primary simply continued from its own maximum. Nothing in MySQL coordinates id ranges between servers.
+
+> **Common mistake:** assuming auto-increment ids are unique "across the cluster". They are unique per server's data.
+
+## Q2. Errant GTIDs
+
+**Question:** what is an errant GTID, and how did you find the ones on the old source?
+
+A transaction recorded in one server's `gtid_executed` that the authoritative primary does not have. Here they were the old source's own transactions 1211–2825 (its UUID `8b1c…`), committed after the replica lost contact. Found with `SELECT GTID_SUBTRACT(<old source gtid_executed>, <new primary gtid_executed>)`, which returned `8b1c…:1211-2825`.
+
+> **Common mistake:** comparing only row counts. Two servers can have the same count and different rows; GTID sets show which transactions differ.
+
+## Q3. Failing on the first transaction
+
+**Question:** why did replication from the new primary to the old source fail on its **first** transaction?
+
+With auto-positioning, the old source told the new primary which GTIDs it already had, and the new primary sent everything else: its own new transactions, starting with `8b356a6f-…:6`, the insert of id 1204. The old source already had a row with id 1204 (one of its errant transactions), so the row event failed with `Duplicate entry '1204' for key 'ev.PRIMARY'` and the applier stopped.
+
+> **Common mistake:** "fixing" it with `replica_skip_errors = 1062` or by injecting empty transactions. That leaves the two servers permanently different.
+
+## Q4. Silent errant transactions
+
+**Question:** could errant transactions go unnoticed? Give an example.
+
+Yes. Suppose the errant transactions were updates to sellers' bank details on the old source, and the new primary never touches those rows again. The old source replicates from the new primary without any error, but it keeps the updated bank details while the new primary has the old ones. Nobody notices until a later failover makes the old source primary again, or its errant GTIDs are shipped to other replicas, which then hold data the primary never had.
+
+> **Common mistake:** concluding "replication is running, so the data matches".
+
+## Q5. super_read_only
+
+**Question:** why is `super_read_only` better than `read_only` on a replica?
+
+`read_only = ON` still lets accounts with `SUPER` or `CONNECTION_ADMIN` write, and many applications and scripts connect as such accounts (in the lab, `root`). `super_read_only = ON` blocks them too, with `ERROR 1290`, while the replication threads keep applying changes. In the lab both were 0 on a fresh replica, and a `root` insert succeeded and broke replication.
+
+> **Common mistake:** setting it with `SET GLOBAL` only. After a restart it is back to the configuration file's value, which is exactly when an old source should come back read-only.
+
+## Q6. Bringing the old source back
+
+**Question:** write the steps you would follow to bring the old source back as a replica safely.
+
+1. Start it with `super_read_only = ON` (in its configuration) and without starting replication.
+2. Compare: `GTID_SUBTRACT(old, new)`. If empty, re-point it with `CHANGE REPLICATION SOURCE TO … SOURCE_AUTO_POSITION = 1` and start.
+3. If not empty: extract the errant transactions (`mysqlbinlog --include-gtids=<errant set>` on its binlogs), decide with the business which to re-apply on the new primary as new transactions.
+4. Then discard the old source's data and re-clone it from the new primary (`CLONE INSTANCE FROM …` or a fresh backup), and only then start replication.
+
+> **Common mistake:** doing step 4 before step 3, which destroys the only copy of the lost orders.

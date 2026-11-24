@@ -1,0 +1,54 @@
+---
+title: "Answers: Split brain and fencing"
+description: "Worked answers to the Session 5 Concept 5 check questions."
+companion: "answers"
+tags: ["replication", "split-brain", "fencing", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/warm-standby-failover.html"
+  - "https://www.mongodb.com/docs/manual/core/replica-set-elections/"
+---
+
+<Tldr>
+A failover is safe only when exactly one node can write. Databases with majority membership enforce that themselves; PostgreSQL and MySQL replication leave it to the tooling around them.
+</Tldr>
+
+## Q1. Same row count
+
+**Question:** both PostgreSQL servers had 1,010 rows. Why is that not reassuring?
+
+The counts matched by coincidence: each side had the same 1,000 shared rows plus 10 of its own. The ten rows on `rpc-pg1` came from client 201, those on `rpc-pg2` from client 202, and the ids differed (`rpc-pg2` reached 1033 because its sequence jumped on promotion). Split brain is about **different** writes, not more or fewer rows.
+
+> **Common mistake:** checking a split by comparing `count(*)`. Compare timelines (or GTID sets) and the rows written after the fork.
+
+## Q2. Majority vs no majority
+
+**Question:** why can a MongoDB replica set not keep two primaries confirming `w: "majority"` writes, while two PostgreSQL primaries can both confirm commits?
+
+A MongoDB primary needs acknowledgements from a majority of voting members for a `w: "majority"` write, and only one side of any partition can contain a majority. The minority side cannot confirm such writes, and it gives up the primary role after about `electionTimeoutMillis` (here 9.7 s). A PostgreSQL primary confirms a commit with only its own WAL flush (or one synchronous standby); it never asks anyone whether it is still the primary, so both sides of a partition can confirm commits indefinitely.
+
+> **Common mistake:** believing MongoDB cannot lose writes in a partition. `w: 1` writes on the minority side are confirmed and later rolled back (Concept 2).
+
+## Q3. Why two nodes need a third
+
+**Question:** why does a 2-node setup with automatic failover need a third party (a witness or consensus store)?
+
+With two nodes, when they lose contact each sees the same thing: "the other is gone". Neither can tell a dead peer from a broken link, and neither has a majority on its own. Either both promote (split brain) or neither does (no failover). A third vote (a witness node, an arbiter, a consensus store in another location) lets exactly one side form a majority of 2 of 3.
+
+> **Common mistake:** putting the third vote in the same rack or availability zone as one of the databases, so a single failure takes two of three votes.
+
+## Q4. A VIP is not fencing
+
+**Question:** why is moving the virtual IP not enough to fence the old primary?
+
+Moving the VIP only changes where **new** connections go. Existing connections in application pools, workers with cached DNS answers, cron jobs with a host name in their configuration and admin sessions keep reaching the old primary's real address, and the old primary still accepts writes from them. Fencing has to stop the **server** from writing: shut it down, make it read-only, or isolate it.
+
+> **Common mistake:** testing failover with a fresh client after moving the VIP, which of course reaches the new primary.
+
+## Q5. Fencing for a PostgreSQL pair on cloud VMs
+
+**Question:** which fencing method would you choose for a PostgreSQL pair on cloud VMs, and why?
+
+A lease in a consensus store across three zones, as Patroni does with etcd: the primary may stay primary only while it can renew its leader key, and demotes itself to read-only when it cannot, so a cut-off primary stops writing on its own within the lease time. Add a watchdog so a hung node that cannot demote itself is rebooted. A cloud-API STONITH (stopping the old VM before promoting) is a reasonable addition, but it depends on the cloud API being reachable during the very incident that caused the failover.
+
+> **Common mistake:** relying on "the old primary is probably down" because health checks fail from one location.
