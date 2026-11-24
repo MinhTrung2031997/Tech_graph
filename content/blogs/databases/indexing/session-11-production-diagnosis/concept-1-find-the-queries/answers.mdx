@@ -1,0 +1,71 @@
+---
+title: "Answers: Find the queries that cost the most"
+description: "Worked answers to the Session 11 Concept 1 check questions."
+companion: "answers"
+tags: ["indexing", "diagnosis", "pg_stat_statements", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pgstatstatements.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/performance-schema-statement-digests.html"
+  - "https://www.mongodb.com/docs/manual/tutorial/manage-the-database-profiler/"
+---
+
+<Tldr>
+Total time over a known window first; per-call evidence second; the slowest single execution last.
+</Tldr>
+
+## Q1. 39 ms vs 121 ms
+
+**Question:** why was the order-detail query (39 ms) a bigger problem than the top-SKU report (121 ms)?
+
+Because it ran 21 times as often. Order detail: 3,990 calls × 39.3 ms = **156.9 s** (69% of execution time). Top SKUs: 188 × 121 ms = **22.8 s** (10%). Making the report instant would free at most 10% of the server; fixing order detail frees two thirds. It also runs on a page customers wait for, while the report runs for staff.
+
+> **Common mistake:** optimizing whichever query tops the slow log, because it has the biggest number next to it.
+
+## Q2. 16,707 buffers for 2 rows
+
+**Question:** what does 16,707 buffers per call tell you when the query returns 2 rows?
+
+`order_items` has 16,667 pages, so each call reads the whole table (plus a few index pages for `orders`): a sequential scan for 2 rows. That is the plan signal of a missing index on the filter or join column, here `order_items.order_id` (Session 9). With the index, the same call needs ≈ 8 buffers.
+
+> **Common mistake:** reading only the time. On a warm cache a full scan of a 130 MB table takes 39 ms and looks "fine"; the buffer count shows it is not.
+
+## Q3. Resetting everything
+
+**Question:** why should you not call `pg_stat_statements_reset()` with no arguments on a shared server?
+
+It clears the statistics of **every** user and database. Other teams lose their history, monitoring that computes rates from the counters sees a jump, and nobody can compare before and after any more. Reset only what you measure: `pg_stat_statements_reset(0, <dbid>, 0)` for one database (or a specific `queryid`), or record the counters before and subtract, as with MySQL.
+
+> **Common mistake:** resetting in production "to get a clean picture" and losing the month of data that showed when a regression started.
+
+## Q4. MySQL snapshot diff
+
+**Question:** why does MySQL need a snapshot diff, and what does `sys.statements_with_full_table_scans` show after a fix?
+
+The digest table accumulates since the server started, and truncating it (`TRUNCATE performance_schema.events_statements_summary_by_digest`) resets it for everyone. Copying the counters into a table before a window and subtracting afterwards measures just that window. After the indexes were added, the `sys` view still showed the login with half of its executions "without an index" and `rows_examined_avg` 50,001, the average of 100,000 before the fix and 1 after. A cumulative view cannot say whether the fix worked; the diff of the second run showed 146 executions, 1 row examined each, 0 without an index.
+
+> **Common mistake:** concluding a fix "didn't work" because `no_index_used_count` is still non-zero.
+
+## Q5. ORDER BY total_latency
+
+**Question:** what went wrong with `ORDER BY total_latency` on `sys.statement_analysis`?
+
+In `sys.statement_analysis`, latency columns are formatted strings ("33.19 s", "98.03 ms"). Sorting them compares text, so "98.03 ms" and "92.67 ms" sorted above "910.56 ms". The `x$` versions (`sys.x$statement_analysis`) expose raw picoseconds; sort on those and format with `sys.format_time()` for display.
+
+> **Common mistake:** trusting a view's column because it looks numeric.
+
+## Q6. Profiler scope
+
+**Question:** which MongoDB profiler settings are per database and which are server-wide?
+
+The **level** (0, 1, 2) and the `system.profile` collection are per database. `slowms`, `sampleRate` and `filter` apply to the whole `mongod`: they also control what goes into the slow query log for every database. Changing `slowms` to see your queries changes logging for everyone.
+
+> **Common mistake:** setting `slowms: 0` "for a minute" on a busy server and filling the disk with log lines.
+
+## Q7. What a threshold log hides
+
+**Question:** a slow query log with a 100 ms threshold is your only tool. Which query from this workload would you never see, and why does it matter?
+
+The login by email (4.6 ms in PostgreSQL, 7.9 ms in MySQL, 7.3 ms in MongoDB) and the order detail in PostgreSQL (39 ms). Together they were 81% of PostgreSQL's database time. A threshold log shows only rare, slow statements, like the reports. Frequent, moderately slow statements need an aggregating tool (`pg_stat_statements`, digests, the profiler at level 2 or with a low `slowms` during a sampling window).
+
+> **Common mistake:** lowering the threshold to 0 in production to catch everything; use the aggregated statistics instead.

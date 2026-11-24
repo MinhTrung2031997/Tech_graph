@@ -1,0 +1,406 @@
+---
+title: "Lab and session quiz: Capstone: diagnosing indexes in production"
+description: "Run an 8-query e-commerce workload against all three engines, rank it with pg_stat_statements, MySQL digest snapshots and the MongoDB profiler, capture plans with auto_explain and the optimizer trace, test candidate indexes with hypopg, invisible and hidden indexes, measure WAL per write, then fix, re-measure and decide when to stop."
+type: "how-to"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "pg_stat_statements", "hypopg", "pgbench", "lab", "capstone"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pgbench.html"
+  - "https://www.postgresql.org/docs/current/pgstatstatements.html"
+  - "https://www.postgresql.org/docs/current/auto-explain.html"
+  - "https://hypopg.readthedocs.io/en/latest/installation.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/performance-schema-statement-digests.html"
+  - "https://www.mongodb.com/docs/manual/tutorial/manage-the-database-profiler/"
+---
+
+<Tldr>
+Uses the containers from the [Session 1 lab](/blogs/databases/indexing/session-1-storage-basics/lab) (aliases `pg`, `my`, `mg`) and the `customers` and `order_items` tables from the [Session 9 lab](/blogs/databases/indexing/session-9-indexes-for-joins/lab); run that setup first. Step 1 restarts PostgreSQL once and returns the three tables to the case study's starting point. Page, buffer, row and key counts for single queries should match this page; workload totals and every timing will not (they depend on your machine and what else runs on it). Run the shell parts with `bash`.
+</Tldr>
+
+## 1. Setup
+
+### PostgreSQL: preload two modules, install hypopg
+
+```bash
+# Each library is its own string; '...,...' as one string names a library that does not exist,
+# and the server then refuses to start.
+docker exec idx-pg psql -U postgres -c "ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements', 'auto_explain'"
+docker restart idx-pg && sleep 3
+docker exec idx-pg psql -U postgres -c "SHOW shared_preload_libraries"      # pg_stat_statements, auto_explain
+
+# hypopg is not in the image: compile it inside the container (no restart needed).
+docker exec idx-pg sh -c 'apk add --no-cache build-base >/dev/null && cd /tmp &&
+  wget -q https://github.com/HypoPG/hypopg/archive/refs/tags/1.4.2.tar.gz -O hypopg.tgz &&
+  tar xzf hypopg.tgz && cd hypopg-1.4.2 && make with_llvm=no && make with_llvm=no install'
+```
+
+```sql
+-- pg
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+CREATE EXTENSION IF NOT EXISTS hypopg;
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+```
+
+If the restart fails, `docker logs idx-pg` shows `could not access file "pg_stat_statements,auto_explain"`: fix `postgresql.auto.conf` with `docker cp` out, edit, `docker cp` back, then `docker start idx-pg`.
+
+### Return to the starting point
+
+The Session 9 lab (and Session 10) left indexes and a foreign key that would hide the problems this case study finds. The scripts below keep the primary keys plus `orders (customer_id)` and `(status, created_at)`, drop the foreign key (MySQL cannot keep it without an index on `order_id`), and delete rows added by earlier runs of this lab. Run them again whenever you want to restart the case study.
+
+```sql
+-- pg-s11-reset.sql: docker exec -i idx-pg psql -U postgres -q < pg-s11-reset.sql
+ALTER TABLE order_items DROP CONSTRAINT IF EXISTS order_items_order_fk;
+DO $$ DECLARE r record; BEGIN
+  FOR r IN SELECT i.indexrelid::regclass::text AS idx
+           FROM pg_index i JOIN pg_class t ON t.oid = i.indrelid
+           WHERE t.relname IN ('orders', 'customers', 'order_items')
+             AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid)   -- keep primary keys
+             AND i.indexrelid::regclass::text NOT IN ('orders_customer_idx', 'orders_status_created_idx')
+  LOOP EXECUTE format('DROP INDEX %s', r.idx); END LOOP;
+END $$;
+CREATE INDEX IF NOT EXISTS orders_customer_idx ON orders (customer_id);
+CREATE INDEX IF NOT EXISTS orders_status_created_idx ON orders (status, created_at);
+-- Remove orders and items inserted by earlier runs of the checkout script.
+DELETE FROM order_items WHERE id > 2000000;
+DELETE FROM orders WHERE id > 1000000;
+DROP SEQUENCE IF EXISTS wl_orders, wl_items;
+CREATE SEQUENCE wl_orders START 1000001;
+CREATE SEQUENCE wl_items START 2000001;
+ALTER DATABASE postgres RESET random_page_cost;
+VACUUM ANALYZE orders;
+VACUUM ANALYZE order_items;
+VACUUM ANALYZE customers;
+```
+
+```sql
+-- mysql-s11-reset.sql: prints the statements to run; pipe them back into mysql
+--   docker exec -i idx-mysql mysql -uroot -plab lab -N < mysql-s11-reset.sql | docker exec -i idx-mysql mysql -uroot -plab lab
+SELECT CONCAT('ALTER TABLE ', TABLE_NAME, ' DROP FOREIGN KEY ', CONSTRAINT_NAME, ';')
+FROM information_schema.TABLE_CONSTRAINTS
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('orders', 'customers', 'order_items') AND CONSTRAINT_TYPE = 'FOREIGN KEY';
+SELECT DISTINCT CONCAT('ALTER TABLE ', TABLE_NAME, ' DROP INDEX ', INDEX_NAME, ';')
+FROM information_schema.STATISTICS
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('orders', 'customers', 'order_items')
+  AND INDEX_NAME NOT IN ('PRIMARY', 'orders_customer_idx', 'orders_status_created_idx');
+SELECT 'ALTER TABLE orders ADD INDEX orders_customer_idx (customer_id);' FROM DUAL
+WHERE NOT EXISTS (SELECT 1 FROM information_schema.STATISTICS
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'orders' AND INDEX_NAME = 'orders_customer_idx');
+SELECT 'DELETE FROM order_items WHERE id > 2000000; DELETE FROM orders WHERE id > 1000000; ANALYZE TABLE orders, customers, order_items;';
+```
+
+```js
+// mongo-s11-reset.js: docker cp mongo-s11-reset.js idx-mongo:/ && docker exec idx-mongo mongosh --quiet lab /mongo-s11-reset.js
+const keep = { orders: ['_id_', 'customer_id_1', 'es'], customers: ['_id_'], order_items: ['_id_'] };
+for (const [c, names] of Object.entries(keep))
+  db[c].getIndexes().map(i => i.name).filter(n => !names.includes(n)).forEach(n => db[c].dropIndex(n));
+db.orders.createIndex({ customer_id: 1 });                                  // no-op if it exists
+db.orders.createIndex({ status: 1, created_at: -1 }, { name: 'es' });
+db.orders.deleteMany({ _id: { $gt: 1000000 } });                            // checkouts from earlier runs
+db.order_items.deleteMany({ _id: { $gt: 2000000 } });
+for (const c of Object.keys(keep)) print(c, JSON.stringify(db[c].getIndexes().map(i => i.name)), db[c].estimatedDocumentCount());
+```
+
+Check: PostgreSQL `orders` 10,102 pages, `order_items` 16,667, `customers` 854; 513 gold customers in SG in every engine.
+
+### The workload
+
+PostgreSQL: save the 8 pgbench scripts in a folder `wl/`, then `docker cp wl idx-pg:/wl`.
+
+```sql
+-- wl/q1_login.sql: find a customer by email
+\set c random(1, 100000)
+SELECT id, tier, country FROM customers WHERE email = 'c' || :c || '@example.com';
+
+-- wl/q2_history.sql: a customer's newest orders (first page of a keyset list)
+\set c random(1, 100000)
+SELECT id, created_at, status, amount FROM orders
+WHERE customer_id = :c AND created_at < '2026-01-01' ORDER BY created_at DESC LIMIT 20;
+
+-- wl/q3_detail.sql: one order with its items
+\set id random(1, 1000000)
+SELECT o.id, o.status, o.amount, i.sku, i.qty, i.price
+FROM orders o JOIN order_items i ON i.order_id = o.id WHERE o.id = :id;
+
+-- wl/q4_admin.sql: newest pending orders of one day
+\set d random(0, 360)
+SELECT id, customer_id, amount, created_at FROM orders
+WHERE status = 'pending'
+  AND created_at >= timestamptz '2025-01-01' + :d * interval '1 day'
+  AND created_at <  timestamptz '2025-01-02' + :d * interval '1 day'
+ORDER BY created_at DESC LIMIT 50;
+
+-- wl/q5_daily.sql: daily revenue report for one week
+\set w random(0, 50)
+SELECT date_trunc('day', created_at) AS day, count(*), sum(amount) FROM orders
+WHERE created_at >= timestamptz '2025-01-01' + :w * interval '7 days'
+  AND created_at <  timestamptz '2025-01-08' + :w * interval '7 days'
+GROUP BY 1 ORDER BY 1;
+
+-- wl/q6_topsku.sql: top 10 SKUs of one week
+\set w random(0, 50)
+SELECT i.sku, sum(i.qty) AS units FROM orders o JOIN order_items i ON i.order_id = o.id
+WHERE o.created_at >= timestamptz '2025-01-01' + :w * interval '7 days'
+  AND o.created_at <  timestamptz '2025-01-08' + :w * interval '7 days'
+GROUP BY i.sku ORDER BY units DESC LIMIT 10;
+
+-- wl/q7_latest.sql: latest order of each gold customer in one country
+\set k random(0, 4)
+SELECT c.id, o.id AS order_id, o.created_at, o.amount
+FROM customers c
+CROSS JOIN LATERAL (SELECT id, created_at, amount FROM orders
+                    WHERE customer_id = c.id ORDER BY created_at DESC LIMIT 1) o
+WHERE c.tier = 'gold' AND c.country = (ARRAY['VN','TH','SG','MY','PH'])[1 + :k];
+
+-- wl/q8_checkout.sql: insert one order and its two items
+\set c random(1, 100000)
+BEGIN;
+INSERT INTO orders VALUES (nextval('wl_orders'), :c, 'pending', 'web', 'SKU-000042', 59.90, now());
+INSERT INTO order_items VALUES (nextval('wl_items'), currval('wl_orders'), 'SKU-000042', 1, 29.95),
+                               (nextval('wl_items'), currval('wl_orders'), 'SKU-000777', 1, 29.95);
+COMMIT;
+```
+
+```bash
+#!/bin/bash
+# run-pg.sh: reset this database's statistics, run 60 s with 4 clients, print the ranking.
+P() { docker exec idx-pg psql -U postgres "$@"; }
+P -Atc "SELECT pg_stat_statements_reset(0, (SELECT oid FROM pg_database WHERE datname = current_database()), 0)" >/dev/null
+docker exec idx-pg sh -c 'cd /wl && pgbench -U postgres -n -c 4 -j 2 -T 60 \
+  -f q1_login.sql@30 -f q2_history.sql@25 -f q3_detail.sql@20 -f q4_admin.sql@4 \
+  -f q5_daily.sql@1 -f q6_topsku.sql@1 -f q7_latest.sql@2 -f q8_checkout.sql@17 postgres' | grep -E "processed|^tps"
+P -c "SELECT left(regexp_replace(query, '\s+', ' ', 'g'), 45) AS query, calls,
+       round(total_exec_time) AS total_ms, round(mean_exec_time::numeric, 2) AS mean_ms,
+       round(100 * total_exec_time / sum(total_exec_time) OVER ()) AS pct,
+       (shared_blks_hit + shared_blks_read) / calls AS blks_per_call
+FROM pg_stat_statements
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND query NOT LIKE '%pg_stat_statements%'
+ORDER BY total_exec_time DESC LIMIT 10"
+```
+
+MySQL: generate 500 statements with the same mix (`oid`/`iid` set the first new order and item ids; use new ones for every run).
+
+```awk
+# gen-mysql-wl.awk: awk -v n=500 -v seed=1 -v oid=1000001 -v iid=2000001 -f gen-mysql-wl.awk > wl-1.sql
+BEGIN {
+  srand(seed);
+  ctry[0]="VN"; ctry[1]="TH"; ctry[2]="SG"; ctry[3]="MY"; ctry[4]="PH";
+  for (k = 0; k < n; k++) {
+    r = rand() * 100; c = 1 + int(rand() * 100000); id = 1 + int(rand() * 1000000);
+    d = int(rand() * 361); w = int(rand() * 51);
+    if (r < 30) printf "SELECT id, tier, country FROM customers WHERE email = 'c%d@example.com';\n", c;
+    else if (r < 55) printf "SELECT id, created_at, status, amount FROM orders WHERE customer_id = %d AND created_at < '2026-01-01' ORDER BY created_at DESC LIMIT 20;\n", c;
+    else if (r < 75) printf "SELECT o.id, o.status, o.amount, i.sku, i.qty, i.price FROM orders o JOIN order_items i ON i.order_id = o.id WHERE o.id = %d;\n", id;
+    else if (r < 79) printf "SELECT id, customer_id, amount, created_at FROM orders WHERE status = 'pending' AND created_at >= '2025-01-01' + INTERVAL %d DAY AND created_at < '2025-01-02' + INTERVAL %d DAY ORDER BY created_at DESC LIMIT 50;\n", d, d;
+    else if (r < 80) printf "SELECT DATE(created_at) AS day, COUNT(*), SUM(amount) FROM orders WHERE created_at >= '2025-01-01' + INTERVAL %d DAY AND created_at < '2025-01-08' + INTERVAL %d DAY GROUP BY day ORDER BY day;\n", w*7, w*7;
+    else if (r < 81) printf "SELECT i.sku, SUM(i.qty) AS units FROM orders o JOIN order_items i ON i.order_id = o.id WHERE o.created_at >= '2025-01-01' + INTERVAL %d DAY AND o.created_at < '2025-01-08' + INTERVAL %d DAY GROUP BY i.sku ORDER BY units DESC LIMIT 10;\n", w*7, w*7;
+    else if (r < 83) printf "SELECT c.id, o.id AS order_id, o.created_at, o.amount FROM customers c JOIN LATERAL (SELECT id, created_at, amount FROM orders WHERE customer_id = c.id ORDER BY created_at DESC LIMIT 1) o ON TRUE WHERE c.tier = 'gold' AND c.country = '%s';\n", ctry[int(rand()*5)];
+    else { printf "START TRANSACTION; INSERT INTO orders VALUES (%d, %d, 'pending', 'web', 'SKU-000042', 59.90, NOW()); INSERT INTO order_items VALUES (%d, %d, 'SKU-000042', 1, 29.95), (%d, %d, 'SKU-000777', 1, 29.95); COMMIT;\n", oid, c, iid, oid, iid+1, oid; oid++; iid += 2; }
+  }
+}
+```
+
+The snapshot and diff queries are on the [Concept 1 page](/blogs/databases/indexing/session-11-production-diagnosis/concept-1-find-the-queries); save them as `digest-snap.sql` and `digest-diff.sql`.
+
+MongoDB: a seeded loop with the same mix (set `N` and the first new order id `OID` when you run it).
+
+```js
+// mongo-wl.js: docker cp mongo-wl.js idx-mongo:/ && docker exec idx-mongo mongosh --quiet lab --eval 'const N = 300; let OID = 1000001;' --file /mongo-wl.js
+const rnd = (() => { let a = 12345; return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; })();   // seeded PRNG
+const day = d => new Date(Date.UTC(2025, 0, 1) + d * 86400000);
+const countries = ['VN', 'TH', 'SG', 'MY', 'PH'];
+let timeouts = 0;
+for (let k = 0; k < N; k++) {
+  const r = rnd() * 100, c = 1 + Math.floor(rnd() * 100000), id = 1 + Math.floor(rnd() * 1000000);
+  const d = Math.floor(rnd() * 361), w = Math.floor(rnd() * 51);
+  try {
+    if (r < 30) db.customers.findOne({ email: `c${c}@example.com` }, { tier: 1, country: 1 });
+    else if (r < 55) db.orders.find({ customer_id: c, created_at: { $lt: new Date('2026-01-01') } },
+      { created_at: 1, status: 1, amount: 1 }).sort({ created_at: -1 }).limit(20).toArray();
+    else if (r < 75) db.orders.aggregate([{ $match: { _id: id } },
+      { $lookup: { from: 'order_items', localField: '_id', foreignField: 'order_id', as: 'items' } }]).toArray();
+    else if (r < 79) db.orders.find({ status: 'pending', created_at: { $gte: day(d), $lt: day(d + 1) } },
+      { customer_id: 1, amount: 1, created_at: 1 }).sort({ created_at: -1 }).limit(50).toArray();
+    else if (r < 80) db.orders.aggregate([{ $match: { created_at: { $gte: day(w * 7), $lt: day(w * 7 + 7) } } },
+      { $group: { _id: { $dateTrunc: { date: '$created_at', unit: 'day' } }, n: { $sum: 1 }, revenue: { $sum: '$amount' } } },
+      { $sort: { _id: 1 } }]).toArray();
+    else if (r < 81) db.orders.aggregate([{ $match: { created_at: { $gte: day(w * 7), $lt: day(w * 7 + 7) } } },
+      { $lookup: { from: 'order_items', localField: '_id', foreignField: 'order_id', as: 'items' } },
+      { $unwind: '$items' }, { $group: { _id: '$items.sku', units: { $sum: '$items.qty' } } },
+      { $sort: { units: -1 } }, { $limit: 10 }], { maxTimeMS: 10000 }).toArray();
+    else if (r < 83) db.customers.aggregate([{ $match: { tier: 'gold', country: countries[Math.floor(rnd() * 5)] } },
+      { $lookup: { from: 'orders', let: { c: '$_id' }, as: 'latest', pipeline: [
+        { $match: { $expr: { $eq: ['$customer_id', '$$c'] } } }, { $sort: { created_at: -1 } }, { $limit: 1 }] } }]).toArray();
+    else {
+      db.orders.insertOne({ _id: OID, customer_id: c, status: 'pending', channel: 'web', sku: 'SKU-000042', amount: 59.9, created_at: new Date() });
+      db.order_items.insertMany([{ _id: 2 * OID - 1, order_id: OID, sku: 'SKU-000042', qty: 1, price: 29.95 },
+                                 { _id: 2 * OID, order_id: OID, sku: 'SKU-000777', qty: 1, price: 29.95 }]);
+      OID++;
+    }
+  } catch (e) { if (e.codeName === 'MaxTimeMSExpired') timeouts++; else throw e; }
+}
+print('timeouts', timeouts, 'next OID', OID);
+```
+
+## Exercise 1: find the queries (Concept 1)
+
+1. PostgreSQL: `bash run-pg.sh`. Before reading the output, predict the top three by total time.
+2. MySQL: `digest-snap.sql`, then the 500 statements, then `digest-diff.sql` (read it twice a few seconds apart).
+3. MongoDB: enable the profiler, run 300 operations, group by `queryHash`.
+
+```js
+// mg
+db.setProfilingLevel(0); db.system.profile.drop();
+db.createCollection("system.profile", { capped: true, size: 64 * 1024 * 1024 });
+db.setProfilingLevel(2);
+// … run mongo-wl.js with N = 300, OID = 1000001, then:
+db.setProfilingLevel(0);
+db.system.profile.aggregate([
+  { $match: { op: { $in: ['query', 'command', 'insert'] }, ns: { $ne: db.getName() + '.system.profile' } } },
+  { $group: { _id: { ns: '$ns', shape: { $ifNull: ['$queryHash', '$op'] } }, calls: { $sum: 1 }, total_ms: { $sum: '$millis' },
+              docs: { $sum: '$docsExamined' }, keys: { $sum: '$keysExamined' }, plan: { $first: '$planSummary' } } },
+  { $sort: { total_ms: -1 } }, { $limit: 8 }]);
+db.getSiblingDB('admin').aggregate([{ $queryStats: {} }]).toArray().length;   // try it
+```
+
+| Engine | Expected top statements (lab run) |
+|---|---|
+| PostgreSQL (336 tps) | Order detail 69% (16,707 buffers per call, 2 rows), login 12% (854), top SKUs 10%, daily revenue 5%, CRM 4% |
+| MySQL (21.9 s) | Order detail 17.1 s (2,000,077 rows examined per call), top SKUs 2.7 s, login 1.16 s (100,000) |
+| MongoDB (45.5 s) | Top SKUs 3 timeouts, order detail 54 × 263 ms (2,000,062 docs), login 99 × 7.3 ms (52,029 docs) |
+
+## Exercise 2: capture plans (Concept 2)
+
+```sql
+-- pg: plans of statements over 20 ms in this session; then read docker logs idx-pg
+SET auto_explain.log_min_duration = '20ms';
+SET auto_explain.log_analyze = on;
+SET auto_explain.log_buffers = on;
+SET auto_explain.log_timing = off;
+SELECT o.id, o.status, o.amount, i.sku, i.qty, i.price FROM orders o JOIN order_items i ON i.order_id = o.id WHERE o.id = 424242;
+SELECT id, tier FROM customers WHERE email = 'c4242@example.com';   -- logged?
+```
+
+```sql
+-- my: the optimizer trace for the revenue report (run again after Exercise 4)
+SET SESSION optimizer_trace = 'enabled=on';
+SELECT DATE(created_at) AS day, COUNT(*), SUM(amount) FROM orders
+WHERE created_at >= '2025-06-01' AND created_at < '2025-06-08' GROUP BY day ORDER BY day;
+SELECT TRACE FROM information_schema.OPTIMIZER_TRACE;
+```
+
+```js
+// mg: the log line vs the explain stage
+db.orders.aggregate([{ $match: { _id: 515151 } }, { $lookup: { from: "order_items", localField: "_id", foreignField: "order_id", as: "items" } }]).toArray();
+// docker logs idx-mongo | grep '"Slow query"' | grep 515151 | tail -1   (if slowms is above 265, look in system.profile instead)
+db.orders.explain("executionStats").aggregate([{ $match: { _id: 515151 } },
+  { $lookup: { from: "order_items", localField: "_id", foreignField: "order_id", as: "items" } }]).stages[1];
+```
+
+Expected: PostgreSQL logs the order detail (≈ 29 ms, Parallel Seq Scan on `order_items`, 669,004 rows removed per worker) and not the login. MongoDB: `planSummary` `EXPRESS_IXSCAN { _id: 1 }` with `docsExamined` 2,000,225; the `$lookup` stage shows `collectionScans: 1`, `indexesUsed: []`.
+
+## Exercise 3: test before building (Concept 3)
+
+```sql
+-- pg
+EXPLAIN SELECT o.id, o.status, o.amount, i.sku, i.qty, i.price FROM orders o JOIN order_items i ON i.order_id = o.id WHERE o.id = 424242;
+SELECT * FROM hypopg_create_index('CREATE INDEX ON order_items (order_id)');
+EXPLAIN SELECT o.id, o.status, o.amount, i.sku, i.qty, i.price FROM orders o JOIN order_items i ON i.order_id = o.id WHERE o.id = 424242;
+EXPLAIN ANALYZE SELECT i.sku FROM order_items i WHERE i.order_id = 424242;
+SELECT index_name, pg_size_pretty(hypopg_relation_size(indexrelid)) FROM hypopg_list_indexes;
+SELECT hypopg_reset();
+```
+
+```sql
+-- my
+ALTER TABLE order_items ADD INDEX order_items_order_idx (order_id) INVISIBLE;
+EXPLAIN ANALYZE SELECT o.id, i.sku FROM orders o JOIN order_items i ON i.order_id = o.id WHERE o.id = 424242;
+SET SESSION optimizer_switch = 'use_invisible_indexes=on';
+EXPLAIN ANALYZE SELECT o.id, i.sku FROM orders o JOIN order_items i ON i.order_id = o.id WHERE o.id = 424242;
+-- in a second session, the first EXPLAIN again: still a table scan
+ALTER TABLE order_items ALTER INDEX order_items_order_idx VISIBLE;
+```
+
+```js
+// mg
+db.order_items.createIndex({ order_id: 1 }, { name: "order_id" });
+db.order_items.hideIndex("order_id");
+db.order_items.find({ order_id: 424242 }).hint("order_id").toArray();   // BadValue
+db.order_items.unhideIndex("order_id");
+```
+
+Write cost, PostgreSQL. Run the checkout script alone, 4 clients × 5,000 transactions, a few times before and after the Exercise 4 indexes, and read `wal_bytes` per call:
+
+```bash
+P() { docker exec idx-pg psql -U postgres "$@"; }
+P -Atc "SELECT pg_stat_statements_reset(0, (SELECT oid FROM pg_database WHERE datname = current_database()), 0)" >/dev/null
+docker exec idx-pg sh -c 'cd /wl && pgbench -U postgres -n -c 4 -j 2 -t 5000 -f q8_checkout.sql postgres' | grep ^tps
+P -Atc "SELECT left(query, 25), round(wal_bytes / calls), wal_fpi FROM pg_stat_statements
+        WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) AND query LIKE 'INSERT%'"
+P -Atc "SELECT leaf_pages, round(avg_leaf_density) FROM pgstatindex('orders_cust_created_idx')"   # after Exercise 4
+```
+
+Expected: `order_items` insert 326 → 463 bytes in every run; the `orders` insert changes over time (Concept 3). Ignore runs with thousands of full-page images (`wal_fpi`): a checkpoint fell into them.
+
+## Exercise 4: fix, re-measure, repeat (Concept 4)
+
+```sql
+-- pg, iteration 1
+CREATE INDEX CONCURRENTLY order_items_order_idx ON order_items (order_id);
+CREATE UNIQUE INDEX CONCURRENTLY customers_email_key ON customers (email);
+CREATE INDEX CONCURRENTLY orders_cust_created_idx ON orders (customer_id, created_at);
+CREATE INDEX CONCURRENTLY orders_created_brin ON orders USING brin (created_at);
+DROP INDEX CONCURRENTLY orders_customer_idx;
+VACUUM ANALYZE orders; VACUUM ANALYZE order_items; VACUUM ANALYZE customers;
+-- bash run-pg.sh, then iteration 2:
+ALTER DATABASE postgres SET random_page_cost = 1.1;
+-- bash run-pg.sh; check the revenue report's plan for lossy heap blocks, then:
+SELECT brin_summarize_new_values('orders_created_brin');
+ALTER INDEX orders_created_brin SET (autosummarize = on);
+-- iteration 3:
+CREATE INDEX CONCURRENTLY customers_country_tier ON customers (country, tier);
+-- bash run-pg.sh
+```
+
+```sql
+-- my
+ALTER TABLE customers ADD UNIQUE INDEX customers_email_key (email), ALGORITHM=INPLACE, LOCK=NONE;
+ALTER TABLE orders ADD INDEX orders_cust_created_idx (customer_id, created_at),
+                   ADD INDEX orders_created_amt (created_at, amount),
+                   DROP INDEX orders_customer_idx, ALGORITHM=INPLACE, LOCK=NONE;
+ALTER TABLE customers ADD INDEX customers_country_tier (country, tier), ALGORITHM=INPLACE, LOCK=NONE;
+-- order_items_order_idx was made visible in Exercise 3
+```
+
+```js
+// mg (order_id was built in Exercise 3)
+db.customers.createIndex({ email: 1 }, { unique: true });
+db.customers.createIndex({ country: 1, tier: 1 });
+db.orders.createIndex({ customer_id: 1, created_at: -1 });
+db.orders.createIndex({ created_at: 1, amount: 1 });
+db.orders.dropIndex("customer_id_1");
+```
+
+Re-run each workload with new ids (MySQL: `oid=1000101 iid=2000201`; MongoDB: `OID` = the "next OID" the previous run printed).
+
+| Engine | Lab result |
+|---|---|
+| PostgreSQL | 336 → 3,333 → 5,038 → 5,944 tps; final top: top SKUs 49%, daily revenue 32% |
+| MySQL | 21.9 s → 0.55 s; CRM query 32.7 → 6.4 ms with `(country, tier)` |
+| MongoDB | 45.5 s → 0.87 s; no timeouts; revenue report covered (0 documents) |
+
+The tables are left with the case-study indexes. If you want the Session 9 foreign key back: `ALTER TABLE order_items ADD CONSTRAINT order_items_order_fk FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE;` (PostgreSQL and MySQL).
+
+## Session quiz
+
+1. In your baseline run, which statement was first by total time and which by mean time? Explain the difference with numbers.
+2. What per-call evidence told you the order-detail query was missing an index, in each engine?
+3. Why did `auto_explain` not log the login query, and how did you find it anyway?
+4. Your `hypopg` test predicted a cost of 16.55. What did it not tell you that the real build did?
+5. Why did the top-SKU report not use `order_items (order_id)` after iteration 1, and what did you change?
+6. How did the WAL of an `orders` insert change over your checkout runs after the new indexes, and why?
+7. Compare the date-range index you used in PostgreSQL with MySQL's and MongoDB's: size and why.
+8. After the last iteration, what would you do about the two reports, and why not another index?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-11-production-diagnosis/lab/answers">Answers to the session quiz</DeepDive>

@@ -1,0 +1,76 @@
+---
+title: "Answers: Case study: one workload, three engines, three iterations"
+description: "Worked answers to the Session 11 Concept 4 check questions."
+companion: "answers"
+tags: ["indexing", "case-study", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/runtime-config-query.html#GUC-RANDOM-PAGE-COST"
+  - "https://www.postgresql.org/docs/current/brin.html"
+---
+
+<Tldr>
+Fix the top of the list, re-rank, repeat, and stop when what is left is the work itself.
+</Tldr>
+
+## Q1. 10% to 69%
+
+**Question:** why did the top-SKU report go from 10% to 69% of database time after iteration 1 without getting slower?
+
+A share is relative to the total. Before: 22.8 s of 228.7 s. After iteration 1 the order detail and login almost disappeared (156.9 s + 27.8 s → ≈ 1.9 s), so the total fell to 159.7 s even though the run did 10× more transactions; the report, unchanged per call (≈ 55 ms) but run 2,031 times instead of 188, became 110.8 s of it. Its mean was even better than before (121 → 54.5 ms) because the server was no longer busy scanning `order_items` for every order detail.
+
+> **Common mistake:** reading a rising share as a regression; compare the mean and buffers per call.
+
+## Q2. Why the index was not used
+
+**Question:** `order_items (order_id)` existed after iteration 1, yet the top-SKU report did not use it. Why, and why was changing `random_page_cost` acceptable here?
+
+The planner compared 19,178 index lookups, each costed as random page reads at `random_page_cost = 4` (the default, which models spinning disks), with one sequential scan of `order_items` at 1 per page, and chose the scan and a hash join. On this server the data is on SSD and mostly in memory, so random reads are almost as cheap as sequential ones: the forced nested loop took 11–14 ms against 42–69 ms. Setting 1.1 tells the planner the truth about the hardware. It was acceptable because it was set for this database only and the **whole workload** was re-run afterwards: every query kept or improved its plan.
+
+> **Common mistake:** `SET enable_hashjoin = off` in the application. That hides the cause and breaks the queries for which a hash join is right.
+
+## Q3. More buffers, faster
+
+**Question:** the fixed top-SKU query reads 77,357 buffers per call instead of 26,862 and is faster. How?
+
+The hash join read ≈ 19,300 pages, about two thirds of them from outside `shared_buffers` (the OS cache or disk), in large sequential scans of `order_items` and `orders`, then built a hash table. The nested loop touches 77,357 buffers, but they are repeated visits to the same few thousand pages of the `order_id` index and table, all **hits** in `shared_buffers`: a buffer hit costs far less than a read. The buffer count measures work done in pages, not where the pages came from; read `hit` and `read` separately.
+
+> **Common mistake:** treating "fewer buffers" as the goal in every case.
+
+## Q4. Dropping (customer_id)
+
+**Question:** why was `orders (customer_id)` dropped, and what had to be checked first?
+
+`(customer_id, created_at)` has `customer_id` as its leftmost column, so it serves every query `(customer_id)` served (leftmost prefix, Session 4): equality on `customer_id`, joins on it. Keeping both doubles the write cost for that column. Before dropping: check that no query needs the smaller index for speed (a count of a customer's orders reads a few more pages in the wider index, negligible here), that it does not back a constraint, and that replicas or rare jobs do not depend on it (Session 8). Then drop it with `DROP INDEX CONCURRENTLY`.
+
+> **Common mistake:** keeping both "to be safe": the redundant index costs every insert.
+
+## Q5. BRIN vs (created_at, amount)
+
+**Question:** why did PostgreSQL use BRIN for the date range while MySQL and MongoDB used `(created_at, amount)`?
+
+`created_at` rises with insert order, so in PostgreSQL's heap the rows of one week sit in a contiguous run of pages, and a BRIN index (24 kB, one min/max per 128 pages) narrows the report to ≈ 384 pages (Session 7). MySQL and MongoDB have no BRIN. In InnoDB the table is clustered by `id`, which also rises with time, but the optimizer cannot use that without a condition on `id`; a secondary B-tree on `(created_at, amount)` gives a covering range scan instead. MongoDB likewise needs a B-tree; with `amount` in it, the revenue aggregation is covered (0 documents fetched). The cost: ≈ 24–27 MB instead of 24 kB.
+
+> **Common mistake:** choosing BRIN for a column that does not follow the physical order: it then narrows nothing.
+
+## Q6. Why not more indexes for the reports
+
+**Question:** in the final PostgreSQL run, the two reports were 81% of database time. Why not add more indexes for them?
+
+They already read about what their result requires. The top-SKU report must look at every item of a week's orders (≈ 38,000 items); the revenue report at a week of orders. An index cannot make that set smaller, only cheaper to reach, and the remaining cost is reading and aggregating it. A covering index for the item side would add a third B-tree to every checkout to save a few milliseconds on a query run 1% of the time. The better fix changes the work: maintain a daily summary (units per SKU per day, revenue per day) updated by a job or on insert, so the weekly report reads 7 rows per SKU; or run reports on a replica.
+
+> **Common mistake:** indexing until the ranking is flat, and paying for it on every write.
+
+## Q7. Stakeholder summary
+
+**Question:** write the before/after summary of this case for a non-technical stakeholder in five lines.
+
+One reasonable version:
+
+1. The database could handle 336 shopping transactions per second; two features (order detail and login) used 81% of its time.
+2. We added four lookup structures (indexes), replaced one and corrected one setting, without downtime.
+3. It now handles 5,944 per second: each transaction costs 30× less database time.
+4. The cost: about 65 MB of extra storage and slightly more data written per checkout.
+5. What remains is mostly two weekly reports; we propose precomputing them daily instead of adding more indexes.
+
+> **Common mistake:** presenting only the speed-up and leaving out the cost and the next step.

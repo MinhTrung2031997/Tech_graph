@@ -1,0 +1,73 @@
+---
+title: "Answers: Test an index before you pay for it"
+description: "Worked answers to the Session 11 Concept 3 check questions."
+companion: "answers"
+tags: ["indexing", "hypopg", "invisible-indexes", "answers"]
+status: "draft"
+sources:
+  - "https://hypopg.readthedocs.io/en/latest/usage.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/invisible-indexes.html"
+  - "https://www.mongodb.com/docs/manual/core/index-hidden/"
+---
+
+<Tldr>
+Hypothetical and invisible indexes answer "would the planner use it". Only a real build, measured with the writes, answers "is it worth it".
+</Tldr>
+
+## Q1. What hypopg tells you
+
+**Question:** what does `hypopg` let you learn without building the index, and what can it not tell you?
+
+It tells you whether the planner would **choose** the index for a given query and the **estimated cost** of that plan (28,190 → 16.55 for the order-detail join), plus a rough size. It cannot tell you the real pages read or time (nothing is executed with it), the real size, the build time, or the write cost. It also does not show how other queries' plans would change unless you EXPLAIN them too in the same session.
+
+> **Common mistake:** treating a lower estimated cost as a measured speed-up.
+
+## Q2. EXPLAIN ANALYZE ignores it
+
+**Question:** why did `EXPLAIN ANALYZE` ignore the hypothetical index?
+
+`EXPLAIN ANALYZE` executes the plan. A hypothetical index has no pages, so a plan that scanned it could not run. hypopg only makes the index visible to plain `EXPLAIN` planning; with `ANALYZE` the planner plans without it, here a parallel sequential scan of `order_items` (19.9 ms).
+
+> **Common mistake:** concluding "the planner won't use it" from `EXPLAIN ANALYZE` output.
+
+## Q3. 56 MB vs 39 MB
+
+**Question:** why was the hypothetical size (56 MB) larger than the real one (39 MB)?
+
+The estimate is computed from the number of rows and the average width of the key, as if each row had its own index entry. PostgreSQL B-trees deduplicate equal keys (Session 2): each `order_id` appears twice in `order_items` and is most likely stored once with a list of two row pointers, so the real index is smaller. With unique keys the estimate would be closer; with many duplicates the gap grows.
+
+> **Common mistake:** budgeting disk space for a build from the hypothetical size alone. Also remember the build needs room for the sort.
+
+## Q4. Testing in MySQL without affecting others
+
+**Question:** how do you test a MySQL index on production data without changing other sessions' plans, and what does that test still cost?
+
+Create it `INVISIBLE` (or make an existing one invisible); in your session run `SET SESSION optimizer_switch = 'use_invisible_indexes=on'` and EXPLAIN / EXPLAIN ANALYZE the target queries and others on the same table. Other sessions keep ignoring it. The cost is all of the real index's cost: the online build (I/O, temporary space, a brief metadata lock at start and end, Session 8), and maintenance on every insert, update and delete while it exists, invisible or not.
+
+> **Common mistake:** thinking an invisible index is free because nothing uses it.
+
+## Q5. MongoDB hidden indexes
+
+**Question:** why can a MongoDB hidden index not be used to test a candidate the way a MySQL invisible index can?
+
+There is no per-session opt-in: a hidden index is ignored by the planner for everyone, and even `hint()` on it fails (`BadValue`, "planner returned error"). Hiding is for testing a **removal** (Session 8). To test an **addition**, build it on a copy (or a member taken out of the replica set) and compare there, for example with hide/unhide (273 ms vs 0 ms for the order-detail `$lookup`).
+
+> **Common mistake:** building the index on the production primary "hidden, to be safe": the build cost is paid in full.
+
+## Q6. Steady vs changing WAL
+
+**Question:** `order_items (order_id)` added a steady 137 bytes per checkout, while the WAL of an `orders` insert went up and then back down. Why the difference?
+
+The key patterns differ. `order_id` rises with every order, so each new item entry goes to the **rightmost leaf** of `order_items (order_id)`: one cached page, rightmost splits that leave full pages behind (Session 2). Every checkout adds the same two entries and the same WAL: 326 → 463 bytes, run after run, with leaves at 90% density.
+
+`(customer_id, created_at)` receives each new order at a **random** place (one customer out of 100,000). Built 90% full, it first had room (340–378 bytes per insert), then its leaves filled and split in bulk, and every split is logged (415–593 bytes), then the leaves settled at 54% density with only 2–4 splits per 20,000 inserts (338–353 bytes). The old `(customer_id)` index had about 10 equal keys per customer, which deduplication merges instead of splitting. The settled cost was paid in space: 30 MB → 72 MB.
+
+> **Common mistake:** counting indexes instead of asking where each write lands in each index.
+
+## Q7. One benchmark is not enough
+
+**Question:** why is one benchmark right after building an index not enough to know its write cost?
+
+The cost changes over the index's life: a freshly built B-tree has free space on every leaf, then goes through a burst of page splits as random inserts fill it, then settles at a lower density with fewer splits and a larger size. Checkpoints add full-page images to whichever run they fall into (two runs here had 1,258 and 3,303 of them). A single run after the build can land in any of these phases. Measure several runs over enough writes to reach steady state, and record density (`pgstatindex`) and size as well as WAL.
+
+> **Common mistake:** benchmarking once right after a change and once days later, under different index density, cache and checkpoint conditions.

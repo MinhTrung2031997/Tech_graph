@@ -1,0 +1,84 @@
+---
+title: "Answers: Capstone session quiz"
+description: "Worked answers to the Session 11 quiz, with the numbers from the lab run."
+companion: "answers"
+tags: ["indexing", "lab", "capstone", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pgstatstatements.html"
+  - "https://hypopg.readthedocs.io/en/latest/usage.html"
+---
+
+<Tldr>
+Measure, rank by total, read per-call evidence, test, build online, re-measure, and stop when the work left is the work the query must do. Your numbers will differ; the reasoning should not.
+</Tldr>
+
+## Q1. Total vs mean
+
+**Question:** in your baseline run, which statement was first by total time and which by mean time? Explain the difference with numbers.
+
+Lab run: by total, the order detail (3,990 calls × 39.3 ms = 156.9 s, 69%); by mean, the top-SKU report (121 ms, but 188 calls = 22.8 s, 10%). The order detail ran 21 times as often. Total time is what the server spends; mean time is what one caller waits.
+
+> **Common mistake:** ranking by mean and spending the first iteration on a report.
+
+## Q2. Per-call evidence
+
+**Question:** what per-call evidence told you the order-detail query was missing an index, in each engine?
+
+| Engine | Evidence | Rows returned |
+|---|---|---|
+| PostgreSQL | 16,707 buffers per call (`order_items` has 16,667 pages) | 2 |
+| MySQL | 2,000,077 rows examined per call, `SUM_NO_INDEX_USED` = calls | 2 |
+| MongoDB | 2,000,062 docs examined per call (in the `$lookup` stage) | 1 order with 2 items |
+
+In every engine, reads ≫ results means a scan where a lookup should be.
+
+> **Common mistake:** looking at the plan summary only; in MongoDB it said `EXPRESS_IXSCAN`.
+
+## Q3. The login that was never logged
+
+**Question:** why did `auto_explain` not log the login query, and how did you find it anyway?
+
+It took ≈ 5–7 ms, under the 20 ms `log_min_duration`. It was found by `pg_stat_statements`, which aggregates every execution regardless of duration: 6,072 calls, 12% of database time, 854 buffers per call. Then `EXPLAIN (ANALYZE, BUFFERS)` by hand showed the sequential scan of `customers`.
+
+> **Common mistake:** lowering `log_min_duration` to 0 to catch it, which logs every statement's plan.
+
+## Q4. What hypopg did not tell you
+
+**Question:** your `hypopg` test predicted a cost of 16.55. What did it not tell you that the real build did?
+
+The real execution (8 buffers, 0.02 ms per call in the workload), the real size (39 MB, not the 56 MB estimate), the build time and locks (`CONCURRENTLY`, Session 8), the effect on other queries' plans (the top-SKU report did not use it until the cost model changed), and the write cost (+137 bytes of WAL per checkout).
+
+> **Common mistake:** skipping the measured verification because the hypothetical plan looked right.
+
+## Q5. The unused index
+
+**Question:** why did the top-SKU report not use `order_items (order_id)` after iteration 1, and what did you change?
+
+With `random_page_cost = 4`, 19,178 index lookups were costed above one sequential scan of `order_items`, so the planner kept the hash join (≈ 19,300 buffers, two thirds read from outside `shared_buffers`, 42–69 ms). The nested loop was really 11–14 ms (77,886 buffer hits). Setting `random_page_cost = 1.1` for the database, appropriate for SSD and a mostly cached data set, let the planner pick it; the whole workload was re-run to check no other plan got worse.
+
+> **Common mistake:** adding yet another index for the report when the existing one was simply not chosen.
+
+## Q6. WAL of an orders insert over time
+
+**Question:** how did the WAL of an `orders` insert change over your checkout runs after the new indexes, and why?
+
+Lab: 333–343 bytes before; 340–378 right after building; 415–593 while it was splitting, ≈ 60,000–200,000 inserts later; 338–353 at the end. `(customer_id, created_at)` receives each new order at a random position. Built 90% full, it first had room, then its leaves filled and split in bulk (splits are WAL-logged), then settled at 54% leaf density with 2–4 splits per 20,000 inserts, having grown from 30 to 72 MB. `order_items (order_id)` was constant at +137 bytes per checkout: increasing keys always go to the rightmost leaf.
+
+> **Common mistake:** concluding from one run that an index is "free" or "too expensive".
+
+## Q7. Date-range indexes
+
+**Question:** compare the date-range index you used in PostgreSQL with MySQL's and MongoDB's: size and why.
+
+PostgreSQL: BRIN on `created_at`, 24 kB, because the heap is in insertion order and `created_at` follows it (Session 7); it needs summarization (`autosummarize = on`) as rows arrive. MySQL: `(created_at, amount)`, 26.6 MB, a covering secondary B-tree (no BRIN in InnoDB; the clustered key is `id`). MongoDB: `{ created_at: 1, amount: 1 }`, 23.8 MB, which also makes the revenue aggregation covered (0 documents fetched). Three orders of magnitude in size for the same reports.
+
+> **Common mistake:** assuming a technique carries over between engines unchanged.
+
+## Q8. The reports
+
+**Question:** after the last iteration, what would you do about the two reports, and why not another index?
+
+They were 81% of the remaining PostgreSQL database time at 2% of calls, but each already reads only what its result needs: every item of a week's ≈ 19,000 orders, or the week's orders themselves. Another index could not shrink that set and would tax every checkout. Precompute instead: a daily summary table (units per SKU per day, revenue per day) maintained by a job or trigger, so the weekly report reads 7 rows per SKU; or a materialized view refreshed nightly; or run reports on a replica so they do not compete with checkouts.
+
+> **Common mistake:** believing every slow query needs a new index; the course's last lesson is when it does not.

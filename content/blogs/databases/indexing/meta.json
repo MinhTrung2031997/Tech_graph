@@ -10,6 +10,7 @@
     "session-7-specialist-indexes",
     "session-8-when-indexes-hurt",
     "session-9-indexes-for-joins",
-    "session-10-pagination-aggregation"
+    "session-10-pagination-aggregation",
+    "session-11-production-diagnosis"
   ]
 }
