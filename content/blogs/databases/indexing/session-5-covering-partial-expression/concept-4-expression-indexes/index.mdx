@@ -1,0 +1,290 @@
+---
+title: "Concept 4: Expression indexes"
+description: "Index the result of an expression (lower(sku), the UTC day of created_at) so queries that filter on that expression can seek. PostgreSQL expression indexes and the IMMUTABLE rule, MySQL functional key parts, and MongoDB's alternatives: collation indexes and stored computed fields."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "expression-index", "collation"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-expressional.html"
+  - "https://www.postgresql.org/docs/current/xfunc-volatility.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/create-index.html#create-index-functional-key-parts"
+  - "https://www.mongodb.com/docs/manual/core/index-case-insensitive/"
+---
+
+<Tldr>
+Session 3 showed that a function on a column hides it from the index (`created_at::date = …` → Seq Scan). When the query cannot be rewritten, **index the expression itself**. In PostgreSQL, `CREATE INDEX ON orders (lower(sku))` turned a parallel Seq Scan into a Bitmap scan over 207 rows; MySQL's functional key parts do the same (`((LOWER(sku)))`, `ref`, 200 rows). The expression must be **deterministic**: PostgreSQL rejected `created_at::date` (it depends on the session time zone) and accepted `(created_at AT TIME ZONE 'UTC')::date`. MongoDB has no expression indexes: use a **case-insensitive collation index** (200 keys) or store the computed value in a field.
+</Tldr>
+
+## When to index an expression
+
+| Query | Plain index on the column | Expression index |
+|---|---|---|
+| `WHERE lower(email) = lower($1)` | ✗ function hides the column | `ON users (lower(email))` |
+| `WHERE (created_at AT TIME ZONE 'UTC')::date = $1` | ✗ | `ON orders (((created_at AT TIME ZONE 'UTC')::date))` |
+| `WHERE created_at >= $1 AND created_at < $2` | ✓ already sargable | Not needed: prefer this rewrite |
+| `WHERE data->>'country' = 'VN'` (JSON) | ✗ | `ON events ((data->>'country'))` |
+
+Prefer rewriting the query (Session 3, Concept 5) when you can; index the expression when the expression is the natural way to ask, or the query is outside your control.
+
+| Term | Meaning |
+|---|---|
+| Expression index | Entries hold the computed value, sorted by it |
+| IMMUTABLE | A function whose result depends only on its arguments, never on settings, time or data; required for index expressions in PostgreSQL |
+| Exact match | The query must contain the same expression as the index (`lower(sku)`, not `upper(sku)`) |
+| **✓ Same expression / ✗ Different** | Index usable or not |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: expression indexes"
+  height={330}
+  nodes={[
+    { id: 'q', label: 'WHERE', sub: '', x: 20, y: 20, w: 260 },
+    { id: 'imm', label: 'IMMUTABLE?', sub: 'required to build', x: 340, y: 20, w: 200 },
+    { id: 'err', label: '✗ Not immutable', sub: 'CREATE INDEX fails', x: 600, y: 20, w: 180 },
+    { id: 'idx', label: 'Expression index', sub: 'entries = computed values', x: 340, y: 150, w: 200 },
+    { id: 'yes', label: '✓ Same expression', sub: 'index scan', x: 600, y: 150, w: 180 },
+    { id: 'no', label: '✗ Different expression', sub: 'not usable', x: 340, y: 270, w: 200 },
+  ]}
+  edges={[
+    { id: 'q-imm', from: 'q', to: 'imm' },
+    { id: 'imm-err', from: 'imm', to: 'err' },
+    { id: 'imm-idx', from: 'imm', to: 'idx' },
+    { id: 'idx-yes', from: 'idx', to: 'yes' },
+    { id: 'idx-no', from: 'idx', to: 'no' },
+  ]}
+  cases={[
+    {
+      title: 'lower(sku)',
+      path: 'lower() is immutable → index on lower(sku) → WHERE lower(sku) = … ✓ Bitmap, 207 rows',
+      summary: 'Without the index: Parallel Seq Scan over 1M rows.',
+      subs: { q: "lower(sku) = 'sku-000123'", idx: 'orders_sku_lower' },
+      steps: [
+        {
+          title: 'Build it',
+          note: 'lower() is IMMUTABLE for a given collation, so the index can store lower(sku) for every row, sorted.',
+          code: 'CREATE INDEX orders_sku_lower ON orders (lower(sku));\nANALYZE orders;',
+          active: ['q', 'imm', 'idx'],
+          edges: ['q-imm', 'imm-idx'],
+        },
+        {
+          title: '✓ The query uses the same expression',
+          note: "WHERE lower(sku) = 'sku-000123': Bitmap Index Scan on orders_sku_lower, 207 rows. ANALYZE also collected statistics on lower(sku) itself (pg_stats lists them under the index's name), so the estimate is good.",
+          code: "EXPLAIN ANALYZE SELECT * FROM orders WHERE lower(sku) = 'sku-000123';",
+          active: ['idx', 'yes'],
+          edges: ['idx-yes'],
+        },
+        {
+          title: '✗ A different expression',
+          note: "WHERE upper(sku) = 'SKU-000123' or WHERE sku ILIKE 'sku-000123' cannot use it: the planner matches expressions textually, it does not reason about equivalence.",
+          active: ['idx', 'no'],
+          edges: ['idx-no'],
+        },
+      ],
+    },
+    {
+      title: 'The day of a timestamp',
+      path: 'created_at::date ✗ not immutable (depends on TimeZone) → (created_at AT TIME ZONE \'UTC\')::date ✓',
+      summary: 'Measured: Index Scan, 2,740 rows, 35 buffers.',
+      subs: { q: 'day of created_at', idx: 'orders_day_utc' },
+      steps: [
+        {
+          title: '✗ Rejected',
+          note: 'created_at is timestamptz. Its ::date depends on the session\'s TimeZone setting: the same row could index as 1 March in one session and 2 March in another. ERROR: functions in index expression must be marked IMMUTABLE.',
+          code: 'CREATE INDEX ON orders ((created_at::date));',
+          active: ['q', 'imm', 'err'],
+          edges: ['q-imm', 'imm-err'],
+        },
+        {
+          title: 'Fix the time zone in the expression',
+          note: '(created_at AT TIME ZONE \'UTC\')::date always gives the UTC day, whatever the session: immutable, so it can be indexed.',
+          code: "CREATE INDEX orders_day_utc ON orders (((created_at AT TIME ZONE 'UTC')::date));",
+          active: ['imm', 'idx'],
+          edges: ['imm-idx'],
+        },
+        {
+          title: '✓ Query with the same expression',
+          note: "WHERE (created_at AT TIME ZONE 'UTC')::date = '2025-03-01': Index Scan using orders_day_utc, 2,740 rows, 35 buffers. Choose the time zone your business days are defined in; Asia/Ho_Chi_Minh gives Vietnamese calendar days.",
+          code: "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders\nWHERE (created_at AT TIME ZONE 'UTC')::date = '2025-03-01';",
+          active: ['idx', 'yes'],
+          edges: ['idx-yes'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: functional key parts
+
+MySQL 8.0.13+ indexes expressions written in double parentheses; internally each is a hidden virtual generated column.
+
+| Term | Meaning |
+|---|---|
+| Functional key part | `INDEX ((expr))`; the query must use the same expression |
+| Generated column | The older way: `ALTER TABLE … ADD day DATE AS (DATE(created_at))`, then index `day` |
+| **✓ Same expression / ✗ Different** | As in PostgreSQL |
+
+<Flow
+  title="MySQL: functional indexes"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'WHERE', sub: '', x: 20, y: 20, w: 260 },
+    { id: 'idx', label: 'Functional index', sub: 'hidden generated column', x: 340, y: 20, w: 220 },
+    { id: 'yes', label: '✓ Same expression', sub: 'type: ref', x: 620, y: 20, w: 160 },
+    { id: 'no', label: '✗ Different expression', sub: 'type: ALL', x: 340, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-idx', from: 'q', to: 'idx' },
+    { id: 'idx-yes', from: 'idx', to: 'yes' },
+    { id: 'idx-no', from: 'idx', to: 'no' },
+  ]}
+  cases={[
+    {
+      title: 'DATE(created_at)',
+      path: 'INDEX ((DATE(created_at))) → WHERE DATE(created_at) = … ✓ ref, 2,740 rows',
+      summary: 'Session 3 showed the same query as type ALL without this index.',
+      subs: { q: "DATE(created_at) = '2025-03-01'", yes: 'ref, rows 2,740' },
+      steps: [
+        {
+          title: 'Index the expression',
+          note: 'MySQL\'s DATETIME has no time zone, so DATE() is deterministic and allowed. Size: 1,123 pages (16 KB).',
+          code: 'CREATE INDEX orders_day ON orders ((DATE(created_at)));',
+          active: ['q', 'idx'],
+          edges: ['q-idx'],
+        },
+        {
+          title: '✓ Same expression',
+          note: "EXPLAIN SELECT * FROM orders WHERE DATE(created_at) = '2025-03-01': type ref, key orders_day, rows 2,740.",
+          active: ['idx', 'yes'],
+          edges: ['idx-yes'],
+        },
+      ],
+    },
+    {
+      title: 'LOWER(sku)',
+      path: 'INDEX ((LOWER(sku))) → WHERE LOWER(sku) = … ✓ ref, 200 rows',
+      summary: 'Often unnecessary in MySQL: default collations are already case-insensitive.',
+      subs: { q: "LOWER(sku) = 'sku-000123'", yes: 'ref, rows 200' },
+      steps: [
+        {
+          title: '✓ Same expression',
+          note: "type ref, key orders_sku_lower, rows 200. But note: with MySQL's default utf8mb4_0900_ai_ci collation, sku = 'sku-000123' already matches 'SKU-000123' case-insensitively through a plain index on sku.",
+          code: "CREATE INDEX orders_sku_lower ON orders ((LOWER(sku)));\nEXPLAIN SELECT * FROM orders WHERE LOWER(sku) = 'sku-000123';",
+          active: ['q', 'idx', 'yes'],
+          edges: ['q-idx', 'idx-yes'],
+        },
+        {
+          title: '✗ Different expression',
+          note: 'UPPER(sku) = … or a different function cannot use it.',
+          active: ['idx', 'no'],
+          edges: ['idx-no'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: collations and computed fields
+
+MongoDB indexes fields, not expressions. Two substitutes:
+
+| Need | Substitute |
+|---|---|
+| Case-insensitive match | An index with a collation of strength 1 or 2; the query must specify the same collation |
+| Any other derived value (day, normalised text, JSON path) | Store it as its own field at write time and index that field |
+
+| Term | Meaning |
+|---|---|
+| Collation strength 2 | Compares letters ignoring case (but not accents) |
+| **✓ Same collation / ✗ Default collation** | The index is used only by queries with a matching collation |
+
+<Flow
+  title="MongoDB: case-insensitive lookups"
+  height={300}
+  nodes={[
+    { id: 'q', label: "find({ sku: 'sku-000123' })", sub: '', x: 20, y: 20, w: 260 },
+    { id: 'ci', label: 'Index { sku: 1 }', sub: 'collation en, strength 2', x: 340, y: 20, w: 220 },
+    { id: 'yes', label: '✓ Same collation', sub: '200 keys, 200 docs', x: 620, y: 20, w: 160 },
+    { id: 'no', label: '✗ Default collation', sub: 'binary comparison', x: 340, y: 150, w: 220 },
+    { id: 'zero', label: '0 results', sub: '', x: 620, y: 150, w: 160 },
+  ]}
+  edges={[
+    { id: 'q-ci', from: 'q', to: 'ci' },
+    { id: 'ci-yes', from: 'ci', to: 'yes' },
+    { id: 'ci-no', from: 'ci', to: 'no' },
+    { id: 'no-zero', from: 'no', to: 'zero' },
+  ]}
+  cases={[
+    {
+      title: 'With the collation',
+      path: 'query collation strength 2 ✓ = index collation → IXSCAN sku_ci → 200 documents',
+      summary: 'Measured: 200 keys examined, 200 returned.',
+      steps: [
+        {
+          title: '✓ Matching collation',
+          note: 'The index stores sku keys in a case-insensitive order; the query asks for the same collation, so sku-000123 matches SKU-000123.',
+          code: 'db.orders.createIndex({ sku: 1 }, { name: "sku_ci", collation: { locale: "en", strength: 2 } })\ndb.orders.find({ sku: "sku-000123" }).collation({ locale: "en", strength: 2 })',
+          active: ['q', 'ci', 'yes'],
+          edges: ['q-ci', 'ci-yes'],
+        },
+      ],
+    },
+    {
+      title: 'Without the collation',
+      path: 'default (binary) comparison ✗ index not usable → COLLSCAN → 0 results',
+      summary: 'Measured: COLLSCAN, nReturned 0.',
+      steps: [
+        {
+          title: '✗ Different collation',
+          note: 'Without .collation(), the comparison is binary: sku-000123 ≠ SKU-000123, and the collation index cannot serve it. Result: COLLSCAN, 0 documents. Setting a default collation on the collection avoids having to pass it each time.',
+          code: 'db.orders.find({ sku: "sku-000123" })',
+          active: ['q', 'ci', 'no', 'zero'],
+          edges: ['q-ci', 'ci-no', 'no-zero'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+An expression index is maintained on every insert and on every update that changes its input columns, and the function runs each time. Expensive functions (regexes, JSON parsing of large documents) make writes slower. Index the expression only if queries really use it; otherwise rewrite the query.
+</Pitfall>
+
+## Real-world scenario: case-insensitive email login
+
+Login does `WHERE email = $1`, and users type their address with random capitalisation. The team adds `lower()` to the query and logins become full scans.
+
+| Engine | Fix |
+|---|---|
+| PostgreSQL | `CREATE UNIQUE INDEX users_email_lower ON users (lower(email));` and query `WHERE lower(email) = lower($1)`; the unique index also stops `A@x.com` and `a@x.com` from both registering. Alternative: the `citext` type |
+| MySQL | Usually nothing: the default `_ci` collation already compares case-insensitively, and a unique index on `email` already rejects case variants |
+| MongoDB | Unique index on `email` with collation strength 2, queries with that collation; or store `email_lower` and index it |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 5: unique indexes | Unique expression indexes enforce case-insensitive uniqueness |
+| Session 7: GIN and trigram indexes | For JSON containment and substring search beyond a single expression |
+| Session 8: write amplification | Expression maintenance costs on every write |
+
+## Key takeaways
+
+1. An expression index stores computed values, so queries filtering on the same expression can seek.
+2. PostgreSQL requires IMMUTABLE expressions: `created_at::date` on `timestamptz` was rejected; `(created_at AT TIME ZONE 'UTC')::date` worked.
+3. The query must use the same expression as the index; planners match it textually.
+4. PostgreSQL gathers statistics on indexed expressions, improving estimates.
+5. MySQL 8.0.13+ has functional key parts (hidden generated columns); default `_ci` collations often make `LOWER()` unnecessary.
+6. MongoDB has no expression indexes: use collation indexes for case-insensitivity, stored fields for other derived values.
+
+## Check questions
+
+1. When should you create an expression index instead of rewriting the query?
+2. Why did PostgreSQL refuse `CREATE INDEX ON orders ((created_at::date))`, and what made the UTC version acceptable?
+3. With an index on `lower(sku)`, which of these can use it: `lower(sku) = 'sku-1'`; `upper(sku) = 'SKU-1'`; `sku ILIKE 'sku-1'`?
+4. What extra benefit does an expression index give the PostgreSQL planner, beyond an access path?
+5. Why is an index on `LOWER(sku)` often unnecessary in MySQL?
+6. A MongoDB collation index exists, but a case-insensitive lookup still does a COLLSCAN and returns nothing. What is missing?
+7. How would you make emails unique regardless of case in PostgreSQL and in MongoDB?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-5-covering-partial-expression/concept-4-expression-indexes/answers">Worked answers to Q1–Q7</DeepDive>

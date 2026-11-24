@@ -1,0 +1,293 @@
+---
+title: "Concept 3: Partial indexes"
+description: "Index only the rows your queries look for: CREATE INDEX … WHERE in PostgreSQL and partialFilterExpression in MongoDB. Measured: 1.1 MB instead of 35 MB for cancelled orders. When the planner can use one (and when a query parameter stops it), and what MySQL offers instead."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "partial-index"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-partial.html"
+  - "https://www.postgresql.org/docs/current/sql-prepare.html"
+  - "https://www.mongodb.com/docs/manual/core/index-partial/"
+  - "https://dev.mysql.com/doc/refman/8.4/en/create-index.html#create-index-functional-key-parts"
+---
+
+<Tldr>
+A **partial index** contains entries only for rows matching a condition. Queries about cancelled orders need only the 50,000 cancelled rows indexed, not 1M: `CREATE INDEX … ON orders (created_at) WHERE status = 'cancelled'` is **1.1 MB** against **35 MB** for `(status, created_at)`, and answers "oldest 100 cancelled orders" in 23 buffers. The planner uses it only when it can **prove** the query's WHERE implies the index's WHERE: a literal `status = 'cancelled'` works, a generic prepared statement with `status = $1` does not. MongoDB has the same feature (`partialFilterExpression`, 2.4 MB vs 12 MB); MySQL has none, and its `CASE` expression workaround saved nothing (1,059 pages vs 1,123).
+</Tldr>
+
+## Why index only some rows
+
+| Situation | Full index | Partial index |
+|---|---|---|
+| Queue: `WHERE status = 'pending' ORDER BY created_at` | Entries for 1M rows, 80% never queried | Entries for the 200,000 pending only |
+| Soft deletes: `WHERE deleted_at IS NULL` | Entries for deleted rows too | Live rows only |
+| Rare flag: `WHERE needs_review` | Mostly `false` entries | The few `true` rows |
+| Unique only among active rows | Impossible as a plain unique index | `UNIQUE … WHERE active` |
+
+Smaller index = fewer pages to cache, faster maintenance: rows outside the condition are never written into it.
+
+| PostgreSQL index | Rows indexed | Size |
+|---|---|---|
+| `(status, created_at)` | 1,000,000 | 35 MB (4,461 leaves) |
+| `(created_at) WHERE status = 'pending'` | 200,000 | 4.4 MB (547 leaves) |
+| `(created_at) WHERE status = 'cancelled'` | 50,000 | 1.1 MB (137 leaves) |
+
+## PostgreSQL: CREATE INDEX … WHERE
+
+| Term | Meaning |
+|---|---|
+| Index predicate | The index's `WHERE` clause |
+| Predicate implication | The planner must prove from the query's conditions that every row it wants satisfies the index predicate |
+| Generic plan | A prepared statement's plan built once without knowing parameter values (`plan_cache_mode`, or after 5 executions if no cheaper) |
+| **✓ Implied / ✗ Not provable** | Partial index usable or not |
+
+<Flow
+  title="PostgreSQL: can the partial index serve this query?"
+  height={330}
+  nodes={[
+    { id: 'q', label: 'Query WHERE', sub: '', x: 20, y: 20, w: 260 },
+    { id: 'pred', label: "Index WHERE", sub: "status = 'cancelled'", x: 340, y: 20, w: 220 },
+    { id: 'yes', label: '✓ Implied', sub: 'partial index usable', x: 620, y: 20, w: 160 },
+    { id: 'no', label: '✗ Not provable', sub: 'partial index skipped', x: 340, y: 150, w: 220 },
+    { id: 'part', label: 'Partial index', sub: '1.1 MB, 50,000 entries', x: 620, y: 150, w: 160 },
+    { id: 'full', label: 'Other plan', sub: '', x: 340, y: 270, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-pred', from: 'q', to: 'pred' },
+    { id: 'pred-yes', from: 'pred', to: 'yes' },
+    { id: 'pred-no', from: 'pred', to: 'no' },
+    { id: 'yes-part', from: 'yes', to: 'part' },
+    { id: 'no-full', from: 'no', to: 'full' },
+  ]}
+  cases={[
+    {
+      title: 'Literal match',
+      path: "status = 'cancelled' ✓ implied → Index Scan on the partial index → 100 rows, 23 buffers",
+      summary: 'Oldest 100 cancelled orders, already ordered by created_at.',
+      subs: { q: 'cancelled, oldest 100' },
+      steps: [
+        {
+          title: '✓ The query implies the predicate',
+          note: 'The query says status = \'cancelled\', exactly the index predicate. Every row the query wants is in the index.',
+          code: "CREATE INDEX orders_cancelled_created ON orders (created_at) WHERE status = 'cancelled';\nEXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders\nWHERE status = 'cancelled' ORDER BY created_at LIMIT 100;",
+          active: ['q', 'pred', 'yes'],
+          edges: ['q-pred', 'pred-yes'],
+        },
+        {
+          title: 'Index Scan on 1.1 MB',
+          note: 'Index Scan using orders_cancelled_created: entries are only cancelled orders, sorted by created_at. Limit 100 after 23 buffers. No status check needed: every entry qualifies.',
+          active: ['yes', 'part'],
+          edges: ['yes-part'],
+        },
+      ],
+    },
+    {
+      title: 'Other value',
+      path: "status = 'paid' ✗ not implied → partial index skipped",
+      summary: 'The partial index has no paid rows; another index or a scan is used.',
+      subs: { q: "status = 'paid' …", full: 'status_created / Seq Scan' },
+      steps: [
+        {
+          title: '✗ Different value',
+          note: 'paid rows are not in the cancelled-only index, so it cannot be used. The planner falls back to orders_status_created_idx or a scan.',
+          code: "EXPLAIN SELECT * FROM orders WHERE status = 'paid' ORDER BY created_at LIMIT 100;",
+          active: ['q', 'pred', 'no', 'full'],
+          edges: ['q-pred', 'pred-no', 'no-full'],
+        },
+      ],
+    },
+    {
+      title: 'Parameter in a generic plan',
+      path: 'status = $1 ✗ not provable at plan time → full composite index',
+      summary: 'Measured with plan_cache_mode = force_generic_plan.',
+      subs: { q: 'status = $1 (prepared)', full: 'orders_status_created_idx' },
+      steps: [
+        {
+          title: '✗ Unknown value when planning',
+          note: 'A generic plan must work for any $1. Since $1 might not be cancelled, the planner cannot prove the predicate and ignores the partial index: Index Scan using orders_status_created_idx, Index Cond: status = $1.',
+          code: "PREPARE q(text) AS SELECT * FROM orders WHERE status = $1 ORDER BY created_at LIMIT 100;\nSET plan_cache_mode = force_generic_plan;\nEXPLAIN EXECUTE q('cancelled');",
+          active: ['q', 'pred', 'no', 'full'],
+          edges: ['q-pred', 'pred-no', 'no-full'],
+        },
+        {
+          title: 'Fix: keep the predicate literal',
+          note: "Write the fixed part as a literal and parameterise the rest: WHERE status = 'cancelled' AND created_at >= $1 used the partial index even in a generic plan. Many ORMs parameterise everything; check the SQL they send.",
+          active: ['yes', 'part'],
+        },
+      ],
+    },
+  ]}
+/>
+
+### Partial unique indexes
+
+```sql
+-- At most one pending order per customer
+CREATE UNIQUE INDEX one_pending_per_customer ON orders (customer_id) WHERE status = 'pending';
+-- ERROR:  could not create unique index "one_pending_per_customer"
+-- DETAIL: Key (customer_id)=(66865) is duplicated.
+```
+
+The lab data violates the rule (customers have several pending orders), so the index cannot be built: the constraint is checked over existing rows first. On a table that follows the rule, it enforces "unique among pending rows only", something no plain unique index can express.
+
+## MySQL: no partial indexes
+
+InnoDB indexes every row, and indexes `NULL` values too, so the usual tricks do not shrink anything:
+
+| Attempt | Result in the lab |
+|---|---|
+| Functional index on `(CASE WHEN status = 'pending' THEN created_at END)` | 1,059 pages: the same size as a full date index (1,123), because non-pending rows get a `NULL` entry |
+| Generated column + index | Same: one entry per row |
+
+| Term | Meaning |
+|---|---|
+| **✓ Supported / ✗ Not supported** | MySQL has no `CREATE INDEX … WHERE` |
+
+<Flow
+  title="MySQL: emulating a partial index"
+  height={290}
+  nodes={[
+    { id: 'want', label: 'Index only pending', sub: '', x: 20, y: 20, w: 240 },
+    { id: 'no', label: '✗ Not supported', sub: 'no CREATE INDEX … WHERE', x: 330, y: 20, w: 220 },
+    { id: 'case', label: 'CASE index', sub: '1,059 pages: no saving', x: 610, y: 20, w: 170 },
+    { id: 'table', label: 'Separate table', sub: 'pending rows only', x: 330, y: 150, w: 220 },
+    { id: 'comp', label: 'Composite index', sub: '(status, created_at)', x: 610, y: 150, w: 170 },
+  ]}
+  edges={[
+    { id: 'want-no', from: 'want', to: 'no' },
+    { id: 'no-case', from: 'no', to: 'case' },
+    { id: 'no-table', from: 'no', to: 'table' },
+    { id: 'no-comp', from: 'no', to: 'comp' },
+  ]}
+  cases={[
+    {
+      title: 'The options',
+      path: '✗ no partial index → CASE index (no saving) / composite index / separate table',
+      summary: 'In practice: a composite index, or a dedicated queue table.',
+      steps: [
+        {
+          title: '✗ Not supported',
+          note: 'MySQL 8.4 has no partial index syntax.',
+          code: "CREATE INDEX orders_pending_case ON orders ((CASE WHEN status = 'pending' THEN created_at END));",
+          active: ['want', 'no'],
+          edges: ['want-no'],
+        },
+        {
+          title: 'A CASE index saves nothing',
+          note: 'Every row gets an entry; non-pending rows get NULL. 1,059 pages vs 1,123 for a full index on the date. Queries must also repeat the exact CASE expression to use it.',
+          active: ['no', 'case'],
+          edges: ['no-case'],
+        },
+        {
+          title: 'What works',
+          note: 'A composite (status, created_at) serves the same query (one stretch for pending) at full-index size. For a hot queue that must stay small, keep pending work in its own table and move rows out when done.',
+          active: ['no', 'comp', 'table'],
+          edges: ['no-comp', 'no-table'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: partialFilterExpression
+
+| Term | Meaning |
+|---|---|
+| `partialFilterExpression` | The index's filter: only matching documents get entries |
+| Usability | The query must include the filter condition (or a stricter one); MongoDB does not use it otherwise |
+| Sparse index | Older, narrower form: index only documents that have the field |
+| **✓ Query matches the filter / ✗ Does not** | As in PostgreSQL |
+
+<Flow
+  title="MongoDB: partial index on pending orders"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Filter', sub: '', x: 20, y: 20, w: 260 },
+    { id: 'pf', label: 'partialFilterExpression', sub: "{ status: 'pending' }", x: 340, y: 20, w: 220 },
+    { id: 'yes', label: '✓ Query matches', sub: 'index is a candidate', x: 620, y: 20, w: 160 },
+    { id: 'no', label: '✗ Does not match', sub: 'index not considered', x: 340, y: 150, w: 220 },
+    { id: 'coll', label: 'Other plan', sub: '', x: 620, y: 150, w: 160 },
+  ]}
+  edges={[
+    { id: 'q-pf', from: 'q', to: 'pf' },
+    { id: 'pf-yes', from: 'pf', to: 'yes' },
+    { id: 'pf-no', from: 'pf', to: 'no' },
+    { id: 'no-coll', from: 'no', to: 'coll' },
+  ]}
+  cases={[
+    {
+      title: "status: 'pending' in the query",
+      path: '✓ matches the filter → the 2.4 MB partial index is a candidate',
+      summary: 'Partial index 2.4 MB vs 12 MB for the full { status, created_at } index.',
+      subs: { q: "{ status: 'pending' } sort created_at" },
+      steps: [
+        {
+          title: '✓ Candidate',
+          note: 'The query includes status: "pending", so the partial index can serve it. (In the lab the planner raced it against the full { status, created_at } index and picked the full one: both answered in 100 keys.)',
+          code: 'db.orders.createIndex({ created_at: 1 }, { name: "pending_created", partialFilterExpression: { status: "pending" } })\ndb.orders.find({ status: "pending" }).sort({ created_at: 1 }).limit(100)',
+          active: ['q', 'pf', 'yes'],
+          edges: ['q-pf', 'pf-yes'],
+        },
+      ],
+    },
+    {
+      title: 'created_at only',
+      path: '✗ no status condition → partial index not considered → SORT ← COLLSCAN',
+      summary: 'Using it would miss non-pending documents.',
+      subs: { q: '{ created_at: { $gte: … } }', coll: 'SORT ← COLLSCAN' },
+      steps: [
+        {
+          title: '✗ Would return wrong results',
+          note: 'The index lacks every non-pending document, so it cannot answer a query that wants them. Plan: SORT ← COLLSCAN.',
+          code: 'db.orders.find({ created_at: { $gte: ISODate("2025-06-01") } }).sort({ created_at: 1 }).limit(100)',
+          active: ['q', 'pf', 'no', 'coll'],
+          edges: ['q-pf', 'pf-no', 'no-coll'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+A partial index that queries cannot prove they match is dead weight that still costs writes. After creating one, check the plans of the **real** application queries, with the parameters the driver actually sends, not hand-written literals.
+</Pitfall>
+
+## Real-world scenario: soft deletes
+
+A `products` table keeps deleted rows with `deleted_at` set; 70% of rows are deleted. Every query has `WHERE deleted_at IS NULL`. The index on `(merchant_id, name)` is mostly deleted products.
+
+| PostgreSQL | Effect |
+|---|---|
+| `CREATE INDEX ON products (merchant_id, name) WHERE deleted_at IS NULL` | ≈ 30% of the size; every application query matches the predicate |
+| `CREATE UNIQUE INDEX ON products (merchant_id, sku) WHERE deleted_at IS NULL` | SKUs unique among live products; a deleted product's SKU can be reused |
+
+MongoDB: the same with `partialFilterExpression: { deleted_at: null }` (accepted by MongoDB 8.0 in the lab), and queries that include `deleted_at: null`. MySQL: keep the composite index, or move deleted rows to an archive table.
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 5: unique indexes | Partial unique indexes express "unique among active rows" |
+| Session 7: BRIN, GIN | Other ways to keep indexes small for specific data |
+| Session 8: write amplification | Rows outside the predicate cost the partial index nothing |
+
+## Key takeaways
+
+1. A partial index stores entries only for rows matching its WHERE condition.
+2. Lab: cancelled-only index 1.1 MB vs 35 MB for the full composite; 23 buffers for the oldest 100 cancelled orders.
+3. PostgreSQL uses it only when the query provably implies the predicate; generic plans with `status = $1` cannot.
+4. Partial unique indexes enforce uniqueness among a subset of rows.
+5. MongoDB has `partialFilterExpression` with the same "query must match" rule.
+6. MySQL has no partial indexes; expression or generated-column tricks still index every row.
+
+## Check questions
+
+1. When does a partial index beat a full index? Give two typical predicates.
+2. Why can `WHERE status = 'cancelled' ORDER BY created_at LIMIT 100` use `(created_at) WHERE status = 'cancelled'`, while `WHERE status = 'paid' …` cannot?
+3. A prepared statement `WHERE status = $1` ignores the partial index in a generic plan. Why, and how do you rewrite it?
+4. What did `CREATE UNIQUE INDEX … (customer_id) WHERE status = 'pending'` try to enforce, and why did it fail on the lab data?
+5. Why did MySQL's `CASE` expression index not save space?
+6. Why does MongoDB refuse to use a `{ status: 'pending' }` partial index for a query on `created_at` alone?
+7. Design a PostgreSQL index for soft-deleted products that keeps SKUs unique only among live products.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-5-covering-partial-expression/concept-3-partial-indexes/answers">Worked answers to Q1–Q7</DeepDive>

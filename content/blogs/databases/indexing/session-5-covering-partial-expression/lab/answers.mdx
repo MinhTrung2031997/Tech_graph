@@ -1,0 +1,92 @@
+---
+title: "Answers: Covering, partial and expression indexes session quiz"
+description: "Worked answers to the Session 5 quiz."
+companion: "answers"
+tags: ["indexing", "covering-index", "partial-index", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-index-only-scans.html"
+  - "https://www.postgresql.org/docs/current/indexes-partial.html"
+---
+
+<Tldr>
+Covering removes the row fetch, partial removes irrelevant rows, expression indexes remove the function barrier, unique indexes enforce rules. Each has a condition that must hold for it to work.
+</Tldr>
+
+## Q1. Which queries are covered
+
+**Question:** which of these queries does `(customer_id, created_at) INCLUDE (amount)` cover: (a) `SELECT amount FROM orders WHERE customer_id = 7`; (b) `SELECT amount FROM orders WHERE customer_id = 7 AND amount > 100`; (c) `SELECT status FROM orders WHERE customer_id = 7`?
+
+| Query | Covered? | Why |
+|---|---|---|
+| (a) | ✓ | `customer_id` (key) and `amount` (included) are in the index |
+| (b) | ✓ | `amount > 100` is checked on the included value; it cannot narrow the seek, but no heap visit is needed |
+| (c) | ✗ | `status` is not in the index |
+
+> **Common mistake:** thinking (b) is not covered because `amount` is only an INCLUDE column. Included columns can be filtered, just not searched.
+
+## Q2. Would a bitmap scan suffer too?
+
+**Question:** after Exercise 2's update, would a non-covering Bitmap Heap Scan have been affected as badly as the Index Only Scan? Why?
+
+No. A Bitmap Heap Scan always reads the heap and never consults the visibility map, so cleared bits change nothing for it; it still reads each needed page once, in file order (≈ 4 ms). The Index Only Scan lost its advantage and, worse, visited heap pages in index order.
+
+> **Common mistake:** "the update slowed down the table". It slowed down only plans that relied on the visibility map.
+
+## Q3. Needed vs bypassed
+
+**Question:** Exercise 2's VACUUM reported "index scan needed", but Session 2's VACUUM reported "index scan bypassed". What decided the difference?
+
+The share of heap pages with dead items. Exercise 2's update left dead items on 10,000 pages (98%), far above the bypass threshold (about 2% of pages), so VACUUM vacuumed the indexes and could mark pages all-visible. In Session 2 only 7 pages (0.07%) had dead items, so VACUUM skipped index cleanup to save time, and those 7 pages stayed not all-visible.
+
+> **Common mistake:** assuming every VACUUM cleans indexes.
+
+## Q4. q vs q2
+
+**Question:** in Exercise 3, why did `q2` use the partial index in a generic plan while `q` did not?
+
+`q` has `status = $1`: the generic plan must work for any value, and the planner cannot prove `$1 = 'cancelled'`, so the partial index's predicate is not implied. `q2` has the literal `status = 'cancelled'` and only `created_at` as a parameter: the predicate is implied whatever the parameter, so the partial index is usable.
+
+> **Common mistake:** blaming the partial index; the parameterisation is what hides the predicate.
+
+## Q5. Unpaid invoices in MySQL
+
+**Question:** a MySQL user wants a small index on unpaid invoices only (3% of rows). What would you recommend, given Exercise 3's result?
+
+MySQL cannot index a subset: a `CASE` expression or generated column still gets an entry per row (1,060 pages in the lab, no saving). Options: a composite index starting with the status column, `(paid, due_date)`, which makes unpaid invoices one contiguous stretch (fast queries, full-size index); or, if size really matters, keep unpaid invoices in a separate table and move them when paid.
+
+> **Common mistake:** recommending the `CASE` index as a partial index.
+
+## Q6. upper vs lower
+
+**Question:** why did `upper(sku) = 'SKU-000123'` not use the `lower(sku)` index, even though it finds the same rows?
+
+The planner matches index expressions **textually**. The index stores `lower(sku)` values; the query asks about `upper(sku)`, a different expression. The planner does not reason that the two conditions select the same rows (for some strings they would not). Write the query with the same expression as the index.
+
+> **Common mistake:** expecting semantic equivalence to be detected.
+
+## Q7. NULLs per engine
+
+**Question:** Exercise 5 showed different NULL behaviour in the three engines. For each, how many rows or documents with a missing email can a unique email index accept by default?
+
+| Engine | Rows/documents with no email |
+|---|---|
+| PostgreSQL | Unlimited (NULLs distinct); 1 with `NULLS NOT DISTINCT` |
+| MySQL | Unlimited |
+| MongoDB | 1 (missing field indexed as `null`); unlimited with a partial or sparse index |
+
+> **Common mistake:** assuming SQL semantics in MongoDB.
+
+## Q8. A table-free top 10
+
+**Question:** design indexes for this query in all three engines so it never reads the table: `SELECT created_at, amount FROM orders WHERE customer_id = ? AND status = 'paid' ORDER BY created_at DESC LIMIT 10`.
+
+| Engine | Index | Why |
+|---|---|---|
+| PostgreSQL | `(customer_id, created_at) INCLUDE (amount) WHERE status = 'paid'`, or `(customer_id, status, created_at) INCLUDE (amount)` | Equality, then sort column; `amount` included; the partial version is smaller (status is fixed) |
+| MySQL | `(customer_id, status, created_at, amount)` | Equalities, sort column, then `amount` as a key column for covering |
+| MongoDB | `{ customer_id: 1, status: 1, created_at: -1, amount: 1 }` with projection `{ _id: 0, created_at: 1, amount: 1 }` | E-E-S, then `amount`; exclude `_id` |
+
+PostgreSQL also needs the heap pages to be all-visible (VACUUM) for zero heap fetches.
+
+> **Common mistake:** putting `amount` before `created_at`, which breaks the sort order.

@@ -1,0 +1,84 @@
+---
+title: "Answers: Covering indexes and INCLUDE"
+description: "Worked answers to the Session 5 Concept 1 check questions."
+companion: "answers"
+tags: ["indexing", "covering-index", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-index-only-scans.html"
+  - "https://www.mongodb.com/docs/manual/core/query-optimization/#covered-query"
+---
+
+<Tldr>
+Covered = every column the query touches is in the index. Then the row fetch, usually the expensive step, disappears.
+</Tldr>
+
+## Q1. Covered or not
+
+**Question:** what makes a query "covered" by an index? Give one covered and one non-covered query for `(customer_id, created_at)`.
+
+Every column the query **filters on, sorts by and returns** must be in the index (in InnoDB the primary key counts too).
+
+| Query | Covered? |
+|---|---|
+| `SELECT created_at FROM orders WHERE customer_id = 7 ORDER BY created_at` | ✓ |
+| `SELECT created_at, amount FROM orders WHERE customer_id = 7` | ✗ `amount` |
+
+> **Common mistake:** checking only the WHERE clause; the SELECT list matters as much.
+
+## Q2. Key vs INCLUDE
+
+**Question:** what is the difference between a key column and an `INCLUDE` column in PostgreSQL?
+
+| | Key column | `INCLUDE` column |
+|---|---|---|
+| Where stored | All levels of the B-tree | Leaf entries only |
+| Ordering, search, `ORDER BY` | ✓ | ✗ |
+| Part of uniqueness | ✓ | ✗ |
+| Typical use | Filtered or sorted columns | Columns only returned |
+
+> **Common mistake:** using `INCLUDE` for a column you filter on; it cannot narrow the search.
+
+## Q3. 6,404 → 53 buffers
+
+**Question:** why did the covering index reduce PostgreSQL's buffers from 6,404 to 53?
+
+Without `amount` in the index, each of the 9,956 matching rows had to be fetched from the heap: 6,376 scattered heap pages. With `INCLUDE (amount)`, the leaf entries hold all three columns, and the pages were all-visible, so the Index Only Scan read only the ≈ 50 leaf pages of the range plus the descent: 53 buffers, Heap Fetches 0.
+
+> **Common mistake:** "the covering index is faster because it is a better index". The index part was similar; the heap part vanished.
+
+## Q4. id for free in InnoDB
+
+**Question:** why does `(customer_id, created_at, amount)` cover `SELECT id, amount … WHERE customer_id = ?` in InnoDB?
+
+Every InnoDB secondary entry ends with the primary key, here `id`. So the entry is really `(customer_id, created_at, amount, id)`: the filter column, the returned `amount` and the returned `id` are all there. EXPLAIN shows `Using index`.
+
+> **Common mistake:** adding `id` explicitly to the index.
+
+## Q5. FETCH despite a matching index
+
+**Question:** a MongoDB query on a perfectly matching index still shows `FETCH`. What is the most likely cause?
+
+`_id` is returned by default and is not in the index. Add `_id: 0` to the projection (or include `_id` in the index). In the lab, the same query went from 10,000 documents fetched to 0. Other causes: a projected or filtered field missing from the index, or a field that is an array (multikey indexes cannot cover array fields).
+
+> **Common mistake:** assuming the projection `{ a: 1, b: 1 }` excludes `_id`.
+
+## Q6. UNIQUE with INCLUDE
+
+**Question:** why does `UNIQUE (email) INCLUDE (name)` still enforce unique emails?
+
+Uniqueness is checked on the **key** columns only. `name` is stored in the leaf as payload and plays no part in comparisons, so two rows with the same email and different names still conflict. That is exactly the point: uniqueness on `email`, plus `name` available for index-only scans.
+
+> **Common mistake:** expecting `(email, name)` uniqueness, which is what `UNIQUE (email, name)` would give.
+
+## Q7. Costs of many INCLUDE columns
+
+**Question:** what are the costs of adding many `INCLUDE` columns, and which update behaviour changes in PostgreSQL?
+
+| Cost | Why |
+|---|---|
+| Size | Every leaf entry carries the extra bytes: fewer entries per page, more pages to cache and scan |
+| Write work | Inserts write more; updates to included columns must update the index |
+| HOT updates lost | An update that changes any indexed column, included ones too, cannot be HOT: the row gets a new ctid and **every** index on the table gets a new entry |
+
+> **Common mistake:** assuming `INCLUDE` columns are "free" because they are not searchable.

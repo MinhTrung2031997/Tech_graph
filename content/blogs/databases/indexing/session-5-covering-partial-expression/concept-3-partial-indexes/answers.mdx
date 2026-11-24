@@ -1,0 +1,74 @@
+---
+title: "Answers: Partial indexes"
+description: "Worked answers to the Session 5 Concept 3 check questions."
+companion: "answers"
+tags: ["indexing", "partial-index", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-partial.html"
+  - "https://www.mongodb.com/docs/manual/core/index-partial/"
+---
+
+<Tldr>
+Index only the rows you query; make sure the queries provably ask only for those rows.
+</Tldr>
+
+## Q1. When partial beats full
+
+**Question:** when does a partial index beat a full index? Give two typical predicates.
+
+When queries consistently target a **small, well-defined subset** of rows, so most entries of a full index would never be used: smaller index, more of it cached, cheaper writes for rows outside the subset. Typical predicates: `WHERE status = 'pending'` (queues), `WHERE deleted_at IS NULL` (soft deletes), `WHERE needs_review` (rare flags).
+
+> **Common mistake:** a partial index on a condition matching most rows; it saves little and restricts which queries can use it.
+
+## Q2. cancelled vs paid
+
+**Question:** why can `WHERE status = 'cancelled' ORDER BY created_at LIMIT 100` use `(created_at) WHERE status = 'cancelled'`, while `WHERE status = 'paid' …` cannot?
+
+The planner may use a partial index only if every row the query wants is guaranteed to be in it. `status = 'cancelled'` implies the index predicate exactly, and the index is sorted by `created_at`, so the scan returns the first 100 entries (23 buffers). Paid rows are not in the index at all, so using it for `status = 'paid'` would return nothing; the planner must use another plan.
+
+> **Common mistake:** expecting the index to help any query on `created_at`.
+
+## Q3. Generic plans
+
+**Question:** a prepared statement `WHERE status = $1` ignores the partial index in a generic plan. Why, and how do you rewrite it?
+
+A generic plan is built once for all possible values of `$1`. The planner cannot prove that `$1` will be `'cancelled'`, so the partial index's predicate is not implied and the index is excluded. Rewrite so the predicate is a literal and only the variable part is a parameter: `WHERE status = 'cancelled' AND created_at >= $1` (used the partial index even with `force_generic_plan`). Custom plans (built with the actual value) can use it, but you do not control when PostgreSQL switches to a generic plan.
+
+> **Common mistake:** testing with literals in `psql` and assuming the application's parameterised query behaves the same.
+
+## Q4. One pending order per customer
+
+**Question:** what did `CREATE UNIQUE INDEX … (customer_id) WHERE status = 'pending'` try to enforce, and why did it fail on the lab data?
+
+"Each customer has at most one pending order": uniqueness of `customer_id` among pending rows only, while customers may have any number of non-pending orders. Building a unique index first checks the existing rows; customer 66,865 (among others) already had two pending orders, so the build failed with `Key (customer_id)=(66865) is duplicated`.
+
+> **Common mistake:** thinking a failed unique index build leaves a partial index behind; nothing is created.
+
+## Q5. MySQL's CASE index
+
+**Question:** why did MySQL's `CASE` expression index not save space?
+
+InnoDB indexes **every** row, and stores `NULL` values in indexes. The expression evaluates to `NULL` for non-pending rows, but each of them still gets an entry: 1,059 pages vs 1,123 for a full date index. There is no way to tell MySQL to skip rows.
+
+> **Common mistake:** assuming NULLs are left out of B-tree indexes, as in Oracle.
+
+## Q6. MongoDB and created_at alone
+
+**Question:** why does MongoDB refuse to use a `{ status: 'pending' }` partial index for a query on `created_at` alone?
+
+The query wants documents of every status, but the index only contains pending ones. Using it would silently drop most results. MongoDB only considers a partial index when the query includes the filter condition (or a condition that implies it), so the plan was `SORT ← COLLSCAN`.
+
+> **Common mistake:** hinting the partial index to "make it fast"; MongoDB rejects hints that would give incomplete results.
+
+## Q7. Soft-deleted products
+
+**Question:** design a PostgreSQL index for soft-deleted products that keeps SKUs unique only among live products.
+
+```sql
+CREATE UNIQUE INDEX products_live_sku ON products (merchant_id, sku) WHERE deleted_at IS NULL;
+```
+
+Two live products of the same merchant cannot share a SKU; a deleted product keeps its SKU without blocking reuse. Queries must include `deleted_at IS NULL` to use the index for lookups.
+
+> **Common mistake:** `UNIQUE (merchant_id, sku, deleted_at)`: NULLs are distinct by default, so it would allow duplicate live SKUs.

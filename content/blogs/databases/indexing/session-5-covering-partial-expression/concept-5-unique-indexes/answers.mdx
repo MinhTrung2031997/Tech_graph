@@ -1,0 +1,71 @@
+---
+title: "Answers: Unique indexes as constraints"
+description: "Worked answers to the Session 5 Concept 5 check questions."
+companion: "answers"
+tags: ["indexing", "unique-index", "constraints", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-unique.html"
+  - "https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT"
+  - "https://www.mongodb.com/docs/manual/core/index-unique/"
+---
+
+<Tldr>
+The unique index is the constraint: look before inserting, wait on uncommitted duplicates, fail or update on conflict. Mind each engine's NULL rule.
+</Tldr>
+
+## Q1. What an insert does
+
+**Question:** what exactly does the database do with a unique index when you insert a row?
+
+It descends the unique index to the position of the new key and checks for entries with an equal key. If one belongs to a visible (committed) row, the insert fails (or an upsert takes its update path). If it belongs to an uncommitted transaction, the insert waits for that transaction, then fails if it committed or proceeds if it rolled back. Only then is the new entry added.
+
+> **Common mistake:** "the database checks the table". It checks the index; without the index there is nothing to check efficiently.
+
+## Q2. Two NULL emails
+
+**Question:** a PostgreSQL table with `email text UNIQUE` accepts two rows with `NULL` email. Why, and how do you forbid it?
+
+SQL treats NULL as "unknown", and two unknowns are not considered equal, so by default NULLs never conflict. To forbid duplicates among NULLs, declare `UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15+): the lab then rejected the second NULL. To forbid NULL entirely, add `NOT NULL`.
+
+> **Common mistake:** expecting a unique column to have at most one NULL by default.
+
+## Q3. MongoDB and missing fields
+
+**Question:** why does a MongoDB unique index on `email` reject a second document that has no `email` field, and how do you allow many such documents?
+
+MongoDB indexes a missing field as the value `null`. The first document without `email` gets the key `null`; the second has the same key and violates uniqueness (E11000). Allow many by not indexing them: a partial index with `partialFilterExpression: { email: { $exists: true } }` (or `{ email: { $type: 'string' } }`), or the older `sparse: true` option.
+
+> **Common mistake:** assuming MongoDB follows SQL's "NULLs are distinct" rule.
+
+## Q4. ON CONFLICT needs a unique index
+
+**Question:** why does `INSERT … ON CONFLICT (k)` require a unique index on `k`?
+
+`ON CONFLICT` reacts to a **unique violation**, which only a unique index (or constraint) can raise, and it uses that index both to detect the conflict and to find the existing row to update. The index's wait-on-uncommitted-duplicate behaviour is also what makes the insert-or-update atomic under concurrency. Without a unique index on `k`, PostgreSQL rejects the statement ("there is no unique or exclusion constraint matching the ON CONFLICT specification").
+
+> **Common mistake:** expecting ON CONFLICT to work on any column.
+
+## Q5. Concurrent inserts of the same key
+
+**Question:** two transactions insert the same new key at the same time. What happens in PostgreSQL?
+
+The first transaction's insert adds the entry. The second finds that entry, sees that its transaction is still in progress, and **waits**. When the first commits, the second fails with a unique violation (or, with `ON CONFLICT DO UPDATE`, updates the row the first inserted). If the first rolls back, the second's insert proceeds.
+
+> **Common mistake:** "both succeed and one is removed later". The constraint is enforced at insert time.
+
+## Q6. When the check gets expensive
+
+**Question:** in the lab, the unique check cost almost nothing in PostgreSQL and MySQL. When would it become expensive?
+
+When the unique index does not fit in memory: each check must read the leaf where the key would go, often a random disk read, where a non-unique insert into a cold page might be cheaper (or deferred, as InnoDB's change buffer can do for non-unique indexes, though it is off by default since MySQL 8.4). Also under high concurrency on the same keys (waits), and in InnoDB through the extra locks taken on the key range during the check. MongoDB already showed +49% on a bulk load in memory.
+
+> **Common mistake:** generalising "unique checks are free" from a cached benchmark.
+
+## Q7. Check-then-insert
+
+**Question:** why is "SELECT, then INSERT if not found" unsafe, and what should replace it?
+
+Two concurrent requests can both run the SELECT before either inserts; both see no row and both insert, creating a duplicate. Nothing in between holds a lock on "a row that does not exist yet". Replace it with a unique index plus either a plain `INSERT` that handles the duplicate error, or an atomic upsert (`ON CONFLICT DO NOTHING / DO UPDATE`, `ON DUPLICATE KEY UPDATE`, `upsert: true` with a unique index).
+
+> **Common mistake:** wrapping check-then-insert in a transaction at the default isolation level; it still races.
