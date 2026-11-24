@@ -1,0 +1,66 @@
+---
+title: "Answers: Distributed tables in Citus"
+description: "Worked answers to the Session 7 Concept 1 check questions."
+companion: "answers"
+tags: ["sharding", "citus", "answers"]
+status: "draft"
+sources:
+  - "https://docs.citusdata.com/en/stable/develop/api_udf.html#create-distributed-table"
+  - "https://docs.citusdata.com/en/stable/develop/reference_processing.html"
+---
+
+<Tldr>
+The distribution column decides everything: where a row is stored, which constraints are allowed, and whether a query touches one shard or all of them.
+</Tldr>
+
+## Q1. The refused primary key
+
+**Question:** why did `PRIMARY KEY (id)` stop `create_distributed_table`, and what key did the lab use instead?
+
+Each shard is a separate table, usually on another server. A primary key is enforced by a unique index **inside one shard**, so it can only guarantee uniqueness for rows that are guaranteed to be in the same shard. Two orders with the same `id` but different sellers would hash to different shards and neither index would see the other. Citus therefore refuses unique constraints that do not include the distribution column: "Distributed relations cannot have UNIQUE, EXCLUDE, or PRIMARY KEY constraints that do not include the partition column". The lab used `PRIMARY KEY (seller_id, id)`, which only promises that the pair is unique.
+
+> **Common mistake:** assuming `(seller_id, id)` still makes `id` unique. It does not; keeping `id` unique needs a sequence or ID scheme that cannot produce duplicates (Session 8).
+
+## Q2. Finding the worker
+
+**Question:** how does the coordinator decide that `seller_id = 1673` goes to `pt-citus-w2`?
+
+It hashes the value with the column type's hash function (`hashint4(1673) = 1274531150`), finds the shard in `pg_dist_shard` whose `shardminvalue … shardmaxvalue` contains it (shard 102033, range `1207959552 … 1342177279`), and looks up that shard's placement in `pg_dist_placement` / `citus_shards`: `pt-citus-w2`. `get_shard_id_for_distribution_column('orders_d', 1673)` does the first two steps in one call.
+
+> **Common mistake:** thinking the shard is `seller_id % 32`. Citus uses hash ranges, which is why `seller_id` 1 and 2 are not in neighbouring shards.
+
+## Q3. Where the time went
+
+**Question:** the lookup by `id` returned one row but cost 18 times the plain table. Where did the time go?
+
+The coordinator could not exclude any shard, so it sent 32 tasks over its connections to the two workers, each worker planned and ran 16 index lookups, and the coordinator collected 32 results (31 empty). The plain table did one index lookup in one process. The work per task is tiny; the cost is the per-task overhead: planning on the coordinator, a network round trip, planning on the worker, and merging. 1.96 ms vs 0.11 ms.
+
+> **Common mistake:** adding an index on `id` and expecting single-shard speed. The index makes each of the 32 tasks fast; it does not reduce the number of tasks.
+
+## Q4. Fewer shards
+
+**Question:** why did the 4-shard copy answer the same id lookup in about half the time of the 32-shard table?
+
+Four tasks instead of 32: less per-task overhead (0.92 ms vs 1.96 ms). The trade-off: a shard is the unit Citus moves between workers, so 4 shards can be spread over at most 4 workers and are coarse to rebalance. Citus defaults to 32 so a cluster can grow to many workers without resharding; the docs suggest a shard count of a small multiple of the number of CPU cores across the workers for large tables.
+
+> **Common mistake:** picking the shard count for today's cluster size. It is hard to change later; pick it for the cluster you expect to need.
+
+## Q5. Uneven shards
+
+**Question:** the shards hold between 26,707 and 34,950 rows although the hash ranges are equal. Why?
+
+The hash ranges are equal, but rows arrive in groups: all orders of one seller go to one shard. With 5,000 sellers in 32 buckets, each shard got between 134 and 173 sellers, and sellers have different order counts. The fewer distinct values the distribution column has, and the bigger the largest value, the worse the imbalance. A seller with 30% of all orders would make one shard huge whatever the hash function.
+
+> **Common mistake:** expecting hashing to fix skew in the data. Hashing spreads *values* evenly, not *rows*.
+
+## Q6. Searching by order id
+
+**Question:** a support tool searches orders by id. Name two ways to avoid fanning out to every shard.
+
+Any two of:
+- Make the tool ask for, or already know, the seller (from the ticket, the customer account or the marketplace), and query `WHERE seller_id = … AND id = …`: a router query (0.54 ms in the lab).
+- Encode the shard key into the order number (for example a seller prefix), so the application can extract `seller_id` from the id.
+- Keep a small lookup table `order_id → seller_id`, distributed by `order_id`: one router query to find the seller, a second router query for the order.
+- Accept the fan-out for a rare support query; it is the hot path that must route.
+
+> **Common mistake:** distributing the main table by `id` just for the support tool, which turns every seller dashboard into a fan-out.

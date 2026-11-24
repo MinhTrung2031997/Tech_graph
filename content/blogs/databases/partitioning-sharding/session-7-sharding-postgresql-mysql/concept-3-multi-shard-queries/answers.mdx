@@ -1,0 +1,62 @@
+---
+title: "Answers: Multi-shard queries"
+description: "Worked answers to the Session 7 Concept 3 check questions."
+companion: "answers"
+tags: ["sharding", "citus", "aggregation", "answers"]
+status: "draft"
+sources:
+  - "https://docs.citusdata.com/en/stable/develop/reference_processing.html"
+  - "https://docs.citusdata.com/en/stable/develop/reference_sql.html#aggregate-functions"
+---
+
+<Tldr>
+Ask of every multi-shard query: can each shard reduce its part to a few rows that combine into the answer? If yes, it scales; if not, the coordinator does single-server work on network-delivered data.
+</Tldr>
+
+## Q1. Average across shards
+
+**Question:** how does Citus compute `avg(amount)` over 32 shards without shipping the amounts?
+
+An average is not combinable (the average of averages is wrong when shards have different row counts), but a sum and a count are. The worker part computes, per marketplace, the sum and the count of `amount`; the coordinator adds the sums, adds the counts and divides. The whole query received 96 rows and 4,796 bytes for 1,000,000 orders.
+
+> **Common mistake:** writing an application merge that averages the shard averages. With shards of 26,707 and 34,950 rows, that weights them equally and gives a wrong answer.
+
+## Q2. Per-shard top 10
+
+**Question:** why is a per-shard LIMIT 10 enough for the top 10 sellers, and when would it not be?
+
+Because the query groups by the distribution column: every order of a seller is in one shard, so the seller's GMV computed there is its final total, and the global top 10 must be among the shards' top 10s. It would **not** be enough when the group spans shards, for example top 10 SKUs, days or marketplaces: a day's GMV is split over all 32 shards, and its total only exists after the coordinator adds the 32 parts. Citus knows this: for top 10 days by GMV it did not push the LIMIT down, and every shard sent all its days: 23,392 rows (731 days × 32 shards), 394 kB.
+
+> **Common mistake:** assuming the coordinator always applies LIMIT before merging. It pushes LIMIT down only when that is safe.
+
+## Q3. OFFSET vs keyset
+
+**Question:** why did `LIMIT 10 OFFSET 100000` pull all 1,000,000 rows, and how did the keyset query avoid it?
+
+Rows 100,001 to 100,010 in `created_at` order could come from any shard, in any mix. To be sure, the coordinator needs each shard's first 100,010 rows in that order, then merges and skips 100,000. Each shard had only about 31,000 rows, so all of them were sent: 15 MB, 906 ms. The keyset query gives a starting point instead of a count: "rows after (2024-03-14 02:22:56, 100000)". Each shard can find that point with its `created_at` index and return its next 10: 320 rows, 4.6 ms, same answer.
+
+> **Common mistake:** caching OFFSET pages to hide the cost. The first visit to a deep page still pulls the table.
+
+## Q4. Which ship every row
+
+**Question:** which of these ship every row to the coordinator: `count(DISTINCT seller_id)`, `percentile_cont(0.5)`, `max(amount)`?
+
+Only `percentile_cont(0.5)`: an exact median needs all values in one sorted list, so 1,000,000 values (7.8 MB) were sent. `max(amount)` combines: each shard sends its max. `count(DISTINCT seller_id)` is distinct on the distribution column, so each shard's distinct sellers are disjoint from the others': each shard sends a count (32 rows, 256 bytes) and the coordinator adds them.
+
+> **Common mistake:** assuming any `count(DISTINCT …)` is cheap. On a column other than the distribution column, every shard sends its distinct values for de-duplication: cheap for `status` (3 values), expensive for `customer_id`.
+
+## Q5. Slower when distributed
+
+**Question:** why was the full-table GMV query slower on the 32-shard table than on the plain table here, and why would that change in production?
+
+In the lab the coordinator and both workers are containers on one laptop sharing 10 CPU cores, and the Citus image runs under amd64 emulation. Splitting the scan into 32 tasks adds planning, connections, result transfer and merging, but no extra hardware: 129 ms vs 68 ms (and 93 ms with 4 shards). In production each worker is a separate server with its own CPUs, memory and disks, so the scan of 1M rows splits between machines while the overhead stays roughly the same. The benefit appears when one server's resources are the limit.
+
+> **Common mistake:** benchmarking Citus on a single machine and concluding it is slower than PostgreSQL. It is, on one machine.
+
+## Q6. Distributed DDL
+
+**Question:** `CREATE INDEX` on `orders_d` took about as long as on the plain table. What did it do?
+
+Citus propagated it as 32 `CREATE INDEX` commands, one per shard (`orders_d_amount_idx_102008`, …), run on the two workers in parallel, inside one distributed transaction. `run_command_on_shards` found the index on all 32 shards. Each shard is small (about 31,000 rows), so the 32 builds together took 545 ms vs 495 ms for one build over 1M rows on the plain table. `CREATE INDEX CONCURRENTLY` also works on distributed tables (515 ms).
+
+> **Common mistake:** creating indexes directly on a worker's shard tables. Citus does not know about them; new shards (after a split or a rebalance) will not get them.

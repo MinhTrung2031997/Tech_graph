@@ -1,0 +1,209 @@
+---
+title: "Concept 1: Distributed tables in Citus"
+description: "create_distributed_table splits orders by a hash of seller_id into 32 shards spread over two workers. A query with seller_id = 1673 becomes one task on one shard (router query); a lookup by id alone becomes 32 tasks. On the 1M-row lab table the seller query took 0.62 ms against 0.20 ms on a plain table on the same server, the id lookup 1.96 ms against 0.11 ms; with 4 shards instead of 32 the id lookup took 0.92 ms. A primary key without the distribution column is refused."
+type: "concept"
+tags: ["sharding", "citus", "postgresql", "distribution-column"]
+status: "draft"
+sources:
+  - "https://docs.citusdata.com/en/stable/develop/api_udf.html#create-distributed-table"
+  - "https://docs.citusdata.com/en/stable/get_started/concepts.html"
+  - "https://docs.citusdata.com/en/stable/develop/reference_processing.html"
+  - "https://docs.citusdata.com/en/stable/develop/api_metadata.html"
+---
+
+<Tldr>
+Citus turns one PostgreSQL table into many ordinary tables (**shards**) on **worker** nodes. `create_distributed_table('orders_d', 'seller_id')` cut the 1M orders into **32 shards** by a hash of `seller_id`, 16 per worker. The **coordinator** keeps the hash range of every shard and rewrites each query: with `seller_id = 1673` in the WHERE clause it sends **one task** to one shard (a *router query*); without it, it sends **32 tasks**. Measured on the lab (one connection, pgbench, best of 3): seller lookup **0.62 ms** distributed vs **0.20 ms** on a plain table; lookup by `id` only **1.96 ms** (32 tasks) vs **0.11 ms**; with `seller_id` added **0.54 ms**; single-row INSERT **1.45 ms** vs **0.89 ms**. A primary key must include the distribution column, and an INSERT without it fails.
+</Tldr>
+
+## The setup
+
+All numbers in this session come from database `pt7` on the lab Citus cluster: coordinator `pt-citus` and workers `pt-citus-w1`, `pt-citus-w2`, Citus 13.0 on PostgreSQL 17.2, all on one laptop. The Citus image is built for amd64 and runs under emulation on the lab's arm64 Mac, and the two "servers" share the same 10 CPU cores. So **only ratios measured on Citus are meaningful**; never compare a Citus time with a time from `idx-pg` in earlier sessions. The plain table `orders` (1,000,000 rows, an index on `seller_id` added for this session) stays on the coordinator as the single-node baseline.
+
+```sql
+CREATE TABLE orders_d (LIKE orders INCLUDING DEFAULTS);
+ALTER TABLE orders_d ADD PRIMARY KEY (id);
+SELECT create_distributed_table('orders_d', 'seller_id');
+-- ERROR:  cannot create constraint on "orders_d"
+-- DETAIL:  Distributed relations cannot have UNIQUE, EXCLUDE, or PRIMARY KEY constraints
+--          that do not include the partition column (with an equality operator if EXCLUDE).
+
+ALTER TABLE orders_d DROP CONSTRAINT orders_d_pkey;
+ALTER TABLE orders_d ADD PRIMARY KEY (seller_id, id);
+SELECT create_distributed_table('orders_d', 'seller_id');   -- 206 ms, empty table
+INSERT INTO orders_d SELECT * FROM orders;                  -- 2.4 s
+CREATE INDEX orders_d_created_at_idx ON orders_d (created_at);
+CREATE INDEX orders_d_id_idx ON orders_d (id);
+```
+
+This is the same rule as on a partitioned table ([Session 3, Concept 3](/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-3-unique-keys)): each shard can only check uniqueness inside itself. Session 8 deals with keeping `id` unique anyway.
+
+Distributing a table that already holds data also works (1.9 s for 1M rows), but the original rows stay on the coordinator's disk, hidden: `SELECT count(*) FROM ONLY orders_d2` still returned 1,000,000 until `truncate_local_data_after_distributing_table` was run.
+
+| Term | Meaning |
+|---|---|
+| Coordinator | The node clients connect to. Holds the metadata, plans the query, sends tasks, merges results |
+| Worker | A PostgreSQL server that stores shards and runs tasks |
+| Shard | An ordinary table on a worker, e.g. `orders_d_102033`, holding one hash range |
+| Distribution column | The column whose hash picks the shard: `seller_id` here. Citus also calls it the partition column |
+| Router query | A query the coordinator can send whole to one shard, because the WHERE clause fixes the distribution column |
+| Multi-shard query | A query sent as one task per shard, results merged on the coordinator |
+| Task | One SQL statement run against one shard |
+| **✓ / ✗** | Shard or worker receives a task / is skipped |
+
+## Where a row goes
+
+`pg_dist_shard` splits the 32-bit hash space into 32 equal ranges. Seller 1673 hashes to `hashint4(1673) = 1274531150`, which falls in shard 102033's range `1207959552 … 1342177279`, and that shard lives on `pt-citus-w2`. `get_shard_id_for_distribution_column('orders_d', 1673)` returns the same answer without any arithmetic.
+
+| Measured on `orders_d` | Value |
+|---|---|
+| Shards per worker | 16 and 16 |
+| Size per worker | 70 MB and 71 MB |
+| Sellers per shard | 134 to 173 (5,000 in total) |
+| Rows per shard | 26,707 to 34,950 (mean 31,250, largest/smallest 1.31) |
+
+Equal hash ranges do not mean equal shards: 5,000 sellers hashed into 32 buckets landed unevenly. With few distinct values, or one huge seller, the spread gets worse: that is the shard-key question of Session 5.
+
+<Flow
+  title="Citus: three statements against orders_d"
+  height={290}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'one connection', x: 20, y: 20, w: 200 },
+    { id: 'coord', label: 'Coordinator', sub: 'pt-citus: plan + route', x: 300, y: 20, w: 200 },
+    { id: 'meta', label: 'pg_dist_shard', sub: '32 hash ranges', x: 580, y: 20, w: 200 },
+    { id: 'w1', label: 'Worker pt-citus-w1', sub: '16 shards', x: 100, y: 210, w: 240 },
+    { id: 'w2', label: 'Worker pt-citus-w2', sub: '16 shards', x: 460, y: 210, w: 240 },
+  ]}
+  edges={[
+    { id: 'app-coord', from: 'app', to: 'coord' },
+    { id: 'coord-meta', from: 'coord', to: 'meta' },
+    { id: 'coord-w1', from: 'coord', to: 'w1' },
+    { id: 'coord-w2', from: 'coord', to: 'w2' },
+  ]}
+  cases={[
+    {
+      title: 'WHERE seller_id = 1673 (router)',
+      path: 'coordinator ✓ → hash(1673) in shard 102033 → w2 ✓ 1 task → w1 ✗',
+      summary: 'One shard does the work; the coordinator only forwards. 0.62 ms vs 0.20 ms on the plain table.',
+      steps: [
+        {
+          title: 'Plan: find the shard',
+          note: 'The WHERE clause fixes seller_id, so the coordinator hashes 1673 and looks up the one range that contains 1274531150.',
+          code: 'SELECT count(*), sum(amount) FROM orders_d WHERE seller_id = 1673;',
+          active: ['app', 'coord', 'meta'],
+          edges: ['app-coord', 'coord-meta'],
+          subs: { meta: 'shard 102033 on w2' },
+        },
+        {
+          title: 'Run: one task',
+          note: 'EXPLAIN: Task Count: 1, Node: host=pt-citus-w2. On the worker it is a normal plan: Bitmap Index Scan on orders_d_pkey_102033, 247 rows. The worker part took 2.8 ms in EXPLAIN ANALYZE; the first query in a session also pays about 90 ms to open the connection to the worker.',
+          active: ['coord', 'w1', 'w2'],
+          edges: ['coord-w2'],
+          subs: { w2: '✓ 1 task, 247 rows', w1: '✗ no task' },
+        },
+      ],
+    },
+    {
+      title: 'WHERE id = 777777 (multi-shard)',
+      path: 'coordinator ✓ → no seller_id → w1 ✓ 16 tasks, w2 ✓ 16 tasks → 31 shards return 0 rows',
+      summary: 'The answer is in one shard, but only the shard key tells the coordinator which. 1.96 ms vs 0.11 ms.',
+      steps: [
+        {
+          title: 'No distribution column in the filter',
+          note: 'The coordinator cannot exclude any shard. EXPLAIN: Task Count: 32. Each task is an index lookup on orders_d_id_idx in its own shard; 31 of them find nothing.',
+          code: 'SELECT * FROM orders_d WHERE id = 777777;',
+          active: ['app', 'coord', 'w1', 'w2'],
+          edges: ['app-coord', 'coord-w1', 'coord-w2'],
+          subs: { w1: '✓ 16 tasks', w2: '✓ 16 tasks' },
+        },
+        {
+          title: 'Add the shard key',
+          note: 'Order 777777 belongs to seller 145. With seller_id = 145 AND id = 777777 the query is a router query again: 0.54 ms. With a 4-shard copy of the table, the id-only lookup took 0.92 ms: fewer tasks, less overhead.',
+          code: 'SELECT * FROM orders_d WHERE seller_id = 145 AND id = 777777;',
+          active: ['coord', 'meta', 'w1'],
+          edges: ['coord-meta', 'coord-w1'],
+          subs: { meta: 'shard 102010 on w1', w1: '✓ 1 task' },
+        },
+      ],
+    },
+    {
+      title: 'INSERT',
+      path: 'coordinator ✓ → hash(seller_id) → one shard ✓',
+      summary: 'Every row must carry its distribution column.',
+      steps: [
+        {
+          title: 'Routed insert',
+          note: 'EXPLAIN of an INSERT with seller_id = 1673: Task Count: 1, Insert on ins_dist_102198 on w2. pgbench, 500 single-row inserts: 1.45 ms each vs 0.89 ms into a plain table.',
+          code: "INSERT INTO ins_dist VALUES (99, 1673, 'shopee', 'delivered', 10, now());",
+          active: ['app', 'coord', 'meta', 'w2'],
+          edges: ['app-coord', 'coord-meta', 'coord-w2'],
+          subs: { w2: '✓ 1 row' },
+        },
+        {
+          title: 'Missing distribution column',
+          note: 'The coordinator cannot choose a shard, so the INSERT is refused before any worker is contacted.',
+          code: "INSERT INTO ins_dist (id, marketplace, status, amount, created_at)\nVALUES (1, 'shopee', 'delivered', 10, now());\n-- ERROR:  cannot perform an INSERT without a partition column value",
+          active: ['app', 'coord'],
+          edges: ['app-coord'],
+          subs: { coord: '✗ refused' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Measured latency
+
+One pgbench connection, 200 runs per query (500 for INSERT), three repetitions; the table shows the middle value.
+
+| Query | Plain `orders` (coordinator) | `orders_d`, 32 shards | Ratio |
+|---|---|---|---|
+| `WHERE seller_id = 1673` (count, sum) | 0.20 ms | 0.62 ms (1 task) | 3.1× |
+| `WHERE id = 777777` | 0.11 ms | 1.96 ms (32 tasks) | 18× |
+| `WHERE seller_id = 145 AND id = 777777` | n/a | 0.54 ms (1 task) | |
+| `WHERE id = 777777`, 4-shard copy | n/a | 0.92 ms (4 tasks) | |
+| Single-row INSERT | 0.89 ms | 1.45 ms (1 task) | 1.6× |
+
+A router query costs one extra network hop and the coordinator's planning: here about 0.4 ms. A multi-shard query costs that hop once per task. On one laptop the cluster cannot be faster for small queries; it is built for data that does not fit one server, where every worker brings its own disks, memory and CPUs.
+
+<Pitfall>
+Distributing a table does not distribute your queries. If the hot query in the application is "order by id" and the table is distributed by `seller_id`, every lookup fans out to all shards: here 18 times slower than the single-node table, and the gap grows with the shard count. Before choosing a distribution column, list the top queries and check that most of them carry it in the WHERE clause (Session 5 covers how to choose).
+</Pitfall>
+
+## Real-world scenario: a seller analytics product
+
+A marketplace enabler stores orders for thousands of sellers across Shopee, TikTok Shop and Lazada. Every dashboard request is "for seller X": GMV, top products, returns. Distributing by `seller_id`:
+
+| Need | With `seller_id` as distribution column |
+|---|---|
+| Seller dashboard | Router queries: one shard, cost close to a single-node query |
+| Write path | Each order goes to its seller's shard; writes spread over all workers |
+| Support tool "find order 123" | Fan-out to every shard, unless the tool also knows the seller (store `seller_id` in the order number or the ticket) |
+| Group-wide report | Multi-shard query; Concept 3 shows which ones push down well |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 2, Concept 2](/blogs/databases/partitioning-sharding/session-2-partitioning-postgresql/concept-2-pruning-plan-vs-execution) | Partition pruning on one server is the same idea as shard routing across servers |
+| [Session 3, Concept 3](/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-3-unique-keys) | Unique keys must contain the partition key; the shard key has the same rule |
+| Concept 2 | Joins: which ones stay on one shard |
+| Concept 3 | Multi-shard queries: what is pushed to the workers and what the coordinator must do |
+
+## Key takeaways
+
+1. `create_distributed_table` hashes the distribution column into a fixed number of shards (32 by default) placed on the workers.
+2. A query whose WHERE clause fixes the distribution column is a router query: one task on one shard.
+3. Without the distribution column, the coordinator sends one task per shard; more shards means more tasks.
+4. Primary keys and unique constraints must include the distribution column; INSERTs must supply it.
+5. Equal hash ranges do not guarantee equal shards: here 26,707 to 34,950 rows per shard.
+
+## Check questions
+
+1. Why did `PRIMARY KEY (id)` stop `create_distributed_table`, and what key did the lab use instead?
+2. How does the coordinator decide that `seller_id = 1673` goes to `pt-citus-w2`?
+3. The lookup by `id` returned one row but cost 18 times the plain table. Where did the time go?
+4. Why did the 4-shard copy answer the same id lookup in about half the time of the 32-shard table?
+5. The shards hold between 26,707 and 34,950 rows although the hash ranges are equal. Why?
+6. A support tool searches orders by id. Name two ways to avoid fanning out to every shard.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-7-sharding-postgresql-mysql/concept-1-distributed-tables/answers">Worked answers to Q1–Q6</DeepDive>
