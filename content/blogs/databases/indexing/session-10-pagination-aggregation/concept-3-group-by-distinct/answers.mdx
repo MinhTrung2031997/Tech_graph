@@ -1,0 +1,70 @@
+---
+title: "Answers: GROUP BY and DISTINCT through an index"
+description: "Worked answers to the Session 10 Concept 3 check questions."
+companion: "answers"
+tags: ["indexing", "group-by", "distinct", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/group-by-optimization.html"
+  - "https://wiki.postgresql.org/wiki/Loose_indexscan"
+---
+
+<Tldr>
+Index order turns grouping into a stream that can stop early; few distinct values turn it into a handful of jumps.
+</Tldr>
+
+## Q1. Stopping early
+
+**Question:** why can `GROUP BY customer_id ORDER BY customer_id LIMIT 10` stop early with an index but not with a hash aggregate?
+
+With the index, entries arrive sorted by `customer_id`, so a group is complete as soon as the key changes, and GroupAggregate can emit it immediately; after 10 groups the Limit stops the scan (104 entries, 5 buffers). A hash aggregate receives rows in arbitrary order: the last row of the table might belong to customer 1, so no group is final until every row has been read. Then it still has to sort the groups to apply `ORDER BY … LIMIT`.
+
+> **Common mistake:** thinking the `LIMIT` reduces the work of any plan. It only does for plans that produce rows in the final order.
+
+## Q2. Batches: 5
+
+**Question:** what does `Batches: 5` on a HashAggregate tell you, and what are two ways to avoid it?
+
+The hash table did not fit in its memory limit (`work_mem` × `hash_mem_multiplier`, 8 MB here), so PostgreSQL split the groups into 5 batches and wrote the overflow to temporary files (up to 1,640 kB per process). Avoid it by giving the query an index on the group key (streaming GroupAggregate needs no hash table) or by raising `work_mem` for that session or query. Reducing the number of groups (filtering first) also helps.
+
+> **Common mistake:** raising `work_mem` globally; it applies per sort or hash node, per connection.
+
+## Q3. The recursive CTE
+
+**Question:** how does the recursive CTE find the 5 statuses with 20 buffers?
+
+The anchor reads the smallest status with `ORDER BY status LIMIT 1` (one descent). Each recursive step asks for the smallest status **greater than** the previous one, again `LIMIT 1`: a descent that lands directly on the first entry of the next status, skipping all entries in between. Five values plus a final step that finds nothing make 6 descents of about 3 pages each (some cached), 20 buffers.
+
+> **Common mistake:** writing the recursive step without `LIMIT 1` (or with `MIN()` over a join), which reads every greater entry each time.
+
+## Q4. Recognising the loose scan
+
+**Question:** which MySQL `EXPLAIN` text shows a loose index scan, and why did `SELECT status, MAX(created_at) … GROUP BY status` qualify?
+
+Traditional `EXPLAIN`: `Extra: Using index for group-by` (type `range`). Tree format: "Covering index skip scan for grouping" (or "for deduplication" for `DISTINCT`). It qualified because the group column is the leading column of `(status, created_at)`, the only aggregate is `MAX` on the next column, and every referenced column is in the index: for each status MySQL reads one entry, the last of that status's stretch.
+
+> **Common mistake:** expecting it for `COUNT(*)` or `SUM()` per group; those need every entry of the group.
+
+## Q5. When not to skip
+
+**Question:** when does a loose index scan stop being a good idea?
+
+When the group key has **many** distinct values relative to rows. Each jump is a full descent (≈ 3 pages); with 100,000 customers over 1M orders (10 rows per group), jumping costs more than reading the leaf pages sequentially. MySQL then uses a tight index scan (it chose one for `GROUP BY customer_id`), and the recursive CTE in PostgreSQL would be slower than a plain scan. The jump wins when groups are large: 5 statuses of 50,000–350,000 rows each.
+
+> **Common mistake:** applying the recursive CTE trick to a high-cardinality column.
+
+## Q6. MongoDB's count per status
+
+**Question:** why did MongoDB scan 1M documents for a count per status, and how did a `$sort` change the plan?
+
+`$group: { _id: "$status", n: { $sum: 1 } }` needs every document, and nothing in the pipeline gave the planner a reason to read an index (no `$match`, no `$sort`), so it chose COLLSCAN (1M documents). A leading `{ $sort: { status: 1 } }` can be served by the `es` index, and because `$group` only reads `status`, the scan became PROJECTION_COVERED ← IXSCAN: 1M keys, 0 documents. Same row count, but keys are smaller than documents and do not require loading them.
+
+> **Common mistake:** assuming `$group` will use an index on its `_id` field the way `distinct()` does. Only `$group` without accumulators (or with `$first`/`$last` after a matching `$sort`) becomes a DISTINCT_SCAN.
+
+## Q7. SUM(amount) per customer
+
+**Question:** why was `SUM(amount)` per customer not covered by `orders_customer_idx` in MySQL, and what index would cover it?
+
+`orders_customer_idx` stores `(customer_id, id)`; `amount` is only in the clustered index, so each entry needed a primary-key lookup (101 lookups for 10 customers). `(customer_id, amount)` would cover it: grouping order from the first column, the summed value from the second, no lookups.
+
+> **Common mistake:** adding `(amount, customer_id)`: covering, but in the wrong order for grouping, so MySQL needs a temporary table.

@@ -1,0 +1,81 @@
+---
+title: "Answers: Keyset pagination with a tie-breaker"
+description: "Worked answers to the Session 10 Concept 1 check questions."
+companion: "answers"
+tags: ["indexing", "pagination", "keyset", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/functions-comparisons.html#ROW-WISE-COMPARISON"
+  - "https://dev.mysql.com/doc/refman/8.4/en/range-optimization.html#row-constructor-range-optimization"
+---
+
+<Tldr>
+A cursor is the full sort key of the last row, including a unique tie-breaker, and the condition must be written in a form the engine turns into index bounds.
+</Tldr>
+
+## Q1. Lost rows with a price sort
+
+**Question:** why does paging by `ORDER BY amount DESC` with `WHERE amount < :last` lose rows, and what is the fix?
+
+About 20 orders share each `amount`. When a page ends in the middle of a group of equal amounts, `amount < :last` jumps to the next lower value and the rest of the group is never shown: in the lab page 2 ended on the 2nd of 19 orders at 499.97, so 17 disappeared. `amount <= :last` repeats the ones already shown instead. Fix: sort by `amount DESC, id DESC` and page with `(amount, id) < (:last_amount, :last_id)` (or the engine's equivalent form), backed by an index on `(amount, id)`.
+
+> **Common mistake:** adding `id` to the `ORDER BY` but not to the `WHERE`. The order is then stable, but the cursor still skips or repeats ties.
+
+## Q2. Index for a filtered list
+
+**Question:** which index serves `WHERE status = 'shipped' ORDER BY created_at DESC, id DESC` with keyset pagination, and why that column order?
+
+`(status, created_at, id)` (in InnoDB `(status, created_at)` is enough, since `id` is appended). The equality column first makes all shipped orders one contiguous stretch; inside it, entries are in `(created_at, id)` order, so the cursor is a single position and the scan reads 20 entries and stops (8 buffers in the lab). With `(created_at, id)` only, the scan walks all statuses and filters: fine for a common status, slow for a rare one.
+
+> **Common mistake:** `(created_at, id, status)`: the sort is served, but every non-shipped row in the range is read and discarded.
+
+## Q3. Row value vs OR in PostgreSQL
+
+**Question:** in PostgreSQL, why was `(created_at, id) < (x, y)` 4 buffers but the expanded `OR` 3,557?
+
+A row-value comparison maps directly to the index order of `(created_at, id)`, so the planner uses it as an **Index Cond**: the scan starts at the cursor. The expanded `created_at < x OR (created_at = x AND id < y)` is logically identical, but the planner did not derive scan bounds from the `OR`; it scanned the index from the newest entry and applied the condition as a **Filter**, removing 200,000 rows. Writing `created_at <= x AND (created_at < x OR id < y)` gives it a plain bound (`created_at <= x`) and brought it back to 4 buffers.
+
+> **Common mistake:** assuming that logically equivalent conditions produce the same plan.
+
+## Q4. MySQL's row constructor
+
+**Question:** in MySQL 8.4, why was the row constructor slow, and which two rewrites fixed it?
+
+The range optimizer did not turn `(created_at, id) < (x, y)` into a range here: the plan was a reverse index scan from the newest entry with the comparison as a filter, 200,020 entries examined (≈ 90 ms). Two rewrites became index range scans: the expanded `created_at < x OR (created_at = x AND id < y)` (0.7 ms) and `created_at <= x AND (created_at < x OR id < y)` (0.6 ms).
+
+> **Common mistake:** trusting `EXPLAIN` (`rows: 20`, `Backward index scan`) instead of `EXPLAIN ANALYZE`, which showed the actual 200,020 rows.
+
+## Q5. skip() in MongoDB
+
+**Question:** why does MongoDB's `skip(200000)` examine 200,020 keys but only 20 documents?
+
+The plan places the SKIP stage directly above the IXSCAN and below the FETCH. Skipped entries are discarded as index keys, so their documents are never read. It is still linear: every skipped key is walked (44 ms at 200,000). The `$or` keyset examined 20 keys.
+
+> **Common mistake:** "skip is free in MongoDB because it doesn't fetch". It skips the fetch, not the walk.
+
+## Q6. Previous page
+
+**Question:** write the query for the **previous** page, given the first row of the current page.
+
+```sql
+-- PostgreSQL: walk forwards from the first row shown, then restore the display order
+SELECT * FROM (
+  SELECT id, created_at, amount FROM orders
+  WHERE (created_at, id) > (:first_created_at, :first_id)
+  ORDER BY created_at, id
+  LIMIT 20
+) prev
+ORDER BY created_at DESC, id DESC;
+```
+
+The inner query uses the same index forwards (5 buffers in the lab); the outer sort only reorders 20 rows. In MySQL use `created_at > x OR (created_at = x AND id > y)`; in MongoDB the `$or` with `$gt` and `.sort({ created_at: 1, _id: 1 })`, then reverse in the application.
+
+> **Common mistake:** `ORDER BY … DESC` with `>` on the cursor: that returns the 20 newest rows of the whole table, not the 20 just before the current page.
+
+## Q7. MySQL's table scan for OFFSET
+
+**Question:** why did MySQL switch to a full table scan for `OFFSET 20000` even though an index matched the ORDER BY?
+
+The index on `created_at` is a secondary index: each entry needs a lookup in the clustered primary key to read `amount`. For `OFFSET 20000 LIMIT 20` that is 20,020 lookups. The optimizer compared that with scanning the clustered table once and sorting (keeping only the top 20,020 rows), chose the scan from an offset of about 4,500, and took 118 ms where the forced index took 8 ms. The deeper lesson: with OFFSET, every plan's cost grows with the page number.
+
+> **Common mistake:** fixing it with `FORCE INDEX`. That helps page 1,001 but not page 10,001 (81 ms); keyset fixes both.

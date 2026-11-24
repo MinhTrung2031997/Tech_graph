@@ -1,0 +1,73 @@
+---
+title: "Answers: Where index use stops in pipelines and subqueries"
+description: "Worked answers to the Session 10 Concept 5 check questions."
+companion: "answers"
+tags: ["indexing", "predicate-pushdown", "aggregation-pipeline", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-CTE-MATERIALIZATION"
+  - "https://dev.mysql.com/doc/refman/8.4/en/derived-condition-pushdown-optimization.html"
+  - "https://www.mongodb.com/docs/manual/core/aggregation-pipeline-optimization/"
+---
+
+<Tldr>
+A condition moves down only if filtering earlier gives the same answer. Keys and partition columns pass; aggregates, computed values, unpartitioned windows and LIMIT do not.
+</Tldr>
+
+## Q1. Key vs aggregate
+
+**Question:** why can `WHERE customer_id = 4242` be pushed below `GROUP BY customer_id` but `WHERE n > 25` cannot?
+
+Rows of other customers never contribute to customer 4242's group, so removing them before grouping cannot change that group's count or sum: the filter can run at the scan, where the index serves it (18 buffers). `n` is the count itself; whether a customer has more than 25 orders is unknown until all its rows have been counted, so the filter must run after the aggregation over every row (1,135 buffers, all 1M entries).
+
+> **Common mistake:** writing the aggregate filter in `WHERE` of an outer query and expecting it to be cheaper than `HAVING`. Both run after grouping.
+
+## Q2. A window partitioned by status
+
+**Question:** a window is `PARTITION BY status ORDER BY created_at`. Which outer filters can be pushed below it: `status = 'paid'`, `customer_id = 4242`, `rn <= 10`?
+
+- `status = 'paid'`: **yes**. It removes whole partitions; the paid partition's numbering is unchanged.
+- `customer_id = 4242`: **no**. Removing other customers' rows would renumber the paid partition, changing `rn` for the rows that remain.
+- `rn <= 10`: not pushed to the scan, since it depends on the numbering. PostgreSQL turns it into a Run Condition, which stops emitting rows of a partition after the 10th, but the rows are still read.
+
+> **Common mistake:** pushing `customer_id` inside by hand "for performance", which silently changes what `rn` means.
+
+## Q3. Inlined vs MATERIALIZED
+
+**Question:** what changed between the inlined and the `MATERIALIZED` CTE in PostgreSQL, and when would you still want `MATERIALIZED`?
+
+Inlined (the default since PostgreSQL 12 for a CTE referenced once, without side effects), the CTE is part of one query, so `customer_id = 4242` reached the customer index: 18 buffers. `MATERIALIZED` computes the CTE on its own first (all 350,000 paid rows, stored in a temporary tuplestore), then filters the result: 10,102 buffers and ≈ 77 ms. You still want it when an expensive CTE is referenced several times (compute once), or to stop the planner from choosing a bad plan for the combined query, a deliberate fence.
+
+> **Common mistake:** carrying CTE habits from PostgreSQL 11 and earlier, where every CTE was a fence, into new code, or the reverse: assuming every CTE is inlined (a CTE referenced twice is materialized by default).
+
+## Q4. MySQL's NO_MERGE CTE
+
+**Question:** why did MySQL's `NO_MERGE` CTE still use the customer index?
+
+`NO_MERGE` only prevents merging the CTE into the outer query; MySQL then materializes it. But derived condition pushdown (8.0.22+) still moves `customer_id = 4242` **into** the CTE's query before materialization, so the materialization itself ran an index lookup on `orders_customer_idx` and stored 0 rows (customer 4242 has no paid orders in MySQL's data). The hint `NO_DERIVED_CONDITION_PUSHDOWN` is what disables that (1,955 ms on the grouped example).
+
+> **Common mistake:** assuming "materialized" means "computed without the outer filter" in every engine.
+
+## Q5. LIMIT is a fence everywhere
+
+**Question:** why is a filter outside `SELECT … ORDER BY created_at DESC LIMIT 1000` not pushed inside, in any engine?
+
+The subquery means "the 1,000 newest orders"; the outer filter means "of those, the ones for customer 4242". Pushing the filter inside would mean "the 1,000 newest orders of customer 4242": a different result. So every engine computes the 1,000 rows first (PostgreSQL removed 1,000 rows by Filter, MySQL materialized 1,000 rows and probed an automatic index). It is a correctness rule, not a missing optimization.
+
+> **Common mistake:** a view with `LIMIT` inside ("latest 1,000 orders") that later gets filtered by customer, returning surprisingly few or no rows.
+
+## Q6. Filtering a computed total
+
+**Question:** a MongoDB pipeline computes `total` with `$addFields` and then filters `total > 549`. How do you make it use an index?
+
+Express the condition on the stored field and put it first: `{ $match: { amount: { $gt: 549 / 1.1 } } }` before the `$addFields`, with an index on `amount`. The optimizer could not do this itself because it does not invert arithmetic. If the computation is not invertible (or involves several fields), store the computed value in the document and index it, the MongoDB equivalent of an expression index (Session 5). The lab version scanned 1M documents (798 ms).
+
+> **Common mistake:** adding an index on `total`, a field that only exists inside the pipeline.
+
+## Q7. $sort + $limit coalescence
+
+**Question:** what does `$sort` + `$limit` coalescence save, and what does it not save?
+
+It saves **memory and sort work**: the SORT stage keeps only the current top 20 documents (3,174 bytes in the lab) instead of buffering and sorting all 1M, so it never spills to disk. It does not save the **scan**: without an index on `amount` all 1,000,000 documents were still read (206 ms). With an index on `amount`, the pipeline became LIMIT ← FETCH ← IXSCAN: 20 keys, 4 ms.
+
+> **Common mistake:** reading `limitAmount: 20` in the explain output as "only 20 documents read".

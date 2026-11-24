@@ -1,0 +1,90 @@
+---
+title: "Answers: MIN, MAX and the latest row per group"
+description: "Worked answers to the Session 10 Concept 4 check questions."
+companion: "answers"
+tags: ["indexing", "min-max", "lateral", "top-n", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-LATERAL"
+  - "https://www.mongodb.com/docs/manual/reference/operator/aggregation/group/#optimization-to-return-the-first-document-of-each-group"
+---
+
+<Tldr>
+An extreme value is one end of an index stretch. Per group, that is one descent per group, which only LATERAL (or MongoDB's DISTINCT_SCAN) delivers.
+</Tldr>
+
+## Q1. Which MAX is one descent
+
+**Question:** why is `max(created_at) WHERE status = 'paid'` one descent with `(status, created_at)`, while `max(amount) WHERE status = 'paid'` is not?
+
+In `(status, created_at)`, the paid entries form one stretch sorted by `created_at`; its last entry is the answer (5 buffers). No index has `amount` sorted inside a status stretch. PostgreSQL instead walked `(amount, id)` from the highest amount down and checked `status` on each row until the first paid one. That took 7 buffers here because 35% of orders are paid; for a rare status it could walk thousands of entries. `(status, amount)` would make it one descent.
+
+> **Common mistake:** "there is an index on amount, so max(amount) is always instant". Only without a filter, or with the filter columns before `amount` in the index.
+
+## Q2. The window reads everything
+
+**Question:** why did the window-function query read all 1M orders even with an index on `(customer_id, created_at DESC)`?
+
+The index removed the **sort**: rows arrived in partition and order sequence (the Incremental Sort disappeared, 545 → 377 ms). The window plans showed `Run Condition: row_number() <= 1` (visible in the 500-customer plan), so the WindowAgg stops **returning** rows of a customer after the first. But it still has to **read** every input row to find where each customer's rows end and the next customer begins; it cannot jump to the next customer the way an index descent can. So every index entry was read and every row fetched from the heap (≈ 1M buffers).
+
+> **Common mistake:** expecting `WHERE rn = 1` to make the window skip the rest of each group. It limits the output, not the input.
+
+## Q3. LATERAL in buffers
+
+**Question:** explain the cost of the LATERAL query for the 513 customers in buffers.
+
+Outer side: a bitmap scan of `customers_country_tier` (Session 9) and the 377 customer pages holding the 513 gold SG customers. Inner side, per customer: one descent of `orders_cust_created` (≈ 3 pages: root, internal, leaf) to the end of that customer's stretch, then one heap page for the row: ≈ 4 buffers × 513 ≈ 2,051. Total 2,428 buffers, 1.7 ms warm, independent of how many orders each customer has.
+
+> **Common mistake:** counting the inner side as "513 index scans of the orders table". Each is a descent plus one entry, not a scan.
+
+## Q4. When the window wins
+
+**Question:** when would `ROW_NUMBER()` be the better plan than LATERAL?
+
+When you need every group and groups are small and the data is read anyway: for example "latest order per customer for all customers" when most pages are already being read, or a table without an index on the group key. One sequential pass plus a sort can beat 100,000 random descents on cold storage. Also when you need more than one rank-dependent value per group (rank, running totals). In the lab, LATERAL still won for all customers (168 vs 567 ms) because everything was cached.
+
+> **Common mistake:** treating either form as always faster; the deciding numbers are groups needed × descent cost vs total rows.
+
+## Q5. MySQL's per-customer sort
+
+**Question:** why did MySQL's LATERAL sort each customer's orders, and when would that matter?
+
+The plan did use `orders_cust_created`, but as an equality lookup on `customer_id`: it read all ≈ 10 entries of the customer and applied a top-1 sort ("Sort: orders.created_at DESC, limit input to 1 row(s)"), instead of starting at the end of the stretch and reading one entry backwards as PostgreSQL did. With 10 rows per customer the difference is negligible (8–12 ms for 513 customers). For customers with thousands of orders it reads and sorts all of them per customer: check `EXPLAIN ANALYZE` for the per-loop row count, and consider storing the latest order on the customer row if the query is hot.
+
+> **Common mistake:** assuming LATERAL guarantees one entry per group. It guarantees one subquery per row; the subquery's plan decides the rest.
+
+## Q6. MongoDB's first per group
+
+**Question:** which MongoDB pipeline returns the latest order per customer without reading their other orders, and what does `explain` show?
+
+```js
+db.orders.aggregate([
+  { $match: { customer_id: { $in: ids } } },
+  { $sort: { customer_id: 1, created_at: -1 } },              // matches the index order
+  { $group: { _id: "$customer_id", last: { $first: "$$ROOT" } } }
+])
+```
+
+With the index `{ customer_id: 1, created_at: -1 }`, explain shows `FETCH ← DISTINCT_SCAN` and a `$groupByDistinctScan` stage: 1,023 keys and 513 documents for 513 customers. With `$first: "$created_at"` only, the plan is covered (`PROJECTION_COVERED`), 0 documents.
+
+> **Common mistake:** using `$max: "$created_at"` without the `$sort`, which needs every order of every customer.
+
+## Q7. Three per customer
+
+**Question:** write the "3 most recent orders per customer" version of the LATERAL query. Which index serves it?
+
+```sql
+SELECT c.id, o.id, o.created_at
+FROM customers c
+CROSS JOIN LATERAL (
+  SELECT id, created_at FROM orders
+  WHERE customer_id = c.id
+  ORDER BY created_at DESC
+  LIMIT 3                         -- one descent, then two more entries
+) o
+WHERE c.tier = 'gold' AND c.country = 'SG';
+```
+
+`(customer_id, created_at)`, walked backwards. In the lab: 513 loops, 1,534 rows, ≈ 3,077 buffers for orders (each customer's 3 rows sit on different heap pages). `INCLUDE (amount)` or adding the returned columns would make it index-only.
+
+> **Common mistake:** `ROW_NUMBER() … WHERE rn <= 3`, which still numbers every order of every customer.

@@ -1,0 +1,368 @@
+---
+title: "Concept 1: Keyset pagination with a tie-breaker"
+description: "Paging through 1M orders by (created_at, id): OFFSET vs keyset at pages 1, 1,001 and 10,001, why the sort needs a unique tie-breaker, and why the same keyset condition is an index seek in PostgreSQL but a filter in MySQL (and the other way round). Measured in all three engines."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "pagination", "keyset", "order-by"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/functions-comparisons.html#ROW-WISE-COMPARISON"
+  - "https://dev.mysql.com/doc/refman/8.4/en/range-optimization.html#row-constructor-range-optimization"
+  - "https://www.mongodb.com/docs/manual/reference/method/cursor.skip/"
+---
+
+<Tldr>
+Session 2 showed that `OFFSET` walks and discards every skipped row, and that keyset pagination starts where the last page ended. Real lists sort by a **non-unique** column (date, price), so the keyset must be **two columns**: the sort column plus a unique **tie-breaker** (`id`). Without it, rows with the same value are skipped or repeated (17 orders at 499.97 vanished in the lab). How you write the two-column condition decides whether the index can seek: PostgreSQL turns `(created_at, id) < ($1, $2)` into an **Index Cond** (4 buffers at page 10,001 instead of 3,557) but treats the expanded `OR` form as a filter (3,557 buffers). MySQL 8.4 is the **opposite**: the row constructor walked 200,020 entries (90 ms), the expanded `OR` was a range scan (0.7 ms). The form `a <= x AND (a < x OR id < y)` seeks in both. MongoDB needs the `$or` form and merges two index scans (20 keys).
+</Tldr>
+
+## Where Session 2 stopped
+
+Session 2, Concept 5 and Session 4, Concept 4 paged by `id` alone: `WHERE id < :last ORDER BY id DESC LIMIT 20`. That works because `id` is unique and is the sort key. Two things change in a real list endpoint:
+
+| Real requirement | Problem |
+|---|---|
+| Sort by `created_at`, `amount`, `updated_at` | Not unique: many rows can share a value |
+| Stable pages while you click | The position must be exact, not "values below X" |
+| Filters (`status = 'shipped'`, one customer) | The index must lead with the filter, then the sort, then the tie-breaker |
+| Previous page | The same index walked in the other direction |
+
+Lab setup for this concept (per engine): an index on `(created_at, id)` and one on `(amount, id)`; in InnoDB a secondary index on `(created_at)` already ends with the primary key, so it **is** `(created_at, id)`.
+
+## Why the tie-breaker is required
+
+`amount` has 50,000 distinct values over 1M orders: about 20 orders share each price. Sorted by `amount DESC`, page 2 ended in the middle of the 19 orders at 499.97 (the last one shown was id 941,872).
+
+| Page 3 condition | Result |
+|---|---|
+| `WHERE amount < 499.97` | Starts at 499.96: the **17** remaining orders at 499.97 are never shown |
+| `WHERE amount <= 499.97` | Shows the 2 orders at 499.97 from page 2 **again** |
+| `WHERE (amount, id) < (499.97, 941872)` with `ORDER BY amount DESC, id DESC` | Starts exactly after id 941,872: the 17 remaining orders come first |
+
+| Term | Meaning |
+|---|---|
+| Keyset (cursor) | The sort values of the last row shown, e.g. `(created_at, id)`, sent back by the client |
+| Tie-breaker | A unique column appended to the sort so every row has a distinct position (`id`, `_id`) |
+| Row-value comparison | `(a, b) < (x, y)`: true when `a < x`, or `a = x AND b < y` |
+| Expanded form | The same logic written out: `a < x OR (a = x AND b < y)` |
+| Portable form | `a <= x AND (a < x OR b < y)`: a plain range on `a` plus a check |
+| **✓ Seek / ✗ Walk** | The index starts at the cursor, or reads from the start and discards |
+
+## PostgreSQL: the row-value comparison seeks
+
+Page 10,001 of `ORDER BY created_at DESC, id DESC LIMIT 20` means skipping 200,000 rows. The cursor is the 200,000th row: `('2025-10-20 00:00:31.536+00', 800001)`.
+
+<Flow
+  title="PostgreSQL: page 10,001, three ways"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Page 10,001', sub: 'created_at DESC, id DESC', x: 20, y: 130, w: 240 },
+    { id: 'off', label: 'OFFSET 200000', sub: 'skip in the executor', x: 330, y: 20, w: 200 },
+    { id: 'offbad', label: '✗ 3,557 buffers', sub: '200,020 rows walked', x: 600, y: 20, w: 180 },
+    { id: 'row', label: 'Row comparison', sub: '(created_at, id) < (…)', x: 330, y: 130, w: 200 },
+    { id: 'rowok', label: '✓ 4 buffers', sub: 'Index Cond', x: 600, y: 130, w: 180 },
+    { id: 'or', label: 'Expanded OR', sub: 'a < x OR (a = x AND …)', x: 330, y: 240, w: 200 },
+    { id: 'orbad', label: '✗ 3,557 buffers', sub: 'Filter: 200,000 removed', x: 600, y: 240, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-off', from: 'q', to: 'off' },
+    { id: 'off-bad', from: 'off', to: 'offbad' },
+    { id: 'q-row', from: 'q', to: 'row' },
+    { id: 'row-ok', from: 'row', to: 'rowok' },
+    { id: 'q-or', from: 'q', to: 'or' },
+    { id: 'or-bad', from: 'or', to: 'orbad' },
+  ]}
+  cases={[
+    {
+      title: 'OFFSET',
+      path: 'Index Scan Backward from the newest entry → ✗ 200,020 rows fetched, 200,000 discarded → 20 returned',
+      summary: 'Page 1: 5 buffers. Page 1,001: 361 buffers. Page 10,001: 3,557 buffers (≈ 22 ms).',
+      steps: [
+        {
+          title: 'Walk from the start',
+          note: 'The index delivers rows in the right order, so no Sort is needed, but OFFSET is applied after the scan: the executor fetches 200,020 rows and throws away the first 200,000.',
+          code: 'SELECT id, created_at, amount FROM orders\nORDER BY created_at DESC, id DESC LIMIT 20 OFFSET 200000;',
+          active: ['q', 'off'],
+          edges: ['q-off'],
+        },
+        {
+          title: '✗ Cost grows with the page number',
+          note: 'Index Scan Backward using orders_created_id, rows=200020, Buffers 3,557. Each page costs more than the last: the cost is linear in the offset.',
+          active: ['off', 'offbad'],
+          edges: ['off-bad'],
+        },
+      ],
+    },
+    {
+      title: 'Row-value keyset',
+      path: 'descend to (2025-10-20 00:00:31.536, 800001) → ✓ walk 20 entries backwards → stop',
+      summary: 'Index Cond: ROW(created_at, id) < ROW(…). 4 buffers at page 1,001 and at page 10,001.',
+      steps: [
+        {
+          title: 'One condition on both columns',
+          note: 'PostgreSQL compares the row value (created_at, id) against the cursor using the index order of (created_at, id), so the whole condition becomes a start position for the scan.',
+          code: "SELECT id, created_at, amount FROM orders\nWHERE (created_at, id) < ('2025-10-20 00:00:31.536+00', 800001)\nORDER BY created_at DESC, id DESC LIMIT 20;",
+          active: ['q', 'row'],
+          edges: ['q-row'],
+        },
+        {
+          title: '✓ Same cost on every page',
+          note: 'Index Scan Backward, Index Cond: (ROW(created_at, id) < ROW(…)), Buffers 4, ≈ 0.06 ms. Returned ids 799,981–800,000: exactly the rows OFFSET would have returned.',
+          active: ['row', 'rowok'],
+          edges: ['row-ok'],
+        },
+      ],
+    },
+    {
+      title: 'Expanded OR',
+      path: 'OR of two conditions → no single start position → ✗ walk from the newest entry, filter each row',
+      summary: 'Logically identical, but PostgreSQL cannot turn this OR into index bounds here.',
+      steps: [
+        {
+          title: 'The textbook form',
+          note: 'created_at < x OR (created_at = x AND id < y) means the same as the row comparison, but each OR branch would need its own bounds, and the planner keeps it as a Filter on the ordered scan.',
+          code: "WHERE created_at < '2025-10-20 00:00:31.536+00'\n   OR (created_at = '2025-10-20 00:00:31.536+00' AND id < 800001)",
+          active: ['q', 'or'],
+          edges: ['q-or'],
+        },
+        {
+          title: '✗ As slow as OFFSET',
+          note: 'Filter: (created_at < … OR …), Rows Removed by Filter: 200,000, Buffers 3,557. The rewrite "a <= x AND (a < x OR id < y)" fixes it: Index Cond on created_at <= x, 4 buffers.',
+          active: ['or', 'orbad'],
+          edges: ['or-bad'],
+        },
+      ],
+    },
+  ]}
+/>
+
+| Page | OFFSET (buffers) | Keyset, row comparison (buffers) |
+|---|---|---|
+| 1 | 5 | 5 (no cursor yet) |
+| 1,001 (skip 20,000) | 361 | 4 |
+| 10,001 (skip 200,000) | 3,557 | 4 |
+
+**With a filter in front.** For `status = 'shipped'` (5% of orders), the index must lead with the equality column: `(status, created_at, id)`. Then `status = 'shipped' AND (created_at, id) < (…)` is one Index Cond (8 buffers). The same page with `OFFSET 20000` read 4,247 buffers, because every skipped shipped order sits on a different heap page. Without the composite, PostgreSQL walked `(created_at, id)` and discarded the 95% that were not shipped (380 rows removed for 20 kept): fine for a common status, bad for a rare one. This is the equality → sort order rule from Session 4.
+
+**Previous page.** Flip the comparison and the direction, then reverse the 20 rows: `WHERE (created_at, id) > (first row shown) ORDER BY created_at, id LIMIT 20`, wrapped in an outer `ORDER BY created_at DESC, id DESC`. Index Scan (forward) on the same index, 5 buffers, plus a 20-row sort.
+
+## MySQL: the row constructor walks, the OR seeks
+
+The same three queries on InnoDB, with an index on `(created_at)` (which stores `(created_at, id)`).
+
+<Flow
+  title="MySQL: page 10,001, three ways"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Page 10,001', sub: 'created_at DESC, id DESC', x: 20, y: 130, w: 240 },
+    { id: 'off', label: 'OFFSET 200000', sub: 'cost-based choice', x: 330, y: 20, w: 200 },
+    { id: 'offbad', label: '✗ Table scan + sort', sub: '1M rows, ≈ 120 ms', x: 600, y: 20, w: 180 },
+    { id: 'row', label: 'Row constructor', sub: '(created_at, id) < (…)', x: 330, y: 130, w: 200 },
+    { id: 'rowbad', label: '✗ 200,020 entries', sub: 'Filter, ≈ 90 ms', x: 600, y: 130, w: 180 },
+    { id: 'or', label: 'Expanded OR', sub: 'a < x OR (a = x AND …)', x: 330, y: 240, w: 200 },
+    { id: 'orok', label: '✓ Range scan', sub: '20 entries, 0.7 ms', x: 600, y: 240, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-off', from: 'q', to: 'off' },
+    { id: 'off-bad', from: 'off', to: 'offbad' },
+    { id: 'q-row', from: 'q', to: 'row' },
+    { id: 'row-bad', from: 'row', to: 'rowbad' },
+    { id: 'q-or', from: 'q', to: 'or' },
+    { id: 'or-ok', from: 'or', to: 'orok' },
+  ]}
+  cases={[
+    {
+      title: 'OFFSET',
+      path: 'offset ≤ 4,000 → reverse index scan; offset ≥ 4,500 → ✗ full table scan + sort of 1M rows',
+      summary: 'MySQL gives up on the index early: page 226 already reads the whole table.',
+      steps: [
+        {
+          title: 'The optimizer switches plan',
+          note: 'With OFFSET 4,000 the plan is "Index scan on orders using orders_created (reverse)". From OFFSET 4,500 it becomes "Table scan on orders" + "Sort … limit input to N row(s)": it estimates that 4,520 secondary-index lookups (each a primary-key lookup) cost more than scanning the clustered table once.',
+          code: 'EXPLAIN FORMAT=TREE SELECT id, created_at, amount FROM orders\nORDER BY created_at DESC, id DESC LIMIT 20 OFFSET 20000;',
+          active: ['q', 'off'],
+          edges: ['q-off'],
+        },
+        {
+          title: '✗ Every deep page reads 1M rows',
+          note: 'OFFSET 20,000: 118 ms (table scan + sort). FORCE INDEX (orders_created): 8 ms for 20,020 entries. At OFFSET 200,000 the forced index takes 81 ms and the table scan 122 ms. Either way, the cost grows with the page number.',
+          active: ['off', 'offbad'],
+          edges: ['off-bad'],
+        },
+      ],
+    },
+    {
+      title: 'Row constructor',
+      path: '(created_at, id) < (…) is not turned into a range → ✗ reverse scan from the newest entry, filter each row',
+      summary: 'EXPLAIN: type index, key orders_created, Extra "Using where; Backward index scan".',
+      steps: [
+        {
+          title: 'Looks like a seek',
+          note: 'The plan uses the right index in the right direction, and the estimate says rows=20. But the row-constructor comparison is evaluated as a Filter on each entry.',
+          code: "SELECT id, created_at, amount FROM orders\nWHERE (created_at, id) < ('2025-10-20 00:00:32', 800001)\nORDER BY created_at DESC, id DESC LIMIT 20;",
+          active: ['q', 'row'],
+          edges: ['q-row'],
+        },
+        {
+          title: '✗ 200,020 entries examined',
+          note: 'EXPLAIN ANALYZE: Index scan on orders using orders_created (reverse), actual rows=200020, ≈ 90 ms. The same cost as OFFSET: the "keyset" bought nothing.',
+          active: ['row', 'rowbad'],
+          edges: ['row-bad'],
+        },
+      ],
+    },
+    {
+      title: 'Expanded OR',
+      path: 'range optimizer builds two intervals on (created_at, id) → ✓ reverse range scan from the cursor → 20 entries',
+      summary: 'Index range scan over (created_at < x) OR (created_at = x AND id < y): 0.7 ms.',
+      steps: [
+        {
+          title: 'Intervals the range optimizer understands',
+          note: 'Both OR branches are ranges on the index columns (created_at, then the implicit id), so MySQL builds the union of two intervals and scans it backwards.',
+          code: "WHERE created_at < '2025-10-20 00:00:32'\n   OR (created_at = '2025-10-20 00:00:32' AND id < 800001)",
+          active: ['q', 'or'],
+          edges: ['q-or'],
+        },
+        {
+          title: '✓ Constant cost',
+          note: 'Index range scan on orders using orders_created over (…) (reverse): 0.7 ms at page 10,001, 2.9 ms at page 1,001 (cold pages). The portable form "created_at <= x AND (created_at < x OR id < y)" also became a range: 0.6 ms.',
+          active: ['or', 'orok'],
+          edges: ['or-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+With a filter: `status = 'shipped' AND (created_at < x OR (created_at = x AND id < y))` became a range over `orders_status_created_idx` (InnoDB appends `id`): 1.95 ms, versus 23 ms for `OFFSET 20000` on the same index.
+
+## MongoDB: skip counts keys, $or merges two scans
+
+Index `{ created_at: -1, _id: -1 }`. MongoDB has no row-value comparison, so the keyset is written as an `$or`.
+
+<Flow
+  title="MongoDB: page 10,001, three ways"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Page 10,001', sub: 'sort created_at, _id desc', x: 20, y: 130, w: 240 },
+    { id: 'skip', label: 'skip(200000)', sub: 'SKIP on index keys', x: 330, y: 20, w: 200 },
+    { id: 'skipbad', label: '✗ 200,020 keys', sub: '20 docs, ≈ 44 ms', x: 600, y: 20, w: 180 },
+    { id: 'or', label: '$or keyset', sub: 'two bounded IXSCANs', x: 330, y: 130, w: 200 },
+    { id: 'orok', label: '✓ 20 keys', sub: 'SORT_MERGE, 0 ms', x: 600, y: 130, w: 180 },
+    { id: 'lte', label: '$lte + $or', sub: 'one IXSCAN + filter', x: 330, y: 240, w: 200 },
+    { id: 'lteok', label: '✓ 21 keys', sub: 'FETCH filter', x: 600, y: 240, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-skip', from: 'q', to: 'skip' },
+    { id: 'skip-bad', from: 'skip', to: 'skipbad' },
+    { id: 'q-or', from: 'q', to: 'or' },
+    { id: 'or-ok', from: 'or', to: 'orok' },
+    { id: 'q-lte', from: 'q', to: 'lte' },
+    { id: 'lte-ok', from: 'lte', to: 'lteok' },
+  ]}
+  cases={[
+    {
+      title: 'skip()',
+      path: 'IXSCAN → SKIP 200,000 keys → FETCH 20 documents → ✗ 200,020 keys examined',
+      summary: 'Cheaper than SQL OFFSET per skipped row (no document fetch), but still linear.',
+      steps: [
+        {
+          title: 'SKIP sits below FETCH',
+          note: 'The plan is LIMIT ← PROJECTION ← FETCH ← SKIP ← IXSCAN: skipped entries are discarded as index keys, without reading their documents.',
+          code: 'db.orders.find({}, { created_at: 1, amount: 1 })\n  .sort({ created_at: -1, _id: -1 }).skip(200000).limit(20)',
+          active: ['q', 'skip'],
+          edges: ['q-skip'],
+        },
+        {
+          title: '✗ Still walks every skipped key',
+          note: 'skip 0: 20 keys. skip 20,000: 20,020 keys, 4 ms. skip 200,000: 200,020 keys, 20 documents, 44 ms.',
+          active: ['skip', 'skipbad'],
+          edges: ['skip-bad'],
+        },
+      ],
+    },
+    {
+      title: '$or keyset',
+      path: 'branch 1: created_at < x · branch 2: created_at = x AND _id < y → SORT_MERGE → ✓ 20 keys',
+      summary: 'Each $or branch gets its own index bounds; SORT_MERGE keeps the sort order.',
+      steps: [
+        {
+          title: 'Two branches, two scans',
+          note: 'The query planner plans each $or branch separately (SUBPLAN) against the same index, then merges the two ordered streams.',
+          code: 'db.orders.find({ $or: [\n  { created_at: { $lt: c } },\n  { created_at: c, _id: { $lt: id } } ] })\n  .sort({ created_at: -1, _id: -1 }).limit(20)',
+          active: ['q', 'or'],
+          edges: ['q-or'],
+        },
+        {
+          title: '✓ 20 keys at any depth',
+          note: 'totalKeysExamined 20, totalDocsExamined 20, 0 ms, with c = 2025-10-20T00:00:31.536Z and id = 800,001.',
+          active: ['or', 'orok'],
+          edges: ['or-ok'],
+        },
+      ],
+    },
+    {
+      title: '$lte + $or',
+      path: 'bound created_at ≤ x on the index → check the $or per row → ✓ 21 keys',
+      summary: 'The portable form works here too: one IXSCAN, the tie row checked and dropped.',
+      steps: [
+        {
+          title: 'A plain range plus a check',
+          note: 'created_at ≤ c gives the scan its start; the $or (created_at < c OR _id < id) removes the cursor row itself and any ties already shown.',
+          code: 'db.orders.find({ created_at: { $lte: c },\n  $or: [{ created_at: { $lt: c } }, { _id: { $lt: id } }] })\n  .sort({ created_at: -1, _id: -1 }).limit(20)',
+          active: ['q', 'lte'],
+          edges: ['q-lte'],
+        },
+        {
+          title: '✓ 21 keys',
+          note: 'One IXSCAN, FETCH with a filter: 21 keys and 21 documents for 20 results (the cursor row was read and rejected).',
+          active: ['lte', 'lteok'],
+          edges: ['lte-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+A keyset that uses the index in one engine can silently walk the whole range in another. The same condition was an Index Cond in PostgreSQL and a 200,020-entry Filter in MySQL, and the reverse for the `OR` form. Check `EXPLAIN ANALYZE` (actual rows) or `totalKeysExamined` on a deep page, not page 1, where every form looks instant.
+</Pitfall>
+
+## Real-world scenario: the admin order list
+
+An admin screen lists orders newest first, 50 per page, with filters for status and customer, and a "Next" button. Support staff paging back through last month see the same orders twice and miss others, and deep pages time out.
+
+| Fix | Detail |
+|---|---|
+| Sort by `(created_at DESC, id DESC)` | The tie-breaker makes positions exact |
+| Cursor = last row's `(created_at, id)`, encoded in the URL | No page numbers; "Next" and "Previous" only |
+| Index per filter: `(status, created_at, id)`, `(customer_id, created_at, id)` | Equality, then sort, then tie-breaker |
+| Condition in the form the engine seeks on | PostgreSQL row value; MySQL expanded `OR`; MongoDB `$or`; or `a <= x AND (a < x OR id < y)` everywhere |
+| Jump to a date instead of a page number | `WHERE created_at < :date` is also a seek |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 2: counting | Keyset removes OFFSET but not the "page 3 of 5,000" counter |
+| Concept 4: top-N per group | The same "descend, read a few, stop" pattern, once per group |
+| Session 11: diagnosis | Deep-page OFFSET queries show up as high rows-examined per call |
+
+## Key takeaways
+
+1. Keyset needs the sort column plus a unique tie-breaker; without it, ties are skipped or repeated (17 rows lost in the lab).
+2. The index must be `(filter columns…, sort column, tie-breaker)`, in the sort direction or its exact reverse.
+3. PostgreSQL seeks on `(a, b) < (x, y)` and filters the expanded `OR`; MySQL 8.4 does the opposite.
+4. `a <= x AND (a < x OR b < y)` seeks in PostgreSQL, MySQL and MongoDB.
+5. MongoDB's `skip` discards index keys before fetching, which is cheaper than SQL `OFFSET` but still linear (200,020 keys).
+6. MySQL abandoned the index for `OFFSET` beyond ≈ 4,500 rows and sorted the whole table.
+
+## Check questions
+
+1. Why does paging by `ORDER BY amount DESC` with `WHERE amount < :last` lose rows, and what is the fix?
+2. Which index serves `WHERE status = 'shipped' ORDER BY created_at DESC, id DESC` with keyset pagination, and why that column order?
+3. In PostgreSQL, why was `(created_at, id) < (x, y)` 4 buffers but the expanded `OR` 3,557?
+4. In MySQL 8.4, why was the row constructor slow, and which two rewrites fixed it?
+5. Why does MongoDB's `skip(200000)` examine 200,020 keys but only 20 documents?
+6. Write the query for the **previous** page, given the first row of the current page.
+7. Why did MySQL switch to a full table scan for `OFFSET 20000` even though an index matched the ORDER BY?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-10-pagination-aggregation/concept-1-keyset-pagination/answers">Worked answers to Q1–Q7</DeepDive>

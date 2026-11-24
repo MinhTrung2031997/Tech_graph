@@ -1,0 +1,109 @@
+---
+title: "Answers: Pagination, sorting and aggregation session quiz"
+description: "Worked answers to the Session 10 quiz."
+companion: "answers"
+tags: ["indexing", "pagination", "aggregation", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/range-optimization.html#row-constructor-range-optimization"
+  - "https://www.mongodb.com/docs/manual/core/aggregation-pipeline-optimization/"
+---
+
+<Tldr>
+Every query in this session got fast the same way: read the index in an order that lets the scan stop (or jump), and make sure the condition reaches the scan.
+</Tldr>
+
+## Q1. Infinite feed
+
+**Question:** a mobile app shows an infinite feed sorted by `published_at DESC`. Design the cursor, the index and the query for PostgreSQL and for MySQL.
+
+Cursor: the `(published_at, id)` of the last item shown, encoded (for example base64 JSON) so clients treat it as opaque.
+
+| | PostgreSQL | MySQL |
+|---|---|---|
+| Index | `(published_at, id)` | `(published_at)`: InnoDB appends `id` |
+| Condition | `(published_at, id) < ($1, $2)` | `published_at < ? OR (published_at = ? AND id < ?)` |
+| Order | `ORDER BY published_at DESC, id DESC LIMIT 21` | same |
+
+`LIMIT 21` answers "is there more?" without a count. The form `published_at <= x AND (published_at < x OR id < y)` works in both engines (4 buffers in PostgreSQL, 0.6 ms in MySQL in the lab).
+
+> **Common mistake:** a cursor of `published_at` only. Posts published in the same second are skipped or repeated.
+
+## Q2. Same condition, different engines
+
+**Question:** why does the same keyset condition behave differently in PostgreSQL and MySQL, and which form is safe in both?
+
+The planners recognise different shapes as index bounds. PostgreSQL maps a row-value comparison onto a multi-column B-tree as an Index Cond (4 buffers), but kept the expanded `OR` as a Filter (3,557 buffers). MySQL's range optimizer built two intervals from the expanded `OR` (0.7 ms) but evaluated the row constructor as a filter on a full reverse walk (200,020 entries). `a <= x AND (a < x OR b < y)` gives both a plain range on the first column plus a cheap check: safe in both, and in MongoDB (21 keys).
+
+> **Common mistake:** testing on page 1, where every form returns instantly.
+
+## Q3. "Page 37 of 4,812"
+
+**Question:** a product owner wants "Page 37 of 4,812" on the order list. Give two cheaper alternatives and their costs.
+
+1. **Next/Previous with keyset and `LIMIT n+1`:** each page ≈ 4–8 buffers regardless of depth; no count at all. Add "jump to date" for deep navigation.
+2. **Approximate total:** "about 350,000 paid orders" from `EXPLAIN` rows (free; 51,833 estimated vs 50,000 actual for shipped in the lab), or an exact count computed periodically and cached with its timestamp.
+
+The exact version costs an OFFSET walk (3,557 buffers at page 10,001 and growing) plus a filtered count on every click (1,348 buffers for paid orders).
+
+> **Common mistake:** keeping page numbers but switching to keyset internally: "page 37" has no cursor unless pages 1–36 were visited.
+
+## Q4. DISTINCT country on every page load
+
+**Question:** `SELECT DISTINCT country FROM customers` runs on every page load. What does each engine do with an index on `country`, and what would you do in PostgreSQL?
+
+MySQL uses a loose index scan ("Using index for group-by"): one jump per country, a few index reads. MongoDB's `distinct("country")` uses DISTINCT_SCAN: one key per value. PostgreSQL 17 reads every entry (or row) and hashes them. In PostgreSQL use the recursive CTE (one descent per value, ≈ 20 buffers for 5 values), or better: keep countries in a small reference table, and cache the list in the application, since it changes rarely.
+
+> **Common mistake:** adding the index in PostgreSQL and expecting `DISTINCT` to use it the way MySQL does.
+
+## Q5. 104 entries instead of 1M
+
+**Question:** why does `GROUP BY customer_id ORDER BY customer_id LIMIT 10` read 104 index entries instead of 1M, and what plan node makes that possible?
+
+`GroupAggregate` over an `Index Only Scan` of `orders_customer_idx`: entries arrive sorted by `customer_id`, so each group is finished when the key changes and is emitted immediately; `Limit` stops the scan after the 10th group. The first 10 customers have 104 orders between them, so 104 entries (5 buffers) were read. A HashAggregate would have had to read all 1M rows before emitting any group.
+
+> **Common mistake:** crediting the `LIMIT` alone; it only helps because the aggregate streams.
+
+## Q6. Latest 3 orders for 50 customers
+
+**Question:** write "the latest 3 orders for each of these 50 customers" for PostgreSQL and MongoDB so that neither reads the customers' older orders.
+
+```sql
+-- PostgreSQL: one descent per customer, 3 entries each; index (customer_id, created_at)
+SELECT c.id, o.id, o.created_at, o.amount
+FROM unnest($1::int[]) AS c(id)              -- the 50 customer ids
+CROSS JOIN LATERAL (
+  SELECT id, created_at, amount FROM orders
+  WHERE customer_id = c.id
+  ORDER BY created_at DESC
+  LIMIT 3) o;
+```
+
+```js
+// MongoDB 5.2+: $topN keeps 3 per group; index { customer_id: 1, created_at: -1 }
+db.orders.aggregate([
+  { $match: { customer_id: { $in: ids } } },
+  { $sort: { customer_id: 1, created_at: -1 } },
+  { $group: { _id: "$customer_id",
+              last3: { $topN: { n: 3, sortBy: { created_at: -1 }, output: "$$ROOT" } } } } ]);
+```
+
+The PostgreSQL query reads ≈ 6 buffers per customer (1,534 rows for the 513 gold SG customers took ≈ 3,077 buffers in the lab). The MongoDB `$group` with `$topN` is **not** turned into a DISTINCT_SCAN (that optimization covers `$first`/`$last`), so it reads every order of the 50 customers through the index: in the lab GROUP ← FETCH ← IXSCAN, 500 keys and 500 documents for 50 customers with 10 orders each. To read only 3 per customer, run 50 small `find({ customer_id }).sort({ created_at: -1 }).limit(3)` queries, or a `$lookup` from the customers with a pipeline that sorts and limits.
+
+> **Common mistake:** assuming every "top N per group" form gets the one-descent-per-group plan; check `explain` for DISTINCT_SCAN or a nested loop with `Limit`.
+
+## Q7. The daily_revenue view
+
+**Question:** a view `daily_revenue` groups orders by day and adds a running total with a window function. Which filters on the view can use an index on `created_at`?
+
+None, as the view is written. The running total `sum(revenue) OVER (ORDER BY day)` has no `PARTITION BY`, so the value for any day depends on every earlier day: a filter `day >= '2025-06-01'` cannot be pushed below the window without changing the running totals, and so it cannot reach the `GROUP BY` or the scan. Every query on the view aggregates the whole table. Fixes: a second view without the running total (where `day` filters are pushed through the `GROUP BY`), or a function / parameterized query that takes the date range and applies it inside, defining the running total from the start of the range.
+
+> **Common mistake:** assuming the filter on the grouping key is pushed because it would be without the window.
+
+## Q8. $lookup, $unwind, $match
+
+**Question:** a MongoDB pipeline `$lookup`s items, `$unwind`s them, then `$match`es on `customer_id` and `items.sku`. What does the optimizer do, and which indexes do you need?
+
+It splits the `$match`: the `customer_id` part refers to the orders documents, so it moves to the front, where it can use `{ customer_id: 1 }` (in the lab: IXSCAN, 10 keys). The `$unwind` is absorbed into the `$lookup`, and the `items.sku` part is pushed into the lookup's internal pipeline as a `$match` on `sku`. Each lookup then queries `order_items` by `order_id` (index `{ order_id: 1 }`, or `{ order_id: 1, sku: 1 }` to apply the sku condition in the index too).
+
+> **Common mistake:** an index on `items.sku` in the orders collection: `items` only exists inside the pipeline.

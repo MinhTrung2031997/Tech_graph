@@ -1,0 +1,259 @@
+---
+title: "Lab and session quiz: Pagination, sorting and aggregation"
+description: "Page through 1M orders with OFFSET and three keyset forms in each engine, reproduce the tie-breaker bug, compare exact counts with estimates, turn DISTINCT into a handful of index jumps, find the latest order per customer three ways, and watch filters get stuck above GROUP BY, windows, CTEs and pipeline stages."
+type: "how-to"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "pagination", "aggregation", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/using-explain.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/explain.html#explain-analyze"
+  - "https://www.mongodb.com/docs/manual/core/aggregation-pipeline-optimization/"
+---
+
+<Tldr>
+Uses the containers and aliases (`pg`, `my`, `mg`) from the [Session 1 lab](/blogs/databases/indexing/session-1-storage-basics/lab) and the `customers` and `order_items` tables from the [Session 9 lab](/blogs/databases/indexing/session-9-indexes-for-joins/lab): run its setup first. Every exercise has a prediction step: write down what you expect (plan shape, buffers, keys) before running it. Compare buffers and keys examined, not milliseconds.
+</Tldr>
+
+## Setup: the indexes for this session
+
+Start from the end state of the Session 9 lab: `orders` has its primary key, `(customer_id)`, `(status, created_at)` and `(sku)`; `customers` has `(country, tier)` (10,050 SG customers, 513 of them gold); `order_items` has `(order_id)` and, in PostgreSQL and MySQL, the foreign key to `orders`. Check before you start:
+
+```sql
+-- pg
+SELECT tablename, indexname FROM pg_indexes WHERE tablename IN ('orders', 'customers', 'order_items') ORDER BY 1, 2;
+SELECT count(*) FROM customers WHERE country = 'SG' AND tier = 'gold';   -- 513
+```
+
+Then add this session's indexes. The smallest `orders` index is now `(sku)` (7 MB), which matters for the counting exercise.
+
+```sql
+-- pg: keyset indexes (sort column + tie-breaker), filtered keyset, latest-per-customer
+CREATE INDEX orders_created_id        ON orders (created_at, id);
+CREATE INDEX orders_amount_id         ON orders (amount, id);
+CREATE INDEX orders_status_created_id ON orders (status, created_at, id);
+CREATE INDEX orders_cust_created      ON orders (customer_id, created_at);
+VACUUM ANALYZE orders;
+```
+
+```sql
+-- my: InnoDB secondary indexes already end with the primary key (id)
+ALTER TABLE orders ADD INDEX orders_created (created_at), ADD INDEX orders_amount (amount),
+                   ADD INDEX orders_cust_created (customer_id, created_at);
+ANALYZE TABLE orders;
+```
+
+```js
+// mg
+db.orders.createIndex({ created_at: -1, _id: -1 }, { name: "created_id" });
+db.orders.createIndex({ customer_id: 1, created_at: -1 }, { name: "cust_created" });
+```
+
+## Exercise 1: OFFSET vs keyset at page 10,001 (Concept 1)
+
+Predict, for each engine, how many index entries page 10,001 (skip 200,000) reads with OFFSET, and with each keyset form.
+
+```sql
+-- pg: the cursor is the 200,000th row
+SELECT created_at, id FROM orders ORDER BY created_at DESC, id DESC LIMIT 1 OFFSET 199999;
+-- → 2025-10-20 00:00:31.536+00 | 800001
+
+EXPLAIN (ANALYZE, BUFFERS) SELECT id, created_at, amount FROM orders
+ORDER BY created_at DESC, id DESC LIMIT 20 OFFSET 200000;                        -- form A
+
+EXPLAIN (ANALYZE, BUFFERS) SELECT id, created_at, amount FROM orders
+WHERE (created_at, id) < ('2025-10-20 00:00:31.536+00', 800001)
+ORDER BY created_at DESC, id DESC LIMIT 20;                                      -- form B: row value
+
+EXPLAIN (ANALYZE, BUFFERS) SELECT id, created_at, amount FROM orders
+WHERE created_at < '2025-10-20 00:00:31.536+00'
+   OR (created_at = '2025-10-20 00:00:31.536+00' AND id < 800001)
+ORDER BY created_at DESC, id DESC LIMIT 20;                                      -- form C: expanded OR
+
+EXPLAIN (ANALYZE, BUFFERS) SELECT id, created_at, amount FROM orders
+WHERE created_at <= '2025-10-20 00:00:31.536+00'
+  AND (created_at < '2025-10-20 00:00:31.536+00' OR id < 800001)
+ORDER BY created_at DESC, id DESC LIMIT 20;                                      -- form D: portable
+```
+
+```sql
+-- my: the same four forms with '2025-10-20 00:00:32' (DATETIME has no fraction here); use EXPLAIN ANALYZE
+EXPLAIN FORMAT=TREE SELECT id, created_at, amount FROM orders
+ORDER BY created_at DESC, id DESC LIMIT 20 OFFSET 4000;   -- then 4500: watch the plan change
+```
+
+```js
+// mg: skip vs $or vs $lte + $or
+const b = db.orders.find().sort({ created_at: -1, _id: -1 }).skip(199999).limit(1).toArray()[0];
+db.orders.find({}).sort({ created_at: -1, _id: -1 }).skip(200000).limit(20).explain("executionStats").executionStats;
+db.orders.find({ $or: [{ created_at: { $lt: b.created_at } }, { created_at: b.created_at, _id: { $lt: b._id } }] })
+  .sort({ created_at: -1, _id: -1 }).limit(20).explain("executionStats").executionStats;
+```
+
+| Form | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| A: OFFSET / skip | 3,557 buffers | Table scan + sort (from OFFSET ≈ 4,500), 122 ms | 200,020 keys, 20 docs |
+| B: row value | **4 buffers** (Index Cond) | 200,020 entries (Filter), ≈ 90 ms | n/a |
+| C: expanded OR | 3,557 buffers (Filter) | **range scan, 0.7 ms** | **20 keys** (SORT_MERGE) |
+| D: `<=` AND (`<` OR) | **4 buffers** | **range scan, 0.6 ms** | **21 keys** |
+
+## Exercise 2: the tie-breaker bug (Concept 1)
+
+```sql
+-- pg: page 2 by price ends in the middle of the 499.97 group
+SELECT id, amount FROM orders ORDER BY amount DESC, id DESC LIMIT 1 OFFSET 39;   -- 941872 | 499.97
+SELECT count(*) FROM orders WHERE amount = 499.97;                                -- 19
+
+-- page 3, three ways: count how many 499.97 rows each one shows
+SELECT id, amount FROM orders WHERE amount <  499.97 ORDER BY amount DESC, id DESC LIMIT 20;
+SELECT id, amount FROM orders WHERE amount <= 499.97 ORDER BY amount DESC, id DESC LIMIT 20;
+SELECT id, amount FROM orders WHERE (amount, id) < (499.97, 941872) ORDER BY amount DESC, id DESC LIMIT 20;
+```
+
+Expected: 0 (17 lost), 19 (2 repeated from page 2), 17 (correct).
+
+## Exercise 3: counting (Concept 2)
+
+```sql
+-- pg
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM orders;                          -- which index?
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM orders WHERE status = 'shipped';
+SELECT reltuples::bigint FROM pg_class WHERE relname = 'orders';
+EXPLAIN SELECT 1 FROM orders WHERE status = 'shipped';                           -- estimated rows
+```
+
+```sql
+-- my
+EXPLAIN SELECT COUNT(*) FROM orders;   EXPLAIN ANALYZE SELECT COUNT(*) FROM orders WHERE status = 'shipped';
+SELECT table_rows FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'orders';
+```
+
+```js
+// mg
+db.orders.explain("executionStats").count({ status: "shipped" }).executionStats;  // COUNT_SCAN
+db.orders.countDocuments({});         // time it
+db.orders.estimatedDocumentCount();   // time it
+```
+
+## Exercise 4: DISTINCT and GROUP BY (Concept 3)
+
+```sql
+-- pg: plain DISTINCT vs the recursive CTE (compare Buffers)
+EXPLAIN (ANALYZE, BUFFERS) SELECT DISTINCT status FROM orders;
+EXPLAIN (ANALYZE, BUFFERS) WITH RECURSIVE s AS (
+  (SELECT status FROM orders ORDER BY status LIMIT 1)
+  UNION ALL
+  SELECT (SELECT o.status FROM orders o WHERE o.status > s.status ORDER BY o.status LIMIT 1)
+  FROM s WHERE s.status IS NOT NULL)
+SELECT status FROM s WHERE status IS NOT NULL;
+
+-- streaming group + LIMIT
+EXPLAIN (ANALYZE, BUFFERS) SELECT customer_id, count(*) FROM orders
+GROUP BY customer_id ORDER BY customer_id LIMIT 10;
+```
+
+```sql
+-- my
+EXPLAIN SELECT DISTINCT status FROM orders;                                      -- Extra?
+FLUSH STATUS; SELECT DISTINCT status FROM orders; SHOW SESSION STATUS LIKE 'Handler_read%';
+EXPLAIN ANALYZE SELECT DISTINCT status FROM orders IGNORE INDEX (orders_status_created_idx);
+```
+
+```js
+// mg: which of these reads documents?
+db.runCommand({ explain: { distinct: "orders", key: "status" }, verbosity: "executionStats" });
+db.orders.explain("executionStats").aggregate([{ $group: { _id: "$status", n: { $sum: 1 } } }]);
+db.orders.explain("executionStats").aggregate([{ $sort: { status: 1 } }, { $group: { _id: "$status", n: { $sum: 1 } } }]);
+```
+
+## Exercise 5: the latest order per customer (Concept 4)
+
+Run each for the 513 gold customers in SG, then for all customers, and fill in the table.
+
+```sql
+-- pg / my (MySQL: JOIN LATERAL (…) o ON TRUE)
+SELECT c.id, o.id, o.created_at, o.amount
+FROM customers c
+CROSS JOIN LATERAL (SELECT id, created_at, amount FROM orders
+                    WHERE customer_id = c.id ORDER BY created_at DESC LIMIT 1) o
+WHERE c.tier = 'gold' AND c.country = 'SG';
+
+SELECT * FROM (
+  SELECT o.customer_id, o.id, o.created_at, o.amount,
+         row_number() OVER (PARTITION BY o.customer_id ORDER BY o.created_at DESC) rn
+  FROM orders o JOIN customers c ON c.id = o.customer_id
+  WHERE c.tier = 'gold' AND c.country = 'SG') x
+WHERE rn = 1;
+```
+
+```js
+// mg
+const ids = db.customers.find({ tier: "gold", country: "SG" }, { _id: 1 }).toArray().map(d => d._id);
+db.orders.explain("executionStats").aggregate([
+  { $match: { customer_id: { $in: ids } } },
+  { $sort: { customer_id: 1, created_at: -1 } },
+  { $group: { _id: "$customer_id", last: { $first: "$created_at" } } } ]);
+```
+
+| | 513 customers | All customers |
+|---|---|---|
+| PostgreSQL LATERAL | 2,428 buffers, 1.7 ms | 168 ms |
+| PostgreSQL ROW_NUMBER() | 10,920 buffers, ≈ 41–53 ms | 567 ms |
+| MySQL LATERAL | 8–12 ms | 184 ms |
+| MySQL ROW_NUMBER() | 13.5 ms warm, 119 ms cold | 752 ms |
+| MongoDB `$sort` + `$group` `$first` | DISTINCT_SCAN, 1,023 keys, 0 docs | 100,000 keys, 147 ms |
+
+## Exercise 6: fences (Concept 5)
+
+```sql
+-- pg: same result, different plans
+EXPLAIN (ANALYZE, BUFFERS) WITH paid AS (SELECT * FROM orders WHERE status = 'paid')
+SELECT * FROM paid WHERE customer_id = 4242;
+EXPLAIN (ANALYZE, BUFFERS) WITH paid AS MATERIALIZED (SELECT * FROM orders WHERE status = 'paid')
+SELECT * FROM paid WHERE customer_id = 4242;
+```
+
+```sql
+-- my: switch the pushdown off and on
+EXPLAIN ANALYZE SELECT * FROM (SELECT customer_id, COUNT(*) n, SUM(amount) s FROM orders GROUP BY customer_id) t
+WHERE customer_id = 4242;
+EXPLAIN ANALYZE SELECT /*+ NO_DERIVED_CONDITION_PUSHDOWN(t) */ * FROM
+  (SELECT customer_id, COUNT(*) n, SUM(amount) s FROM orders GROUP BY customer_id) t
+WHERE customer_id = 4242;
+```
+
+```js
+// mg: original field vs computed field after $addFields
+db.orders.explain("executionStats").aggregate([
+  { $addFields: { total: { $multiply: ["$amount", 1.1] } } }, { $match: { customer_id: 4242 } } ]);
+db.orders.explain("executionStats").aggregate([
+  { $addFields: { total: { $multiply: ["$amount", 1.1] } } }, { $match: { total: { $gt: 549 } } } ]);
+```
+
+## Cleanup (optional)
+
+The indexes from this session are not used by later sessions. Drop them to keep writes cheap (Session 8):
+
+```sql
+-- pg
+DROP INDEX orders_created_id, orders_amount_id, orders_status_created_id, orders_cust_created;
+-- my
+ALTER TABLE orders DROP INDEX orders_created, DROP INDEX orders_amount, DROP INDEX orders_cust_created;
+```
+
+```js
+// mg
+db.orders.dropIndexes(["created_id", "cust_created"]);
+```
+
+## Session quiz
+
+1. A mobile app shows an infinite feed sorted by `published_at DESC`. Design the cursor, the index and the query for PostgreSQL and for MySQL.
+2. Why does the same keyset condition behave differently in PostgreSQL and MySQL, and which form is safe in both?
+3. A product owner wants "Page 37 of 4,812" on the order list. Give two cheaper alternatives and their costs.
+4. `SELECT DISTINCT country FROM customers` runs on every page load. What does each engine do with an index on `country`, and what would you do in PostgreSQL?
+5. Why does `GROUP BY customer_id ORDER BY customer_id LIMIT 10` read 104 index entries instead of 1M, and what plan node makes that possible?
+6. Write "the latest 3 orders for each of these 50 customers" for PostgreSQL and MongoDB so that neither reads the customers' older orders.
+7. A view `daily_revenue` groups orders by day and adds a running total with a window function. Which filters on the view can use an index on `created_at`?
+8. A MongoDB pipeline `$lookup`s items, `$unwind`s them, then `$match`es on `customer_id` and `items.sku`. What does the optimizer do, and which indexes do you need?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-10-pagination-aggregation/lab/answers">Answers to the session quiz</DeepDive>

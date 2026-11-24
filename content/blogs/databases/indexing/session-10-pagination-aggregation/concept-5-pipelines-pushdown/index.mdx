@@ -1,0 +1,350 @@
+---
+title: "Concept 5: Where index use stops in pipelines and subqueries"
+description: "An index can only serve a condition that reaches the scan. Which conditions the planner moves down through GROUP BY, window functions, CTEs, LIMIT and MongoDB pipeline stages, and which ones it cannot: an inlined CTE read 18 buffers, the same CTE MATERIALIZED 10,102; a MongoDB $match on a computed field scanned 1M documents while the same pipeline matching an original field read 10 keys."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "aggregation-pipeline", "predicate-pushdown", "cte"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-CTE-MATERIALIZATION"
+  - "https://dev.mysql.com/doc/refman/8.4/en/derived-condition-pushdown-optimization.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/derived-table-optimization.html"
+  - "https://www.mongodb.com/docs/manual/core/aggregation-pipeline-optimization/"
+---
+
+<Tldr>
+Indexes are used by the **scan at the bottom** of a plan. A filter written on the outside of a view, CTE, subquery or later pipeline stage helps only if the planner can **push it down** to that scan without changing the result. It can when the filter is on a **grouping key** or **partition key** (PostgreSQL: 18 buffers, MySQL: a 10-row lookup, MongoDB: 10 keys), or on an **original field** after `$addFields`/`$lookup`/`$unwind`. It cannot when the filter is on an **aggregate** or **computed** value, when a `LIMIT` sits in between, or when the window is not partitioned by the filtered column: those read everything first (1M rows). PostgreSQL's `MATERIALIZED` CTE is an optimization fence (10,102 buffers instead of 18); MySQL pushed the same condition into its materialized CTE anyway. MongoDB coalesced `$sort` + `$limit` into a top-20 sort that kept 3 kB in memory.
+</Tldr>
+
+## The rule
+
+A condition can move below an operator when applying it first gives the same result as applying it after.
+
+| Between the filter and the scan | Filter on… | Can move down? | Why |
+|---|---|---|---|
+| `GROUP BY k` | `k` | ✓ | Removing other groups' rows does not change group `k` |
+| `GROUP BY k` | `count(*)`, `sum(x)` | ✗ | The aggregate is unknown until the group is complete |
+| Window `PARTITION BY k` | `k` | ✓ | Each partition is computed independently |
+| Window without that partition | any column | ✗ | Removing rows changes the row numbers and running totals |
+| `LIMIT n` inside | any column | ✗ | "Filter the first n" ≠ "first n of the filtered" |
+| Computed column | the computed value | ✗ (unless an expression index matches, Session 5) | The index stores the original value |
+| CTE | any | Depends: inlined ✓, materialized ✗ in PostgreSQL | A materialized CTE is computed once, then scanned |
+
+| Term | Meaning |
+|---|---|
+| Predicate pushdown | Moving a WHERE / `$match` condition closer to the table scan |
+| Optimization fence | A construct the planner does not push conditions through |
+| Derived table | MySQL's name for a subquery in FROM (and for CTEs); can be **merged** or **materialized** |
+| Coalescence | MongoDB merging adjacent stages (`$sort` + `$limit` → top-k sort) |
+| **✓ Pushed / ✗ Fenced** | The condition reached the index, or was applied after reading everything |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: does the filter reach the index?"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'WHERE customer_id', sub: '= 4242, outside', x: 20, y: 130, w: 240 },
+    { id: 'grp', label: 'GROUP BY / window', sub: 'by customer_id', x: 330, y: 20, w: 200 },
+    { id: 'grpr', label: '✓ 18 buffers', sub: 'Index Cond', x: 600, y: 20, w: 180 },
+    { id: 'agg', label: 'Filter on count(*)', sub: 'or other partition', x: 330, y: 130, w: 200 },
+    { id: 'aggr', label: '✗ 1M rows first', sub: 'filter afterwards', x: 600, y: 130, w: 180 },
+    { id: 'cte', label: 'CTE', sub: 'inlined vs MATERIALIZED', x: 330, y: 240, w: 200 },
+    { id: 'cter', label: '18 vs 10,102', sub: 'buffers', x: 600, y: 240, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-grp', from: 'q', to: 'grp' },
+    { id: 'grp-r', from: 'grp', to: 'grpr' },
+    { id: 'q-agg', from: 'q', to: 'agg' },
+    { id: 'agg-r', from: 'agg', to: 'aggr' },
+    { id: 'q-cte', from: 'q', to: 'cte' },
+    { id: 'cte-r', from: 'cte', to: 'cter' },
+  ]}
+  cases={[
+    {
+      title: 'Filter on the key',
+      path: 'WHERE customer_id = 4242 outside GROUP BY customer_id (or PARTITION BY customer_id) → ✓ pushed into the scan',
+      summary: 'GROUP BY view: 18 buffers. Window partitioned by customer: 21 buffers.',
+      steps: [
+        {
+          title: 'Through GROUP BY',
+          note: 'The planner moves customer_id = 4242 below the GroupAggregate: Bitmap Index Scan on the customer index, 15 rows, 18 buffers. The view still looks like "all customers".',
+          code: 'SELECT * FROM (\n  SELECT customer_id, count(*) n, sum(amount) s\n  FROM orders GROUP BY customer_id) t\nWHERE customer_id = 4242;',
+          active: ['q', 'grp'],
+          edges: ['q-grp'],
+        },
+        {
+          title: '✓ Through a partitioned window',
+          note: 'row_number() OVER (PARTITION BY customer_id …) with WHERE customer_id = 4242 outside: the condition reaches the scan (Bitmap Heap Scan, 15 rows), then WindowAgg numbers only that customer: 21 buffers.',
+          code: 'SELECT * FROM (\n  SELECT customer_id, id,\n         row_number() OVER (PARTITION BY customer_id ORDER BY created_at DESC) rn\n  FROM orders) t\nWHERE customer_id = 4242;',
+          active: ['grp', 'grpr'],
+          edges: ['grp-r'],
+        },
+      ],
+    },
+    {
+      title: 'Cannot push',
+      path: 'filter on count(*) · window without PARTITION BY customer_id · LIMIT inside → ✗ compute everything, filter after',
+      summary: 'HAVING-style filter: all 1M rows grouped. Unpartitioned window: 999,985 rows removed after numbering.',
+      steps: [
+        {
+          title: 'Filter on an aggregate',
+          note: 'WHERE n > 25 on the grouped view becomes a Filter on the GroupAggregate: all 1,000,000 entries are grouped first, 99,992 groups removed (1,135 buffers).',
+          code: 'SELECT * FROM (\n  SELECT customer_id, count(*) n FROM orders GROUP BY customer_id) t\nWHERE n > 25;',
+          active: ['q', 'agg'],
+          edges: ['q-agg'],
+        },
+        {
+          title: '✗ Window without that partition, or LIMIT inside',
+          note: 'row_number() OVER (ORDER BY created_at DESC) numbers all 1M orders; WHERE customer_id = 4242 then removes 999,985 rows (≈ 1.4 s here). With LIMIT 1000 inside the subquery, the 1,000 newest rows are read and the customer filter applied after (0 rows found): correct, because that is what the query means.',
+          code: 'SELECT * FROM (SELECT * FROM orders ORDER BY created_at DESC LIMIT 1000) t\nWHERE customer_id = 4242;',
+          active: ['agg', 'aggr'],
+          edges: ['agg-r'],
+        },
+      ],
+    },
+    {
+      title: 'CTE',
+      path: 'WITH paid AS (…) inlined → ✓ one plan, customer index · AS MATERIALIZED → ✗ 350,000 rows stored, then filtered',
+      summary: 'Since PostgreSQL 12, a CTE referenced once is inlined unless you write MATERIALIZED.',
+      subs: { cter: 'buffers' },
+      steps: [
+        {
+          title: 'Inlined: one query',
+          note: 'WITH paid AS (SELECT * FROM orders WHERE status = paid) SELECT … WHERE customer_id = 4242 is planned as one query: Bitmap Index Scan on customer_id, status checked on 15 rows, 18 buffers.',
+          code: "WITH paid AS (SELECT * FROM orders WHERE status = 'paid')\nSELECT * FROM paid WHERE customer_id = 4242;",
+          active: ['q', 'cte'],
+          edges: ['q-cte'],
+          subs: { cter: '✓ 18 buffers inlined' },
+        },
+        {
+          title: '✗ MATERIALIZED is a fence',
+          note: 'AS MATERIALIZED computes the CTE first: Seq Scan, 350,000 paid rows written to a temporary store (2,590 temp blocks), then CTE Scan with Filter customer_id = 4242, 349,996 rows removed. 10,102 buffers, ≈ 77 ms.',
+          code: "WITH paid AS MATERIALIZED (SELECT * FROM orders WHERE status = 'paid')\nSELECT * FROM paid WHERE customer_id = 4242;",
+          active: ['cte', 'cter'],
+          edges: ['cte-r'],
+          subs: { cter: '✗ 10,102 materialized' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: merge, push into the derived table, or materialize
+
+<Flow
+  title="MySQL: derived tables and CTEs"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'WHERE customer_id', sub: '= 4242, outside', x: 20, y: 130, w: 240 },
+    { id: 'push', label: 'Condition pushdown', sub: 'into GROUP BY / window', x: 330, y: 20, w: 200 },
+    { id: 'pushr', label: '✓ 10-row lookup', sub: 'vs 1,955 ms without', x: 600, y: 20, w: 180 },
+    { id: 'merge', label: 'CTE merged', sub: 'or NO_MERGE', x: 330, y: 130, w: 200 },
+    { id: 'merger', label: '✓ Index lookup', sub: 'both variants', x: 600, y: 130, w: 180 },
+    { id: 'lim', label: 'LIMIT inside', sub: 'derived table', x: 330, y: 240, w: 200 },
+    { id: 'limr', label: '✗ Materialize 1,000', sub: 'then filter', x: 600, y: 240, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-push', from: 'q', to: 'push' },
+    { id: 'push-r', from: 'push', to: 'pushr' },
+    { id: 'q-merge', from: 'q', to: 'merge' },
+    { id: 'merge-r', from: 'merge', to: 'merger' },
+    { id: 'q-lim', from: 'q', to: 'lim' },
+    { id: 'lim-r', from: 'lim', to: 'limr' },
+  ]}
+  cases={[
+    {
+      title: 'Derived condition pushdown',
+      path: 'WHERE customer_id = 4242 outside a GROUP BY derived table → ✓ pushed (8.0.22+) → ref lookup, 10 rows',
+      summary: 'With the hint NO_DERIVED_CONDITION_PUSHDOWN the same query aggregated all 1M orders: 1,955 ms.',
+      steps: [
+        {
+          title: 'Pushed into the grouped subquery',
+          note: 'EXPLAIN: DERIVED orders, type ref, key orders_customer_idx, rows 10; the outer row is a "system" (single-row) table. The same happened for a window partitioned by customer_id: Covering index lookup (customer_id = 4242), 10 rows.',
+          code: 'EXPLAIN SELECT * FROM (\n  SELECT customer_id, COUNT(*) n, SUM(amount) s\n  FROM orders GROUP BY customer_id) t\nWHERE customer_id = 4242;',
+          active: ['q', 'push'],
+          edges: ['q-push'],
+        },
+        {
+          title: '✓ What it saved',
+          note: 'Hint /*+ NO_DERIVED_CONDITION_PUSHDOWN(t) */: Index scan of orders_customer_idx over 1M entries, each with a primary-key lookup for amount, Group aggregate, Materialize 100,000 groups, then lookup: 1,955 ms. A filter on the aggregate (n > 25) is evaluated after grouping all rows (115 ms).',
+          active: ['push', 'pushr'],
+          edges: ['push-r'],
+        },
+      ],
+    },
+    {
+      title: 'CTE: merged or not',
+      path: 'CTE merged into the outer query → ✓ index lookup · NO_MERGE → materialized, but the condition was pushed in first',
+      summary: 'Unlike PostgreSQL\'s MATERIALIZED, MySQL still pushed customer_id = 4242 into the materialized CTE.',
+      steps: [
+        {
+          title: 'Merged by default',
+          note: 'A simple CTE or derived table is merged: the plan is Index lookup on orders_customer_idx (customer_id = 4242) + Filter status = paid, 10 rows.',
+          code: "WITH paid AS (SELECT * FROM orders WHERE status = 'paid')\nSELECT * FROM paid WHERE customer_id = 4242;",
+          active: ['q', 'merge'],
+          edges: ['q-merge'],
+        },
+        {
+          title: '✓ NO_MERGE still used the index',
+          note: '/*+ NO_MERGE(paid) */ produced "Materialize CTE paid", but inside it the same Index lookup (customer_id = 4242): derived condition pushdown applies to materialized derived tables too. 0.05 ms.',
+          code: "WITH paid AS (SELECT * FROM orders WHERE status = 'paid')\nSELECT /*+ NO_MERGE(paid) */ * FROM paid WHERE customer_id = 4242;",
+          active: ['merge', 'merger'],
+          edges: ['merge-r'],
+        },
+      ],
+    },
+    {
+      title: 'LIMIT inside',
+      path: 'derived table with ORDER BY … LIMIT 1000 → ✗ materialize 1,000 rows → auto_key lookup for the customer',
+      summary: 'As in PostgreSQL, the condition cannot cross a LIMIT: the meaning of the query would change.',
+      steps: [
+        {
+          title: 'Fenced by the LIMIT',
+          note: 'Reverse index scan of orders_created for 1,000 rows, materialized, then an automatic index (<auto_key0>) on the temporary table to find customer 4242: 0 rows, 1.1 ms.',
+          code: 'SELECT * FROM (SELECT * FROM orders ORDER BY created_at DESC LIMIT 1000) t\nWHERE customer_id = 4242;',
+          active: ['q', 'lim'],
+          edges: ['q-lim'],
+        },
+        {
+          title: '✗ Correct but not indexed',
+          note: 'Cheap here because the LIMIT is small. With LIMIT 1,000,000 the same shape materializes the whole table before filtering. If you meant "this customer\'s latest orders", put the filter inside.',
+          active: ['lim', 'limr'],
+          edges: ['lim-r'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: the pipeline optimizer moves $match
+
+Only the stages at the **start** of a pipeline (`$match`, `$sort`, plus `$limit`/`$skip` next to them) can use an index; everything after works on the documents they produce. The optimizer therefore moves `$match` as early as it safely can.
+
+<Flow
+  title="MongoDB: which stages reach the index"
+  height={300}
+  nodes={[
+    { id: 'q', label: '$match placement', sub: 'after another stage', x: 20, y: 130, w: 240 },
+    { id: 'mv', label: 'Moved to the front', sub: '$group key, $addFields', x: 330, y: 20, w: 200 },
+    { id: 'mvr', label: '✓ IXSCAN, 10 keys', sub: 'customer_id', x: 600, y: 20, w: 180 },
+    { id: 'cmp', label: 'Computed field', sub: '$match after $addFields', x: 330, y: 130, w: 200 },
+    { id: 'cmpr', label: '✗ COLLSCAN', sub: '1M docs, ≈ 800 ms', x: 600, y: 130, w: 180 },
+    { id: 'lk', label: '$lookup + $unwind', sub: '+ $match on both', x: 330, y: 240, w: 200 },
+    { id: 'lkr', label: '✓ Split and pushed', sub: '10 keys, 3 ms', x: 600, y: 240, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-mv', from: 'q', to: 'mv' },
+    { id: 'mv-r', from: 'mv', to: 'mvr' },
+    { id: 'q-cmp', from: 'q', to: 'cmp' },
+    { id: 'cmp-r', from: 'cmp', to: 'cmpr' },
+    { id: 'q-lk', from: 'q', to: 'lk' },
+    { id: 'lk-r', from: 'lk', to: 'lkr' },
+  ]}
+  cases={[
+    {
+      title: 'Moved forward',
+      path: '$group by customer_id → $match _id: 4242 · $addFields → $match customer_id → ✓ $match moved before, IXSCAN',
+      summary: 'Both pipelines read 10 index keys: the $match became the query of the first stage.',
+      steps: [
+        {
+          title: 'Through $group on its key',
+          note: 'A $match on the $group _id that maps to one field (customer_id) is rewritten as a $match on customer_id before the $group: GROUP ← PROJECTION_COVERED ← IXSCAN customer_id_1, 10 keys, 0 documents.',
+          code: 'db.orders.aggregate([\n  { $group: { _id: "$customer_id", n: { $sum: 1 } } },\n  { $match: { _id: 4242 } } ])',
+          active: ['q', 'mv'],
+          edges: ['q-mv'],
+        },
+        {
+          title: '✓ Through $addFields',
+          note: 'After $addFields (a new day field), a $match on an original field (customer_id) is moved in front: FETCH ← IXSCAN, 10 keys, 10 documents; $addFields then runs on 10 documents.',
+          code: 'db.orders.aggregate([\n  { $addFields: { day: { $dateTrunc: { date: "$created_at", unit: "day" } } } },\n  { $match: { customer_id: 4242 } } ])',
+          active: ['mv', 'mvr'],
+          edges: ['mv-r'],
+        },
+      ],
+    },
+    {
+      title: 'Computed field',
+      path: '$addFields total = amount × 1.1 → $match total > 549 → ✗ cannot move, COLLSCAN of 1M documents',
+      summary: 'The index stores amount, not amount × 1.1: 798 ms, 1,800 results.',
+      steps: [
+        {
+          title: 'The value does not exist in any index',
+          note: 'The $match depends on a field computed by the previous stage, so it must run after it, on every document.',
+          code: 'db.orders.aggregate([\n  { $addFields: { total: { $multiply: ["$amount", 1.1] } } },\n  { $match: { total: { $gt: 549 } } } ])',
+          active: ['q', 'cmp'],
+          edges: ['q-cmp'],
+        },
+        {
+          title: '✗ 1M documents',
+          note: 'COLLSCAN, 1,000,000 documents, 798 ms. Rewrite the condition on the stored field ({ amount: { $gt: 549 / 1.1 } }) so it can run first and use an index on amount.',
+          active: ['cmp', 'cmpr'],
+          edges: ['cmp-r'],
+        },
+      ],
+    },
+    {
+      title: '$lookup + $unwind',
+      path: '$match on customer_id and items.qty after $lookup/$unwind → ✓ customer_id moved to the front, qty pushed into the lookup',
+      summary: 'One $match was split in two: 10 orders via IXSCAN, items filtered inside the lookup: 7 rows, 3 ms.',
+      steps: [
+        {
+          title: 'Written in the "wrong" order',
+          note: 'Join every order with its items, unwind, then filter: written literally this would join 1M orders.',
+          code: 'db.orders.aggregate([\n  { $lookup: { from: "order_items", localField: "_id",\n               foreignField: "order_id", as: "items" } },\n  { $unwind: "$items" },\n  { $match: { customer_id: 4242, "items.qty": 3 } } ])',
+          active: ['q', 'lk'],
+          edges: ['q-lk'],
+        },
+        {
+          title: '✓ Rewritten by the optimizer',
+          note: 'explain: the first stage is FETCH ← IXSCAN customer_id_1 (10 keys); the $lookup absorbed the $unwind and got an internal pipeline [{ $match: { qty: 3 } }], served by the order_id index on order_items. 7 rows, 3 ms.',
+          active: ['lk', 'lkr'],
+          edges: ['lk-r'],
+        },
+      ],
+    },
+  ]}
+/>
+
+**`$sort` + `$limit`.** Without an index on `amount`, `[{ $sort: { amount: -1 } }, { $limit: 20 }]` still read all 1M documents (206 ms), but the two stages were coalesced into a SORT with `limitAmount: 20` that kept only the current top 20 (3,174 bytes) instead of sorting everything. A `$project` between them did not stop the coalescence (the limit moved before the projection). With an index on `amount` (created for the test, then dropped) the same pipeline became LIMIT ← FETCH ← IXSCAN: 20 keys, 20 documents, 4 ms.
+
+<Pitfall>
+Views, CTEs and pipeline stages make queries readable, but each layer is a possible fence. When a query on a view is slow, check where the condition appears in the plan: in an `Index Cond` / `IXSCAN` bounds (pushed) or in a `Filter` / later `$match` above a full scan (fenced). Rewriting the condition on a stored column, or moving it inside the subquery, is usually enough.
+</Pitfall>
+
+## Real-world scenario: the reporting view
+
+A team defines `customer_stats` as a view (`GROUP BY customer_id` with order counts, totals and a `ROW_NUMBER()` ranking by total) and the customer page queries `SELECT * FROM customer_stats WHERE customer_id = ?`. It takes seconds.
+
+| Finding | Fix |
+|---|---|
+| The ranking window is not partitioned by customer: the filter cannot pass it | Remove the global rank from the per-customer view; compute rankings in a separate (cached) query |
+| Without the rank, `customer_id` is the grouping key | The filter is pushed down: one index lookup per page view |
+| A MongoDB version filters on a `$addFields` total | Filter on stored fields before computing |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 11: diagnosis | Slow queries on views often hide a fence; the plan shows it |
+| Session 9: joins | Join conditions are pushed the same way (parameterized inner scans) |
+| Session 5: expression indexes | The fix when a computed condition must stay computed |
+
+## Key takeaways
+
+1. An index serves only conditions that reach the scan; a condition stuck above a fence filters after reading everything.
+2. Filters on grouping keys and partition keys are pushed down in all three engines (18 buffers, 10-row lookups, 10 keys).
+3. Filters on aggregates, computed values, unpartitioned windows and across `LIMIT` cannot be pushed: that is semantics, not a planner weakness.
+4. PostgreSQL `MATERIALIZED` CTEs are fences (10,102 vs 18 buffers); MySQL pushed conditions even into materialized derived tables.
+5. MongoDB only uses indexes in the leading stages, and moves `$match` forward when it can: `$group` keys, original fields after `$addFields`, `$lookup` + `$unwind`.
+
+## Check questions
+
+1. Why can `WHERE customer_id = 4242` be pushed below `GROUP BY customer_id` but `WHERE n > 25` cannot?
+2. A window is `PARTITION BY status ORDER BY created_at`. Which outer filters can be pushed below it: `status = 'paid'`, `customer_id = 4242`, `rn <= 10`?
+3. What changed between the inlined and the `MATERIALIZED` CTE in PostgreSQL, and when would you still want `MATERIALIZED`?
+4. Why did MySQL's `NO_MERGE` CTE still use the customer index?
+5. Why is a filter outside `SELECT … ORDER BY created_at DESC LIMIT 1000` not pushed inside, in any engine?
+6. A MongoDB pipeline computes `total` with `$addFields` and then filters `total > 549`. How do you make it use an index?
+7. What does `$sort` + `$limit` coalescence save, and what does it not save?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-10-pagination-aggregation/concept-5-pipelines-pushdown/answers">Worked answers to Q1–Q7</DeepDive>

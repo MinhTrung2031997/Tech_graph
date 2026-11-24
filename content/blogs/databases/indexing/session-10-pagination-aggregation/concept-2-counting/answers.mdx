@@ -1,0 +1,70 @@
+---
+title: "Answers: Counting rows and the total-pages problem"
+description: "Worked answers to the Session 10 Concept 2 check questions."
+companion: "answers"
+tags: ["indexing", "count", "pagination", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-index-only-scans.html"
+  - "https://www.mongodb.com/docs/manual/reference/method/db.collection.countDocuments/"
+---
+
+<Tldr>
+An exact count reads every match; make it cheap (covering index), rare (cached, on demand) or approximate (statistics).
+</Tldr>
+
+## Q1. No stored counter
+
+**Question:** why can't PostgreSQL or InnoDB answer `COUNT(*)` from a stored counter?
+
+Under MVCC, the correct count depends on the reader's snapshot: a transaction that started before 1,000 inserts committed must not count them; one that deleted rows but has not committed sees fewer rows than everyone else. A single counter cannot be right for all of them at once, so both engines count the row versions visible to the query. (MyISAM had a counter because it had no transactions.)
+
+> **Common mistake:** "the database must know how many rows it has". It knows approximately (statistics), not exactly for your snapshot.
+
+## Q2. Why the customer index
+
+**Question:** why did PostgreSQL count the table through `orders_sku_idx` and not through the primary key?
+
+`count(*)` needs no column values, only one entry per row, so any B-tree covering all rows works, and the cheapest is the one with the fewest pages. `orders_sku_idx` (added in Session 9) is 7 MB because B-tree deduplication stores each of the 5,000 SKUs once with a list of ≈ 200 row addresses (Session 2); `orders_customer_idx` (100,000 values, ≈ 10 rows each) is 9 MB, the primary key 23 MB (unique values cannot be deduplicated) and the heap 79 MB. Result: 871 buffers.
+
+> **Common mistake:** creating an index "for count(*)" on the primary key column. It already exists and is not the smallest.
+
+## Q3. Heap fetches after updates
+
+**Question:** what makes a PostgreSQL index-only count slower after many updates, and how do you fix it?
+
+Index-only scans skip the heap only for pages marked all-visible in the visibility map. Updates and deletes clear those bits, so each entry on such a page needs a heap visit (`Heap Fetches` > 0), and the count becomes an index scan plus random heap reads. VACUUM sets the bits again; tune autovacuum for the table (Session 5, Concept 2).
+
+> **Common mistake:** looking only at the plan node name; check `Heap Fetches`.
+
+## Q4. Empty filter is the slow one
+
+**Question:** why was `countDocuments({})` slower than `countDocuments({ status: "paid" })` in MongoDB?
+
+`countDocuments` runs an aggregation with the filter as `$match`. An empty `$match` gives the planner no field to bound an index on, so it chose COLLSCAN and read 1,000,000 documents (111 ms). The status filter matches the `es` index, so the plan was COUNT_SCAN: 350,001 keys, 0 documents (35 ms). For the whole collection, `estimatedDocumentCount()` reads metadata in 1 ms.
+
+> **Common mistake:** using `countDocuments({})` for a dashboard tile that only needs "about 1M".
+
+## Q5. MySQL's rough estimate
+
+**Question:** why was MySQL's `EXPLAIN` estimate for shipped orders 94,980 when the real count was 50,000?
+
+The optimizer trace shows the source: an **index dive** (`index_dives_for_eq_ranges: true`, `rows: 94980`). InnoDB descends to the first and last entry of the `status = 'shipped'` range and extrapolates how many entries lie between them from the pages it touched. For a range of 50,000 entries over many leaf pages, the extrapolation was 90% high. Good enough to choose between plans, not to show as a count. PostgreSQL's estimate (51,833) came from its most-common-values list, which stores a sampled frequency per value.
+
+> **Common mistake:** using MySQL `EXPLAIN` rows as a user-facing count for a specific value.
+
+## Q6. LIMIT 21
+
+**Question:** how does `LIMIT 21` tell you whether a next page exists?
+
+Display 20 rows; the 21st only exists if at least one row follows the page. If 21 rows come back, show "Next" (and use the 20th row as the cursor); if 20 or fewer, this is the last page. The cost is one more index entry in a scan that is already positioned.
+
+> **Common mistake:** using the 21st row as the next cursor, which skips it on the next page. The cursor is the last row **displayed**.
+
+## Q7. total on every page
+
+**Question:** a list endpoint returns `total` on every page. What would you change, and what would you tell the product owner?
+
+Make `total` optional (only when the UI asks, e.g. on the first page), return an estimate (`EXPLAIN` rows, cached count with a timestamp), or compute it asynchronously. Explain the trade-off with numbers: a keyset page costs ≈ 4 buffers, the exact count of paid orders 1,348 and growing with the data; "about 350,000" looks the same to a user. If an exact number is required (finance, exports), compute it once for that action with a covering index.
+
+> **Common mistake:** keeping the exact count and adding a cache that is invalidated on every insert, which on a busy table means it is never warm.

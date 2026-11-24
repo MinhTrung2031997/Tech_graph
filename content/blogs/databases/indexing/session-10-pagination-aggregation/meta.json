@@ -1,0 +1,13 @@
+{
+  "title": "Session 10: Pagination, sorting and aggregation",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-keyset-pagination/index",
+    "concept-2-counting/index",
+    "concept-3-group-by-distinct/index",
+    "concept-4-min-max-top-n/index",
+    "concept-5-pipelines-pushdown/index",
+    "lab/index"
+  ]
+}
