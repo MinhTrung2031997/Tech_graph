@@ -1,0 +1,78 @@
+---
+title: "Answers: From index entry to table row"
+description: "Worked answers to the Session 2 Concept 4 check questions: heap visits, visibility, HOT redirects, index-only scans, covering indexes, ICP and covered queries."
+companion: "answers"
+tags: ["indexing", "b-tree", "heap", "covering", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-index-only-scans.html"
+  - "https://www.postgresql.org/docs/current/storage-hot.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/index-condition-pushdown-optimization.html"
+  - "https://www.mongodb.com/docs/manual/core/query-optimization/#covered-query"
+---
+
+<Tldr>
+The index finds the pointer; the row costs a second step. Count both parts separately, and remember that only the table knows whether a row version is visible.
+</Tldr>
+
+## Q1. 10 pages for 7 rows
+
+**Question:** for `SELECT * FROM orders WHERE customer_id = 7` in PostgreSQL, `Buffers: shared hit=10` for 7 rows. Break down the 10 pages.
+
+| Part | Pages |
+|---|---|
+| Index descent: root → internal → leaf (customer 7's posting list fits on one leaf) | 3 |
+| Heap: ctids (19,49), (1363,89), (3459,10), (3656,59), (3873,68), (4240,29), (10071,86): 7 different pages | 7 |
+| **Total** | **10** |
+
+> **Common mistake:** "7 pages, one per row". The index descent is paid too, and the heap part is one page per row only because these rows are on distinct pages.
+
+## Q2. Why the index cannot decide visibility
+
+**Question:** why can't PostgreSQL decide from the index alone whether a row is visible to a query?
+
+Index entries hold only key + ctid. Visibility depends on the row version's `xmin` (which transaction created it) and `xmax` (which deleted or replaced it), stored in the heap tuple header. An index can have entries for versions that are deleted, replaced or not yet committed, and does not change when those transactions commit or abort. Only the heap tuple (or the visibility map's "all-visible" guarantee) can answer.
+
+> **Common mistake:** "the index is updated when a row is deleted". A DELETE only sets `xmax` on the heap row; index entries stay until VACUUM removes them.
+
+## Q3. A redirect line pointer
+
+**Question:** the index points at `(10101,2)`, but slot 2 holds no row. What is it, and how does the lookup still find the row?
+
+Slot 2 is a **redirect line pointer**. id 7 was HOT-updated from slot 2 to slot 3 on the same page; VACUUM later removed the dead version in slot 2 but kept its line pointer, now pointing to slot 3 (`lp_flags = 2` in `heap_page_items`). The lookup reads page 10,101, follows slot 2's redirect to slot 3 and finds the live version, with no extra page read and no index change.
+
+> **Common mistake:** "the index entry is stale and the row is lost". HOT chains exist precisely so the index entry stays valid.
+
+## Q4. What an index-only scan needs
+
+**Question:** what does an index-only scan need besides an index containing all requested columns, and what does `Heap Fetches: 386` mean?
+
+It needs the **visibility map**: for each ctid, the heap page's all-visible bit must be set (by VACUUM), proving every row on it is visible to everyone. Otherwise Postgres must visit the heap to check that row.
+
+`Heap Fetches: 386` = 386 rows were on pages whose bit was not set, so they were checked in the heap. In the lab this happened after 501 updates and a VACUUM that **bypassed index cleanup** (fewer than 2% of pages had dead items), leaving 7 pages not all-visible; `VACUUM (INDEX_CLEANUP ON)` brought it back to 0.
+
+> **Common mistake:** "an index-only scan never touches the heap". It skips the heap only for pages marked all-visible.
+
+## Q5. 9 vs 50 page requests
+
+**Question:** in InnoDB, why does `SELECT id FROM orders WHERE customer_id = 7` cost ≈ 9 page requests but `SELECT id, status …` ≈ 50?
+
+A secondary entry holds `(customer_id, id)`. The first query needs nothing else: the index **covers** it (`Using index`), ≈ 9 requests for the index range. `status` is only in the clustered index, so the second query must descend the clustered index once per row: 10 rows × ≈ 4 requests ≈ 40 more.
+
+> **Common mistake:** "the second query reads more rows". Both read the same 10 entries; the second pays a clustered descent for each.
+
+## Q6. Index condition pushdown
+
+**Question:** what does index condition pushdown save, and in which EXPLAIN column do you see it?
+
+It evaluates conditions on columns **in the secondary index** against the index entry, before the primary-key lookup. Entries that fail are skipped without descending the clustered index, which saves ≈ 3 page requests per rejected entry. EXPLAIN shows `Using index condition` in the **Extra** column.
+
+> **Common mistake:** confusing it with `Using index` (a covering index: no row lookup at all). ICP still looks up the rows that pass.
+
+## Q7. Projection still FETCHes
+
+**Question:** a MongoDB query projects `{ customer_id: 1 }` on an index on `customer_id` but still shows `FETCH`. Why?
+
+The projection includes `_id` by default, and `_id` is not in the `customer_id_1` index, so MongoDB must load each document to return it. Excluding it, `{ _id: 0, customer_id: 1 }`, makes the query covered: `PROJECTION_COVERED`, `totalDocsExamined: 0`.
+
+> **Common mistake:** "the index is not being used". It is (`IXSCAN`); the `FETCH` above it comes from the projection.

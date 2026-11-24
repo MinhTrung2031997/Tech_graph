@@ -1,0 +1,572 @@
+---
+title: "Concept 2: How CREATE INDEX builds and stores it"
+description: "What happens when you run CREATE INDEX in PostgreSQL, MySQL and MongoDB: read every row, sort the keys, write the leaves left to right, build the upper levels. Plus what a B-tree page looks like inside, deduplication and fill factor, measured on the lab."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "b-tree", "create-index"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-createindex.html"
+  - "https://www.postgresql.org/docs/current/btree.html#BTREE-DEDUPLICATION"
+  - "https://www.postgresql.org/docs/current/pageinspect.html"
+  - "https://github.com/postgres/postgres/blob/master/src/backend/access/nbtree/nbtsort.c"
+  - "https://dev.mysql.com/doc/refman/8.4/en/sorted-index-builds.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html"
+  - "https://www.mongodb.com/docs/manual/core/index-creation/"
+---
+
+<Tldr>
+All three engines build an index the same way: **read every row, sort the (key, row pointer) pairs, then write the leaf pages left to right and build each upper level from the first key of every page below.** Building from sorted input is why `CREATE INDEX` on 1M rows takes well under a second, and why a fresh index is compact: PostgreSQL leaves are 90% full, InnoDB pages 15/16. A B-tree page is the same slotted page as a heap page (Session 1), holding `key → pointer` entries in key order, plus pointers to its left and right neighbours.
+</Tldr>
+
+## The build in four steps
+
+| Step | What happens | Lab, PostgreSQL `orders_customer_idx` |
+|---|---|---|
+| 1. Scan | Read every row; extract (key, row pointer) | 1M (customer_id, ctid) pairs from 10,102 heap pages |
+| 2. Sort | Sort the pairs by key, in memory if they fit, otherwise in sorted runs on disk merged together | Fits in `maintenance_work_mem` (64 MB) |
+| 3. Leaves | Write leaf pages left to right, each filled to the fill factor | 1,130 leaves, 90.4% full |
+| 4. Upper levels | Each page's first key becomes an entry one level up, until one page (the root) remains | 5 internal pages including the root: 3 levels |
+
+It took **163 ms**. Inserting the same 1M keys one by one, in random order, would split pages constantly and leave them about 66% full (Concept 6).
+
+## PostgreSQL: CREATE INDEX
+
+| Term | Meaning |
+|---|---|
+| `maintenance_work_mem` | Memory for the sort (64 MB by default) |
+| **✓ Fits in memory** | All pairs are sorted with one in-memory quicksort |
+| **✗ Spills to disk** | The pairs are sorted in memory-sized chunks ("runs"), written to temp files, and merged |
+| Fill factor | How full each leaf is written: 90% by default, leaving room for later inserts |
+| Metapage | Block 0 of the index file: records which block is the root and the tree's height |
+
+<Flow
+  title="PostgreSQL: CREATE INDEX step by step"
+  height={340}
+  nodes={[
+    { id: 'heap', label: 'Heap', sub: '10,102 pages', x: 20, y: 20, w: 180 },
+    { id: 'sort', label: 'Sort', sub: '(key, ctid) pairs', x: 280, y: 20, w: 200 },
+    { id: 'fits', label: '✓ Fits in memory', sub: 'one quicksort', x: 120, y: 140, w: 220 },
+    { id: 'spill', label: '✗ Spills to disk', sub: 'sorted runs, then merge', x: 460, y: 140, w: 240 },
+    { id: 'leaves', label: 'Leaves', sub: 'written left to right', x: 20, y: 270, w: 200 },
+    { id: 'internal', label: 'Internal level', sub: 'first key of each leaf', x: 300, y: 270, w: 200 },
+    { id: 'root', label: 'Root + metapage', sub: 'block 0 → root', x: 580, y: 270, w: 200 },
+  ]}
+  edges={[
+    { id: 'heap-sort', from: 'heap', to: 'sort', label: 'scan' },
+    { id: 'sort-fits', from: 'sort', to: 'fits' },
+    { id: 'sort-spill', from: 'sort', to: 'spill' },
+    { id: 'fits-leaves', from: 'fits', to: 'leaves' },
+    { id: 'spill-leaves', from: 'spill', to: 'leaves' },
+    { id: 'leaves-internal', from: 'leaves', to: 'internal', label: 'keys' },
+    { id: 'internal-root', from: 'internal', to: 'root', label: 'keys' },
+  ]}
+  cases={[
+    {
+      title: 'Sort fits in memory',
+      path: 'Seq Scan of the heap → ✓ in-memory quicksort → leaves → internal pages → root',
+      summary: 'CREATE INDEX ON orders (customer_id): 1M pairs, sorted in memory, 163 ms.',
+      steps: [
+        {
+          title: 'Scan the heap',
+          note: 'Postgres reads all 10,102 heap pages (a Seq Scan, through a ring buffer) and, for every live row, extracts the key and the row\'s address: (customer_id, ctid). Meanwhile the table is locked against writes (SHARE lock); reads continue.',
+          code: 'CREATE INDEX orders_customer_idx ON orders (customer_id);',
+          active: ['heap', 'sort'],
+          edges: ['heap-sort'],
+          subs: { sort: '1M (customer_id, ctid)' },
+        },
+        {
+          title: '✓ The pairs fit in maintenance_work_mem',
+          note: 'About 40 MB of pairs fit in the 64 MB default, so one quicksort orders them by key, and by ctid within a key. trace_sort logs "internal sort … ended".',
+          active: ['sort', 'fits'],
+          edges: ['sort-fits'],
+        },
+        {
+          title: 'Write the leaves left to right',
+          note: 'The sorted pairs stream into leaf pages. Each page is filled to 90% and then a new one is started; customer 1\'s 12 entries come first. Equal keys are merged into one posting-list entry (deduplication, below).',
+          active: ['fits', 'leaves'],
+          edges: ['fits-leaves'],
+          subs: { leaves: '1,130 leaves, 90% full' },
+        },
+        {
+          title: 'Build the level above',
+          note: 'As each leaf is finished, its first key and block number are added to a page one level up. When that page fills, a new one starts, and its first key goes up another level.',
+          active: ['leaves', 'internal'],
+          edges: ['leaves-internal'],
+          subs: { internal: '4 internal pages' },
+        },
+        {
+          title: 'Finish with the root',
+          note: 'The level with a single page is the root. Postgres records its block number and level in the metapage (block 0). bt_metap shows level 2: root, one internal level, leaves.',
+          active: ['internal', 'root'],
+          edges: ['internal-root'],
+          subs: { root: 'level 2, 3 levels in all' },
+        },
+      ],
+    },
+    {
+      title: 'Sort spills to disk',
+      path: 'Seq Scan → ✗ 44 sorted runs on disk → 3 merge passes → leaves → … → root',
+      summary: 'Same build with maintenance_work_mem = 1MB: the pairs do not fit.',
+      steps: [
+        {
+          title: 'Scan the heap',
+          note: 'Same scan, but only 1 MB of sort memory.',
+          code: "SET maintenance_work_mem = '1MB';\nCREATE INDEX ON orders (amount);",
+          active: ['heap', 'sort'],
+          edges: ['heap-sort'],
+          subs: { sort: '1M (amount, ctid)' },
+        },
+        {
+          title: '✗ Spill: sorted runs',
+          note: 'Each time 1 MB of pairs is collected, Postgres sorts it and writes it to a temp file as a sorted run. trace_sort: "switching to external sort", then 44 runs.',
+          active: ['sort', 'spill'],
+          edges: ['sort-spill'],
+          subs: { spill: '44 runs on disk' },
+        },
+        {
+          title: 'Merge the runs into leaves',
+          note: 'The runs are merged (3 passes here) into one sorted stream, which feeds the leaves exactly as before. Measured: 336 ms vs 292 ms with the default 64 MB; on a big table on slow disks the gap is much larger.',
+          active: ['spill', 'leaves'],
+          edges: ['spill-leaves'],
+        },
+        {
+          title: 'Upper levels and root',
+          note: 'Identical to the in-memory case. Raising maintenance_work_mem for a big build (SET maintenance_work_mem = \'1GB\' in that session) avoids the spill.',
+          active: ['leaves', 'internal', 'root'],
+          edges: ['leaves-internal', 'internal-root'],
+        },
+      ],
+    },
+  ]}
+/>
+
+### Inside a PostgreSQL B-tree page
+
+An index page uses the same layout as a heap page, with a 16-byte **special space** at the end holding the tree links.
+
+| Part | Leaf block 1,373 of `orders_pkey` | Internal block 1,270 |
+|---|---|---|
+| Header | Bytes 0–23 | Bytes 0–23 |
+| Line pointers | 367 × 4 B: bytes 24–1,491 | 286 × 4 B: bytes 24–1,167 |
+| Free space | 808 B (the 10% fill-factor reserve) | 2,436 B (internal pages are built 70% full) |
+| Entries | `id → heap ctid`, 16 B each, bytes 2,304–8,175 | `separator id → child block`, 16 B each |
+| Special space (bytes 8,176–8,191) | prev leaf 1,372, next leaf 1,374, level 0 | prev 984, next 1,556, level 1 |
+| First entry | **High key 500,323**: upper bound of this page, not a real entry | "Minus infinity" downlink to the leftmost child |
+
+| Term | Meaning |
+|---|---|
+| High key | On every page except the rightmost of a level: the smallest key allowed on the **next** page. A search for a bigger key moves right |
+| Right-link | The "next" pointer: lets a search that raced with a split recover by moving right (Lehman–Yao), and lets range scans walk the leaves |
+| Posting list | One entry holding a key once and many ctids: deduplication of equal keys |
+
+<Flow
+  title="PostgreSQL: what one B-tree page holds"
+  height={300}
+  nodes={[
+    { id: 'hdr', label: 'Header', sub: 'bytes 0–23', x: 20, y: 30, w: 130 },
+    { id: 'lp', label: 'Line pointers', sub: '', x: 165, y: 30, w: 150 },
+    { id: 'free', label: 'Free space', sub: '', x: 330, y: 30, w: 120 },
+    { id: 'tup', label: 'Entries', sub: '', x: 465, y: 30, w: 170 },
+    { id: 'spec', label: 'Special', sub: '8,176–8,191', x: 650, y: 30, w: 130 },
+    { id: 'hk', label: 'Item 1', sub: '', x: 165, y: 180, w: 200 },
+    { id: 'item', label: 'Item 2 …', sub: '', x: 430, y: 180, w: 200 },
+    { id: 'next', label: 'Right-link', sub: '', x: 660, y: 180, w: 120 },
+  ]}
+  edges={[
+    { id: 'lp-hk', from: 'lp', to: 'hk', quiet: true },
+    { id: 'tup-item', from: 'tup', to: 'item', quiet: true },
+    { id: 'spec-next', from: 'spec', to: 'next', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Leaf page',
+      path: 'header → 367 line pointers → 808 B free → entries id → ctid → special: prev/next leaf',
+      summary: 'Block 1,373 of orders_pkey: ids 499,957–500,322.',
+      subs: { lp: '367 × 4 B', free: '808 B', tup: '16 B each', hk: 'high key 500,323', item: '499,957 → (5050,7)', next: 'block 1,374' },
+      steps: [
+        {
+          title: 'Header and line pointers',
+          note: 'The 24-byte header records where free space starts (lower = 1,492) and ends (upper = 2,304). 367 line pointers follow, one per entry, in key order.',
+          code: "SELECT lower, upper, special FROM page_header(get_raw_page('orders_pkey', 1373));",
+          active: ['hdr', 'lp'],
+        },
+        {
+          title: 'Item 1 is the high key',
+          note: 'The first line pointer points at 500,323: the first key of the next leaf. Any key ≥ 500,323 belongs further right. It is a fence, not an entry for a row.',
+          active: ['lp', 'hk'],
+          edges: ['lp-hk'],
+        },
+        {
+          title: 'Entries: key → heap ctid',
+          note: 'Items 2–367 are 366 entries in id order, each 16 bytes: an 8-byte header holding the ctid plus the 8-byte id. Entry 500,000 → (5050,50) is among them.',
+          active: ['tup', 'item'],
+          edges: ['tup-item'],
+        },
+        {
+          title: '808 bytes left free',
+          note: 'The leaf was written 90% full (fillfactor 90), so about 800 bytes, room for ≈ 40 entries, wait for future inserts before this page has to split.',
+          active: ['free'],
+        },
+        {
+          title: 'Special space: the links',
+          note: 'The last 16 bytes hold the previous leaf (1,372), the next leaf (1,374), the level (0 = leaf) and flags. The next pointer is what range scans follow.',
+          active: ['spec', 'next'],
+          edges: ['spec-next'],
+        },
+      ],
+    },
+    {
+      title: 'Internal page',
+      path: 'header → 286 line pointers → 2,436 B free → separator → child block → special: level 1',
+      summary: 'Block 1,270 of orders_pkey: routes ids from 417,241 onwards.',
+      subs: { lp: '286 × 4 B', free: '2,436 B', tup: 'separator → child', hk: '−∞ → leaf block', item: '499,957 → block 1,373', next: 'block 1,556' },
+      steps: [
+        {
+          title: 'Same layout, different entries',
+          note: 'An internal page has the same header and line pointers. Its 286 entries are separator keys with child block numbers instead of heap ctids.',
+          code: "SELECT * FROM bt_page_items('orders_pkey', 1270) LIMIT 3;",
+          active: ['hdr', 'lp', 'tup'],
+        },
+        {
+          title: 'The first downlink has no key',
+          note: 'On an internal page the first entry\'s key is treated as minus infinity: everything smaller than the second separator goes to this child.',
+          active: ['lp', 'hk'],
+          edges: ['lp-hk'],
+        },
+        {
+          title: 'Separator → child block',
+          note: 'Entry "499,957 → block 1,373" means: ids from 499,957 up to the next separator live in leaf 1,373. That is the hop a lookup for 500,000 takes (Concept 3).',
+          active: ['tup', 'item'],
+          edges: ['tup-item'],
+        },
+        {
+          title: '30% free, level 1',
+          note: 'Internal pages are built 70% full, since they receive a new entry every time a child splits. The special space says level 1 and links to the neighbouring internal pages.',
+          active: ['free', 'spec', 'next'],
+          edges: ['spec-next'],
+        },
+      ],
+    },
+    {
+      title: 'Leaf with posting lists',
+      path: 'entries are key + list of ctids → one entry per customer instead of one per row',
+      summary: 'Block 1 of orders_customer_idx: 88 entries hold 890 ctids.',
+      subs: { lp: '89 × 4 B', free: '752 B', tup: 'key + ctid list', hk: 'high key', item: '1 → 12 ctids, 88 B', next: 'next leaf' },
+      steps: [
+        {
+          title: 'Equal keys share one entry',
+          note: 'customer_id repeats about 10 times. Since PostgreSQL 13, a B-tree stores a repeated key once with a sorted list of ctids, a posting list.',
+          code: "SELECT itemoffset, itemlen, tids[1:3] FROM bt_page_items('orders_customer_idx', 1);",
+          active: ['tup', 'item'],
+          edges: ['tup-item'],
+        },
+        {
+          title: 'Customer 1: 12 rows in 88 bytes',
+          note: 'The entry for customer 1 lists 12 ctids (1041,36), (2565,90), … in 88 bytes. Twelve separate entries would take 12 × 16 = 192 bytes plus 12 line pointers.',
+          active: ['item'],
+        },
+        {
+          title: '890 rows on one page',
+          note: '88 posting-list entries cover 890 rows. The whole index is 9.1 MB, against 21 MB with deduplicate_items = off; on status (5 values), 6.8 MB vs 25 MB.',
+          active: ['lp', 'free'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL InnoDB: sorted index build
+
+| Term | Meaning |
+|---|---|
+| Sorted index build | Since MySQL 5.7: secondary indexes are built bottom-up from sorted input instead of row-by-row inserts |
+| `innodb_sort_buffer_size` | Memory per sort run (1 MB by default); bigger data spills to temp files and is merged |
+| `innodb_fill_factor` | How full pages are written (100 by default, which still leaves 1/16 of each page free) |
+| Online log | Online DDL (`ALGORITHM=INPLACE, LOCK=NONE`): writes during the build are recorded here and applied at the end |
+| **✓ Fits in the sort buffer / ✗ Merge** | Small input sorts in one buffer; larger input is sorted in runs and merged |
+
+<Flow
+  title="InnoDB: CREATE INDEX on a secondary column"
+  height={340}
+  nodes={[
+    { id: 'clu', label: 'Clustered index', sub: '4,203 leaves', x: 20, y: 20, w: 180 },
+    { id: 'buf', label: 'Sort buffer', sub: '(customer_id, id)', x: 280, y: 20, w: 200 },
+    { id: 'fits', label: '✓ Fits the buffer', sub: 'one sort', x: 100, y: 140, w: 200 },
+    { id: 'merge', label: '✗ Merge sort', sub: 'runs in temp files', x: 400, y: 140, w: 200 },
+    { id: 'olog', label: 'Online log', sub: 'writes during the build', x: 580, y: 20, w: 200 },
+    { id: 'leaves', label: 'Leaves, bottom-up', sub: 'filled to 15/16', x: 20, y: 270, w: 220 },
+    { id: 'upper', label: 'Upper levels', sub: 'root last', x: 310, y: 270, w: 180 },
+    { id: 'apply', label: 'Apply online log', sub: 'then commit', x: 570, y: 270, w: 210 },
+  ]}
+  edges={[
+    { id: 'clu-buf', from: 'clu', to: 'buf', label: 'scan' },
+    { id: 'buf-fits', from: 'buf', to: 'fits' },
+    { id: 'buf-merge', from: 'buf', to: 'merge' },
+    { id: 'fits-leaves', from: 'fits', to: 'leaves' },
+    { id: 'merge-leaves', from: 'merge', to: 'leaves' },
+    { id: 'leaves-upper', from: 'leaves', to: 'upper' },
+    { id: 'upper-apply', from: 'upper', to: 'apply', label: 'done' },
+    { id: 'olog-apply', from: 'olog', to: 'apply', label: 'replay' },
+  ]}
+  cases={[
+    {
+      title: 'Build with no concurrent writes',
+      path: 'scan the clustered index → ✗ merge sort (1M entries > 1 MB) → leaves bottom-up → upper levels',
+      summary: 'CREATE INDEX orders_customer_idx: 1,078 leaves, about 1.5 s in the lab.',
+      steps: [
+        {
+          title: 'Scan the clustered index',
+          note: 'InnoDB walks every leaf of the clustered index (the table) and builds an entry per row: (customer_id, id). The secondary entry ends with the primary key, which is the row pointer in InnoDB (Session 1, Concept 2).',
+          code: 'CREATE INDEX orders_customer_idx ON orders (customer_id);',
+          active: ['clu', 'buf'],
+          edges: ['clu-buf'],
+        },
+        {
+          title: '✗ Too big for one buffer: merge sort',
+          note: '1M entries of ≈ 17 B do not fit in a 1 MB sort buffer, so InnoDB sorts buffer-sized runs, writes them to temporary files and merges them.',
+          active: ['buf', 'merge'],
+          edges: ['buf-merge'],
+        },
+        {
+          title: 'Write leaves bottom-up',
+          note: 'Sorted entries fill leaf pages left to right to 15/16 of 16 KB, about 930 entries per page: 1,078 leaves (mysql.innodb_index_stats n_leaf_pages).',
+          active: ['merge', 'leaves'],
+          edges: ['merge-leaves'],
+          subs: { leaves: '1,078 leaves' },
+        },
+        {
+          title: 'Upper levels, then commit',
+          note: 'Node pointers are built level by level up to the root. With nothing in the online log, the index is ready.',
+          active: ['leaves', 'upper', 'apply'],
+          edges: ['leaves-upper', 'upper-apply'],
+          subs: { olog: 'empty' },
+        },
+      ],
+    },
+    {
+      title: 'Small table: fits the buffer',
+      path: 'scan the clustered index → ✓ entries fit in the 1 MB sort buffer → leaves → upper levels',
+      summary: 'A 20,000-row table: about 340 KB of entries, sorted in one buffer.',
+      steps: [
+        {
+          title: 'Scan the clustered index',
+          note: 'Same scan, on a small table: 20,000 entries of ≈ 17 B.',
+          code: 'CREATE INDEX coupons_customer_idx ON coupons (customer_id);',
+          active: ['clu', 'buf'],
+          edges: ['clu-buf'],
+          subs: { clu: '20,000 rows' },
+        },
+        {
+          title: '✓ Fits the sort buffer',
+          note: 'About 340 KB fits in the 1 MB innodb_sort_buffer_size, so one in-memory sort is enough; no temporary files.',
+          active: ['buf', 'fits'],
+          edges: ['buf-fits'],
+        },
+        {
+          title: 'Leaves, upper levels, done',
+          note: 'About 22 leaves and a root: a 2-level index.',
+          active: ['fits', 'leaves', 'upper', 'apply'],
+          edges: ['fits-leaves', 'leaves-upper', 'upper-apply'],
+          subs: { leaves: '≈ 22 leaves', olog: 'empty' },
+        },
+      ],
+    },
+    {
+      title: 'Build with concurrent writes',
+      path: 'scan + sort as before → online log collects INSERT/UPDATE/DELETE → replayed at the end',
+      summary: 'Online DDL lets the application keep writing; the changes are applied before the index goes live.',
+      steps: [
+        {
+          title: 'The scan starts from a snapshot',
+          note: 'InnoDB scans the table as it was when the build started. Reads and writes continue (LOCK=NONE is the default for adding a secondary index).',
+          code: 'ALTER TABLE orders ADD INDEX orders_customer_idx (customer_id), ALGORITHM=INPLACE, LOCK=NONE;',
+          active: ['clu', 'buf'],
+          edges: ['clu-buf'],
+        },
+        {
+          title: 'Writes go to the online log',
+          note: 'An INSERT of order 1,000,001 for customer 77 during the build is applied to the table as usual and also recorded in the online log for the new index.',
+          active: ['olog'],
+          subs: { olog: '+ (77, 1000001)' },
+        },
+        {
+          title: 'Sort and build as before',
+          note: 'Merge sort, leaves bottom-up, upper levels.',
+          active: ['buf', 'merge', 'leaves', 'upper'],
+          edges: ['buf-merge', 'merge-leaves', 'leaves-upper'],
+        },
+        {
+          title: 'Replay the log, briefly lock, commit',
+          note: 'The logged changes are applied to the new index; a short exclusive metadata lock at the end makes it visible. If the log outgrows innodb_online_alter_log_max_size (128 MB), the build fails and must be retried.',
+          active: ['olog', 'apply', 'upper'],
+          edges: ['olog-apply', 'upper-apply'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: createIndex
+
+| Term | Meaning |
+|---|---|
+| Hybrid index build | Since MongoDB 4.2: an exclusive lock only at the very start and end; reads and writes continue in between |
+| External sorter | Collects keys in memory up to `maxIndexBuildMemoryUsageMegabytes` (200 MB by default), spilling sorted runs to disk beyond that |
+| Side-writes table | Records writes made during the build; drained into the index before it finishes |
+| Prefix compression | WiredTiger stores a key's shared prefix with the previous key only once, shrinking indexes on repetitive keys |
+| **✓ Fits in 200 MB / ✗ Spill** | Same decision as the SQL engines |
+
+<Flow
+  title="MongoDB: createIndex step by step"
+  height={340}
+  nodes={[
+    { id: 'lock1', label: 'Exclusive lock', sub: 'brief, at the start', x: 20, y: 20, w: 180 },
+    { id: 'scan', label: 'Collection scan', sub: '1M documents', x: 290, y: 20, w: 200 },
+    { id: 'side', label: 'Side-writes table', sub: 'writes during build', x: 630, y: 140, w: 150 },
+    { id: 'fits', label: '✓ Fits in 200 MB', sub: 'in-memory sort', x: 100, y: 140, w: 210 },
+    { id: 'spill', label: '✗ Spill', sub: 'sorted runs on disk', x: 400, y: 140, w: 200 },
+    { id: 'bulk', label: 'Bulk load', sub: 'new WiredTiger B-tree', x: 20, y: 270, w: 220 },
+    { id: 'drain', label: 'Drain side writes', sub: '', x: 310, y: 270, w: 190 },
+    { id: 'lock2', label: 'Exclusive lock', sub: 'brief, at the end', x: 580, y: 270, w: 200 },
+  ]}
+  edges={[
+    { id: 'lock1-scan', from: 'lock1', to: 'scan' },
+    { id: 'scan-fits', from: 'scan', to: 'fits' },
+    { id: 'scan-spill', from: 'scan', to: 'spill' },
+    { id: 'fits-bulk', from: 'fits', to: 'bulk' },
+    { id: 'spill-bulk', from: 'spill', to: 'bulk' },
+    { id: 'bulk-drain', from: 'bulk', to: 'drain' },
+    { id: 'side-drain', from: 'side', to: 'drain', quiet: true },
+    { id: 'drain-lock2', from: 'drain', to: 'lock2' },
+  ]}
+  cases={[
+    {
+      title: 'Build on the lab collection',
+      path: 'lock briefly → scan → ✓ sort in memory → bulk load → drain (nothing) → lock briefly → ready',
+      summary: 'db.orders.createIndex({ customer_id: 1 }): 577 ms, 6.8 MB.',
+      steps: [
+        {
+          title: 'Brief exclusive lock',
+          note: 'MongoDB takes an exclusive lock just long enough to register the build and start recording writes, then releases it.',
+          code: 'db.orders.createIndex({ customer_id: 1 })',
+          active: ['lock1'],
+        },
+        {
+          title: 'Scan the collection',
+          note: 'Every document is read and its key extracted: (customer_id, RecordId).',
+          active: ['lock1', 'scan'],
+          edges: ['lock1-scan'],
+        },
+        {
+          title: '✓ Keys fit in 200 MB',
+          note: '1M small keys fit comfortably, so the sorter orders them in memory.',
+          active: ['scan', 'fits'],
+          edges: ['scan-fits'],
+        },
+        {
+          title: 'Bulk load the new index',
+          note: 'The sorted keys are appended to a new WiredTiger table in order. Prefix compression stores repeated key prefixes once: 6.8 MB for 1M entries, against 9.1 MB for the deduplicated PostgreSQL index.',
+          active: ['fits', 'bulk'],
+          edges: ['fits-bulk'],
+          subs: { bulk: '6.8 MB' },
+        },
+        {
+          title: 'Drain, lock briefly, done',
+          note: 'No writes happened during the build, so there is nothing to drain. A final short exclusive lock commits the index. On a replica set, members build together and commit once enough of them are done (commitQuorum).',
+          active: ['bulk', 'drain', 'lock2'],
+          edges: ['bulk-drain', 'drain-lock2'],
+          subs: { drain: 'nothing to drain' },
+        },
+      ],
+    },
+    {
+      title: 'Large build that spills',
+      path: 'scan → ✗ sorted runs written to disk past 200 MB → merged into the bulk load → drain side writes',
+      summary: 'A collection with hundreds of millions of keys: the sorter spills, and writes during the long build must be drained.',
+      steps: [
+        {
+          title: 'Scan while the application writes',
+          note: 'The build may take hours. Writes keep coming and are recorded in the side-writes table.',
+          code: 'db.events.createIndex({ user_id: 1, ts: -1 })',
+          active: ['scan', 'side'],
+          subs: { side: 'thousands of writes' },
+        },
+        {
+          title: '✗ Spill past 200 MB',
+          note: 'Each time the sorter fills its memory, it writes a sorted run to the dbPath\'s _tmp directory.',
+          active: ['scan', 'spill'],
+          edges: ['scan-spill'],
+        },
+        {
+          title: 'Merge into the bulk load',
+          note: 'The runs are merged into one sorted stream that is bulk-loaded into the new index.',
+          active: ['spill', 'bulk'],
+          edges: ['spill-bulk'],
+        },
+        {
+          title: 'Drain the side writes, then commit',
+          note: 'The recorded writes are applied to the new index (some draining happens before the final lock, so the locked part stays short), then the index is committed.',
+          active: ['side', 'drain', 'lock2'],
+          edges: ['side-drain', 'drain-lock2'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## The engines side by side
+
+Lab, same 1M rows, index on `customer_id`:
+
+| | PostgreSQL 17 | MySQL 8.4 | MongoDB 8.0 |
+|---|---|---|---|
+| Build time | 163 ms | ≈ 1.5 s | 577 ms |
+| Size | 9.1 MB (deduplicated; 21 MB without) | 1,251 pages × 16 KB ≈ 19.5 MB | 6.8 MB (prefix-compressed) |
+| Leaves | 1,130, 90% full | 1,078, ≈ 15/16 full | not reported |
+| What blocks during the build | Writes to the table (reads continue); `CONCURRENTLY` avoids it (Session 8) | Nothing for long: online DDL, short metadata locks at start and end | Nothing for long: brief exclusive locks at start and end |
+| Memory knob | `maintenance_work_mem` | `innodb_sort_buffer_size` | `maxIndexBuildMemoryUsageMegabytes` |
+
+<Pitfall>
+A plain `CREATE INDEX` in PostgreSQL blocks **every INSERT, UPDATE and DELETE** on the table until it finishes. On a big production table that can be minutes of failed or queued writes. Use `CREATE INDEX CONCURRENTLY` there (Session 8 covers its trade-offs).
+</Pitfall>
+
+## Real-world scenario: the index that was twice as big as expected
+
+A team adds an index on `status` to a 200M-row PostgreSQL 12 table and is surprised it takes 5 GB for five distinct values. After upgrading to PostgreSQL 16 and running `REINDEX`, it shrinks to about 1.4 GB.
+
+| | Without deduplication (≤ v12, or `deduplicate_items = off`) | With deduplication (v13+) |
+|---|---|---|
+| Entry per row | 16 B + 4 B line pointer | Key once per posting list + 6 B per ctid |
+| Lab, 1M rows, `status` | 25 MB | 6.8 MB |
+
+**What to check:** `pgstatindex` and index sizes after major upgrades: deduplication only applies to indexes built or rebuilt on v13+. And ask whether a five-value column needs an index at all; usually a partial index (Session 5) or a composite one (Session 4) serves the real query better.
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 3: point lookup | Uses the root, separators and high keys built here |
+| Concept 6: page splits | Explains why a fresh index is compact and an old one is not |
+| Session 5: unique indexes | Uniqueness is checked while building and on every insert |
+| Session 8: CREATE INDEX CONCURRENTLY | The locking cost of the plain build, and how to avoid it |
+
+## Key takeaways
+
+1. Every engine builds an index by scanning the table, sorting (key, row pointer) pairs and writing leaves left to right, then each upper level.
+2. The sort runs in memory if it fits (`maintenance_work_mem`, `innodb_sort_buffer_size`, 200 MB in MongoDB), otherwise as sorted runs merged from disk.
+3. A fresh B-tree is compact: PostgreSQL leaves 90% full, internal pages 70%; InnoDB pages 15/16.
+4. A B-tree page is a slotted page: header, line pointers, entries in key order, and links to its neighbours; non-rightmost pages start with a high key.
+5. PostgreSQL 13+ deduplicates equal keys into posting lists; MongoDB uses prefix compression; both shrink indexes on repetitive keys.
+6. A plain PostgreSQL `CREATE INDEX` blocks writes; InnoDB and MongoDB build online with brief locks.
+
+## Check questions
+
+1. List the four steps of building a B-tree index from an existing table. Why is this much faster than inserting the keys one by one?
+2. `trace_sort` reports "switching to external sort with 6 tapes" and 44 runs. What happened, and which setting would avoid it?
+3. In leaf block 1,373, item 1 is 500,323 while the page holds ids 499,957–500,322. What is item 1 for?
+4. Why does a freshly built PostgreSQL leaf have about 800 bytes free, and why are internal pages left emptier?
+5. `orders_customer_idx` is 9.1 MB, and 21 MB with `deduplicate_items = off`. Explain the difference using customer 1's entry.
+6. Which of the three engines blocks application writes during a default index build, and for how long?
+7. An InnoDB secondary index entry on `customer_id` holds two values. Which, and why the second?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-2-btree-internals/concept-2-create-index/answers">Worked answers to Q1–Q7</DeepDive>

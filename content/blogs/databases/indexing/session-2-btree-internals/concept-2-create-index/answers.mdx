@@ -1,0 +1,96 @@
+---
+title: "Answers: How CREATE INDEX builds and stores it"
+description: "Worked answers to the Session 2 Concept 2 check questions: bottom-up builds, external sorts, high keys, fill factor, deduplication and build locking."
+companion: "answers"
+tags: ["indexing", "b-tree", "create-index", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-createindex.html"
+  - "https://www.postgresql.org/docs/current/btree.html#BTREE-DEDUPLICATION"
+  - "https://dev.mysql.com/doc/refman/8.4/en/sorted-index-builds.html"
+  - "https://www.mongodb.com/docs/manual/core/index-creation/"
+---
+
+<Tldr>
+Scan, sort, fill leaves left to right, build upward. Everything else on this page (spills, fill factors, high keys, posting lists, locks) is a detail of one of those four steps.
+</Tldr>
+
+## Q1. The four steps
+
+**Question:** list the four steps of building a B-tree index from an existing table. Why is this much faster than inserting the keys one by one?
+
+1. **Scan** every row and extract (key, row pointer).
+2. **Sort** the pairs by key.
+3. **Write the leaves** left to right, each filled to the fill factor.
+4. **Build the upper levels** from the first key of each page, up to a single root.
+
+| | Bottom-up from sorted input | One insert per key |
+|---|---|---|
+| Work per key | Append to the current page | A descent from the root, then an insert |
+| Page splits | None | Thousands (one per ≈ 40 inserts into a full page) |
+| Page fill | 90% (PostgreSQL) / 15/16 (InnoDB), as chosen | ≈ 66% with random keys (Concept 6) |
+| Writes | Each page written once, sequentially | Pages rewritten many times, randomly |
+
+> **Common mistake:** "it is faster because it is done in one transaction". The gain comes from sorted, append-only page writes, not from the transaction.
+
+## Q2. External sort
+
+**Question:** `trace_sort` reports "switching to external sort with 6 tapes" and 44 runs. What happened, and which setting would avoid it?
+
+The (key, ctid) pairs did not fit in `maintenance_work_mem` (set to 1 MB in that test). Postgres switched to an external merge sort: it sorted 1 MB chunks, wrote 44 sorted runs to temp files, and merged them in passes. Raising `maintenance_work_mem` for the session (the 64 MB default was enough for the 40 MB of pairs: "internal sort … ended, 40202 KB used") makes it a single in-memory sort.
+
+> **Common mistake:** raising `work_mem`. That setting is for query sorts and hashes; index builds use `maintenance_work_mem`.
+
+## Q3. Item 1 of leaf 1,373
+
+**Question:** in leaf block 1,373, item 1 is 500,323 while the page holds ids 499,957–500,322. What is item 1 for?
+
+It is the **high key**: the upper bound of this page and the first key allowed on the next page (block 1,374). It is not an entry for any row. A search for a key ≥ 500,323 that lands here (for example because the page split while the search was descending) knows it must follow the right-link to the next page. Only the rightmost page of each level has no high key.
+
+> **Common mistake:** treating it as a row with id 500,323. That row is in leaf 1,374; item 1 here only marks the boundary.
+
+## Q4. Free space in fresh pages
+
+**Question:** why does a freshly built PostgreSQL leaf have about 800 bytes free, and why are internal pages left emptier?
+
+| Page | Built to | Why |
+|---|---|---|
+| Leaf | 90% (`fillfactor` 90): 808 B free in block 1,373 | Room for ≈ 40 more entries before the first split, so inserts into the middle of the key range do not split pages immediately |
+| Internal | 70%: 2,436 B free in block 1,270 | Every split of a child adds one entry to its parent; internal pages are few and hot, so splitting them is avoided by leaving more room |
+
+> **Common mistake:** "the free space is waste". It is a deliberate reserve; an index that only ever gets keys at the right end (sequential ids) can use `fillfactor = 100`.
+
+## Q5. Deduplication
+
+**Question:** `orders_customer_idx` is 9.1 MB, and 21 MB with `deduplicate_items = off`. Explain the difference using customer 1's entry.
+
+Customer 1 has 12 orders.
+
+| | Entries | Bytes |
+|---|---|---|
+| Without deduplication | 12 entries of 16 B + 12 line pointers of 4 B | 240 B |
+| With deduplication | 1 posting-list entry: key once + 12 ctids | 88 B + 1 line pointer = 92 B |
+
+Each customer has about 10 orders, so the whole index shrinks by roughly the same factor: 21 MB → 9.1 MB. On `status`, with 5 values and 200,000 rows each, the effect is bigger: 25 MB → 6.8 MB.
+
+> **Common mistake:** "deduplication removes duplicate rows". Every row is still indexed; only the repeated key bytes are stored once.
+
+## Q6. Who blocks writes
+
+**Question:** which of the three engines blocks application writes during a default index build, and for how long?
+
+| Engine | Default build | Writes blocked |
+|---|---|---|
+| PostgreSQL | `CREATE INDEX` takes a SHARE lock | **Yes, for the whole build.** Reads continue. `CREATE INDEX CONCURRENTLY` avoids it |
+| MySQL InnoDB | Online DDL (`ALGORITHM=INPLACE, LOCK=NONE`) | No; short metadata locks at start and end, writes replayed from the online log |
+| MongoDB | Hybrid build | No; brief exclusive locks at start and end, writes drained from the side-writes table |
+
+> **Common mistake:** assuming PostgreSQL builds are online like the others. Only the `CONCURRENTLY` variant is.
+
+## Q7. The InnoDB secondary entry
+
+**Question:** an InnoDB secondary index entry on `customer_id` holds two values. Which, and why the second?
+
+`(customer_id, id)`: the indexed column and the **primary key**. The primary key is InnoDB's row pointer: to get the full row, InnoDB searches the clustered index by that id (Session 1, Concept 2). It also makes every entry unique, so equal `customer_id` values are ordered by `id`.
+
+> **Common mistake:** "a page number". InnoDB secondary indexes never store page addresses, so rows can move during page splits without touching them.

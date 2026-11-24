@@ -1,0 +1,382 @@
+---
+title: "Concept 5: Range scans along the leaves"
+description: "How a B-tree answers BETWEEN, <, > and ORDER BY … LIMIT: one descent to the first key, then a walk along linked leaf pages until the range ends, forwards or backwards. Traced on the lab in PostgreSQL, InnoDB and MongoDB."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "b-tree", "range-scan"]
+status: "draft"
+sources:
+  - "https://github.com/postgres/postgres/blob/master/src/backend/access/nbtree/README"
+  - "https://www.postgresql.org/docs/current/indexes-ordering.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/range-optimization.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/order-by-optimization.html"
+  - "https://www.mongodb.com/docs/manual/tutorial/sort-results-with-indexes/"
+---
+
+<Tldr>
+A range scan **descends once** to the first key of the range, then **walks right along the linked leaves**, entry by entry, and **stops at the first key past the end**. It never goes back up the tree. The entries come out sorted, so `ORDER BY` on the indexed column is free, and walking left gives `ORDER BY … DESC`. In the lab, `id BETWEEN 200000 AND 201000` (1,001 rows) read 6 index pages in PostgreSQL: root, one internal page, four leaves. The rest of the cost is fetching the rows, which is cheap here only because ids and heap order match.
+</Tldr>
+
+## Descend once, then walk
+
+| Phase | What happens | `id BETWEEN 200000 AND 201000` in PostgreSQL |
+|---|---|---|
+| 1. Descend | A point lookup for the **lower bound** (Concept 3) | Root 412 → internal 411 → leaf 550 |
+| 2. Walk | Read entries in order; at the end of a leaf, follow its right-link | Leaves 550 → 551 → 552 → 553 |
+| 3. Stop | The first entry above the **upper bound** ends the scan | 201,001 on leaf 553 |
+| Rows | Fetch each row (Concept 4) | Heap pages 2,020–2,030 |
+
+Without a lower bound (`id < 500`), the descent goes to the leftmost leaf. Without an upper bound (`id > 999000`), the walk runs to the rightmost leaf.
+
+## PostgreSQL: walking orders_pkey
+
+| Term | Meaning |
+|---|---|
+| Right-link / left-link | Each leaf's special space holds its right and left neighbours' block numbers (Concept 2) |
+| Index Scan Backward | The same walk to the left, for `ORDER BY … DESC` |
+| **✓ In range** | The entry is ≤ the upper bound: return it (fetch its row) and continue |
+| **✗ Past the end** | The entry is above the upper bound, or a `LIMIT` is satisfied: stop |
+
+<Flow
+  title="PostgreSQL: a range scan on orders_pkey"
+  height={360}
+  nodes={[
+    { id: 'root', label: 'Root', sub: 'block 412', x: 20, y: 20, w: 150 },
+    { id: 'int', label: 'Internal', sub: 'block 411', x: 230, y: 20, w: 150 },
+    { id: 'l1', label: 'Leaf 550', sub: '199,837–200,202', x: 20, y: 140, w: 170 },
+    { id: 'l2', label: 'Leaf 551', sub: '200,203–200,568', x: 215, y: 140, w: 170 },
+    { id: 'l3', label: 'Leaf 552', sub: '200,569–200,934', x: 410, y: 140, w: 170 },
+    { id: 'l4', label: 'Leaf 553', sub: '200,935–201,300', x: 605, y: 140, w: 175 },
+    { id: 'in', label: '✓ In range', sub: 'fetch the row', x: 120, y: 270, w: 220 },
+    { id: 'out', label: '✗ Past the end', sub: 'stop', x: 460, y: 270, w: 220 },
+    { id: 'heap', label: 'Heap pages', sub: '', x: 450, y: 20, w: 330 },
+  ]}
+  edges={[
+    { id: 'root-int', from: 'root', to: 'int' },
+    { id: 'int-l1', from: 'int', to: 'l1', quiet: true },
+    { id: 'int-l4', from: 'int', to: 'l4', quiet: true },
+    { id: 'l1-l2', from: 'l1', to: 'l2', both: true },
+    { id: 'l2-l3', from: 'l2', to: 'l3', both: true },
+    { id: 'l3-l4', from: 'l3', to: 'l4', both: true },
+    { id: 'l1-in', from: 'l1', to: 'in', quiet: true },
+    { id: 'l4-out', from: 'l4', to: 'out', quiet: true },
+    { id: 'l4-in', from: 'l4', to: 'in', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Forward: BETWEEN',
+      path: 'descend to 200,000 → leaf 550 → 551 → 552 → 553 ✓ in range … ✗ 201,001 past the end',
+      summary: 'Measured: 1,001 rows; 6 index pages + 11 heap pages (Buffers: shared hit=19 read=1).',
+      steps: [
+        {
+          title: 'Descend to the lower bound',
+          note: 'A point lookup for 200,000: root 412 → internal 411 (separator 199,837) → leaf 550. The binary search on leaf 550 lands on the first entry ≥ 200,000.',
+          code: 'SELECT * FROM orders WHERE id BETWEEN 200000 AND 201000;',
+          active: ['root', 'int', 'l1'],
+          edges: ['root-int', 'int-l1'],
+        },
+        {
+          title: '✓ 200,000 … 200,202 in range',
+          note: 'Postgres reads leaf 550\'s entries in order from 200,000 to its last entry, 200,202: 203 rows. Each one\'s heap row is fetched; consecutive ids sit on the same heap page, starting at page 2,020.',
+          active: ['l1', 'in', 'heap'],
+          edges: ['l1-in'],
+          subs: { heap: 'page 2,020 → …' },
+        },
+        {
+          title: 'Follow the right-links',
+          note: 'At the end of leaf 550, its right-link says the next leaf is 551, then 552, then 553. No trip back to the internal page: the leaves form a chain in key order.',
+          active: ['l1', 'l2', 'l3', 'l4'],
+          edges: ['l1-l2', 'l2-l3', 'l3-l4'],
+        },
+        {
+          title: '✗ 201,001: past the end, stop',
+          note: 'On leaf 553 the scan reads 200,935 … 201,000 (in range), then 201,001: above the upper bound. The scan stops; the rest of leaf 553 and every later leaf are never read.',
+          active: ['l4', 'out'],
+          edges: ['l4-out'],
+        },
+        {
+          title: 'Total: 6 index pages, 11 heap pages',
+          note: 'Index part: root + internal + 4 leaves = 6 (the index-only version of the query shows 7: those 6 plus one visibility-map page). Heap: 1,001 consecutive ids on pages 2,020–2,030 = 11 pages. EXPLAIN reports 20 buffers, because a heap page shared by two leaves\' entries is counted again when the scan moves to the next leaf.',
+          active: ['in', 'heap'],
+          subs: { in: '1,001 rows', heap: 'pages 2,020–2,030' },
+        },
+      ],
+    },
+    {
+      title: 'Backward: ORDER BY DESC LIMIT 10',
+      path: 'descend to the rightmost leaf → walk left ✓ 10 entries → ✗ LIMIT reached, stop',
+      summary: 'Measured: Index Scan Backward, Buffers: 5 (3 index + 2 heap); no sort.',
+      subs: { l4: 'rightmost: leaf 2,744', l3: '(left neighbour)', l1: '', l2: '', int: 'block 2,700' },
+      steps: [
+        {
+          title: 'Descend to the end of the index',
+          note: 'No upper bound and descending order: the scan starts at the rightmost leaf (root 412 → internal 2,700 → leaf 2,744), at its last entry, 1,000,000.',
+          code: 'SELECT * FROM orders ORDER BY id DESC LIMIT 10;',
+          active: ['root', 'int', 'l4'],
+          edges: ['root-int', 'int-l4'],
+        },
+        {
+          title: '✓ 1,000,000 down to 999,991',
+          note: 'Entries are read right to left. The 10 rows are on heap pages 10,101 and 10,100.',
+          active: ['l4', 'in', 'heap'],
+          edges: ['l4-in'],
+          subs: { heap: 'pages 10,100–10,101' },
+        },
+        {
+          title: '✗ LIMIT reached: stop',
+          note: 'The Limit node has its 10 rows. If more had been needed, the scan would follow leaf 2,744\'s left-link to its neighbour. Total 5 buffers; no Sort node, because the index already delivers the order.',
+          active: ['l4', 'out'],
+          edges: ['l4-out'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL InnoDB: ranges on the clustered and secondary indexes
+
+| Term | Meaning |
+|---|---|
+| `type: range` | EXPLAIN access type for a range scan on an index |
+| Clustered range | The leaves are the rows: walking them returns rows directly |
+| Secondary range | Walk the secondary leaves; each entry costs a primary-key lookup unless the index covers the query |
+| **✓ In range / ✗ Past the end** | Same rule as PostgreSQL |
+
+<Flow
+  title="InnoDB: range scans"
+  height={440}
+  nodes={[
+    { id: 'root', label: 'Root', sub: 'level 2', x: 20, y: 20, w: 150 },
+    { id: 'int', label: 'Internal', sub: 'level 1', x: 230, y: 20, w: 150 },
+    { id: 'lk', label: 'PK lookups', sub: 'one descent per row', x: 400, y: 370, w: 380 },
+    { id: 'l1', label: 'Leaf A', sub: '', x: 20, y: 140, w: 170 },
+    { id: 'l2', label: 'Leaf B', sub: '', x: 215, y: 140, w: 170 },
+    { id: 'l3', label: 'Leaf C', sub: '', x: 410, y: 140, w: 170 },
+    { id: 'l4', label: 'Leaf D', sub: '', x: 605, y: 140, w: 175 },
+    { id: 'in', label: '✓ In range', sub: '', x: 120, y: 270, w: 220 },
+    { id: 'out', label: '✗ Past the end', sub: 'stop', x: 460, y: 270, w: 220 },
+  ]}
+  edges={[
+    { id: 'root-int', from: 'root', to: 'int' },
+    { id: 'int-l1', from: 'int', to: 'l1', quiet: true },
+    { id: 'l1-l2', from: 'l1', to: 'l2', both: true },
+    { id: 'l2-l3', from: 'l2', to: 'l3', both: true },
+    { id: 'l3-l4', from: 'l3', to: 'l4', both: true },
+    { id: 'l1-in', from: 'l1', to: 'in', quiet: true },
+    { id: 'l4-out', from: 'l4', to: 'out', quiet: true },
+    { id: 'in-lk', from: 'in', to: 'lk', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Primary-key range',
+      path: 'descend to id 100,000 → leaves are rows ✓ … → ✗ 101,001 past the end',
+      summary: 'Measured: 1,001 rows over ≈ 5 leaves, 26 page requests, no second step.',
+      subs: { l1: 'ids ≈ 99,9xx–100,1xx', l2: '≈ 238 rows', l3: '≈ 238 rows', l4: 'ends ≈ 101,1xx', in: 'the rows themselves', lk: '(not needed)' },
+      steps: [
+        {
+          title: 'Descend to the lower bound',
+          note: 'A primary-key descent to id 100,000: root → internal → the leaf holding it.',
+          code: 'SELECT COUNT(*), SUM(amount) FROM orders WHERE id BETWEEN 100000 AND 101000;',
+          active: ['root', 'int', 'l1'],
+          edges: ['root-int', 'int-l1'],
+        },
+        {
+          title: '✓ Rows straight from the leaves',
+          note: 'Each leaf entry is the full row, so amount is right there. About 238 rows per 16 KB leaf.',
+          active: ['l1', 'in'],
+          edges: ['l1-in'],
+        },
+        {
+          title: 'Next-page pointers',
+          note: 'InnoDB leaves are doubly linked (FIL_PAGE_PREV / FIL_PAGE_NEXT). The scan moves leaf to leaf.',
+          active: ['l1', 'l2', 'l3', 'l4'],
+          edges: ['l1-l2', 'l2-l3', 'l3-l4'],
+        },
+        {
+          title: '✗ Past the end',
+          note: 'id 101,001 ends the scan. The lab measured 26 page requests for ≈ 5 distinct leaves plus the descent: InnoDB re-accesses the current leaf as it hands rows to the server in batches, and the counter counts every access.',
+          active: ['l4', 'out'],
+          edges: ['l4-out'],
+        },
+      ],
+    },
+    {
+      title: 'Secondary-index range',
+      path: 'customer_id index: descend to 1 → walk leaves ✓ → each entry → PK lookup → … ✗ past 1,000',
+      summary: 'customer_id BETWEEN 1 AND 1000: 10,000 entries walked in order, 10,000 clustered lookups.',
+      subs: { l1: '(1, 100000) …', l2: '(250, …) …', l3: '(600, …) …', l4: '… (1000, …)', in: 'entry (customer, id)', lk: '10,000 descents' },
+      steps: [
+        {
+          title: 'Descend the secondary index to customer 1',
+          note: 'The secondary B-tree is sorted by (customer_id, id). The descent lands on (1, 100000).',
+          code: 'SELECT * FROM orders WHERE customer_id BETWEEN 1 AND 1000;',
+          active: ['root', 'int', 'l1'],
+          edges: ['root-int', 'int-l1'],
+        },
+        {
+          title: '✓ Entry in range → primary-key lookup',
+          note: 'The entry gives id 100,000; InnoDB descends the clustered index to fetch the row. The walk of the secondary leaves is sequential and cheap; the lookups jump all over the table (Session 1, Concept 4).',
+          active: ['l1', 'in', 'lk'],
+          edges: ['l1-in', 'in-lk'],
+        },
+        {
+          title: 'Walk on, stop after customer 1,000',
+          note: 'The secondary leaves are walked in order (≈ 930 entries per leaf, ≈ 11 leaves). The first entry with customer_id 1,001 ends the scan. Measured earlier: 4,224 on-demand page reads, nearly all from the lookups.',
+          active: ['l2', 'l3', 'l4', 'out'],
+          edges: ['l1-l2', 'l2-l3', 'l3-l4', 'l4-out'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: IXSCAN with bounds
+
+| Term | Meaning |
+|---|---|
+| `indexBounds` | The range the IXSCAN walks, e.g. `_id: [100000, 101000]` |
+| `direction` | `forward` or `backward`: the walk direction along the index |
+| `SORT` stage | Appears when the index cannot provide the order; absent when it can |
+| **✓ In bounds / ✗ Past the bound** | Same rule as the SQL engines |
+
+<Flow
+  title="MongoDB: range scans on the _id index"
+  height={440}
+  nodes={[
+    { id: 'q', label: 'IXSCAN', sub: '_id_', x: 315, y: 20, w: 170 },
+    { id: 'fetch', label: 'FETCH', sub: 'collection B-tree', x: 400, y: 370, w: 380 },
+    { id: 'l1', label: 'Index leaf', sub: '', x: 20, y: 140, w: 170 },
+    { id: 'l2', label: 'Next leaf', sub: '', x: 215, y: 140, w: 170 },
+    { id: 'l3', label: '…', sub: '', x: 410, y: 140, w: 170 },
+    { id: 'l4', label: 'Last leaf', sub: '', x: 605, y: 140, w: 175 },
+    { id: 'in', label: '✓ In bounds', sub: '', x: 120, y: 270, w: 220 },
+    { id: 'out', label: '✗ Past the bound', sub: 'stop', x: 460, y: 270, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-l1', from: 'q', to: 'l1' },
+    { id: 'q-l4', from: 'q', to: 'l4', quiet: true },
+    { id: 'l1-l2', from: 'l1', to: 'l2' },
+    { id: 'l2-l3', from: 'l2', to: 'l3' },
+    { id: 'l3-l4', from: 'l3', to: 'l4' },
+    { id: 'l1-in', from: 'l1', to: 'in', quiet: true },
+    { id: 'l4-in', from: 'l4', to: 'in', quiet: true },
+    { id: 'l4-out', from: 'l4', to: 'out', quiet: true },
+    { id: 'in-fetch', from: 'in', to: 'fetch', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Forward range',
+      path: 'IXSCAN bounds [100000, 101000] forward → ✓ 1,001 keys → FETCH each → ✗ stop',
+      summary: 'Measured: keysExamined 1,001, docsExamined 1,001, nReturned 1,001.',
+      subs: { l1: 'from _id 100,000', l4: 'to _id 101,000', in: '1,001 keys' },
+      steps: [
+        {
+          title: 'Descend to the lower bound',
+          note: 'The IXSCAN\'s indexBounds are [100000, 101000]. WiredTiger positions a cursor at the first key ≥ 100,000.',
+          code: 'db.orders.find({ _id: { $gte: 100000, $lte: 101000 } })',
+          active: ['q', 'l1'],
+          edges: ['q-l1'],
+        },
+        {
+          title: '✓ Keys in bounds → FETCH',
+          note: 'Each key yields a RecordId; FETCH loads the document from the collection B-tree.',
+          active: ['l1', 'in', 'fetch'],
+          edges: ['l1-in', 'in-fetch'],
+        },
+        {
+          title: 'Cursor moves forward',
+          note: 'The cursor advances key by key across leaf pages. WiredTiger moves to the next leaf through the tree, rather than by stored sibling pointers, but the order is the same.',
+          active: ['l1', 'l2', 'l3', 'l4'],
+          edges: ['l1-l2', 'l2-l3', 'l3-l4'],
+        },
+        {
+          title: '✗ Past the bound',
+          note: 'The first key above 101,000 ends the scan: keysExamined 1,001, exactly the range, no wasted keys.',
+          active: ['l4', 'out'],
+          edges: ['l4-out'],
+        },
+      ],
+    },
+    {
+      title: 'Backward: sort desc, limit 10',
+      path: 'IXSCAN direction backward from the last key → ✓ 10 keys → ✗ LIMIT reached',
+      summary: 'Measured: LIMIT <- FETCH <- IXSCAN, keysExamined 10; no SORT stage.',
+      subs: { l4: 'from _id 1,000,000', in: '10 keys' },
+      steps: [
+        {
+          title: 'Start at the end',
+          note: 'sort({ _id: -1 }) matches the index order reversed, so the IXSCAN runs backward from the last key.',
+          code: 'db.orders.find().sort({ _id: -1 }).limit(10)',
+          active: ['q', 'l4'],
+          edges: ['q-l4'],
+        },
+        {
+          title: '✓ 10 keys, 10 documents',
+          note: 'Keys 1,000,000 down to 999,991, each fetched.',
+          active: ['l4', 'in', 'fetch'],
+          edges: ['l4-in', 'in-fetch'],
+        },
+        {
+          title: '✗ LIMIT reached',
+          note: 'keysExamined 10, docsExamined 10. No SORT stage: had there been one, MongoDB would have had to read every matching document before returning the first.',
+          active: ['l4', 'out'],
+          edges: ['l4-out'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## The engines side by side
+
+| | PostgreSQL | InnoDB | MongoDB |
+|---|---|---|---|
+| Leaf links | Right-link and left-link in each page | Doubly linked leaf pages | Cursor moves through the tree (no stored sibling pointers needed) |
+| Rows for a primary-key range | Heap pages (consecutive here: 11 pages) | In the leaves already | FETCH per document |
+| `ORDER BY` on the indexed column | Free (no Sort node) | Free (no `Using filesort`) | Free (no `SORT` stage) |
+| Descending order | Index Scan Backward | Backward index read | IXSCAN `direction: backward` |
+
+<Pitfall>
+A range scan is cheap on the **index** side no matter what; the **row** side depends on how the rows are laid out. `id BETWEEN 200000 AND 201000` touched 11 heap pages because ids follow insert order. `customer_id BETWEEN 1 AND 1000` touched 63% of the table for 1% of the rows (Session 1, Concept 4). The same range scan, very different cost.
+</Pitfall>
+
+## Real-world scenario: pagination with OFFSET
+
+A list endpoint pages through orders with `ORDER BY id DESC LIMIT 20 OFFSET :n`. Page 1 is instant; page 5,000 takes seconds.
+
+| Query | What the scan does |
+|---|---|
+| `ORDER BY id DESC LIMIT 20 OFFSET 0` | Walk left from the end, return 20 entries |
+| `ORDER BY id DESC LIMIT 20 OFFSET 100000` | Walk left 100,020 entries, fetching and discarding the first 100,000 rows, then return 20 |
+| `WHERE id < :last_seen_id ORDER BY id DESC LIMIT 20` (keyset) | Descend to `last_seen_id`, walk left 20 entries |
+
+**Fix:** keyset pagination: remember the last id of the previous page and start the range there. Every page costs one descent plus 20 entries, whatever its number. The same works in MySQL and in MongoDB (`find({ _id: { $lt: lastId } }).sort({ _id: -1 }).limit(20)`).
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 3: Bitmap Heap Scan | The alternative when a range's rows are scattered |
+| Session 4: composite indexes | Equality columns first, then the range column, so the walk covers one contiguous stretch |
+| Session 4: ORDER BY + LIMIT | The "walk and stop early" pattern above |
+| Session 5: covering indexes | Removes the row part of a range scan |
+
+## Key takeaways
+
+1. A range scan descends once to the lower bound, walks the linked leaves in key order and stops at the first key past the upper bound.
+2. It never returns to upper levels; the index cost is the height plus the leaves covered.
+3. Entries come out sorted, so `ORDER BY` on the indexed column needs no sort, ascending or descending.
+4. `ORDER BY … LIMIT n` stops after n entries: a few pages, however big the table.
+5. The row part of a range scan depends on physical layout: consecutive rows are cheap, scattered rows are not.
+6. `OFFSET` pagination walks and discards every skipped entry; keyset pagination starts the range where the last page ended.
+
+## Check questions
+
+1. Describe the three phases of `WHERE id BETWEEN 200000 AND 201000` on `orders_pkey`, naming the lab's pages.
+2. Why does a range scan never need to go back up to the internal pages?
+3. The index-only version of that query shows 7 buffers and the normal version 20. Account for both numbers.
+4. How does `ORDER BY id DESC LIMIT 10` avoid sorting 1M rows, and how many pages does it read?
+5. Why does an InnoDB range on the primary key not need a second step, while a range on `customer_id` does?
+6. A MongoDB plan for `find({ status: 'paid' }).sort({ created_at: -1 }).limit(10)` shows a `SORT` stage. What does that tell you about the indexes?
+7. Why is `OFFSET 100000` slow even with an index, and what is the fix?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-2-btree-internals/concept-5-range-scans/answers">Worked answers to Q1–Q7</DeepDive>

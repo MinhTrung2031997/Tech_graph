@@ -1,0 +1,85 @@
+---
+title: "Answers: Page splits on insert"
+description: "Worked answers to the Session 2 Concept 6 check questions: middle, rightmost and root splits, fill after random inserts, InnoDB split counters and WiredTiger reconciliation."
+companion: "answers"
+tags: ["indexing", "b-tree", "page-split", "answers"]
+status: "draft"
+sources:
+  - "https://github.com/postgres/postgres/blob/master/src/backend/access/nbtree/README"
+  - "https://dev.mysql.com/doc/refman/8.4/en/index-page-merge-threshold.html"
+  - "https://source.wiredtiger.com/develop/arch-btree.html"
+---
+
+<Tldr>
+Split = divide the entries, add a page, add a downlink. Where the insert lands decides how full the halves are, and that decides how big the index ends up.
+</Tldr>
+
+## Q1. The split of leaf 138
+
+**Question:** leaf 138 had 407 entries and 8 bytes free when one more insert arrived. Describe the split: how the entries were divided, where the new page went, and what changed in the parent.
+
+| | Before | After |
+|---|---|---|
+| Block 138 | 407 entries, 8 B free, ids 497,770–501,420 | 204 entries (497,770–499,790), high key 499,800, 4,068 B free |
+| New block 276 | did not exist (file had 276 blocks) | 209 entries (499,800–501,420), 3,968 B free; file now 277 blocks |
+| Links | 138 → 139 | 138 → 276 → 139 |
+| Parent, block 3 | 274 entries | 275: new downlink 499,800 → 276 |
+
+A middle split: entries divided about in half, both pages ≈ 50% full, and the new page at the end of the file, far from its key-order neighbours on disk.
+
+> **Common mistake:** "the new key goes to a new page on its own". Half the existing entries move with it.
+
+## Q2. 90% vs 50/50
+
+**Question:** why does PostgreSQL keep the old page 90% full on a rightmost split but split 50/50 in the middle?
+
+| Split | Future inserts into the old page | Best choice |
+|---|---|---|
+| Rightmost, at the end of increasing keys | None: keys only grow | Keep it full (at `fillfactor`, 90%) and start an almost empty new page |
+| Middle | Likely, on both sides | Share free space evenly, so neither half splits again soon |
+
+A 50/50 split at the right edge would leave every finished page half empty forever: a sequentially filled index would end up twice as large.
+
+> **Common mistake:** "rightmost splits are 100% full". They respect `fillfactor`; set it to 100 to fill pages completely.
+
+## Q3. How the tree grows taller
+
+**Question:** how does a B-tree grow taller, and why does that keep every leaf at the same depth?
+
+Only by a **root split**: when the root is full, it splits like any page, and a new root is created above the two halves (in the lab: block 3 at level 1, entries −∞ → 1 and 3,670 → 2). The new level is added at the **top**, above every existing path, so every leaf gets one level deeper at once: depth stays equal for all leaves, which is the "balanced" in B-tree.
+
+> **Common mistake:** "the tree grows at the bottom where the inserts happen". Leaves split sideways; only the root adds height.
+
+## Q4. 3,711 vs 2,733 leaves
+
+**Question:** 1M random inserts gave 3,711 leaves at 66.4%; sequential gave 2,733 at 90.1%. Explain the ratio.
+
+Same entries, different fill: 2,733 × 90.1% ≈ 3,711 × 66.4% ≈ 2,463 "full-page equivalents". Random inserts split pages in the middle (≈ 50%) and pages refill only partly before splitting again, settling around ⅔ full on average (≈ ln 2 ≈ 69% in theory). So 90.1 / 66.4 ≈ 1.36× more leaves.
+
+> **Common mistake:** blaming the random values themselves. The keys take the same space; the empty space left by middle splits does not.
+
+## Q5. Splits that move nothing
+
+**Question:** InnoDB counted 4,449 page splits for 1M **sequential** inserts. Were rows moved? What do those splits represent?
+
+No rows were moved. With increasing keys InnoDB splits at the insert point, the end of the full page, so the new page starts empty and receives the next rows. The `index_page_splits` metric counts each such new page: 4,449 ≈ the 4,445 leaves of the table. Random inserts counted 10,803, and those did move about half a page's rows each.
+
+> **Common mistake:** reading the counter as "4,449 expensive splits". Compare it with the number of pages, and with a random-key run, before concluding anything.
+
+## Q6. Why MongoDB grew only 4%
+
+**Question:** why did random inserts grow the MongoDB `_id` index by only 4%?
+
+WiredTiger modifies pages in memory and writes them to disk through **reconciliation**, which packs a page's current contents into fresh blocks. A page that was split in memory is written out as densely filled blocks, so the half-empty pages typical of PostgreSQL and InnoDB never reach the disk. Random inserts still cost cache misses (random pages must be in memory) and page rewrites at checkpoints, but not on-disk size.
+
+> **Common mistake:** concluding random keys are free in MongoDB. For a clustered collection the documents themselves split, and random keys always cost cache locality.
+
+## Q7. 55% dense, 60% fragmented
+
+**Question:** an index's `avg_leaf_density` is 55% and `leaf_fragmentation` 60%. What probably happened, and what would you do?
+
+Many middle splits: random-order inserts (UUIDv4, hashes, unordered external ids), possibly plus deletes that left pages partly empty. Density well below the ≈ 66% steady state suggests deletes too. 60% of leaves are out of disk order, so range scans on cold data do random I/O.
+
+**Do:** `REINDEX INDEX CONCURRENTLY …` to rebuild from sorted input (≈ 90% density, 0% fragmentation); if inserts stay random, consider a lower `fillfactor`, or a time-ordered key (UUIDv7) for new data.
+
+> **Common mistake:** `VACUUM FULL` on the table to fix an index. It rebuilds indexes too, but takes an exclusive lock on everything; `REINDEX CONCURRENTLY` targets just the index, online.

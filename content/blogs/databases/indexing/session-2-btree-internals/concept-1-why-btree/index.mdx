@@ -1,0 +1,268 @@
+---
+title: "Concept 1: Why a B-tree, not a binary tree or a hash"
+description: "What an index structure has to do on disk, and why sorted pages of hundreds of keys (a B-tree) beat binary search, binary trees and hash tables. Measured on the lab's 1M-row orders table."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "b-tree"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/btree.html"
+  - "https://www.postgresql.org/docs/current/hash-index.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-physical-structure.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-adaptive-hash.html"
+  - "https://www.mongodb.com/docs/manual/core/indexes/index-types/index-hashed/"
+  - "https://github.com/postgres/postgres/blob/master/src/backend/access/nbtree/README"
+---
+
+<Tldr>
+An index on disk is judged by **how many pages it reads** per lookup. A **B-tree** packs hundreds of sorted keys into each page, so every page read narrows the search hundreds of times: 1M keys need **3 levels**, 100M need 4. A binary tree narrows by 2 per read (≈ 20 reads), binary search over sorted pages by 2 per read (≈ 14 reads) and cannot absorb inserts, and a hash finds one key in ≈ 1 read but cannot do ranges or sorting. The B-tree is the only one that is fast, ordered **and** cheap to update, which is why PostgreSQL, InnoDB and MongoDB all use it by default.
+</Tldr>
+
+## What an index structure must do
+
+| Requirement | Why it matters |
+|---|---|
+| Few page reads per lookup | Each read is a trip to `shared_buffers`, the OS or the disk (Session 1) |
+| Equality: `id = 500000` | The most common query |
+| Ranges and order: `BETWEEN`, `<`, `ORDER BY … LIMIT` | Dashboards, pagination, time windows |
+| Cheap inserts and deletes | The index changes with every write to the table |
+| Stays balanced | Every lookup must cost the same, whatever was inserted |
+
+## Four candidate structures
+
+| Structure | Keys per page read | Reads to find 1 key in 1M | Range / order | Inserts |
+|---|---|---|---|---|
+| Sorted pages + binary search | Halves the pages each read | log₂(10,102 pages) ≈ **14** | ✓ | ✗ shifting rows to keep order |
+| Binary search tree | 1 key per node, halves each read | log₂(1M) ≈ **20** (worse if unbalanced) | ✓ | ✓ but unbalances without rotations |
+| Hash table | — | ≈ **1–2** | ✗ no order at all | ✓ |
+| B-tree | Hundreds of keys per page | **3** (measured) | ✓ | ✓ splits keep it balanced |
+
+**The key number is fan-out**: how many children one page points to. A binary tree has fan-out 2. A B-tree internal page of `orders_pkey` holds about **286** separator keys, so each read divides the remaining search by 286 instead of 2.
+
+| Term | Meaning |
+|---|---|
+| Fan-out | Children per internal page (286 measured in `orders_pkey`) |
+| Height / levels | Pages read from root to leaf (3 for 1M keys) |
+| B+tree | The variant all three engines use: entries only in the leaves, internal pages hold only separator keys, leaves linked to their neighbours |
+| **✓ Found** | The key's entry is reached |
+| **✗ Not supported** | The structure cannot answer this kind of query |
+
+<Flow
+  title="Finding id 500,000 among 1M keys"
+  height={330}
+  nodes={[
+    { id: 'q', label: 'WHERE id = 500000', sub: 'then id BETWEEN …', x: 20, y: 20, w: 200 },
+    { id: 'r1', label: 'Read 1', sub: '', x: 20, y: 130, w: 140 },
+    { id: 'r2', label: 'Read 2', sub: '', x: 210, y: 130, w: 140 },
+    { id: 'r3', label: 'Read 3', sub: '', x: 400, y: 130, w: 140 },
+    { id: 'rn', label: 'Reads 4 …', sub: '', x: 590, y: 130, w: 190 },
+    { id: 'found', label: '✓ Found', sub: '', x: 420, y: 250, w: 200 },
+    { id: 'nope', label: '✗ Not supported', sub: '', x: 20, y: 250, w: 240 },
+  ]}
+  edges={[
+    { id: 'q-r1', from: 'q', to: 'r1' },
+    { id: 'r1-r2', from: 'r1', to: 'r2' },
+    { id: 'r2-r3', from: 'r2', to: 'r3' },
+    { id: 'r3-rn', from: 'r3', to: 'rn' },
+    { id: 'rn-found', from: 'rn', to: 'found', quiet: true },
+    { id: 'r1-found', from: 'r1', to: 'found', quiet: true },
+    { id: 'r3-found', from: 'r3', to: 'found', quiet: true },
+    { id: 'r1-nope', from: 'r1', to: 'nope', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Binary search tree',
+      path: 'one key per node → 20 levels → 20 reads',
+      summary: 'Each node holds one key, so each read only halves the search.',
+      subs: { found: 'after ≈ 20 reads' },
+      steps: [
+        {
+          title: 'Read 1: the root node',
+          note: 'The root holds one key, say 500,123. 500,000 is smaller, so go left. Half the keys are ruled out.',
+          active: ['q', 'r1'],
+          edges: ['q-r1'],
+          subs: { r1: 'key 500,123 → left' },
+        },
+        {
+          title: 'Reads 2 and 3',
+          note: 'Each node again has one key and two children. With 1M keys a balanced tree is log₂(1,000,000) ≈ 20 levels deep. Nodes are allocated as keys arrive, so neighbouring nodes sit on different pages: each level is a separate page read.',
+          active: ['r1', 'r2', 'r3'],
+          edges: ['r1-r2', 'r2-r3'],
+          subs: { r2: 'key 250,061 → right', r3: 'key 375,092 → right' },
+        },
+        {
+          title: 'Reads 4 to 20',
+          note: 'Seventeen more reads, each ruling out half of what is left. And this is the best case: insert keys in increasing order without rebalancing and the tree degrades into a list, 1M reads deep.',
+          active: ['r3', 'rn'],
+          edges: ['r3-rn'],
+          subs: { rn: '17 more nodes' },
+        },
+        {
+          title: '✓ Found after ≈ 20 reads',
+          note: 'Correct, ordered, but 20 page reads for one key: almost 7× the B-tree.',
+          active: ['rn', 'found'],
+          edges: ['rn-found'],
+        },
+      ],
+    },
+    {
+      title: 'Sorted pages, binary search',
+      path: 'probe the middle page → halve → … → 14 reads',
+      summary: 'The table itself kept sorted by id; binary search over its 10,102 pages.',
+      subs: { found: 'after ≈ 14 reads' },
+      steps: [
+        {
+          title: 'Read 1: the middle page',
+          note: 'Read page 5,051 of 10,102. Its ids are around 500,000+; compare and keep the left or right half.',
+          active: ['q', 'r1'],
+          edges: ['q-r1'],
+          subs: { r1: 'page 5,051' },
+        },
+        {
+          title: 'Reads 2, 3, … 14',
+          note: 'Each read halves the remaining pages: log₂(10,102) ≈ 14 reads. Better than the binary tree, because each probe checks a whole page of 99 rows.',
+          active: ['r1', 'r2', 'r3', 'rn'],
+          edges: ['r1-r2', 'r2-r3', 'r3-rn'],
+          subs: { r2: 'page 2,525 or 7,576', r3: '…', rn: '11 more pages' },
+        },
+        {
+          title: '✓ Found, but inserts are the problem',
+          note: 'An insert of id 250 must go between id 249 and id 251, so every following row has to shift to make room. Keeping a big table physically sorted under inserts is not practical; that is why heaps exist (Session 1, Concept 2).',
+          active: ['rn', 'found'],
+          edges: ['rn-found'],
+        },
+      ],
+    },
+    {
+      title: 'Hash index',
+      path: 'hash(500000) → bucket page ✓ found; BETWEEN ✗ not supported',
+      summary: 'One read for equality, nothing for ranges or order.',
+      subs: { found: 'after ≈ 1–2 reads', nope: 'ranges, ORDER BY, prefixes' },
+      steps: [
+        {
+          title: 'Read 1: the bucket',
+          note: 'hash(500000) picks a bucket. The bucket page holds the entries whose keys hash there, including 500,000 → its row address.',
+          active: ['q', 'r1'],
+          edges: ['q-r1'],
+          subs: { r1: 'bucket 18,412' },
+        },
+        {
+          title: '✓ Found in about 1 read',
+          note: 'Overflow pages can add a read when a bucket is crowded. For pure equality this beats a 3-level B-tree.',
+          active: ['r1', 'found'],
+          edges: ['r1-found'],
+        },
+        {
+          title: '✗ BETWEEN 100000 AND 101000',
+          note: 'hash(100000) and hash(100001) land in unrelated buckets: the hash destroys order. A range, an ORDER BY or a LIKE "abc%" prefix cannot use it; the database falls back to a full scan.',
+          active: ['r1', 'nope'],
+          edges: ['r1-nope'],
+        },
+      ],
+    },
+    {
+      title: 'B-tree (measured)',
+      path: 'root 412 → internal 1,270 → leaf 1,373 ✓ found in 3 reads',
+      summary: 'orders_pkey in the lab: 286 keys per internal page, 3 levels for 1M keys.',
+      subs: { found: 'after 3 reads' },
+      steps: [
+        {
+          title: 'Read 1: root page (block 412)',
+          note: 'The root holds 10 separators splitting 1M ids into 10 ranges of ≈ 104,000. 500,000 falls in the range starting at 417,241.',
+          active: ['q', 'r1'],
+          edges: ['q-r1'],
+          subs: { r1: 'root block 412' },
+        },
+        {
+          title: 'Read 2: internal page (block 1,270)',
+          note: 'This page holds 286 separators for ids 417,241 onwards, each covering ≈ 366 ids (one leaf). 500,000 falls under separator 499,957.',
+          active: ['r1', 'r2'],
+          edges: ['r1-r2'],
+          subs: { r2: 'block 1,270' },
+        },
+        {
+          title: 'Read 3: leaf page (block 1,373)',
+          note: 'The leaf holds ids 499,957–500,322 in order. A binary search inside the page finds 500,000 → heap ctid (5050,50).',
+          active: ['r2', 'r3'],
+          edges: ['r2-r3'],
+          subs: { r3: 'leaf block 1,373' },
+        },
+        {
+          title: '✓ Found in 3 reads, ranges included',
+          note: 'EXPLAIN shows Buffers: shared hit=4: 3 index pages + 1 heap page. For BETWEEN, the same descent finds the first key and the scan walks right along the linked leaves (Concept 5).',
+          active: ['r3', 'found'],
+          edges: ['r3-found'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## How tall does a B-tree get?
+
+With fan-out f, each level multiplies the keys reachable by f. Using the lab's numbers (≈ 366 keys per leaf, ≈ 286 children per internal page):
+
+| Levels | Leaves reachable | Keys reachable |
+|---|---|---|
+| 2 (root + leaves) | 286 | ≈ 105,000 |
+| 3 | 286² ≈ 82,000 | ≈ 30 million |
+| 4 | 286³ ≈ 23 million | ≈ 8.6 billion |
+
+**height ≈ 1 + ⌈log_f(N / keys per leaf)⌉.** Growth is so slow that almost every real index has 2–4 levels, and the root and upper levels are hot enough to stay cached: a lookup usually costs one leaf read from disk at most. Wider keys (a 36-byte UUID string instead of an 8-byte integer) lower the fan-out and can add a level.
+
+## The three engines
+
+| | PostgreSQL | MySQL InnoDB | MongoDB (WiredTiger) |
+|---|---|---|---|
+| Default index | B-tree (`nbtree`, Lehman-Yao B+tree with right-links) | B+tree; the table itself is one (clustered index) | B-tree for every index and for the collection |
+| Page size | 8 KB | 16 KB | Up to 16 KB for index pages, 32 KB for collection leaf pages (default maxima) |
+| Measured height, 1M rows | 3 levels (`bt_metap`: root level 2) | 3 (primary-key lookup = 3 page requests) | 3 (`maximum tree depth` of `_id_`) |
+| Hash option | `CREATE INDEX … USING hash`: equality only, crash-safe since v10, rarely worth it | Adaptive hash index: built automatically in memory over hot B-tree pages; you cannot create one | "Hashed" index = a B-tree over hash values, used to spread shard keys evenly; still no ranges |
+
+<Pitfall>
+"Hash indexes are faster for equality" is true by one or two page reads at best. Since the upper levels of a B-tree are almost always cached, a B-tree equality lookup is usually one disk read too, and it also serves ranges, sorting and uniqueness. Reach for a hash index only after measuring a real gain.
+</Pitfall>
+
+## Real-world scenario: an index on a long text key
+
+A team indexes `external_ref varchar(200)`, filled with 120-character strings, on a 50M-row table. Lookups need one more page read than on the integer primary key, and the index is several times larger.
+
+| | `bigint` key | 120-byte text key |
+|---|---|---|
+| Entry size (key + header + pointer) | ≈ 16 B | ≈ 130 B |
+| Entries per 8 KB leaf (90% full) | ≈ 366 | ≈ 55 |
+| Leaves for 50M entries | ≈ 137,000 | ≈ 910,000 (≈ 7 GB) |
+| Internal fan-out | ≈ 286 | ≈ 55 |
+| Height | 4 (root → 2 → 478 → leaves) | 5 (root → 6 → 301 → 16,500 → leaves) |
+
+**Fixes:** index a fixed-size hash of the value as a B-tree on `md5(external_ref)::uuid` (16 bytes) when only equality is needed (an expression index, Session 5); or keep the text index and accept the size when prefix searches are needed. PostgreSQL's B-tree deduplication (Concept 2) helps only when values repeat.
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 3: point lookup | The 3 reads above, page by page |
+| Concept 5: range scans | Ordered, linked leaves are what make ranges cheap |
+| Session 4: composite indexes | Multi-column keys are just longer sorted keys, with the same fan-out trade-off |
+| Session 7: specialist indexes | GIN, BRIN and GiST exist for queries a B-tree's single sort order cannot serve |
+
+## Key takeaways
+
+1. On disk, an index structure is judged by page reads per lookup.
+2. Fan-out is everything: a B-tree page holds hundreds of keys, so 1M keys need 3 levels; a binary tree needs ≈ 20.
+3. Binary search over a sorted table is fast to read but impossible to keep sorted under inserts.
+4. A hash finds a key in ≈ 1 read but destroys order: no ranges, no `ORDER BY`, no prefixes.
+5. All three engines use B+trees: entries in linked leaves, internal pages with separators only.
+6. Height grows with log_fanout(N), so real indexes have 2–4 levels and their upper levels stay cached.
+7. Wide keys lower fan-out: bigger index, sometimes one more level.
+
+## Check questions
+
+1. Why is "number of page reads" the right way to compare index structures, rather than number of key comparisons?
+2. A balanced binary search tree and a B-tree with fan-out 286 both index 1M keys. How many page reads does each need for one lookup? Show the formula.
+3. Why can't a database keep a large table physically sorted by `id` and binary-search it instead of building an index?
+4. A query runs `WHERE created_at BETWEEN '2025-03-01' AND '2025-03-02' ORDER BY created_at`. Why can a hash index on `created_at` not help, while a B-tree can?
+5. With ≈ 366 keys per leaf and fan-out 286, at roughly how many keys does `orders_pkey` need a 4th level?
+6. MySQL has an "adaptive hash index" and MongoDB a "hashed index". Is either a hash table you query instead of a B-tree? Explain each in one sentence.
+7. Why does a 120-byte text key make an index taller than an 8-byte integer key on the same rows?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-2-btree-internals/concept-1-why-btree/answers">Worked answers to Q1–Q7</DeepDive>

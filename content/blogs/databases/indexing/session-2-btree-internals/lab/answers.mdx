@@ -1,0 +1,85 @@
+---
+title: "Answers: B-tree internals session quiz"
+description: "Worked answers to the Session 2 quiz, checked against the lab's B-trees."
+companion: "answers"
+tags: ["indexing", "b-tree", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pageinspect.html"
+  - "https://github.com/postgres/postgres/blob/master/src/backend/access/nbtree/README"
+---
+
+<Tldr>
+Every answer is something you can see with `bt_metap`, `bt_page_items`, `bt_page_stats` or `pgstatindex` on the lab database.
+</Tldr>
+
+## Q1. Pages per lookup
+
+**Question:** `bt_metap('orders_pkey')` says level 2. How many pages does a lookup read in the index, and how many in total for a row that exists?
+
+Level 2 is the root's level; levels 2, 1 and 0 make **3 index pages** (root, internal, leaf). For an existing row, add the heap page: **4 in total**, matching `Buffers: shared hit=4` (after a warm-up query on the connection).
+
+> **Common mistake:** reading "level 2" as "2 levels". Levels are numbered from 0 at the leaves.
+
+## Q2. Which child for 650,000
+
+**Question:** on root block 412, which child does a search for `id = 650000` follow, and why?
+
+The root's separators include 625,861 → block 1,842 and 730,171 → block 2,128. Since 625,861 ≤ 650,000 < 730,171, the search follows **item 7 → block 1,842**: the last separator not greater than the key.
+
+> **Common mistake:** following 730,171, the first separator greater than the key. A separator is the *lower* bound of its child's range.
+
+## Q3. The high key's ctid
+
+**Question:** leaf 1,373's item 1 points at `(5053,1)` with key 500,323. Why does a leaf entry point into page 5,053 when the page's real entries start at page 5,050?
+
+Item 1 is not a real entry: it is the **high key**, a copy of the first key of the next leaf (500,323, whose row is on heap page 5,053) made when the leaf was split. In such "pivot" tuples the TID field is not used as a row pointer; the offset part is reused to store the number of key columns (1), which is why it reads `(5053,1)`. Lookups never follow it to the heap; they use only its key, as the page's upper bound.
+
+> **Common mistake:** counting it as one of the page's rows. The leaf has 367 items but 366 entries.
+
+## Q4. Why deduplication helped status more
+
+**Question:** deduplication shrank `orders_status_idx` from 25 MB to 6.8 MB but `orders_customer_idx` only from 21 MB to 9.1 MB. Why the difference?
+
+A posting list stores the key once plus 6 bytes per row. The saving grows with the number of rows per key.
+
+| Index | Rows per key | Without dedup, per row | With dedup, per row | Ratio |
+|---|---|---|---|---|
+| `status` | ≈ 200,000 (5 values) | ≈ 20 B (entry + line pointer) | ≈ 6 B (one ctid; key and overhead shared by hundreds) | 25 / 6.8 ≈ 3.7× |
+| `customer_id` | ≈ 10 | ≈ 20 B | ≈ 8–9 B (key + header shared by only 10 ctids) | 21 / 9.1 ≈ 2.3× |
+
+> **Common mistake:** "deduplication works better on text". It depends on how often a key repeats, not its type.
+
+## Q5. From 10 buffers to 4
+
+**Question:** `SELECT * FROM orders WHERE customer_id = 7` costs 10 buffers. What would you change so it costs 4, and what is the precondition?
+
+Make it an **index-only scan**: select only columns in the index (`SELECT customer_id …`), or build an index that contains the needed columns (`INCLUDE`, Session 5). Then the 7 heap pages are skipped: 3 index pages + 1 visibility-map page = 4.
+
+**Precondition:** the heap pages must be marked all-visible in the visibility map, which VACUUM does; otherwise each row still needs a heap fetch.
+
+> **Common mistake:** "add another index on customer_id". The index already finds the rows in 3 pages; the 7 heap pages are the cost.
+
+## Q6. A ten times wider range
+
+**Question:** the range `id BETWEEN 200000 AND 201000` read 4 leaves. How many would `id BETWEEN 200000 AND 210000` read, roughly?
+
+10,001 entries at ≈ 366 per leaf ≈ 27.3 leaves, so **28 leaves** (29 if the range starts and ends in the middle of a leaf). Plus root and internal page: ≈ 30 index pages. The heap part grows likewise: ≈ 102 pages.
+
+> **Common mistake:** "one more descent per 1,000 rows". There is one descent; the extra cost is only the leaves walked.
+
+## Q7. 366 / 54 rather than 210 / 210
+
+**Question:** in Exercise 7, why did the root split leave block 1 with 366 entries and block 2 with 54, rather than about 210 each?
+
+The keys were inserted in increasing order, so the split was a **rightmost split** caused by an insert at the end of the page. PostgreSQL keeps the old page at the fill factor (90% ≈ 366 entries) because no smaller key will ever be inserted there, and the new page receives everything that follows: 54 entries after the remaining inserts.
+
+> **Common mistake:** assuming every split is 50/50. Only middle splits are.
+
+## Q8. UUIDv4 growth in MongoDB
+
+**Question:** a table with a UUIDv4 primary key has 30% more leaf pages in PostgreSQL after a year. Would the same table in MongoDB show the same growth in its `_id` index? Why or why not?
+
+**Mostly not.** In the lab, random inserts grew PostgreSQL's index by 38% but MongoDB's `_id` index by only 4%. WiredTiger splits pages in memory and writes them to disk through reconciliation, which packs each page into dense blocks, so half-empty pages do not accumulate on disk. Random keys still hurt MongoDB in other ways: every insert needs a random index page in the cache (misses once the index outgrows memory), and in a clustered collection the documents themselves are ordered by `_id`.
+
+> **Common mistake:** assuming all B-tree engines behave the same on disk. The page format and write path decide how much empty space persists.
