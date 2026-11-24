@@ -1,0 +1,89 @@
+---
+title: "Answers: Choosing a shard key session quiz"
+description: "Worked answers to the Session 5 quiz."
+companion: "answers"
+tags: ["sharding", "shard-key", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-choose-a-shard-key/"
+  - "https://docs.citusdata.com/en/stable/sharding/data_modeling.html"
+---
+
+<Tldr>
+A good shard key has many values, no dominant value, does not only grow, and appears in the filters of your small, frequent queries. No key is perfect on all four; choose the trade-off on purpose.
+</Tldr>
+
+## Q1. Three properties
+
+**Question:** name the three properties to check for a candidate shard key, and the Concept that measured each.
+
+| Property | Concept | Measurement |
+|---|---|---|
+| Cardinality | 1 | `marketplace`: 3 ranges, 2 jumbo, 80/20 split; Citus 2 of 32 shards used |
+| Monotonicity | 2 | Ranged `_id`: 100,000 / 0 new orders |
+| Frequency | 4 | Seller with 20%: unmovable range, one 24 MB shard, all new writes on one shard |
+
+Query targeting (Concept 3) is the fourth check: not a property of the values, but of how the key matches your queries.
+
+> **Common mistake:** checking only cardinality. `id` has perfect cardinality and is still a poor ranged key because it is monotonic.
+
+## Q2. 800,496 documents on one shard
+
+**Question:** sharding by `marketplace` left 800,496 documents on one shard. Why can neither the balancer nor more shards fix it?
+
+All documents with the same key value must be in the same range, and range boundaries can only fall between values. shopee and tiktok are single values of 501,221 and 299,275 documents; the balancer cannot split them, and its attempts to move them failed (both were flagged jumbo). More shards only add empty shards: with three values, at most three shards hold data, and shopee alone is half of everything.
+
+> **Common mistake:** "we'll add shards later". A key's cardinality is the ceiling on how many shards it can use.
+
+## Q3. 100,000 / 0
+
+**Question:** with ranged `_id`, 100,000 new orders went 100,000 / 0. Why does the balancer not prevent that, and what did hashing change?
+
+New ids are larger than every existing boundary, so they fall into the range ending at MaxKey, which one shard owns. The balancer moves data after it has been written; it does not change where the next write goes. Hashing replaces the id by its hash for placement, and hashes of consecutive ids are scattered, so the same inserts split 50,097 / 49,903 (MongoDB) and 50,063 / 49,937 (Citus).
+
+> **Common mistake:** trusting a balanced `sh.status()` during a load as proof that writes are spread.
+
+## Q4. The read cost of hashing
+
+**Question:** what is the read-side cost of a hashed key, measured in this session?
+
+A range of key values is no longer on one shard: the `_id` range 500,000 – 509,999 was `SINGLE_SHARD` on the ranged collection and `SHARD_MERGE` on both shards with hashing; on Citus a range of ids is always `Task Count: 32`. In this idle lab the hashed range read was faster (26 ms vs 51 ms) because two shards worked in parallel, but it used both shards. And hashed `_id` targets nothing except lookups by `_id` (Concept 3).
+
+> **Common mistake:** hashing by default "to be safe" and then discovering every dashboard query fans out.
+
+## Q5. seller_id and created_at in the filter
+
+**Question:** a query filters on `seller_id` and `created_at`. On which of the five MongoDB keys is it targeted, and what does explain show on the others?
+
+Targeted (`SINGLE_SHARD`) on `{ seller_id: 1 }` and `{ seller_id: 1, created_at: 1 }`. On hashed `_id`, ranged `_id` and `marketplace` explain shows `SHARD_MERGE` with both shards listed, even when one of them examines 0 keys.
+
+> **Common mistake:** expecting `{ created_at }` in the filter to help routing on a key that does not contain `created_at`.
+
+## Q6. 15× vs 1.3×
+
+**Question:** why was the Citus fan-out penalty (15×) so much larger than MongoDB's (1.3×) in this lab?
+
+The fan-out factor: 32 shard queries instead of 1 on Citus, 2 instead of 1 on MongoDB. Each shard query costs a round trip, planning and execution on a worker, and the coordinator merges 32 partial results. The Citus containers also ran under amd64 emulation, which inflates per-task cost, so the exact ratio is lab-specific; the rule (fan-out cost grows with shard count) is not.
+
+> **Common mistake:** choosing a high shard count "for the future" without noticing that every non-targeted query pays for each shard.
+
+## Q7. Who spreads what
+
+**Question:** seller 1 owns 20% of the orders. Which designs spread its new writes, which spread only its stored data, and which spread neither?
+
+| Design | Stored data | New writes |
+|---|---|---|
+| `{ seller_id: 1 }` (MongoDB), `seller_id` (Citus) | Neither: one range / one shard (isolate and move only) | One shard |
+| `{ seller_id: 1, created_at: 1 }` | Spread: 6 time slices that can move | One shard (latest slice) |
+| hashed `_id` | Spread | Spread (25,088 / 24,912) |
+| `{ seller_id, bucket }` with `bucket = id % N` (not measured here) | Spread over N ranges | Spread over N ranges |
+
+> **Common mistake:** declaring the hot-tenant problem solved after adding `created_at` to the key.
+
+## Q8. A seller-centre key
+
+**Question:** for a seller-centre application on Shopee, TikTok and Lazada orders, which key would you choose, and what would you do about the few giant sellers?
+
+Key on the seller (`seller_id` in Citus, `{ seller_id: 1, created_at: 1 }` in MongoDB): the frequent queries ("my orders", "my GMV this month") are targeted, writes spread across thousands of sellers, and `created_at` lets a large seller's history be split. For the few giant sellers: isolate them into their own shard and place them on strong nodes (Citus `isolate_tenant_to_new_shard`, MongoDB zones), and if one seller's write rate exceeds a shard, add a bucket for that seller. Make order lookups by id targeted by carrying the seller id with the order number or using an id → seller lookup. Do not key on `marketplace` (3 values) or a time field (monotonic).
+
+> **Common mistake:** choosing the key from the data model alone. Start from the top queries and the write pattern, then check cardinality, frequency and monotonicity on real data.

@@ -1,0 +1,234 @@
+---
+title: "Concept 2: Monotonic keys and where new writes go"
+description: "Order ids and timestamps only go up. With a ranged shard key on _id, all 100,000 new orders landed on one MongoDB shard (100,000 vs 0) and the balancer had to move data afterwards; with a hashed _id they split 50,097 / 49,903, and Citus's hash distribution split them 50,063 / 49,937. The price of hashing: a range of ids is no longer on one shard."
+type: "concept"
+tags: ["sharding", "shard-key", "mongodb", "citus", "hashed-sharding", "hotspot"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-choose-a-shard-key/#monotonically-changing-shard-keys"
+  - "https://www.mongodb.com/docs/manual/core/hashed-sharding/"
+  - "https://www.mongodb.com/docs/manual/reference/operator/aggregation/shardedDataDistribution/"
+  - "https://docs.citusdata.com/en/stable/sharding/data_modeling.html"
+---
+
+<Tldr>
+A **monotonic** key only grows: order ids, `created_at`, ObjectIds. With **range** sharding, the newest values all fall into the **top range**, which one shard owns, so that shard takes every insert. Measured on MongoDB: after loading 1M orders by ranged `_id`, inserting the next **100,000 orders put 100,000 on `sh2` and 0 on `sh1`**. A **hashed** `_id` split the same inserts **50,097 / 49,903**, and Citus, which always hashes, split them **50,063 / 49,937** across its workers (3,027–3,235 per shard). Hashing has a price: a query for a **range** of ids is targeted with ranged sharding (one shard, 10,000 docs) and goes to every shard with hashing (2 MongoDB shards; 32 Citus shards).
+</Tldr>
+
+## The setup
+
+Two MongoDB copies of the 1M `orders`, sharded while empty and loaded in id order (4 MB range size), and the Citus table `c_by_id` distributed on `id`:
+
+```js
+sh.shardCollection('pt5.o_range',  { _id: 1 })          // ranged
+sh.shardCollection('pt5.o_hashed', { _id: 'hashed' })   // hashed
+```
+
+```sql
+SELECT create_distributed_table('c_by_id', 'id');       -- Citus: always hash
+```
+
+New orders are the next 100,000 ids (1,000,001 – 1,100,000), inserted with balancing switched off **for that collection only** (`sh.disableBalancing('pt5.o_range')`) so nothing moves during the count. Per-shard counts come from `$collStats` and `$shardedDataDistribution`.
+
+| Term | Meaning |
+|---|---|
+| Monotonic key | Each new value is larger than all earlier ones (ids from a sequence, timestamps, ObjectIds) |
+| Ranged sharding | Each shard owns contiguous intervals of the key; neighbouring values live together |
+| Hashed sharding | Each shard owns intervals of **hash(key)**; neighbouring values are scattered |
+| Top range | The range ending at MaxKey; every value larger than all existing ones falls into it |
+| Owned / orphan documents | Documents a shard is responsible for / copies left behind after a range moved away, deleted later |
+| **✓ / ✗** | The shard receives / does not receive the new rows |
+
+## MongoDB: ranged vs hashed `_id`
+
+<Flow
+  title="MongoDB: where 100,000 new order ids go, ranged vs hashed _id"
+  height={340}
+  nodes={[
+    { id: 'ins', label: 'insertMany', sub: 'ids 1,000,001 …', x: 20, y: 20, w: 180 },
+    { id: 'mongos', label: 'mongos', sub: 'routing table', x: 300, y: 20, w: 200 },
+    { id: 'bal', label: 'Balancer', sub: 'on config server', x: 580, y: 20, w: 200 },
+    { id: 'ra', label: 'Range group 1', sub: '', x: 20, y: 150, w: 200 },
+    { id: 'rb', label: 'Range group 2', sub: '', x: 580, y: 150, w: 200 },
+    { id: 'sh1', label: 'Shard sh1', sub: '', x: 20, y: 280, w: 200 },
+    { id: 'sh2', label: 'Shard sh2', sub: '', x: 580, y: 280, w: 200 },
+  ]}
+  edges={[
+    { id: 'ins-mongos', from: 'ins', to: 'mongos' },
+    { id: 'mongos-ra', from: 'mongos', to: 'ra', quiet: true },
+    { id: 'mongos-rb', from: 'mongos', to: 'rb', quiet: true },
+    { id: 'ra-sh1', from: 'ra', to: 'sh1', quiet: true },
+    { id: 'rb-sh2', from: 'rb', to: 'sh2', quiet: true },
+    { id: 'rb-ra', from: 'rb', to: 'ra', label: 'moveRange', quiet: true },
+    { id: 'bal-rb', from: 'bal', to: 'rb', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Ranged { _id: 1 }',
+      path: 'mongos → new id > every boundary → top range ✓ on sh2 gets 100,000 → sh1 ✗ gets 0 → balancer moves data later',
+      summary: 'One shard takes every new insert.',
+      subs: { ra: '13 ranges: 1 … 462,059', rb: 'top: 462,060 → MaxKey', sh1: '462,059 owned', sh2: '537,941 owned' },
+      steps: [
+        {
+          title: 'Loading 1M in id order',
+          note: 'The collection starts as one range on sh2, so all 1,000,000 inserts went there (8.5 s). The balancer then cut and moved 13 ranges of about 4 MB to sh1 within 15 s. Because the cuts come from the bottom of sh2\'s data, sh1 ended up with ids 1 – 462,059 and sh2 kept 462,060 → MaxKey as one range.',
+          active: ['ins', 'mongos', 'bal', 'ra', 'rb', 'sh1', 'sh2'],
+          edges: ['ins-mongos', 'bal-rb', 'rb-ra'],
+        },
+        {
+          title: 'The next 100,000 orders',
+          note: 'Every new id is larger than 462,060, so mongos routes all of them to the top range. Measured with $collStats before and after: sh2 +100,000, sh1 +0.',
+          code: "copyInto('o_range', d => Object.assign(d, { _id: d._id + 1000000 }), { _id: { $lte: 100000 } })\n// delta { sh1: 0, sh2: 100000 }",
+          active: ['ins', 'mongos', 'rb', 'sh2'],
+          edges: ['ins-mongos', 'mongos-rb', 'rb-sh2'],
+          subs: { rb: '✓ +100,000', sh2: '✓ 637,941 owned', sh1: '✗ +0' },
+        },
+        {
+          title: 'The balancer catches up afterwards',
+          note: 'With balancing re-enabled, the balancer moved one more 4 MB range (35,543 docs) to sh1 about 10 s later: sh1 497,602, sh2 602,398 owned. Every new insert still goes to sh2; the balancer only ever moves data after it has been written there.',
+          code: "sh.enableBalancing('pt5.o_range')",
+          active: ['bal', 'rb', 'ra', 'sh1'],
+          edges: ['bal-rb', 'rb-ra', 'ra-sh1'],
+          subs: { sh1: '497,602 owned' },
+        },
+      ],
+    },
+    {
+      title: "Hashed { _id: 'hashed' }",
+      path: 'mongos → hash(new id) is random → both ranges ✓ → sh1 ✓ 49,903, sh2 ✓ 50,097 → no migration needed',
+      summary: 'Consecutive ids hash to unrelated values.',
+      subs: { ra: 'hash ≥ 0 → MaxKey', rb: 'MinKey → hash < 0', sh1: '499,595 owned', sh2: '500,405 owned' },
+      steps: [
+        {
+          title: 'Pre-split when the collection is empty',
+          note: 'Sharding an empty collection on a hashed key creates one range per shard up front. Loading 1M ids gave 500,405 / 499,595 with zero migrations.',
+          code: "sh.shardCollection('pt5.o_hashed', { _id: 'hashed' })\n// config.chunks: sh1 1, sh2 1",
+          active: ['ins', 'mongos', 'ra', 'rb', 'sh1', 'sh2'],
+          edges: ['ins-mongos', 'mongos-ra', 'mongos-rb', 'ra-sh1', 'rb-sh2'],
+        },
+        {
+          title: 'The next 100,000 orders',
+          note: 'Same inserts: sh1 +49,903, sh2 +50,097. Both shards share the write load, and the balancer has nothing to do.',
+          active: ['ins', 'mongos', 'ra', 'rb', 'sh1', 'sh2'],
+          edges: ['ins-mongos', 'mongos-ra', 'mongos-rb', 'ra-sh1', 'rb-sh2'],
+          subs: { sh1: '✓ +49,903', sh2: '✓ +50,097' },
+        },
+        {
+          title: 'What the balancer saw',
+          note: 'config.changelog has no moveChunk.commit for o_hashed: it never needed to move anything.',
+          active: ['bal'],
+          edges: [],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Citus: the hash is built in
+
+Citus distributes by hash only, so a growing `id` is not a write hotspot. The same trade-off appears on the read side.
+
+<Flow
+  title="Citus: new ids and id ranges on a table distributed by id"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'SQL', x: 20, y: 20, w: 180 },
+    { id: 'coord', label: 'Coordinator', sub: 'hash(id) → shard', x: 300, y: 20, w: 200 },
+    { id: 'meta', label: 'pg_dist_shard', sub: '32 hash ranges', x: 580, y: 20, w: 200 },
+    { id: 'w1', label: 'Worker w1', sub: '16 shards', x: 20, y: 200, w: 200 },
+    { id: 'w2', label: 'Worker w2', sub: '16 shards', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'app-coord', from: 'app', to: 'coord' },
+    { id: 'coord-meta', from: 'coord', to: 'meta', quiet: true },
+    { id: 'coord-w1', from: 'coord', to: 'w1', quiet: true },
+    { id: 'coord-w2', from: 'coord', to: 'w2', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Insert 100,000 new ids',
+      path: 'coordinator → hash(id) per row → w1 ✓ 50,063 → w2 ✓ 49,937',
+      summary: 'Consecutive ids land in every shard.',
+      steps: [
+        {
+          title: 'Hash each id',
+          note: 'INSERT … SELECT of ids 1,000,001 – 1,100,000: the coordinator hashes each id and sends it to its shard.',
+          code: "INSERT INTO c_by_id SELECT id + 1000000, … FROM orders WHERE id <= 100000;",
+          active: ['app', 'coord', 'meta'],
+          edges: ['app-coord', 'coord-meta'],
+        },
+        {
+          title: 'Spread over all 32 shards',
+          note: 'Counted per shard with run_command_on_shards: 3,027 to 3,235 new rows in each of the 32 shards, 50,063 on w1 and 49,937 on w2.',
+          code: "SELECT * FROM run_command_on_shards('c_by_id', $$SELECT count(*) FROM %s WHERE id > 1000000$$);",
+          active: ['coord', 'w1', 'w2'],
+          edges: ['coord-w1', 'coord-w2'],
+          subs: { w1: '✓ +50,063', w2: '✓ +49,937' },
+        },
+      ],
+    },
+    {
+      title: 'Read a range of ids',
+      path: 'coordinator → id range has no single hash → w1 ✓ 16 tasks, w2 ✓ 16 tasks',
+      summary: 'Neighbouring ids are in different shards, so a range touches all of them.',
+      steps: [
+        {
+          title: 'id BETWEEN is not targeted',
+          note: 'EXPLAIN shows Task Count: 32 for id >= 500000 AND id < 510000. An IN list of two ids shows Task Count: 2: the coordinator hashes each listed value, but it cannot hash a range.',
+          code: "EXPLAIN SELECT count(*) FROM c_by_id WHERE id >= 500000 AND id < 510000;\n--  Task Count: 32",
+          active: ['app', 'coord', 'w1', 'w2'],
+          edges: ['app-coord', 'coord-w1', 'coord-w2'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Measured
+
+| | Ranged `_id` (MongoDB) | Hashed `_id` (MongoDB) | Hash on `id` (Citus) |
+|---|---|---|---|
+| Where 100,000 new orders went | **sh2 100,000 / sh1 0** | 50,097 / 49,903 | w1 50,063 / w2 49,937 |
+| Migrations to balance the 1M load | 13, then 1 more after the new batch | 0 | 0 (shards are fixed hash ranges) |
+| Query `_id` / `id` from 500,000 to 509,999 | **1 shard**, 10,000 docs, 51 ms | 2 shards (5,047 + 4,953 docs), 26 ms | 32 tasks |
+| Lookup of one id | 1 shard | 1 shard | 1 task |
+
+Two honest notes on this lab:
+
+- Both MongoDB shards run on one laptop, so the 1M load took the same time either way (8.5 s ranged, 8.3 s hashed). On separate machines, ranged inserts are limited by **one** shard's write capacity no matter how many shards you add; that conclusion follows from the routing above, not from a timing here.
+- The id-range query was **faster** hashed (26 ms vs 51 ms) because both shards worked in parallel on a 10,000-row result. Scatter-gather costs more total work and more connections (Concept 3), but for a large result it can finish sooner.
+
+<Pitfall>
+`created_at` is monotonic too. Sharding orders by `{ created_at: 1 }` "so monthly reports are targeted" sends every new order to the shard that owns the present, and that shard also serves most reads, because recent orders are the hot ones. A compound key that starts with a high-cardinality field (`{ seller_id: 1, created_at: 1 }`) or a hashed key avoids the single hot shard.
+</Pitfall>
+
+## Real-world scenario: flash sale on a ranged key
+
+On a 12.12 sale the order rate jumps tenfold. With a ranged, monotonic key every one of those inserts hits the shard holding the top range; the other shards are idle for writes, and the balancer starts moving freshly written ranges off the busy shard at the worst moment, adding migration work to it. With a hashed key or a seller-first compound key, the same burst spreads over all shards from the first second.
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 2, partitioning by range](/blogs/databases/partitioning-sharding/session-2-partitioning-postgresql/concept-1-declarative-partitioning) | In one database, every new order also lands in the newest partition, and that is fine: one machine takes the writes either way |
+| Concept 3 | The cost of queries that are not routed to one shard |
+| Concept 4 | Hashing a key does not help when one value is hot |
+
+## Key takeaways
+
+1. With ranged sharding, a monotonic key sends every new insert to the shard that owns the top range: 100,000 vs 0 here.
+2. The balancer moves data only after it is written, so it never removes the insert hotspot.
+3. Hashed sharding (MongoDB `'hashed'`, every Citus table) spread the same inserts about 50/50.
+4. Hashing turns a range query on the key into a query to every shard.
+5. A hashed collection that is empty when sharded starts with ranges on every shard, so no migrations are needed.
+
+## Check questions
+
+1. Why did all 100,000 new orders go to sh2, even though sh1 owned 13 ranges?
+2. After re-enabling balancing, the balancer moved one range. Did that make the next insert go to sh1?
+3. Why did the hashed collection need no migrations at all?
+4. Citus showed Task Count 32 for an id range and 2 for an IN list of two ids. Explain both numbers.
+5. The id-range query was faster on the hashed collection in this lab. Why might that reverse on a busy production cluster?
+6. Is `{ created_at: 1 }` a better shard key than `{ _id: 1 }` for `orders`? Why or why not?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-5-choosing-a-shard-key/concept-2-monotonic-keys/answers">Worked answers to Q1–Q6</DeepDive>

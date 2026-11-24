@@ -1,0 +1,65 @@
+---
+title: "Answers: What a shard key decides"
+description: "Worked answers to the Session 5 Concept 1 check questions."
+companion: "answers"
+tags: ["sharding", "shard-key", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-choose-a-shard-key/"
+  - "https://www.mongodb.com/docs/manual/core/sharding-data-partitioning/"
+  - "https://docs.citusdata.com/en/stable/sharding/data_modeling.html"
+---
+
+<Tldr>
+The key's distinct values are the smallest pieces the cluster can move. Too few values, and no balancer or hash can spread the data.
+</Tldr>
+
+## Q1. Three decisions
+
+**Question:** name the three things a shard key decides.
+
+1. **Placement:** which shard owns each stored row.
+2. **Write routing:** which shard receives each insert, update or delete.
+3. **Query targeting:** which queries the router can send to one shard instead of all.
+
+> **Common mistake:** choosing a key only for even data spread. Spread is one of three outcomes; a key that spreads data perfectly but targets none of your frequent queries (hashed `_id` for seller dashboards) costs you on every read.
+
+## Q2. Lazada moved, shopee did not
+
+**Question:** why did the MongoDB balancer move the lazada range but not the shopee range?
+
+A range boundary must be a shard-key value, so the collection could only ever be cut at "shopee" and "tiktok". `config.changelog` shows the timing: the balancer moved the lazada range six seconds into the load, when it held only 36,871 documents, and every later lazada insert was routed straight to sh1 (199,504 in the end). By the time it tried shopee (twice) and tiktok (once), each range was one value with hundreds of thousands of documents, above the migration limit (Concept 4: about 71,000 documents at a 4 MB range size). Each attempt ended in `moveChunk.error`, and both were flagged jumbo.
+
+> **Common mistake:** expecting the balancer to split a range "in the middle". With one key value there is no middle.
+
+## Q3. jumbo: true
+
+**Question:** what does `jumbo: true` on a range mean, and why can't waiting fix it?
+
+The balancer found the range larger than the configured range size and could not split it, because every document in it has the same shard-key value. The balancer then stops trying to move it. Waiting changes nothing: more inserts with that value only make it larger. The fixes are structural: refine the key with another field (`refineCollectionShardKey`, Session 6) or reshard.
+
+> **Common mistake:** clearing the jumbo flag by hand and expecting the range to move. The flag is a symptom; the range is still one value.
+
+## Q4. Two shards out of 32
+
+**Question:** Citus has 32 shards. Why did only 2 receive rows with `marketplace`, and could it have been 3?
+
+Each value is hashed and lands in the one shard whose hash range contains its hash. Three values can reach at most three shards; here `hash('shopee')` and `hash('tiktok')` happened to fall into the same range (shard 102129), so only two did. With a different shard count or different values it could have been three, but never more.
+
+> **Common mistake:** assuming hashing guarantees spread. Hashing spreads *many* values evenly; it cannot create more pieces than there are values.
+
+## Q5. Everything on sh2 first
+
+**Question:** both collections started with all 1M documents on sh2. Why, and what did the balancer do differently for `seller_id`?
+
+`sh2` is the primary shard of database `pt5`, and an empty collection sharded on a ranged key starts as one range (MinKey → MaxKey) on the primary shard. MongoDB 8.0 does not split ranges during inserts, so all 1M documents went into that range. The balancer then splits while migrating. With `seller_id` it could cut between any two sellers, so it moved seven 4 MB pieces (35,464–36,023 documents each) to sh1 until the shards were within 3 × 4 MB.
+
+> **Common mistake:** bulk-loading a large collection after sharding it on a ranged key and expecting the load to spread. Load first and shard afterwards, pre-split, or use a hashed key on an empty collection (Concept 2).
+
+## Q6. Six shards
+
+**Question:** your cluster grows from 2 to 6 shards. What is the best possible split of the `marketplace`-keyed collection?
+
+Three shards hold one value each (shopee 50%, tiktok 30%, lazada 20%) and three shards hold nothing. The busiest shard keeps half the data and half the writes, the same as with two shards. Adding hardware did not help.
+
+> **Common mistake:** planning capacity by shard count. With a low-cardinality key, capacity is set by the largest value.

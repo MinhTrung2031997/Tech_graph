@@ -1,0 +1,63 @@
+---
+title: "Answers: Monotonic keys and where new writes go"
+description: "Worked answers to the Session 5 Concept 2 check questions."
+companion: "answers"
+tags: ["sharding", "shard-key", "hashed-sharding", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/hashed-sharding/"
+  - "https://www.mongodb.com/docs/manual/core/sharding-choose-a-shard-key/#monotonically-changing-shard-keys"
+  - "https://docs.citusdata.com/en/stable/develop/reference_processing.html"
+---
+
+<Tldr>
+With ranges, "new" means "the top range". With hashes, "new" means "anywhere", and "a range of keys" also means "anywhere".
+</Tldr>
+
+## Q1. All new orders on sh2
+
+**Question:** why did all 100,000 new orders go to sh2, even though sh1 owned 13 ranges?
+
+sh1's 13 ranges covered ids 1 – 462,059. Every new id (1,000,001 and up) is larger than any existing boundary, so each one falls into the range ending at MaxKey, which sh2 owned. How many ranges a shard owns does not matter; only which shard owns the range the new values fall into.
+
+> **Common mistake:** reading "13 ranges on sh1, 1 on sh2" as "sh1 does most of the work". Range count says nothing about where the next write goes.
+
+## Q2. Does the catch-up help the next insert?
+
+**Question:** after re-enabling balancing, the balancer moved one range. Did that make the next insert go to sh1?
+
+No. The balancer moved the range 462,060 – 497,602 (35,543 documents) to sh1 and the top range (497,603 → MaxKey) stayed on sh2. The next insert still goes to sh2. Balancing moves old data to even out storage; it never moves the place where new data arrives.
+
+> **Common mistake:** expecting the balancer to rotate the top range between shards. It may move it occasionally, but then the other shard becomes the hot one.
+
+## Q3. No migrations for the hashed collection
+
+**Question:** why did the hashed collection need no migrations at all?
+
+Sharding an **empty** collection on a hashed key creates initial ranges on every shard (here one on sh1 for hash ≥ 0 and one on sh2 for hash < 0). Hashes of consecutive ids are unrelated, so inserts split about 50/50 from the first document, and the shards never drifted more than 3 × 4 MB apart.
+
+> **Common mistake:** sharding a non-empty collection on a hashed key and expecting the same pre-split. A collection with data starts with ranges on its current shard and needs the balancer, as the ranged collections did.
+
+## Q4. Task Count 32 and 2
+
+**Question:** Citus showed Task Count 32 for an id range and 2 for an IN list of two ids. Explain both numbers.
+
+For an IN list, the coordinator hashes each listed value and finds its shard: two values, two shards (they happened to differ). For a range, there is no way to know which hash values the ids in the range have without enumerating them, and consecutive ids hash into all shards anyway, so all 32 shards are asked.
+
+> **Common mistake:** rewriting a range into `IN (…)` with thousands of values to "make it targeted". Thousands of values still reach every shard.
+
+## Q5. Faster scatter-gather
+
+**Question:** the id-range query was faster on the hashed collection in this lab. Why might that reverse on a busy production cluster?
+
+In the lab, both shards were idle and worked on half of the 10,000 documents each in parallel (26 ms vs 51 ms). In production each shard is serving other traffic; a scatter-gather query occupies **every** shard and waits for the **slowest** one, while the targeted version uses one shard and leaves the others free. Under load, total work and tail latency matter more than the parallel speed-up.
+
+> **Common mistake:** benchmarking a sharded cluster with one query at a time. Measure under realistic concurrency.
+
+## Q6. created_at instead of _id
+
+**Question:** is `{ created_at: 1 }` a better shard key than `{ _id: 1 }` for `orders`? Why or why not?
+
+No, it has the same problem. `created_at` is monotonic, so every new order goes to the shard owning the latest time range, exactly like ranged `_id`. It does target month queries, but it also concentrates the hottest reads (recent orders) on that same shard. Both are poor keys on their own.
+
+> **Common mistake:** choosing a time key because reports filter by time. Reports are better served by a key that spreads writes plus secondary indexes on time, or by an analytics copy.
