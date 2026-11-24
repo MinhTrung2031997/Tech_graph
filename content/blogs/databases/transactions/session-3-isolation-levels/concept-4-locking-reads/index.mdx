@@ -1,0 +1,329 @@
+---
+title: "Concept 4: Locking reads"
+description: "SELECT … FOR UPDATE reads the newest committed version and locks it, so a read-modify-write cannot lose an update at any level. Why it returns a different value than a plain SELECT in the same MySQL transaction, why it fails with 40001 under PostgreSQL REPEATABLE READ, what NOWAIT and SKIP LOCKED do, and how MongoDB gets the same effect by writing first."
+type: "concept"
+tags: ["transactions", "isolation", "locking", "for-update", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE"
+  - "https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-in-applications/"
+---
+
+<Tldr>
+A **locking read** (`SELECT … FOR UPDATE` / `FOR SHARE`) does two things a plain `SELECT` does not: it reads the **newest committed** version, and it **locks** that row until the transaction ends. In one MySQL REPEATABLE READ transaction, a plain read returned **1000**, `FOR UPDATE` returned **900** (T2's commit) and the next plain read **1000** again. Used for read-modify-write, it makes the second transaction **wait** instead of overwriting: with application-computed values, T2 waited (≈ 1 s in MySQL), read **950**, wrote 850, and the final balance was **850** in both PostgreSQL and MySQL. Under PostgreSQL REPEATABLE READ, `FOR UPDATE` on a row changed after the snapshot raises **40001** instead. `NOWAIT` fails at once (`could not obtain lock on row`, MySQL error **3572**) and `SKIP LOCKED` returns only unlocked rows. MongoDB has no locking read: writing first (`findOneAndUpdate` with `$inc: { version: 1 }`) made the second transaction retry **14** times in 1.2 s and also ended at **850**.
+</Tldr>
+
+## Plain read vs locking read
+
+| | Plain `SELECT` | `SELECT … FOR UPDATE` |
+|---|---|---|
+| Which version | The transaction's snapshot (Concept 1) | The newest committed version |
+| Locks | None | Row lock until COMMIT/ROLLBACK |
+| Other writers | Not affected | Wait (or fail with NOWAIT) |
+| Other plain readers | Not affected | Not affected (MVCC) |
+
+| Lock clause | PostgreSQL | MySQL | Blocks |
+|---|---|---|---|
+| `FOR UPDATE` | ✓ | ✓ | Every other locking read and every write of the row |
+| `FOR NO KEY UPDATE` | ✓ (taken by ordinary UPDATEs: `pgrowlocks` showed `No Key Update` during `UPDATE … SET balance`) | – | Like FOR UPDATE, but lets `FOR KEY SHARE` through (foreign-key checks) |
+| `FOR SHARE` | ✓ | ✓ (`LOCK IN SHARE MODE` is the old name) | Writes and FOR UPDATE; other FOR SHARE readers allowed |
+| `FOR KEY SHARE` | ✓ (taken by foreign-key checks) | – | Only changes to the key |
+| `NOWAIT` / `SKIP LOCKED` | ✓ | ✓ (8.0+) | Fail at once / skip locked rows |
+
+| Term | Meaning |
+|---|---|
+| Read-modify-write | Read a value, compute in the application, write the result |
+| **✓ Correct balance** | 850 after T1 (−50) and T2 (−100) |
+| **✗ Error / skipped** | The locking read failed (40001, NOWAIT) or skipped the row |
+
+Session 5 covers lock modes, gap locks and how indexes change what gets locked.
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: FOR UPDATE in READ COMMITTED and REPEATABLE READ"
+  height={260}
+  nodes={[
+    { id: 't1', label: 'T1', sub: 'read, compute, write', x: 20, y: 20, w: 200 },
+    { id: 'row', label: 'accounts id 1', sub: 'balance 1000', x: 300, y: 20, w: 200 },
+    { id: 't2', label: 'T2', sub: 'read, compute, write', x: 580, y: 20, w: 200 },
+    { id: 'ok', label: '✓ Correct balance', sub: '', x: 120, y: 180, w: 220 },
+    { id: 'err', label: '✗ Error', sub: '', x: 460, y: 180, w: 220 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row', label: 'lock' },
+    { id: 't2-row', from: 't2', to: 'row', label: 'lock' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-err', from: 'row', to: 'err' },
+  ]}
+  cases={[
+    {
+      title: 'Read-modify-write, both lock',
+      path: 'T1 FOR UPDATE 1000 → T2 FOR UPDATE waits → T1 writes 950, commits → T2 reads 950 → ✓ 850',
+      summary: 'READ COMMITTED: the waiting locking read returns the version T1 committed.',
+      steps: [
+        {
+          title: 't0: T1 locks and reads',
+          note: 'T1 reads 1000 with FOR UPDATE (psql \\gset stores it in :b) and will write :b − 50 after 2 s of "work".',
+          code: "BEGIN;\nSELECT balance AS b FROM accounts WHERE id = 1 FOR UPDATE \\gset   -- 1000.00",
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+          subs: { row: 'locked by T1' },
+        },
+        {
+          title: 't1: T2 waits',
+          note: 'T2 runs the same locking read and blocks on T1\'s row lock. A plain SELECT would not block and would return 1000, the stale value.',
+          active: ['t2', 'row'],
+          edges: ['t2-row'],
+          subs: { t2: 'waiting for T1' },
+        },
+        {
+          title: 't2: T1 commits, T2 continues',
+          note: 'T1 writes 950 and commits. T2\'s locking read now returns the newest version, 950, and T2 writes 950 − 100. Final 850 with values computed in the application.',
+          code: "UPDATE accounts SET balance = :b - 50 WHERE id = 1; COMMIT;     -- T1\n-- T2's FOR UPDATE returns 950.00\nUPDATE accounts SET balance = :b - 100 WHERE id = 1; COMMIT;    -- T2: final 850.00",
+          active: ['t2', 'row', 'ok'],
+          edges: ['t2-row', 'row-ok'],
+          subs: { ok: '850', t2: 'read 950' },
+        },
+      ],
+    },
+    {
+      title: 'READ COMMITTED: newest, not snapshot',
+      path: 'plain read 1000 → T2 commits 900 → FOR UPDATE → ✓ 900',
+      summary: 'A locking read ignores the statement snapshot and follows the row to its newest version.',
+      steps: [
+        {
+          title: 'Two reads, two answers',
+          note: 'Within one READ COMMITTED transaction: plain SELECT 1000, T2 committed −100, SELECT … FOR UPDATE 900.',
+          code: "BEGIN;\nSELECT balance FROM accounts WHERE id = 1;              -- 1000.00\n-- T2 commits 900\nSELECT balance FROM accounts WHERE id = 1 FOR UPDATE;   -- 900.00",
+          active: ['t1', 't2', 'row', 'ok'],
+          edges: ['t2-row', 't1-row', 'row-ok'],
+          subs: { ok: 'FOR UPDATE = 900' },
+        },
+      ],
+    },
+    {
+      title: 'REPEATABLE READ: changed row',
+      path: 'snapshot 1000 → T2 commits 900 → FOR UPDATE → ✗ 40001',
+      summary: 'The snapshot and the newest version disagree, and REPEATABLE READ will not hide that.',
+      steps: [
+        {
+          title: 'Locking a row the snapshot cannot see',
+          note: 'Returning 900 would break the snapshot; returning 1000 and locking would let T1 act on stale data. PostgreSQL aborts, exactly as for an UPDATE (Concept 2). Taking FOR UPDATE as the first statement narrows the window (a change committed before it is simply read: 800 in the lab), but if that FOR UPDATE has to wait for a transaction that then commits, it still fails with 40001.',
+          code: "BEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT balance FROM accounts WHERE id = 1;   -- 1000.00\n-- T2 commits 900\nSELECT balance FROM accounts WHERE id = 1 FOR UPDATE;\n-- ERROR:  could not serialize access due to concurrent update",
+          active: ['t1', 't2', 'row', 'err'],
+          edges: ['t2-row', 't1-row', 'row-err'],
+          subs: { err: '40001' },
+        },
+      ],
+    },
+    {
+      title: 'NOWAIT',
+      path: 'T1 holds FOR UPDATE → T2 FOR UPDATE NOWAIT → ✗ error at once',
+      summary: 'For callers that would rather fail than queue.',
+      steps: [
+        {
+          title: 'No queueing',
+          note: 'SQLSTATE 55P03 (lock_not_available). SKIP LOCKED instead returns the rows that are free: the basis of job queues (Session 7).',
+          code: "SELECT balance FROM accounts WHERE id = 1 FOR UPDATE NOWAIT;\n-- ERROR:  could not obtain lock on row in relation \"accounts\"",
+          active: ['t1', 't2', 'row', 'err'],
+          edges: ['t1-row', 't2-row', 'row-err'],
+          subs: { err: '55P03' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL InnoDB
+
+<Flow
+  title="MySQL: locking reads inside REPEATABLE READ"
+  height={260}
+  nodes={[
+    { id: 't1', label: 'T1', sub: 'read, compute, write', x: 20, y: 20, w: 200 },
+    { id: 'row', label: 'accounts id 1', sub: 'balance 1000', x: 300, y: 20, w: 200 },
+    { id: 't2', label: 'T2', sub: 'read, compute, write', x: 580, y: 20, w: 200 },
+    { id: 'ok', label: '✓ Correct balance', sub: '', x: 120, y: 180, w: 220 },
+    { id: 'err', label: '✗ Error / skipped', sub: '', x: 460, y: 180, w: 220 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row', label: 'lock' },
+    { id: 't2-row', from: 't2', to: 'row', label: 'lock' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-err', from: 'row', to: 'err' },
+  ]}
+  cases={[
+    {
+      title: 'Two views in one transaction',
+      path: 'plain 1000 → T2 commits 900 → FOR UPDATE 900 → plain 1000',
+      summary: 'REPEATABLE READ snapshot for plain reads, newest version for locking reads.',
+      steps: [
+        {
+          title: 'Plain read',
+          note: 'The first consistent read creates the read view: 1000.',
+          code: "START TRANSACTION;\nSELECT balance FROM accounts WHERE id = 1;   -- 1000.00",
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+        },
+        {
+          title: 'T2 commits, T1 locks',
+          note: 'T2 commits 900. T1\'s FOR UPDATE reads the newest version: 900.',
+          code: "SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;   -- 900.00",
+          active: ['t1', 't2', 'row', 'ok'],
+          edges: ['t2-row', 't1-row', 'row-ok'],
+          subs: { ok: 'FOR UPDATE = 900' },
+        },
+        {
+          title: 'Plain read again',
+          note: 'Back to the read view: 1000. Do not mix the two kinds of read for the same decision; in read-modify-write code, read with FOR UPDATE only.',
+          code: "SELECT balance FROM accounts WHERE id = 1;   -- 1000.00",
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+        },
+      ],
+    },
+    {
+      title: 'Read-modify-write, both lock',
+      path: 'T1 FOR UPDATE 1000 → T2 waits 0.98 s → T2 reads 950 → ✓ 850',
+      summary: 'The fix for Concept 2\'s silent lost update in InnoDB.',
+      steps: [
+        {
+          title: 'T1 locks, T2 queues',
+          note: 'Both use SELECT … INTO @b FOR UPDATE and then write @b − amount. T2 started 1 s after T1 and waited 0.98 s for T1\'s commit.',
+          code: "START TRANSACTION;\nSELECT balance INTO @b FROM accounts WHERE id = 1 FOR UPDATE;\nUPDATE accounts SET balance = @b - 50 WHERE id = 1;\nCOMMIT;",
+          active: ['t1', 't2', 'row'],
+          edges: ['t1-row', 't2-row'],
+          subs: { row: 'X lock: T1, T2 waiting' },
+        },
+        {
+          title: 'T2 sees T1\'s result',
+          note: 'T2 read 950 and wrote 850. Without FOR UPDATE, the same code gave 950 (Concept 2).',
+          active: ['t2', 'row', 'ok'],
+          edges: ['t2-row', 'row-ok'],
+          subs: { ok: '850', t2: 'read 950 after 0.98 s' },
+        },
+      ],
+    },
+    {
+      title: 'NOWAIT and SKIP LOCKED',
+      path: 'T1 holds row 1 → NOWAIT ✗ error 3572; SKIP LOCKED over ids 1, 2 → returns only 2',
+      summary: 'Two ways not to wait.',
+      steps: [
+        {
+          title: 'NOWAIT',
+          note: 'Fails immediately instead of waiting up to innodb_lock_wait_timeout (50 s by default).',
+          code: "SELECT balance FROM accounts WHERE id = 1 FOR UPDATE NOWAIT;\n-- ERROR 3572 (HY000): Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set.",
+          active: ['t1', 't2', 'row', 'err'],
+          edges: ['t1-row', 't2-row', 'row-err'],
+          subs: { err: 'error 3572' },
+        },
+        {
+          title: 'SKIP LOCKED',
+          note: 'Asked for ids 1 and 2, got only 2: row 1 was locked by T1 and silently left out. Right for queues, wrong for anything that must see every row.',
+          code: "SELECT id FROM accounts WHERE id IN (1, 2) FOR UPDATE SKIP LOCKED;   -- 2",
+          active: ['t2', 'row', 'err'],
+          edges: ['t2-row', 'row-err'],
+          subs: { err: 'row 1 skipped' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: write first
+
+<Flow
+  title="MongoDB: claiming a document by writing it"
+  height={260}
+  nodes={[
+    { id: 't1', label: 'T1 (transaction)', sub: 'claim, compute, write', x: 20, y: 20, w: 200 },
+    { id: 'row', label: 'accounts _id 1', sub: 'balance 1000, version 1', x: 300, y: 20, w: 200 },
+    { id: 't2', label: 'T2 (transaction)', sub: 'claim, compute, write', x: 580, y: 20, w: 200 },
+    { id: 'ok', label: '✓ Correct balance', sub: '', x: 120, y: 180, w: 220 },
+    { id: 'err', label: '✗ WriteConflict', sub: 'retried', x: 460, y: 180, w: 220 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row', label: 'claim' },
+    { id: 't2-row', from: 't2', to: 'row', label: 'claim' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-err', from: 'row', to: 'err' },
+  ]}
+  cases={[
+    {
+      title: 'findOneAndUpdate as a lock',
+      path: 'T1 $inc version (claims) → T2 claim ✗ WriteConflict × 13 → T1 commits 950 → T2 attempt 14 reads 950 → ✓ 850',
+      summary: 'There is no SELECT … FOR UPDATE; an early write plays its role.',
+      steps: [
+        {
+          title: 'T1 claims the document',
+          note: 'The first operation of T1\'s transaction is a write: findOneAndUpdate with $inc version, returning the document (balance 1000, version 2). Until T1 ends, any other transaction writing this document conflicts.',
+          code: "s.withTransaction(() => {\n  const doc = a.findOneAndUpdate({ _id: 1 }, { $inc: { version: 1 } },\n                                 { returnDocument: 'after' });\n  // … 2 s of work, then write doc.balance - 50\n}, { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } });",
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+          subs: { row: 'written by T1 (uncommitted)' },
+        },
+        {
+          title: 'T2 conflicts and retries',
+          note: 'T2\'s claim fails with WriteConflict. MongoDB does not queue it; withTransaction() catches the TransientTransactionError and runs the callback again. T2 needed 14 attempts over 1.2 s.',
+          active: ['t2', 'row', 'err'],
+          edges: ['t2-row', 'row-err'],
+          subs: { err: '13 conflicts' },
+        },
+        {
+          title: 'T1 commits, T2 succeeds',
+          note: 'T1 wrote 950 and committed after 2,013 ms. T2\'s 14th attempt claimed version 3, read 950 and wrote 850. Without the claim, T2 would still be protected (its final write would conflict), but only after doing its work; claiming first makes the conflict happen before the work.',
+          active: ['t1', 't2', 'row', 'ok'],
+          edges: ['t2-row', 'row-ok'],
+          subs: { ok: '850, version 3' },
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+A locking read only helps if **every** writer takes it. If one code path updates the row without `FOR UPDATE` and computes from a plain read, it can still overwrite. And `SKIP LOCKED` hides rows by design: using it in a report or a balance check silently returns partial results.
+</Pitfall>
+
+## Real-world scenario: seat booking
+
+A booking service reads seat 14C, checks it is free, then marks it taken.
+
+| Engine | Pattern | Behaviour under two concurrent bookings |
+|---|---|---|
+| PostgreSQL / MySQL | `SELECT … FROM seats WHERE id = ? FOR UPDATE`, check, `UPDATE` | Second booking waits, then sees "taken" and refuses |
+| PostgreSQL / MySQL, many seats | `… FOR UPDATE SKIP LOCKED LIMIT 1` over free seats | Each booking gets a different free seat without waiting |
+| PostgreSQL / MySQL, kiosk UI | `… FOR UPDATE NOWAIT` | Second user is told "being booked" at once |
+| MongoDB | `findOneAndUpdate({ _id, status: 'free' }, { $set: { status: 'held' } })` | One request matches; the other gets null, no transaction needed |
+
+## Why this matters for transactions
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 5: cost under contention | Waiting (locks) vs aborting (snapshots) under load |
+| Session 5: locks and indexes | What exactly `FOR UPDATE` locks when the WHERE is not on an index |
+| Session 6: deadlocks | Two locking reads in opposite order |
+| Session 7: application patterns | Pessimistic locking, SKIP LOCKED queues |
+
+## Key takeaways
+
+1. A locking read returns the newest committed version and locks it; a plain read returns the snapshot.
+2. In MySQL REPEATABLE READ, plain and locking reads in one transaction can disagree (1000 / 900 / 1000).
+3. With FOR UPDATE on both sides, read-modify-write gave 850 in PostgreSQL and MySQL: the second transaction waited.
+4. PostgreSQL REPEATABLE READ refuses to lock a row changed after the snapshot (40001); locking first narrows the window but does not close it, so keep a retry.
+5. NOWAIT fails immediately; SKIP LOCKED skips locked rows; MongoDB gets the same effect with an early write and retries.
+
+## Check questions
+
+1. Why did `SELECT … FOR UPDATE` return 900 when the plain `SELECT` just before it returned 1000?
+2. In the read-modify-write test, what did T2 read with `FOR UPDATE`, and why is the final balance correct?
+3. Why does PostgreSQL REPEATABLE READ raise 40001 on `FOR UPDATE`, and how do you avoid it?
+4. When would you choose `NOWAIT`, and when `SKIP LOCKED`?
+5. MongoDB has no `FOR UPDATE`. What did T2 experience instead, and how many attempts did it take?
+6. Why is it unsafe if only some code paths use `FOR UPDATE`?
+7. What is the difference between `FOR UPDATE` and `FOR NO KEY UPDATE` in PostgreSQL, and which one does a plain `UPDATE` take?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-3-isolation-levels/concept-4-locking-reads/answers">Worked answers to Q1–Q7</DeepDive>

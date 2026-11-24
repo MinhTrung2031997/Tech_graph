@@ -1,0 +1,74 @@
+---
+title: "Answers: When the snapshot starts"
+description: "Worked answers to the Session 3 Concept 1 check questions."
+companion: "answers"
+tags: ["transactions", "isolation", "snapshot", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-consistent-read.html"
+---
+
+<Tldr>
+READ COMMITTED: one snapshot per statement. REPEATABLE READ and MongoDB transactions: one snapshot per transaction, taken by the first read.
+</Tldr>
+
+## Q1. 1000, then 900
+
+**Question:** in READ COMMITTED, T1 reads a balance twice and gets 1000 then 900. Explain which snapshot each read used.
+
+The first `SELECT` took a snapshot before T2 committed, so the newest version it could see was 1000. The second `SELECT` took a **new** snapshot after T2's commit, which includes T2's version, 900. Both reads were correct for their own moment; the transaction just has no single moment.
+
+> **Common mistake:** "READ COMMITTED reads uncommitted data". It never does; it reads data committed before **each statement**.
+
+## Q2. pg_sleep vs \! sleep
+
+**Question:** why did the PostgreSQL REPEATABLE READ transaction that ran `SELECT pg_sleep(2)` first still read 1000, while the one that slept with `\! sleep 2` read 900?
+
+The snapshot is taken by the **first statement** of the transaction. `SELECT pg_sleep(2)` is a statement, so it took the snapshot before T2 committed; the later read used it (1000). `\! sleep 2` is a psql shell command that sends nothing to the server, so the first statement was the balance `SELECT`, run after T2's commit (900).
+
+> **Common mistake:** believing `BEGIN ISOLATION LEVEL REPEATABLE READ` freezes the database at that moment.
+
+## Q3. 1000, 900, 1000 in MySQL
+
+**Question:** a MySQL REPEATABLE READ transaction reads 1000 with a plain `SELECT`, 900 with `SELECT … FOR UPDATE`, then 1000 again. How is that possible?
+
+Plain `SELECT`s are **consistent reads** from the transaction's read view, created at the first one (1000, before T2's commit). A **locking read** ignores the read view: it must lock the row that exists now, so it reads the newest committed version (900). The third read is a consistent read again and uses the read view (1000).
+
+> **Common mistake:** assuming one transaction always sees one version of a row in InnoDB.
+
+## Q4. What snapshot isolation prevents
+
+**Question:** which anomalies does snapshot isolation prevent, and which one does it still allow?
+
+It prevents dirty reads, non-repeatable reads and phantoms for reads (every read uses one snapshot; T1 saw 1000 twice and did not see the inserted row). With first-updater-wins (PostgreSQL RR, MongoDB) it also prevents lost updates. It still allows **write skew** (Concept 3): two transactions that read the same rows and write different ones both commit.
+
+> **Common mistake:** "snapshot isolation is serializable". The joint-account test broke its rule at RR in all three engines.
+
+## Q5. MongoDB and repeatable reads
+
+**Question:** why does MongoDB not need a "REPEATABLE READ" setting inside transactions?
+
+Every multi-document transaction already reads from one snapshot, chosen by its first operation. Even with `readConcern: "local"` the transaction read 1000 twice. The read concern inside a transaction chooses how durable that snapshot is (`"snapshot"` = majority-committed), not whether it is stable.
+
+> **Common mistake:** expecting two reads outside a transaction to be repeatable because the read concern is `"majority"`.
+
+## Q6. Consistent report
+
+**Question:** a report runs three queries and must be consistent. Write the opening statement for PostgreSQL, MySQL and MongoDB.
+
+| Engine | Opening |
+|---|---|
+| PostgreSQL | `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;` then the three queries, then `COMMIT` |
+| MySQL | `START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY;` (default level is REPEATABLE READ) |
+| MongoDB | `s.startTransaction({ readConcern: { level: 'snapshot' } })` and run the three reads through the session (≤ 60 s), or one aggregation |
+
+> **Common mistake:** wrapping the queries in a transaction at READ COMMITTED, which gives each query its own snapshot anyway.
+
+## Q7. No phantom at REPEATABLE READ
+
+**Question:** the SQL standard allows phantoms at REPEATABLE READ. Why did PostgreSQL's REPEATABLE READ not show one?
+
+The standard defines levels by the anomalies they must prevent; an implementation may prevent more. PostgreSQL implements REPEATABLE READ as snapshot isolation: the count of branch B01 ran against the same snapshot both times, and the row inserted by T2 was committed after that snapshot, so it was invisible (1000 both times). MySQL's plain reads behave the same way.
+
+> **Common mistake:** reading the standard's table as a description of what each database does.

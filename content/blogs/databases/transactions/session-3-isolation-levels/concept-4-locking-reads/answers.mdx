@@ -1,0 +1,70 @@
+---
+title: "Answers: Locking reads"
+description: "Worked answers to the Session 3 Concept 4 check questions."
+companion: "answers"
+tags: ["transactions", "locking", "for-update", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html"
+---
+
+<Tldr>
+A locking read reads the newest version and holds it until commit; it protects read-modify-write only if every writer uses it.
+</Tldr>
+
+## Q1. 900 after 1000
+
+**Question:** why did `SELECT … FOR UPDATE` return 900 when the plain `SELECT` just before it returned 1000?
+
+The plain read used the transaction's snapshot (statement snapshot in PostgreSQL RC, read view in MySQL RR), taken before T2's commit. A locking read must lock the row as it exists now, so it reads the **newest committed** version, 900. Returning 1000 while locking 900 would let the transaction act on a value that no longer exists.
+
+> **Common mistake:** thinking FOR UPDATE just "adds a lock" to the same read.
+
+## Q2. Why 850 is correct
+
+**Question:** in the read-modify-write test, what did T2 read with `FOR UPDATE`, and why is the final balance correct?
+
+T2's locking read waited for T1's lock (≈ 1 s in MySQL). When T1 committed 950, T2's read returned **950**, so T2 computed 950 − 100 = 850. Both changes are in the final value. The two read-modify-write sequences ran one after the other on the row.
+
+> **Common mistake:** using FOR UPDATE in only one of the two code paths; the other can still read 1000 and overwrite.
+
+## Q3. 40001 on FOR UPDATE
+
+**Question:** why does PostgreSQL REPEATABLE READ raise 40001 on `FOR UPDATE`, and how do you avoid it?
+
+The snapshot shows 1000 but the newest version, committed by T2 after the snapshot, is 900. Locking it would either break the snapshot or hide T2's change, so PostgreSQL aborts, as for an UPDATE. Making `SELECT … FOR UPDATE` the **first** statement narrows the problem: a change committed before that statement is part of the snapshot and is simply read (800 in the lab). It does not remove it: when that first `FOR UPDATE` had to wait for a transaction that then committed, it still failed with 40001. So either use READ COMMITTED for this read-modify-write (the locking read then returns the newest version) or keep a retry loop.
+
+> **Common mistake:** retrying the `FOR UPDATE` statement alone; the whole transaction is aborted.
+
+## Q4. NOWAIT or SKIP LOCKED
+
+**Question:** when would you choose `NOWAIT`, and when `SKIP LOCKED`?
+
+`NOWAIT` when the caller must work on **that specific row** but should not queue: fail fast and tell the user ("being edited", "being booked"). `SKIP LOCKED` when **any** suitable row will do and locked ones can be taken by someone else: job queues, handing out free seats or coupons. Never use `SKIP LOCKED` where every row must be seen; in the lab it silently returned only id 2 of ids 1 and 2.
+
+> **Common mistake:** using SKIP LOCKED in a balance check or report.
+
+## Q5. MongoDB without FOR UPDATE
+
+**Question:** MongoDB has no `FOR UPDATE`. What did T2 experience instead, and how many attempts did it take?
+
+T1 claimed the document by writing it first (`findOneAndUpdate` with `$inc: { version: 1 }`). T2's claim hit WriteConflict instead of waiting; `withTransaction()` retried the callback until T1 committed. T2 needed **14 attempts** over 1.2 s, then read 950 and wrote 850.
+
+> **Common mistake:** reading with `findOne` and expecting other transactions to wait; reads in MongoDB take no document locks.
+
+## Q6. Partial adoption
+
+**Question:** why is it unsafe if only some code paths use `FOR UPDATE`?
+
+Row locks only coordinate transactions that request them. A path that reads with a plain `SELECT` does not wait for the lock holder and gets the snapshot value; if it then writes an absolute value computed from that read, it overwrites the other path's change (the 950 result of Concept 2). Plain `UPDATE`s do wait for the lock, but compute on the newest value only if they are relative.
+
+> **Common mistake:** adding FOR UPDATE to the "important" path only.
+
+## Q7. FOR UPDATE vs FOR NO KEY UPDATE
+
+**Question:** what is the difference between `FOR UPDATE` and `FOR NO KEY UPDATE` in PostgreSQL, and which one does a plain `UPDATE` take?
+
+`FOR UPDATE` is the strongest row lock: it also conflicts with `FOR KEY SHARE`, the lock foreign-key checks take on the referenced row. `FOR NO KEY UPDATE` does not conflict with `FOR KEY SHARE`, so inserting a child row that references the locked row does not wait. An `UPDATE` that does not change a key column takes `FOR NO KEY UPDATE`: during `UPDATE accounts SET balance = …`, `pgrowlocks` showed `No Key Update`. `DELETE` or changing a key takes `FOR UPDATE`.
+
+> **Common mistake:** using `FOR UPDATE` by habit on parent rows, which makes inserts of child rows wait.

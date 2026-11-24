@@ -1,0 +1,76 @@
+---
+title: "Answers: Write skew and SERIALIZABLE"
+description: "Worked answers to the Session 3 Concept 3 check questions."
+companion: "answers"
+tags: ["transactions", "serializable", "write-skew", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html#XACT-SERIALIZABLE"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html#isolevel_serializable"
+---
+
+<Tldr>
+Write skew needs either a serializable check (PostgreSQL SSI, MySQL shared locks) or a conflict you create on purpose by writing a common row.
+</Tldr>
+
+## Q1. Both committed
+
+**Question:** why did both REPEATABLE READ transactions commit, although the result broke the rule?
+
+Snapshot isolation only compares **write sets**. T1 wrote account 1, T2 wrote account 2: no row was written by both, so first-updater-wins found nothing. The rule depends on what each transaction **read** (the sum of both accounts), and plain reads are not tracked.
+
+> **Common mistake:** "each transaction checked the rule, so the result must satisfy it". Each checked it on a snapshot that the other was about to change.
+
+## Q2. SIRead locks
+
+**Question:** what is an SIRead lock, and why does it never make another transaction wait?
+
+It is PostgreSQL's record that a SERIALIZABLE transaction **read** a tuple, page or relation. When another transaction writes there, PostgreSQL notes a read/write dependency; when dependencies form a dangerous pattern, it aborts a transaction with 40001. The lock is only bookkeeping: no one waits for it, so SERIALIZABLE in PostgreSQL adds aborts, not blocking.
+
+> **Common mistake:** looking for SIRead locks in lock-wait diagnostics; they never appear as waits.
+
+## Q3. Disjoint ranges, one failure
+
+**Question:** two SERIALIZABLE transactions read and wrote disjoint id ranges, yet one failed. What made their locks overlap?
+
+Earlier updates had placed the newest versions of ids 1–3 and 5001–5003 on the same heap page, 73. T2 read three tuples on that page; with `max_pred_locks_per_page = 2` its tuple locks were promoted to a lock on **page 73**. T1's update of id 1, whose version was on page 73, then counted as a write under T2's lock, and T2 was cancelled as a pivot. On a freshly loaded table the same test committed both.
+
+> **Common mistake:** concluding the transactions really conflicted; the lock was coarser than the data.
+
+## Q4. Sequential scans
+
+**Question:** why can a sequential scan make SERIALIZABLE abort more transactions?
+
+A sequential scan reads every tuple, so it takes a single SIRead lock on the **whole relation**. Any write anywhere in the table is then a potential conflict: summing branch B01 and updating an account in B02 aborted the other transaction. An index scan locks only the index pages and tuples it touched.
+
+> **Common mistake:** ignoring plans when tuning SERIALIZABLE; indexes reduce false aborts.
+
+## Q5. MySQL SERIALIZABLE
+
+**Question:** how does MySQL SERIALIZABLE prevent write skew, and what error does the application see?
+
+Inside a transaction, every plain `SELECT` becomes `SELECT … FOR SHARE`. Both transactions held shared locks on accounts 1 and 2; each `UPDATE` needed an exclusive lock on a row the other had share-locked, so they waited on each other. InnoDB's deadlock detector rolled back T2: `ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction`.
+
+> **Common mistake:** treating 1213 as a bug to log and ignore; the transaction was rolled back and must be retried.
+
+## Q6. Autocommit vs transaction
+
+**Question:** why did the SERIALIZABLE autocommit SELECT not block the writer, while the one in a transaction did?
+
+The conversion to `FOR SHARE` applies only when autocommit is off. In autocommit mode a `SELECT` is its own transaction, and InnoDB serves it as a consistent read with no locks, because nothing in the same transaction can depend on it later. The writer finished in 0.003 s instead of waiting 2.48 s.
+
+> **Common mistake:** setting SERIALIZABLE globally to "fix" a report, which then blocks writers only when run inside transactions.
+
+## Q7. Joint account in MongoDB
+
+**Question:** fix the joint-account rule in MongoDB without SERIALIZABLE.
+
+Make both transactions **write** a document that represents the rule, so their write sets overlap. Options: each transaction bumps a version on every account it read (as in the lab: T1 failed with WriteConflict, sum 1100), or keep a pair document `{ _id: 'pair-1-2', total: 2000 }` and withdraw with
+
+```js
+pairs.updateOne({ _id: 'pair-1-2', total: { $gte: 1000 + amount } }, { $inc: { total: -amount } })
+```
+
+in the same transaction as the account update, treating `modifiedCount: 0` as "rule would be broken".
+
+> **Common mistake:** relying on `readConcern: "snapshot"`; it makes reads consistent, not serializable.

@@ -1,0 +1,362 @@
+---
+title: "Concept 2: Writing a row that changed after your snapshot"
+description: "A snapshot read can be stale by the time the transaction writes. PostgreSQL READ COMMITTED re-reads the newest row, REPEATABLE READ aborts with error 40001, MySQL REPEATABLE READ silently writes on top of the newest row, and a MongoDB transaction fails with WriteConflict. Measured with the same read-sleep-write test in each engine."
+type: "concept"
+tags: ["transactions", "isolation", "postgresql", "mysql", "mongodb", "lost-update", "write-conflict"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html#XACT-READ-COMMITTED"
+  - "https://www.postgresql.org/docs/current/transaction-iso.html#XACT-REPEATABLE-READ"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-consistent-read.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-production-consideration/"
+---
+
+<Tldr>
+T1 reads balance **1000**, T2 commits −100 (**900**), then T1 writes. What happens depends on engine and level. **PostgreSQL READ COMMITTED**: a relative `UPDATE … balance − 50` works on the newest row (**850**, correct), but writing a value computed from the stale read (`SET balance = 950`) loses T2's update (**950**). A blocked `UPDATE` re-checks its `WHERE` against the new row and can end up updating **0 rows**. **PostgreSQL REPEATABLE READ** refuses: `ERROR: could not serialize access due to concurrent update`. **MySQL REPEATABLE READ** does not refuse: the `UPDATE` writes on the newest row (850, or 950 with an absolute value), and an `UPDATE` of branch B01 touched **1,001** rows although the snapshot showed 1,000. A **MongoDB transaction** fails with `WriteConflict` (labelled `TransientTransactionError`) after **7 ms**, without waiting.
+</Tldr>
+
+## The question each engine answers
+
+A write cannot go to an old version: it must change the **newest** version of the row. When the transaction's snapshot is older than that version, the engine has three choices:
+
+| Choice | Who does it | Consequence |
+|---|---|---|
+| Write on the newest version | PostgreSQL READ COMMITTED, MySQL READ COMMITTED **and REPEATABLE READ** | No error; relative updates stay correct; values computed from the stale read overwrite the other commit (lost update) |
+| Abort the transaction | PostgreSQL REPEATABLE READ and SERIALIZABLE ("first updater wins"), MongoDB transactions | The application must retry the whole transaction |
+| Make the other transaction wait earlier | MySQL SERIALIZABLE (shared locks on reads, Concept 3) | Deadlocks instead of silent overwrites |
+
+| Term | Meaning |
+|---|---|
+| Relative update | `SET balance = balance - 50`: the arithmetic runs on whatever version the UPDATE finds |
+| Absolute update | `SET balance = 950`, where 950 was computed by the application from an earlier read |
+| Re-check (EvalPlanQual) | PostgreSQL READ COMMITTED: after waiting for a row lock, re-evaluate the `WHERE` on the newest version |
+| First updater wins | If a row was changed by a transaction that committed after my snapshot, my write fails |
+| **✓ Correct balance** | 850: both changes applied |
+| **✗ Error** | The engine aborts the write (40001 / WriteConflict) |
+| **✗ Lost update** | 950: T2's −100 disappeared |
+
+The test: accounts id 1 starts at 1000. T1 begins, reads it, sleeps 2 s, writes. T2 starts at 1 s and commits `balance − 100`.
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: the newest version decides"
+  height={260}
+  nodes={[
+    { id: 't1', label: 'T1', sub: 'read 1000, then write', x: 20, y: 20, w: 200 },
+    { id: 'row', label: 'accounts id 1', sub: 'balance 1000', x: 300, y: 20, w: 200 },
+    { id: 't2', label: 'T2', sub: 'balance − 100, commit', x: 580, y: 20, w: 200 },
+    { id: 'ok', label: '✓ Correct balance', sub: '', x: 20, y: 180, w: 220 },
+    { id: 'err', label: '✗ Error 40001', sub: '', x: 290, y: 180, w: 220 },
+    { id: 'bad', label: '✗ Lost update', sub: '', x: 560, y: 180, w: 220 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row', label: 'write' },
+    { id: 't2-row', from: 't2', to: 'row', label: 'commit' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-err', from: 'row', to: 'err' },
+    { id: 'row-bad', from: 'row', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'READ COMMITTED, relative update',
+      path: 'T1 read 1000 → T2 commit 900 → T1 balance − 50 on the newest row → ✓ 850',
+      summary: 'The UPDATE does not use T1\'s earlier read at all.',
+      steps: [
+        {
+          title: 'T1 reads, T2 commits',
+          note: 'T1 read 1000 at t0; T2 committed 900 at t1.',
+          code: "BEGIN;\nSELECT balance FROM accounts WHERE id = 1;   -- 1000.00",
+          active: ['t1', 't2', 'row'],
+          edges: ['t2-row'],
+          subs: { row: 'newest: 900' },
+        },
+        {
+          title: 'The UPDATE finds 900',
+          note: 'The UPDATE takes its own snapshot and finds the newest version: 900 − 50 = 850. Correct, because the arithmetic runs inside the database.',
+          code: 'UPDATE accounts SET balance = balance - 50 WHERE id = 1;\nCOMMIT;   -- final 850.00',
+          active: ['t1', 'row', 'ok'],
+          edges: ['t1-row', 'row-ok'],
+          subs: { ok: '850' },
+        },
+      ],
+    },
+    {
+      title: 'READ COMMITTED, absolute update',
+      path: 'T1 read 1000, computes 950 → T2 commit 900 → T1 SET 950 → ✗ lost update',
+      summary: 'The value came from the stale read, so the database cannot help.',
+      steps: [
+        {
+          title: 'The application computes 950',
+          note: 'T1 read 1000 and decided the new balance is 950. T2 then committed 900.',
+          active: ['t1', 't2', 'row'],
+          edges: ['t2-row'],
+          subs: { row: 'newest: 900' },
+        },
+        {
+          title: 'T1 overwrites',
+          note: 'SET balance = 950 replaces 900. T2\'s withdrawal of 100 is gone: final 950. This is Session 2\'s lost update, and READ COMMITTED allows it.',
+          code: 'UPDATE accounts SET balance = 950.00 WHERE id = 1;\nCOMMIT;   -- final 950.00',
+          active: ['t1', 'row', 'bad'],
+          edges: ['t1-row', 'row-bad'],
+          subs: { bad: '950: −100 lost' },
+        },
+      ],
+    },
+    {
+      title: 'READ COMMITTED, blocked UPDATE re-checks',
+      path: 'T1 holds the row lock → T2 waits → T1 commits 900 → T2 re-checks balance ≥ 1000 → ✓ UPDATE 0',
+      summary: 'A waiting UPDATE re-evaluates its WHERE on the version it finally gets.',
+      steps: [
+        {
+          title: 'Both want the same row',
+          note: 'T1 runs UPDATE … balance − 100 WHERE id = 1 AND balance >= 1000 and keeps its transaction open for 2 s. T2 runs the same statement and waits for T1\'s row lock.',
+          code: 'UPDATE accounts SET balance = balance - 100\nWHERE id = 1 AND balance >= 1000;',
+          active: ['t1', 't2', 'row'],
+          edges: ['t1-row'],
+          subs: { row: 'locked by T1' },
+        },
+        {
+          title: 'T2 re-checks after T1 commits',
+          note: 'T1 commits 900. T2 does not fail and does not use the old 1000: it re-evaluates balance >= 1000 on the newest version, which is false, so it updates 0 rows. Final 900. Conditional updates are therefore safe in READ COMMITTED.',
+          active: ['t2', 'row', 'ok'],
+          edges: ['t2-row', 'row-ok'],
+          subs: { ok: '900, T2: UPDATE 0' },
+        },
+      ],
+    },
+    {
+      title: 'REPEATABLE READ',
+      path: 'T1 snapshot 1000 → T2 commit 900 → T1 UPDATE → ✗ 40001; if T2 had rolled back → ✓ proceeds',
+      summary: 'First updater wins: T1 may not change a row its snapshot does not show.',
+      steps: [
+        {
+          title: 'T1 writes a newer row',
+          note: 'T1\'s snapshot says 1000 but the newest committed version (900) is from a transaction outside the snapshot. Writing it would lose T2\'s change or base T1\'s logic on stale data, so PostgreSQL aborts T1. The final balance stays 900. The same happened with SELECT … FOR UPDATE instead of UPDATE.',
+          code: "BEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT balance FROM accounts WHERE id = 1;   -- 1000.00\n-- T2 commits\nUPDATE accounts SET balance = balance - 50 WHERE id = 1;\n-- ERROR:  could not serialize access due to concurrent update",
+          active: ['t1', 't2', 'row', 'err'],
+          edges: ['t2-row', 't1-row', 'row-err'],
+          subs: { err: 'SQLSTATE 40001' },
+        },
+        {
+          title: 'Only a commit counts',
+          note: 'When the blocking transaction rolled back instead of committing, the waiting REPEATABLE READ UPDATE went ahead (balance 900 after its own −100). And when the blocking transaction committed instead, the waiting REPEATABLE READ UPDATE got the same 40001.',
+          active: ['t1', 'row', 'ok'],
+          edges: ['t1-row', 'row-ok'],
+          subs: { ok: 'T2 rolled back: 900' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL InnoDB
+
+<Flow
+  title="MySQL: REPEATABLE READ writes on the newest row"
+  height={260}
+  nodes={[
+    { id: 't1', label: 'T1', sub: 'read 1000, then write', x: 20, y: 20, w: 200 },
+    { id: 'row', label: 'accounts id 1', sub: 'balance 1000', x: 300, y: 20, w: 200 },
+    { id: 't2', label: 'T2', sub: 'balance − 100, commit', x: 580, y: 20, w: 200 },
+    { id: 'ok', label: '✓ Correct balance', sub: '', x: 20, y: 180, w: 220 },
+    { id: 'err', label: '✗ Nothing updated', sub: '', x: 290, y: 180, w: 220 },
+    { id: 'bad', label: '✗ Lost update', sub: '', x: 560, y: 180, w: 220 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row', label: 'write' },
+    { id: 't2-row', from: 't2', to: 'row', label: 'commit' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-err', from: 'row', to: 'err' },
+    { id: 'row-bad', from: 'row', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'Relative update',
+      path: 'T1 snapshot 1000 → T2 commit 900 → T1 balance − 50 → ✓ 850, no error',
+      summary: 'Unlike PostgreSQL REPEATABLE READ, InnoDB does not abort.',
+      steps: [
+        {
+          title: 'The UPDATE reads the newest row',
+          note: 'An UPDATE is a locking operation: it reads the newest committed version (900), not T1\'s read view. Result 850, and T1\'s own SELECT afterwards also showed 850 because a transaction always sees its own changes.',
+          code: "START TRANSACTION;\nSELECT balance FROM accounts WHERE id = 1;   -- 1000.00 (read view)\n-- T2 commits 900\nUPDATE accounts SET balance = balance - 50 WHERE id = 1;\nSELECT balance FROM accounts WHERE id = 1;   -- 850.00",
+          active: ['t1', 't2', 'row', 'ok'],
+          edges: ['t2-row', 't1-row', 'row-ok'],
+          subs: { ok: '850' },
+        },
+      ],
+    },
+    {
+      title: 'Absolute update',
+      path: 'T1 read 1000, computes 950 → T2 commit 900 → T1 SET 950 → ✗ lost update',
+      summary: 'REPEATABLE READ does not stop lost updates in InnoDB.',
+      steps: [
+        {
+          title: 'T1 overwrites',
+          note: 'Final balance 950: T2\'s −100 is gone, with no error. In PostgreSQL REPEATABLE READ the same code fails with 40001; in MySQL it needs SELECT … FOR UPDATE (Concept 4) or a compare-and-set.',
+          code: 'UPDATE accounts SET balance = 950.00 WHERE id = 1;\nCOMMIT;   -- final 950.00',
+          active: ['t1', 't2', 'row', 'bad'],
+          edges: ['t2-row', 't1-row', 'row-bad'],
+          subs: { bad: '950: −100 lost' },
+        },
+      ],
+    },
+    {
+      title: 'Compare-and-set',
+      path: 'T1 read 1000 → T2 commit 900 → UPDATE … WHERE balance = 1000 → ✗ 0 rows (detected)',
+      summary: 'Putting the expected old value in the WHERE turns a silent overwrite into a detectable miss.',
+      steps: [
+        {
+          title: 'The condition fails on the newest row',
+          note: 'The UPDATE checks balance = 1000 against the newest version (900): ROW_COUNT() = 0. The application sees 0 rows, re-reads and retries. Session 7 builds optimistic locking on this.',
+          code: 'UPDATE accounts SET balance = 950.00 WHERE id = 1 AND balance = 1000.00;\nSELECT ROW_COUNT();   -- 0',
+          active: ['t1', 't2', 'row', 'err'],
+          edges: ['t2-row', 't1-row', 'row-err'],
+          subs: { err: 'ROW_COUNT() = 0' },
+        },
+      ],
+    },
+    {
+      title: 'UPDATE sees rows the SELECT did not',
+      path: 'count B01 = 1000 → T2 inserts a B01 account → count still 1000 → UPDATE B01 → 1,001 rows',
+      summary: 'Writes are not limited to the snapshot, and after the write the snapshot shows the new row.',
+      steps: [
+        {
+          title: 'The snapshot hides the new row',
+          note: 'T1 counted 1000 accounts in B01. T2 inserted account 10001 in B01 and committed. T1\'s second count: still 1000.',
+          code: "SELECT COUNT(*) FROM accounts WHERE branch = 'B01';   -- 1000, then 1000",
+          active: ['t1', 't2', 'row'],
+          edges: ['t2-row'],
+          subs: { row: 'B01: 1001 rows (newest)' },
+        },
+        {
+          title: 'The UPDATE does not',
+          note: 'UPDATE … WHERE branch = \'B01\' changed 1,001 rows, including the one T1 could not see. Afterwards T1\'s count returned 1001: rows a transaction modified become visible to it. A batch that "updates what it counted" can touch rows it never counted.',
+          code: "UPDATE accounts SET version = version + 1 WHERE branch = 'B01';   -- 1001 rows\nSELECT COUNT(*) FROM accounts WHERE branch = 'B01';                -- 1001",
+          active: ['t1', 'row', 'bad'],
+          edges: ['t1-row', 'row-bad'],
+          subs: { bad: '1,001 updated, 1,000 counted' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: conflicting writes abort at once"
+  height={260}
+  nodes={[
+    { id: 't1', label: 'T1 (transaction)', sub: 'read 1000, then write', x: 20, y: 20, w: 200 },
+    { id: 'row', label: 'accounts _id 1', sub: 'balance 1000', x: 300, y: 20, w: 200 },
+    { id: 't2', label: 'T2', sub: '$inc −100', x: 580, y: 20, w: 200 },
+    { id: 'ok', label: '✓ Correct balance', sub: '', x: 20, y: 180, w: 220 },
+    { id: 'err', label: '✗ WriteConflict', sub: '', x: 290, y: 180, w: 220 },
+    { id: 'bad', label: '✗ Lost update', sub: 'not possible here', x: 560, y: 180, w: 220 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row', label: 'write' },
+    { id: 't2-row', from: 't2', to: 'row', label: 'commit' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-err', from: 'row', to: 'err' },
+  ]}
+  cases={[
+    {
+      title: 'Write after a newer commit',
+      path: 'T1 snapshot 1000 → T2 commit 900 → T1 updateOne → ✗ WriteConflict',
+      summary: 'Snapshot isolation with first-updater-wins, like PostgreSQL REPEATABLE READ.',
+      steps: [
+        {
+          title: 'T1 writes a document changed after its snapshot',
+          note: 'The update fails with WriteConflict and the error carries the label TransientTransactionError: the whole transaction must be retried. Final balance 900 (T2 only). A lost update cannot happen inside a transaction.',
+          code: "s.startTransaction({ readConcern: { level: 'snapshot' } });\na.findOne({ _id: 1 }).balance;   // 1000.00\n// T2 commits 900\na.updateOne({ _id: 1 }, { $inc: { balance: NumberDecimal('-50') } });\n// WriteConflict, errorLabels: ['TransientTransactionError']",
+          active: ['t1', 't2', 'row', 'err', 'bad'],
+          edges: ['t2-row', 't1-row', 'row-err'],
+          subs: { err: 'TransientTransactionError' },
+        },
+      ],
+    },
+    {
+      title: 'Two open transactions, same document',
+      path: 'T1 updates, holds → T2 updates → ✗ WriteConflict after 7 ms (no waiting)',
+      summary: 'MongoDB does not queue the second transaction behind the first.',
+      steps: [
+        {
+          title: 'The second writer fails fast',
+          note: 'T1 updated _id 1 and held its transaction open for 3 s. T2, in its own transaction, tried to update the same document and failed after 7 ms. maxTransactionLockRequestTimeoutMillis is 5 ms by default; the conflict itself is detected by the storage engine immediately. T1 then committed normally.',
+          code: "// T2\ns.startTransaction();\na.updateOne({ _id: 1 }, { $inc: { balance: NumberDecimal('-50') } });\n// WriteConflict after 7 ms",
+          active: ['t1', 't2', 'row', 'err'],
+          edges: ['t1-row', 't2-row', 'row-err'],
+          subs: { row: 'uncommitted write by T1', err: 'T2 after 7 ms' },
+        },
+      ],
+    },
+    {
+      title: 'Plain write vs open transaction',
+      path: 'T1 transaction updates, holds 3 s → T2 plain updateOne waits ≈ 2 s → ✓ 850',
+      summary: 'Writes outside a transaction are retried internally until the transaction ends.',
+      steps: [
+        {
+          title: 'The single write waits instead',
+          note: 'A non-transactional updateOne hit the same WriteConflict internally, but the server retried it until T1 committed: it returned after 2,086 ms with the correct 850 (1000 − 100 − 50).',
+          code: "db.accounts.updateOne({ _id: 1 }, { $inc: { balance: NumberDecimal('-50') } });   // 2,086 ms",
+          active: ['t1', 't2', 'row', 'ok'],
+          edges: ['t1-row', 't2-row', 'row-ok'],
+          subs: { ok: '850 after 2,086 ms' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Summary of the same test
+
+| T1 reads 1000, T2 commits 900, T1 writes | PG RC | PG RR | MySQL RR | MongoDB transaction |
+|---|---|---|---|---|
+| `balance − 50` | ✓ 850 | ✗ 40001 | ✓ 850 | ✗ WriteConflict |
+| `SET balance = 950` (computed in app) | ✗ 950, lost update | ✗ 40001 | ✗ 950, lost update | ✗ WriteConflict |
+| `… WHERE balance = 1000` | ✓ 0 rows | ✗ 40001 | ✓ 0 rows | ✗ WriteConflict |
+
+<Pitfall>
+"We run REPEATABLE READ, so lost updates cannot happen" is true in PostgreSQL and false in MySQL. The same read-then-write code that fails safely with 40001 in PostgreSQL silently overwrites in InnoDB. In MySQL, protect read-modify-write with `SELECT … FOR UPDATE`, a compare-and-set `WHERE`, or a relative `UPDATE`.
+</Pitfall>
+
+## Real-world scenario: the stock reservation
+
+A checkout service reads `stock`, checks `stock >= qty` in code, then writes `stock = stock_read - qty`. In production two checkouts of the last item both succeed and stock ends at 0 instead of −1 being rejected.
+
+| Engine / level | What happens (same mechanism as the balance test above) | Fix |
+|---|---|---|
+| PostgreSQL RC, MySQL RC / RR | Both read 1, both wrote 0: one sale is not reflected (lost update) | One statement: `UPDATE inventory SET stock = stock - 1 WHERE sku = ? AND stock >= 1`, check the row count |
+| PostgreSQL RR | The second checkout got 40001 | Retry the transaction (Concept 5) |
+| MongoDB | The second transaction got WriteConflict | `withTransaction()` retries; or a single `updateOne` with `stock: { $gte: 1 }` in the filter |
+
+## Why this matters for transactions
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 3: write skew | Conflicts on the **same** row are caught; conflicts across different rows are not |
+| Concept 4: locking reads | `FOR UPDATE` makes T2 wait instead of conflicting later |
+| Concept 5: cost under contention | Every 40001 or WriteConflict is a retry |
+| Session 7: application patterns | Relative updates, compare-and-set and version columns |
+
+## Key takeaways
+
+1. A write always targets the newest version; the engines differ in what they do when the snapshot is older.
+2. PostgreSQL READ COMMITTED writes on the newest row and re-checks `WHERE` after waiting; REPEATABLE READ aborts with 40001.
+3. MySQL REPEATABLE READ never aborts for this: relative updates stay correct, absolute ones lose updates, and UPDATE can touch rows the snapshot did not show.
+4. MongoDB transactions abort with WriteConflict (TransientTransactionError) within milliseconds; single writes wait and retry internally.
+5. Relative updates and compare-and-set conditions are correct at every level.
+
+## Check questions
+
+1. Why did `UPDATE … SET balance = balance − 50` give 850 in PostgreSQL READ COMMITTED, although T1 had read 1000?
+2. What does PostgreSQL READ COMMITTED do when an UPDATE waits for a row lock and the row changes meanwhile?
+3. Why does PostgreSQL REPEATABLE READ abort T1 instead of applying its update to 900?
+4. The same code runs on PostgreSQL REPEATABLE READ and MySQL REPEATABLE READ. In which does it lose an update, and why?
+5. A MySQL REPEATABLE READ transaction counted 1,000 rows and then updated 1,001. Explain.
+6. Why did T2's transaction get WriteConflict after 7 ms, while a plain `updateOne` waited 2 s and succeeded?
+7. Rewrite "read stock, check, write stock − qty" so that it is correct at every level in all three engines.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-3-isolation-levels/concept-2-writing-a-changed-row/answers">Worked answers to Q1–Q7</DeepDive>

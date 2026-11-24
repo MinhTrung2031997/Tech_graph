@@ -1,0 +1,98 @@
+---
+title: "Answers: Isolation levels session quiz"
+description: "Worked answers to the Session 3 quiz."
+companion: "answers"
+tags: ["transactions", "isolation", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-in-applications/"
+---
+
+<Tldr>
+Know, per engine, when the snapshot is taken, what a write does with a newer row, which level catches write skew, and what each level costs when rows are hot.
+</Tldr>
+
+## Q1. Two reads around an API call
+
+**Question:** a transaction reads a balance, calls a payment API for 3 s, then reads it again. At which levels and in which engines can the two reads differ?
+
+| Engine | Can differ | Cannot differ (plain reads) |
+|---|---|---|
+| PostgreSQL | READ COMMITTED (default) | REPEATABLE READ, SERIALIZABLE |
+| MySQL | READ COMMITTED; also at REPEATABLE READ if the second read is a locking read (`FOR UPDATE`) | REPEATABLE READ plain reads (default), SERIALIZABLE |
+| MongoDB | Two operations outside a transaction | Inside a transaction (but a 3 s call keeps it open; the limit is 60 s) |
+
+Separately: holding a transaction open across an external call is itself a problem (Session 8).
+
+> **Common mistake:** assuming MySQL's REPEATABLE READ makes every read in the transaction repeatable.
+
+## Q2. Lost update in MySQL
+
+**Question:** your service runs on MySQL at REPEATABLE READ and does "read balance, compute, `UPDATE … SET balance = ?`". Show the lost update and give two fixes.
+
+T1 reads 1000; T2 commits −100 (900); T1 writes 1000 − 50 = 950. Final 950: T2's withdrawal is gone, with no error (measured in Concept 2). Fixes, any two:
+
+- Read with `SELECT … FOR UPDATE` so T2 waits (final 850 in the lab).
+- Write relatively: `UPDATE accounts SET balance = balance - 50 WHERE id = ?`.
+- Compare-and-set: `… WHERE id = ? AND balance = :read_value` and retry when the row count is 0, or a `version` column (Session 7).
+
+> **Common mistake:** "raise the level to REPEATABLE READ"; it already is.
+
+## Q3. Lost update vs write skew in PostgreSQL
+
+**Question:** explain why PostgreSQL REPEATABLE READ prevented the lost update but not write skew.
+
+A lost update needs two transactions to write the **same row**; REPEATABLE READ refuses to write a row that was committed after the snapshot (first updater wins, 40001). Write skew involves **different rows**: each transaction writes only its own account, so no write ever meets a newer version, and the rule spanning both rows is not checked. Only SERIALIZABLE tracks the reads that the decision was based on.
+
+> **Common mistake:** thinking 40001 at REPEATABLE READ means write skew was detected.
+
+## Q4. SERIALIZABLE failure without a conflict
+
+**Question:** a PostgreSQL SERIALIZABLE transaction failed although it touched only rows no one else wrote. Give two possible reasons.
+
+1. **Coarse SIRead locks**: its read took a page lock (more than two tuples on a page) or a relation lock (sequential scan), and another transaction wrote elsewhere on that page or table (both measured in Concept 3).
+2. **It read rows others wrote**: it did not write them, but it read them; a read/write dependency in each direction (it read something another wrote, and another read something it wrote) is enough. It may have been chosen as the pivot of a pattern involving transactions it never met directly.
+
+The memory limit `max_pred_locks_per_transaction` also promotes locks to coarser levels when exceeded.
+
+> **Common mistake:** checking only what the failed transaction wrote.
+
+## Q5. Why MySQL SERIALIZABLE deadlocks
+
+**Question:** why is MySQL's SERIALIZABLE level more likely to produce deadlocks than PostgreSQL's?
+
+MySQL implements SERIALIZABLE with real **shared locks** on everything a transaction reads. Two transactions that read the same row and then write it each wait for the other's shared lock to be released: a deadlock (29% of hot transfers in Concept 5). PostgreSQL's SIRead locks never block anyone, so it cannot deadlock on them; it aborts with 40001 instead.
+
+> **Common mistake:** concluding PostgreSQL SERIALIZABLE is cheaper; on the same hot rows it aborted 70% of attempts.
+
+## Q6. withTransaction
+
+**Question:** what does `withTransaction()` do on `TransientTransactionError`, and why can it run your callback many times?
+
+It aborts the failed attempt, starts a new transaction and calls the callback again, until it commits or a time limit (120 s by default in the drivers) is reached. It also retries the commit on `UnknownTransactionCommitResult`. Each WriteConflict means another attempt: 12,194 callback runs for 8,000 transfers on the hot accounts. The callback must therefore be free of external side effects and compute everything from data read inside it.
+
+> **Common mistake:** counting the callback runs as the number of business operations (for example in metrics).
+
+## Q7. Hot transfers: level per engine
+
+**Question:** on 10 hot accounts, which level would you choose for transfers in each engine, and what code must accompany it?
+
+| Engine | Choice | Accompanying code |
+|---|---|---|
+| PostgreSQL | READ COMMITTED with one relative `UPDATE` (and `CHECK (balance >= 0)` or `WHERE balance >= amount`) | Check the row count; consistent row order or one statement for both rows |
+| MySQL | READ COMMITTED or REPEATABLE READ, relative `UPDATE`, or `SELECT … FOR UPDATE` if the balance must be read first | Same; handle 1213 in case of lock-order deadlocks |
+| MongoDB | One transaction per transfer with `withTransaction()` | Idempotent callback; consider fewer hot documents |
+
+Use SERIALIZABLE only for transactions that enforce a rule spanning several rows, with retries.
+
+> **Common mistake:** picking SERIALIZABLE for hot transfers: 70% aborts in PostgreSQL, 29% deadlocks in MySQL.
+
+## Q8. Immediate read view in MySQL
+
+**Question:** which statement starts a read view immediately in MySQL, and when do you need it?
+
+`START TRANSACTION WITH CONSISTENT SNAPSHOT`. A plain `START TRANSACTION` creates the read view at the first consistent read (the lab's run read 900 after waiting), so anything committed in between is visible. You need the immediate form when the snapshot must correspond to the start of the transaction, for example a consistent export of several tables (`mysqldump --single-transaction`) or when the transaction records a position (binlog, timestamp) at the start and later reads must match it.
+
+> **Common mistake:** believing `START TRANSACTION` alone fixes the snapshot at that moment.

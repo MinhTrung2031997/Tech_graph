@@ -1,0 +1,240 @@
+---
+title: "Lab and session quiz: Isolation levels per engine"
+description: "Reproduce when each engine takes its snapshot, what happens when a transaction writes a row changed after its snapshot, write skew at REPEATABLE READ vs SERIALIZABLE, locking reads, and the failure rate of each level on 10 hot accounts with pgbench, a MySQL stored procedure and parallel mongosh clients."
+type: "how-to"
+tags: ["transactions", "isolation", "postgresql", "mysql", "mongodb", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html"
+  - "https://www.postgresql.org/docs/current/pgbench.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions/"
+---
+
+<Tldr>
+Uses the containers and the `bank` database from the [Session 1 lab](/blogs/databases/transactions/session-1-transaction-guarantees/lab): PostgreSQL `idx-pg`, MySQL `idx-mysql`, and the replica set `tx-mongo` (multi-document transactions do not work on a standalone `mongod`). Every exercise needs **two terminals**, T1 and T2; start T1 first and run T2 while T1 is sleeping. Before each run, write down what you expect T1 to read and what the final balance will be.
+</Tldr>
+
+## Setup
+
+Define these in every terminal (bash or zsh):
+
+```bash
+pgb() { docker exec -it idx-pg psql -U postgres -d bank "$@"; }
+myb() { docker exec -it idx-mysql mysql -uroot -plab bank "$@"; }
+mgb() { docker exec -it tx-mongo mongosh --quiet bank "$@"; }
+```
+
+Reset the ten accounts used below before every exercise:
+
+```sql
+-- PostgreSQL and MySQL
+UPDATE accounts SET balance = 1000, version = 1 WHERE id <= 10;
+DELETE FROM accounts WHERE id > 10000;
+```
+
+```js
+// MongoDB
+db.accounts.updateMany({ _id: { $lte: 10 } }, { $set: { balance: NumberDecimal('1000.00'), version: 1 } });
+db.accounts.deleteMany({ _id: { $gt: 10000 } });
+```
+
+## Exercise 1: when the snapshot starts (Concept 1)
+
+PostgreSQL, T1 (all statements in one psql session):
+
+```sql
+BEGIN ISOLATION LEVEL READ COMMITTED;            -- then repeat with REPEATABLE READ
+SELECT balance FROM accounts WHERE id = 1;
+SELECT pg_sleep(10);                             -- T2 runs now
+SELECT balance FROM accounts WHERE id = 1;
+COMMIT;
+```
+
+T2: `UPDATE accounts SET balance = balance - 100 WHERE id = 1;`
+
+| Level | Expected reads (lab) |
+|---|---|
+| READ COMMITTED | 1000, 900 |
+| REPEATABLE READ | 1000, 1000 |
+| REPEATABLE READ, but replace the first `SELECT` with `\! sleep 10` | 900 (the snapshot is taken by the first statement) |
+
+MySQL: the same with `START TRANSACTION` and `DO SLEEP(10)`; then compare `START TRANSACTION WITH CONSISTENT SNAPSHOT` followed directly by `DO SLEEP(10)` (lab: 1000) with plain `START TRANSACTION` (lab: 900). Phantoms: replace the read with `SELECT COUNT(*) FROM accounts WHERE branch = 'B01'` and let T2 run `INSERT INTO accounts VALUES (10001, 'owner-10001', 'B01', 500, 1)`.
+
+MongoDB, T1:
+
+```js
+const s = db.getMongo().startSession(); const a = s.getDatabase('bank').accounts;
+s.startTransaction({ readConcern: { level: 'snapshot' } });
+a.findOne({ _id: 1 }).balance;     // 1000
+sleep(10000);                      // T2: db.accounts.updateOne({ _id: 1 }, { $inc: { balance: NumberDecimal('-100') } })
+a.findOne({ _id: 1 }).balance;     // still 1000
+s.commitTransaction();
+db.accounts.findOne({ _id: 1 }).balance;   // 900
+```
+
+## Exercise 2: writing a changed row (Concept 2)
+
+T1 reads, sleeps, writes; T2 commits `balance − 100` during the sleep.
+
+```sql
+-- PostgreSQL T1
+BEGIN ISOLATION LEVEL REPEATABLE READ;           -- then READ COMMITTED
+SELECT balance FROM accounts WHERE id = 1;
+SELECT pg_sleep(10);
+UPDATE accounts SET balance = balance - 50 WHERE id = 1;   -- RR: ERROR … concurrent update
+COMMIT;
+```
+
+```sql
+-- MySQL T1 (REPEATABLE READ, the default)
+START TRANSACTION;
+SELECT balance FROM accounts WHERE id = 1;       -- 1000
+DO SLEEP(10);
+UPDATE accounts SET balance = 950.00 WHERE id = 1;   -- absolute value from the read
+COMMIT;
+SELECT balance FROM accounts WHERE id = 1;       -- 950: T2's −100 is lost
+```
+
+Repeat the MySQL run with `WHERE id = 1 AND balance = 1000.00` and check `SELECT ROW_COUNT();` (lab: 0).
+
+PostgreSQL READ COMMITTED re-check: T1 `BEGIN; UPDATE accounts SET balance = balance - 100 WHERE id = 1 AND balance >= 1000; SELECT pg_sleep(10); COMMIT;`, T2 the same statement. T2 waits, then reports `UPDATE 0`.
+
+MongoDB T1 inside a transaction: read, `sleep(10000)`, then `a.updateOne({ _id: 1 }, { $inc: { balance: NumberDecimal('-50') } })`. Expected: `WriteConflict` with label `TransientTransactionError`. Then run the write in T2 as a **transaction** while T1 holds an uncommitted update (lab: WriteConflict after 7 ms), and as a plain `updateOne` (lab: waited until T1 committed).
+
+## Exercise 3: write skew (Concept 3)
+
+Both terminals run this, T1 withdrawing from account 1 and T2 from account 2, starting within the sleep:
+
+```sql
+BEGIN ISOLATION LEVEL REPEATABLE READ;           -- then SERIALIZABLE
+SELECT sum(balance) FROM accounts WHERE id IN (1, 2);   -- 2000: "900 is fine"
+SELECT pg_sleep(5);
+UPDATE accounts SET balance = balance - 900 WHERE id = 1;   -- T2: id = 2
+COMMIT;
+SELECT sum(balance) FROM accounts WHERE id IN (1, 2);
+```
+
+Expected: REPEATABLE READ 200; SERIALIZABLE one transaction fails with `could not serialize access due to read/write dependencies among transactions` and the sum is 1100. While T1 sleeps, look at its predicate locks from a third terminal:
+
+```sql
+SELECT pid, locktype, relation::regclass, page, tuple FROM pg_locks WHERE mode = 'SIReadLock';
+```
+
+Then replace `WHERE id IN (1, 2)` with `WHERE branch = 'B01'` (T1) and `'B02'` (T2), and update ids 1 and 2: one transaction still fails, because the sequential scan locked the whole table.
+
+MySQL: the same script with `SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE; START TRANSACTION;` gives `ERROR 1213 (40001): Deadlock found`. MongoDB: the transaction version gives 200; add `a.updateOne({ _id: 2 }, { $inc: { version: 1 } })` after the read in T1 (and `_id: 1` in T2) and one transaction fails with WriteConflict.
+
+## Exercise 4: locking reads (Concept 4)
+
+```sql
+-- MySQL T1
+START TRANSACTION;
+SELECT balance FROM accounts WHERE id = 1;               -- 1000
+DO SLEEP(10);                                            -- T2 commits −100
+SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;    -- 900
+SELECT balance FROM accounts WHERE id = 1;               -- 1000
+COMMIT;
+```
+
+Read-modify-write with locks in both terminals (T2 starts during T1's sleep):
+
+```sql
+-- MySQL
+START TRANSACTION;
+SELECT balance INTO @b FROM accounts WHERE id = 1 FOR UPDATE;
+DO SLEEP(5);                                             -- T2: no sleep, amount 100
+UPDATE accounts SET balance = @b - 50 WHERE id = 1;
+COMMIT;
+-- final: 850
+```
+
+```sql
+-- PostgreSQL (psql \gset stores the column in :b)
+BEGIN;
+SELECT balance AS b FROM accounts WHERE id = 1 FOR UPDATE \gset
+SELECT pg_sleep(5);
+UPDATE accounts SET balance = :b - 50 WHERE id = 1;
+COMMIT;
+```
+
+While T1 holds the lock, try `… FOR UPDATE NOWAIT` (PostgreSQL 55P03, MySQL 3572) and `SELECT id FROM accounts WHERE id IN (1, 2) FOR UPDATE SKIP LOCKED` (returns 2).
+
+## Exercise 5: failure rate under contention (Concept 5)
+
+PostgreSQL, with pgbench inside the container. Create the script once:
+
+```bash
+docker exec -i idx-pg sh -c 'cat > /tmp/transfer.sql' <<'EOF'
+\set a random(1, 10)
+\set b 1 + (:a + random(0, 8)) % 10
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT balance FROM accounts WHERE id = :a;
+UPDATE accounts SET balance = balance + CASE WHEN id = :a THEN -1 ELSE 1 END WHERE id IN (:a, :b);
+COMMIT;
+EOF
+docker exec idx-pg pgbench -U postgres -n -c 8 -j 4 -T 10 --max-tries=1 --failures-detailed -f /tmp/transfer.sql bank
+```
+
+Change the level (READ COMMITTED, SERIALIZABLE), then `--max-tries=10`, then `random(1, 10000)` and `% 10000` for the spread-out version. Record "number of failed transactions" and "transactions retried".
+
+MySQL, a stored procedure that counts failures:
+
+```sql
+DELIMITER //
+CREATE PROCEDURE transfer_bench(IN n INT, IN k INT)
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  DECLARE a, b INT;
+  DECLARE bal DECIMAL(12,2);
+  DECLARE ok, deadlocks, timeouts INT DEFAULT 0;
+  WHILE i < n DO
+    SET a = 1 + FLOOR(RAND() * k), b = 1 + (a + FLOOR(RAND() * 9)) % k;
+    BEGIN
+      DECLARE EXIT HANDLER FOR 1213 BEGIN ROLLBACK; SET deadlocks = deadlocks + 1; END;
+      DECLARE EXIT HANDLER FOR 1205 BEGIN ROLLBACK; SET timeouts = timeouts + 1; END;
+      START TRANSACTION;
+      SELECT balance INTO bal FROM accounts WHERE id = a;
+      UPDATE accounts SET balance = balance + IF(id = a, -1, 1) WHERE id IN (a, b);
+      COMMIT;
+      SET ok = ok + 1;
+    END;
+    SET i = i + 1;
+  END WHILE;
+  SELECT ok, deadlocks, timeouts;
+END //
+DELIMITER ;
+```
+
+```bash
+for c in 1 2 3 4 5 6 7 8; do
+  docker exec idx-mysql mysql -uroot -plab bank -N -e \
+    "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE; CALL transfer_bench(1000, 10);" &
+done; wait
+```
+
+MongoDB: save the client loop from [Concept 5](/blogs/databases/transactions/session-3-isolation-levels/concept-5-cost-under-contention) (1,000 transfers in transactions, counting `WriteConflict`) as `/tmp/bench.js` inside `tx-mongo` and start 8 copies with `docker exec tx-mongo mongosh --quiet bank /tmp/bench.js &`. Then wrap the body in `s.withTransaction(…)` and count callback runs.
+
+| Run (lab) | Failed / attempts |
+|---|---|
+| PostgreSQL RC, hot | 0 |
+| PostgreSQL RR, hot, no retry | 51,125 / 73,693 (69.4%) |
+| PostgreSQL SERIALIZABLE, hot, no retry | 38,967 / 55,620 (70.1%) |
+| MySQL SERIALIZABLE, hot | 2,302 deadlocks / 8,000 |
+| MongoDB, hot | 3,743 WriteConflict / 8,000; `withTransaction`: 12,194 attempts for 8,000 |
+| All engines, spread over 10,000 accounts | ≤ 0.3% |
+
+Check after every run that `SELECT sum(balance) FROM accounts WHERE id <= 10` is still 10000.00.
+
+## Session quiz
+
+1. A transaction reads a balance, calls a payment API for 3 s, then reads it again. At which levels and in which engines can the two reads differ?
+2. Your service runs on MySQL at REPEATABLE READ and does "read balance, compute, `UPDATE … SET balance = ?`". Show the lost update and give two fixes.
+3. Explain why PostgreSQL REPEATABLE READ prevented the lost update but not write skew.
+4. A PostgreSQL SERIALIZABLE transaction failed although it touched only rows no one else wrote. Give two possible reasons.
+5. Why is MySQL's SERIALIZABLE level more likely to produce deadlocks than PostgreSQL's?
+6. What does `withTransaction()` do on `TransientTransactionError`, and why can it run your callback many times?
+7. On 10 hot accounts, which level would you choose for transfers in each engine, and what code must accompany it?
+8. Which statement starts a read view immediately in MySQL, and when do you need it?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-3-isolation-levels/lab/answers">Answers to the session quiz</DeepDive>
