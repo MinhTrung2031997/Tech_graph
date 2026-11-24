@@ -1,6 +1,7 @@
 {
   "title": "Transactions",
   "pages": [
-    "session-1-transaction-guarantees"
+    "session-1-transaction-guarantees",
+    "session-2-anomalies"
   ]
 }

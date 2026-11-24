@@ -1,0 +1,264 @@
+---
+title: "Concept 5: Write skew"
+description: "Two transactions check a rule that spans two accounts (their total must stay at least 1,000), each withdraws 900 from a different account, and both commit: total 200. Allowed by PostgreSQL and MySQL REPEATABLE READ and by MongoDB transactions; stopped by PostgreSQL SERIALIZABLE (40001), MySQL SERIALIZABLE (a deadlock), SELECT … FOR UPDATE on both rows, or a write to a shared guard document in MongoDB."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "isolation", "write-skew", "serializable"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html#XACT-SERIALIZABLE"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html#isolevel_serializable"
+  - "https://www.mongodb.com/docs/manual/core/transactions-production-consideration/"
+---
+
+<Tldr>
+**Write skew** is the anomaly snapshots cannot catch. Accounts 30 and 31 belong to one family, with a rule that their combined balance must stay at least 1,000 (both start at 1,000). T1 checks the total (2,000), withdraws 900 from account 30; T2 checks the total (2,000), withdraws 900 from account 31. They write **different rows**, so no write conflict exists, and both commit: total **200**. That happened at PostgreSQL and MySQL **REPEATABLE READ** and in **MongoDB transactions**. **PostgreSQL SERIALIZABLE** aborted T2 ("could not serialize access due to read/write dependencies", 40001), **MySQL SERIALIZABLE** turned the reads into shared locks and T2 died in a **deadlock**, and locking both rows with `FOR UPDATE` made T2 wait, see 1,100 and refuse. MongoDB has no SERIALIZABLE level: a write to a shared **guard document** forced a WriteConflict.
+</Tldr>
+
+## Why snapshots miss it
+
+| Step | T1 | T2 |
+|---|---|---|
+| Read the rule's input | total of 30 + 31 = 2,000 | total of 30 + 31 = 2,000 |
+| Decide | 2,000 − 900 ≥ 1,000 ✓ | 2,000 − 900 ≥ 1,000 ✓ |
+| Write | account 30: 1,000 → 100 | account 31: 1,000 → 100 |
+| Conflict check (snapshot isolation) | No other transaction wrote **row 30** | No other transaction wrote **row 31** |
+| Result | Commit | Commit → total 200 ✗ |
+
+Each transaction's decision depended on a row the **other** one changed. Snapshot isolation only compares write sets, so it sees nothing wrong.
+
+| Term | Meaning |
+|---|---|
+| Write skew | Two transactions read overlapping data, write disjoint data, and together break a rule each one checked |
+| SERIALIZABLE | The result must equal some one-at-a-time order of the transactions |
+| SSI | Serializable Snapshot Isolation: PostgreSQL's SERIALIZABLE, which tracks read/write dependencies |
+| **✓ Rule kept** | Total of accounts 30 and 31 ≥ 1,000 (it ended at 1,100) |
+| **✗ Rule broken** | Total 200 |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: two withdrawals against one rule"
+  height={300}
+  nodes={[
+    { id: 't1', label: 'T1', sub: 'checks total · −900 from 30', x: 20, y: 20, w: 240 },
+    { id: 'rows', label: 'Accounts 30 + 31', sub: 'total 2,000', x: 320, y: 90, w: 180 },
+    { id: 't2', label: 'T2', sub: 'checks total · −900 from 31', x: 20, y: 180, w: 240 },
+    { id: 'ok', label: '✓ Rule kept', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'bad', label: '✗ Rule broken', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-rows', from: 't1', to: 'rows' },
+    { id: 't2-rows', from: 't2', to: 'rows' },
+    { id: 'rows-ok', from: 'rows', to: 'ok' },
+    { id: 'rows-bad', from: 'rows', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'REPEATABLE READ',
+      path: 'both see 2,000 → T1 −900 on 30, commit → T2 −900 on 31, commit → ✗ total 200',
+      summary: 'No row was written twice, so snapshot isolation finds no conflict.',
+      subs: { bad: 'total 200.00' },
+      steps: [
+        {
+          title: 'Both check the rule',
+          code: "BEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT sum(balance) FROM accounts WHERE id IN (30, 31);   -- 2000.00 (T1 and T2)",
+          note: 'Both decide that a withdrawal of 900 keeps the total at 1,100 or more.',
+          active: ['t1', 't2', 'rows'],
+          edges: ['t1-rows', 't2-rows'],
+        },
+        {
+          title: 'Different rows, both commit',
+          code: 'T1: UPDATE accounts SET balance = balance - 900 WHERE id = 30; COMMIT;\nT2: UPDATE accounts SET balance = balance - 900 WHERE id = 31; COMMIT;',
+          note: 'Final total 200.00: each transaction was right about its snapshot and wrong about the combined result.',
+          active: ['t1', 't2', 'rows', 'bad'],
+          edges: ['t1-rows', 't2-rows', 'rows-bad'],
+          subs: { rows: '100 + 100' },
+        },
+      ],
+    },
+    {
+      title: 'SERIALIZABLE',
+      path: 'both see 2,000 → T1 commits → T2 UPDATE ✗ 40001 → ✓ total 1,100',
+      summary: 'SSI notices that each transaction read what the other wrote: a dangerous structure.',
+      subs: { ok: 'total 1,100.00' },
+      steps: [
+        {
+          title: 'T2 is cancelled',
+          code: "BEGIN ISOLATION LEVEL SERIALIZABLE;\n…\nUPDATE accounts SET balance = balance - 900 WHERE id = 31;\n-- ERROR:  could not serialize access due to read/write dependencies among transactions\n-- DETAIL:  Reason code: Canceled on identification as a pivot, during write.\n-- HINT:  The transaction might succeed if retried.",
+          note: 'PostgreSQL tracks predicate (SIRead) locks on what each serializable transaction read. T2 read rows that T1 wrote and T1 read rows that T2 is writing: no serial order can explain both, so one is aborted. On retry, T2 sees 1,100 and refuses the withdrawal.',
+          active: ['t1', 't2', 'rows', 'ok'],
+          edges: ['t1-rows', 't2-rows', 'rows-ok'],
+        },
+      ],
+    },
+    {
+      title: 'FOR UPDATE on both rows',
+      path: 'T1 locks 30 and 31 → T2 waits 0.7 s → T2 sees 1,100 → refuses → ✓ total 1,100',
+      summary: 'Lock everything the decision depends on, not just the row you change.',
+      subs: { ok: 'total 1,100.00' },
+      steps: [
+        {
+          title: 'Materialize the conflict with locks',
+          code: 'SELECT sum(balance) FROM (\n  SELECT balance FROM accounts WHERE id IN (30, 31) ORDER BY id FOR UPDATE) x;',
+          note: 'At READ COMMITTED: T1 locked both rows at 49.8 s. T2 asked at 50.1 s and got the rows at 50.8 s, after T1\'s commit: total 1,100. 1,100 − 900 = 200 < 1,000, so T2 refused. ORDER BY id makes both transactions lock in the same order (Session 6).',
+          active: ['t1', 't2', 'rows', 'ok'],
+          edges: ['t1-rows', 't2-rows', 'rows-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL
+
+<Flow
+  title="MySQL: SERIALIZABLE means shared locks"
+  height={300}
+  nodes={[
+    { id: 't1', label: 'T1', sub: 'checks total · −900 from 30', x: 20, y: 20, w: 240 },
+    { id: 'rows', label: 'Accounts 30 + 31', sub: 'total 2,000', x: 320, y: 90, w: 180 },
+    { id: 't2', label: 'T2', sub: 'checks total · −900 from 31', x: 20, y: 180, w: 240 },
+    { id: 'ok', label: '✓ Rule kept', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'bad', label: '✗ Rule broken', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-rows', from: 't1', to: 'rows' },
+    { id: 't2-rows', from: 't2', to: 'rows' },
+    { id: 'rows-ok', from: 'rows', to: 'ok' },
+    { id: 'rows-bad', from: 'rows', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'REPEATABLE READ',
+      path: 'both see 2,000 → both withdraw → ✗ total 200',
+      summary: 'Same as PostgreSQL.',
+      subs: { bad: 'total 200.00' },
+      steps: [
+        {
+          title: 'Both commit',
+          code: "SELECT sum(balance) FROM accounts WHERE id IN (30, 31);   -- 2000.00 (both)\nUPDATE accounts SET balance = balance - 900 WHERE id = 30;   -- T1\nUPDATE accounts SET balance = balance - 900 WHERE id = 31;   -- T2",
+          note: 'Final total 200.00.',
+          active: ['t1', 't2', 'rows', 'bad'],
+          edges: ['t1-rows', 't2-rows', 'rows-bad'],
+          subs: { rows: '100 + 100' },
+        },
+      ],
+    },
+    {
+      title: 'SERIALIZABLE',
+      path: 'both read with shared locks → T1 UPDATE waits for T2 → T2 UPDATE waits for T1 → ✗ deadlock, T2 rolled back → ✓ total 1,100',
+      summary: 'InnoDB SERIALIZABLE = REPEATABLE READ with every plain SELECT turned into SELECT … FOR SHARE.',
+      subs: { ok: 'total 1,100.00' },
+      steps: [
+        {
+          title: 'Shared locks on both rows',
+          code: 'SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;\nSTART TRANSACTION;\nSELECT sum(balance) FROM accounts WHERE id IN (30, 31);   -- takes S locks on 30 and 31',
+          note: 'With autocommit off (inside a transaction), every plain read takes shared locks. T1 and T2 both hold S on rows 30 and 31; shared locks are compatible, so both reads succeed.',
+          active: ['t1', 't2', 'rows'],
+          edges: ['t1-rows', 't2-rows'],
+        },
+        {
+          title: 'Deadlock',
+          code: 'UPDATE … WHERE id = 30;   -- T1 needs X on 30, waits for T2\'s S\nUPDATE … WHERE id = 31;   -- T2 needs X on 31, waits for T1\'s S\n-- T2: ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction',
+          note: 'Each waits for the other: InnoDB detects the cycle at once and rolls back T2. T1\'s update then proceeds and commits. Final total 1,100.00. The anomaly is prevented, at the cost of a deadlock and a retry.',
+          active: ['t1', 't2', 'rows', 'ok'],
+          edges: ['t1-rows', 't2-rows', 'rows-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: snapshot transactions allow write skew"
+  height={300}
+  nodes={[
+    { id: 't1', label: 'T1 transaction', sub: 'checks total · −900 from 30', x: 20, y: 20, w: 240 },
+    { id: 'rows', label: '_id 30 + _id 31', sub: 'total 2,000', x: 320, y: 90, w: 180 },
+    { id: 't2', label: 'T2 transaction', sub: 'checks total · −900 from 31', x: 20, y: 180, w: 240 },
+    { id: 'ok', label: '✓ Rule kept', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'bad', label: '✗ Rule broken', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-rows', from: 't1', to: 'rows' },
+    { id: 't2-rows', from: 't2', to: 'rows' },
+    { id: 'rows-ok', from: 'rows', to: 'ok' },
+    { id: 'rows-bad', from: 'rows', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'Plain transactions',
+      path: 'both read 2,000 → each $inc −900 on its own document → both commit → ✗ 100 + 100',
+      summary: 'MongoDB transactions are snapshot isolation; there is no stricter level.',
+      subs: { bad: '100.00 + 100.00' },
+      steps: [
+        {
+          title: 'Both commit',
+          code: 'a.accounts.find({ _id: { $in: [30, 31] } })   // total 2000 (both)\na.accounts.updateOne({ _id: 30 }, { $inc: { balance: NumberDecimal("-900") } })   // T1\na.accounts.updateOne({ _id: 31 }, { $inc: { balance: NumberDecimal("-900") } })   // T2',
+          note: 'Commit ok for both: 100.00 + 100.00. Write conflicts are detected per document, and the two transactions wrote different documents.',
+          active: ['t1', 't2', 'rows', 'bad'],
+          edges: ['t1-rows', 't2-rows', 'rows-bad'],
+        },
+      ],
+    },
+    {
+      title: 'Guard document',
+      path: 'each transaction also $inc a shared pairs document → T2 ✗ WriteConflict → ✓ 100 + 1,000',
+      summary: 'Turn the read dependency into a write conflict on purpose.',
+      subs: { rows: '+ pairs "30-31"', ok: '100.00 + 1,000.00' },
+      steps: [
+        {
+          title: 'Write the thing you read',
+          code: 'a.pairs.updateOne({ _id: "30-31" }, { $inc: { v: 1 } })   // in both transactions\n// T2: WriteConflict, errorLabels ["TransientTransactionError"]',
+          note: 'Both transactions now write the same document, so the second one fails with WriteConflict. Its retry reads total 1,100 and refuses. Embedding both balances in one family document would make it a single-document update with no transaction at all.',
+          active: ['t1', 't2', 'rows', 'ok'],
+          edges: ['t1-rows', 't2-rows', 'rows-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+Write skew hides behind code that looks correct: "check, then act" on rows that other transactions also check. Typical cases: at least one doctor on call, no double booking of a room (two inserts into an empty range), spending limits across several cards, unique usernames enforced by a SELECT instead of a UNIQUE index. Prefer a constraint the database can enforce (UNIQUE, exclusion constraint); otherwise use SERIALIZABLE with retries, or lock what the decision depends on.
+</Pitfall>
+
+## Real-world scenario: double booking
+
+A booking service checks `SELECT count(*) FROM bookings WHERE room = 12 AND tsrange overlaps …` and inserts if zero. Under load, two bookings for the same slot appear every week. It is write skew with **inserts**: both transactions read an empty range and insert different rows.
+
+| Fix | Engine |
+|---|---|
+| Exclusion constraint `EXCLUDE USING gist (room WITH =, during WITH &&)` | PostgreSQL ([Indexing Session 7](/blogs/databases/indexing/session-7-specialist-indexes/concept-4-gist-trigram)) |
+| SERIALIZABLE + retry | PostgreSQL; MySQL (locks, deadlocks) |
+| Lock a parent row (`SELECT … FROM rooms WHERE id = 12 FOR UPDATE`) first | PostgreSQL, MySQL |
+| One document per room-day with an array of slots, updated with a condition | MongoDB |
+
+## Why this matters for transactions
+
+| Later topic | Why this concept matters |
+|---|---|
+| [Session 3: isolation levels](/blogs/databases/transactions/session-3-isolation-levels/lab) | How SSI and InnoDB SERIALIZABLE work, and their costs |
+| [Session 6: deadlocks](/blogs/databases/transactions/session-6-deadlocks/lab) | MySQL SERIALIZABLE turns write skew into deadlocks |
+| [Session 7: application patterns](/blogs/databases/transactions/session-7-application-patterns/lab) | Retry loops for 40001 |
+
+## Key takeaways
+
+1. Write skew: two transactions check a shared rule, write different rows, and break the rule together (total 200).
+2. Snapshot isolation (PostgreSQL and MySQL REPEATABLE READ, MongoDB transactions) does not detect it.
+3. PostgreSQL SERIALIZABLE aborted T2 with 40001; MySQL SERIALIZABLE produced a deadlock that rolled back T2.
+4. Locking every row the decision reads (`FOR UPDATE` on both) or writing a shared guard document also prevents it.
+5. Best of all: express the rule as a constraint the database enforces.
+
+## Check questions
+
+1. Why did neither transaction get a write conflict at REPEATABLE READ?
+2. What did PostgreSQL SERIALIZABLE detect, and what must the application do with the error?
+3. Why did MySQL SERIALIZABLE end in a deadlock rather than a serialization error?
+4. Why does `FOR UPDATE` need to cover both accounts, not just the one being debited?
+5. How does the guard document fix write skew in MongoDB, and what is the simpler data-model alternative?
+6. Explain the double-booking bug as write skew, and give the PostgreSQL constraint that removes it.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-2-anomalies/concept-5-write-skew/answers">Worked answers to Q1–Q6</DeepDive>

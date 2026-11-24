@@ -1,0 +1,64 @@
+---
+title: "Answers: Non-repeatable reads and read skew"
+description: "Worked answers to the Session 2 Concept 2 check questions."
+companion: "answers"
+tags: ["transactions", "isolation", "read-skew", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-consistent-read.html"
+  - "https://www.mongodb.com/docs/manual/reference/parameters/"
+---
+
+<Tldr>
+The question is always "when was my snapshot taken": per statement (READ COMMITTED, MongoDB without a transaction) or once per transaction (REPEATABLE READ, MongoDB transactions).
+</Tldr>
+
+## Q1. Why 500.00
+
+**Question:** why did T1 see 500.00 on its second read at READ COMMITTED although T1 never changed anything?
+
+At READ COMMITTED every statement starts with a new snapshot of everything committed so far. T2 committed between T1's two statements, so the second snapshot included T2's change. READ COMMITTED promises only that you never see uncommitted data, not that committed data stands still.
+
+> **Common mistake:** "a transaction freezes the data it reads". Only REPEATABLE READ and stricter levels (or MongoDB transactions) do.
+
+## Q2. Did anyone wait
+
+**Question:** did T2 have to wait for T1 in any of these runs? Why not?
+
+No. T1 only read, and plain reads take no row locks in any of the three engines; they read old versions instead (MVCC). T2's update went through at once, and even at REPEATABLE READ T1 simply kept reading the old version.
+
+> **Common mistake:** expecting REPEATABLE READ to lock the rows it reads. In PostgreSQL, MySQL and MongoDB it keeps a snapshot, not locks (MySQL SERIALIZABLE is the exception, Concept 5).
+
+## Q3. Read skew
+
+**Question:** explain read skew with the lab's numbers, and why each individual read was correct.
+
+T1 read account 40 = 1,000 before the transfer and account 41 = 1,100 after it. Both values were committed and correct **at the moment each was read**. Their sum, 2,100, corresponds to no moment: before the transfer the total was 2,000 (1,000 + 1,000), after it also 2,000 (900 + 1,100).
+
+> **Common mistake:** looking for a bug in the transfer. The transfer was atomic; the reader mixed two moments.
+
+## Q4. Fixing the audit
+
+**Question:** give two ways to make the branch audit consistent in PostgreSQL without changing the default level.
+
+1. Run the ten queries in one transaction started with `BEGIN ISOLATION LEVEL REPEATABLE READ` (the default for other sessions does not change).
+2. Compute everything in **one statement**: `SELECT branch, sum(balance) FROM accounts GROUP BY branch`; a single statement always uses one snapshot. A third option is running it on a replica that is paused, or using an exported snapshot (`pg_export_snapshot`) shared by several sessions.
+
+> **Common mistake:** adding `FOR SHARE` locks to the audit queries; that blocks transfers and still does not make separate statements share a snapshot.
+
+## Q5. When InnoDB takes the read view
+
+**Question:** when does InnoDB create the read view in a REPEATABLE READ transaction?
+
+At the transaction's **first consistent read** (the first plain `SELECT`), not at `START TRANSACTION`. Changes committed between `START TRANSACTION` and that first read are therefore visible. `START TRANSACTION WITH CONSISTENT SNAPSHOT` creates the read view immediately.
+
+> **Common mistake:** assuming the snapshot starts at `BEGIN` in every engine. PostgreSQL also takes it at the first statement, not at `BEGIN`.
+
+## Q6. MongoDB's limit
+
+**Question:** what limits how long a MongoDB transaction can keep its snapshot?
+
+`transactionLifetimeLimitSeconds` (60 s on the lab server): a transaction running longer is aborted by the server. The old versions it reads come from WiredTiger's cache and history store; keeping many of them pressures the cache, which is why MongoDB keeps transactions short. Snapshot reads outside transactions can go back up to `minSnapshotHistoryWindowInSeconds` (300 s on the lab server).
+
+> **Common mistake:** using a MongoDB transaction for a long report; split it, or use one aggregation.
