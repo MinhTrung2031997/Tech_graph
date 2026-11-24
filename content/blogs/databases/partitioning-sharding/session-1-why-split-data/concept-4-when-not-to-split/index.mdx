@@ -1,0 +1,344 @@
+---
+title: "Concept 4: When not to split"
+description: "The same 5M orders as a plain table with the right index and as 24 monthly partitions. For the one-month sum the right index matched the partition: PostgreSQL 7.4 ms vs 8.2 ms, MySQL 25 ms vs 25 ms. Queries without the partition key paid for partitioning: a lookup by id probed all 24 partitions (76 buffers vs 7 in PostgreSQL, 24 index reads vs 1 in MySQL) and an unindexed seller query got slower."
+type: "concept"
+tags: ["partitioning", "indexing", "postgresql", "mysql", "mongodb", "explain"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/ddl-partitioning.html#DDL-PARTITIONING-PRUNING"
+  - "https://www.postgresql.org/docs/current/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE-BEST-PRACTICES"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-pruning.html"
+  - "https://www.mongodb.com/docs/manual/core/query-optimization/#covered-query"
+---
+
+<Tldr>
+Partitioning is not a query accelerator. On the one-month sum (212,039 rows of 5M) the partitioned table scanned only its March partition, and a plain table with the **right index** was just as fast: PostgreSQL **7.4 ms** (index-only scan on `(created_at) INCLUDE (amount)`, 820 buffers) vs **8.2 ms** (partition scan, 1,982 buffers); MySQL **25 ms** vs **25 ms**; MongoDB has no partitions and did it in **43 ms** with a covering index. Queries that do not filter on the partition key pay instead: a lookup by `id` probed **all 24 partitions** (PostgreSQL 76 buffers and 0.22 ms vs 7 buffers and 0.04 ms, plus 2–4 ms of planning in a new session; MySQL 24 index reads vs 1), and a seller report with no index went from 51–60 ms to 66–116 ms. Split data when you need what Concepts 1–3 showed (cheap retention, smaller maintenance units, more servers), not to speed up queries an index can serve.
+</Tldr>
+
+## The setup
+
+`orders_m` is a copy of `orders` partitioned by month on `created_at` (24 partitions); the lab shows how it is built. Because a primary key on a partitioned table must include the partition key, its primary key is `(id, created_at)`. Each query ran 3–5 times in a new session (best or range shown).
+
+| Term | Meaning |
+|---|---|
+| Partition key | `created_at`: the column the partitions are split on |
+| Pruning | Skipping partitions whose range cannot match: only possible when the WHERE clause constrains the partition key |
+| Covering index | An index holding every column the query needs, so the table is not read (index-only scan / covered query) |
+| Append | PostgreSQL plan node that runs one child scan per partition and concatenates the results |
+| **✓ Scanned / ✗ Pruned** | Whether a partition (or index) is read for the query |
+
+## PostgreSQL
+
+| Query | `orders` (plain) | `orders_m` (24 partitions) |
+|---|---|---|
+| Sum of one month, index on `created_at` | 9.7–13.3 ms, 3,009 buffers | 8.2–9.2 ms, 1,982 buffers (one partition) |
+| Sum of one month, covering index `(created_at) INCLUDE (amount)` | **7.4–7.7 ms, 820 buffers**, 0 heap fetches | (not needed) |
+| Lookup by `id` | 0.04–0.05 ms, 7 buffers, planning 0.16–0.21 ms | 0.22–0.24 ms, 76 buffers, planning 2.0–3.7 ms |
+| Lookup by `id` and the month | | 0.05 ms, 7 buffers (one partition) |
+| Sum for one seller (no index) | 51–60 ms | 66–116 ms |
+
+The planning cost of `orders_m` falls to 0.08–0.19 ms when the same session repeats the query (the partition metadata is then cached), so it matters most for short-lived connections.
+
+<Flow
+  title="PostgreSQL: plain table with the right index vs monthly partitions"
+  height={290}
+  nodes={[
+    { id: 'q', label: 'Query', sub: 'sum, lookup, report', x: 20, y: 110, w: 180 },
+    { id: 'planner', label: 'Planner', sub: 'chooses what to read', x: 260, y: 110, w: 200 },
+    { id: 'plain', label: 'orders', sub: 'plain, 5M rows', x: 540, y: 20, w: 240 },
+    { id: 'mar', label: 'orders_m_2025_03', sub: '212,039 rows, 26 MB', x: 540, y: 110, w: 240 },
+    { id: 'others', label: 'Other 23 partitions', sub: '4.8M rows', x: 540, y: 200, w: 240 },
+  ]}
+  edges={[
+    { id: 'q-planner', from: 'q', to: 'planner' },
+    { id: 'planner-plain', from: 'planner', to: 'plain' },
+    { id: 'planner-mar', from: 'planner', to: 'mar' },
+    { id: 'planner-others', from: 'planner', to: 'others' },
+  ]}
+  cases={[
+    {
+      title: 'Sum of one month',
+      path: 'plain: covering index ✓ 820 buffers, 7.4 ms · partitioned: 2025_03 ✓ 1,982 buffers, 8.2 ms, 23 others ✗ pruned',
+      summary: 'With the right index, the plain table is as fast as the pruned partition.',
+      steps: [
+        {
+          title: 'Plain table, ordinary index',
+          note: 'Parallel Index Scan on orders_created_at_idx: 212,039 rows, 3,009 buffers, 9.7–13.3 ms. The heap rows of one month are stored together because id grows with created_at.',
+          code: "SELECT sum(amount) FROM orders\nWHERE created_at >= '2025-03-01' AND created_at < '2025-04-01';",
+          active: ['q', 'planner', 'plain'],
+          edges: ['q-planner', 'planner-plain'],
+          subs: { plain: '✓ index + heap, 3,009 buffers' },
+        },
+        {
+          title: 'Plain table, covering index',
+          note: 'With (created_at) INCLUDE (amount): Parallel Index Only Scan, Heap Fetches 0, 820 buffers, 7.4–7.7 ms. The index costs 150 MB and slows every insert a little.',
+          code: 'CREATE INDEX orders_created_amount_idx ON orders (created_at) INCLUDE (amount);',
+          active: ['planner', 'plain'],
+          edges: ['planner-plain'],
+          subs: { plain: '✓ index only, 820 buffers' },
+        },
+        {
+          title: 'Partitioned: prune to March',
+          note: 'Only orders_m_2025_03 appears in the plan: Parallel Seq Scan of the whole partition, 1,982 buffers, 8.2–9.2 ms. The other 23 partitions are never opened.',
+          code: "SELECT sum(amount) FROM orders_m\nWHERE created_at >= '2025-03-01' AND created_at < '2025-04-01';",
+          active: ['q', 'planner', 'mar', 'others'],
+          edges: ['q-planner', 'planner-mar'],
+          subs: { mar: '✓ seq scan, 1,982 buffers', others: '✗ pruned' },
+        },
+      ],
+    },
+    {
+      title: 'Lookup by id',
+      path: 'plain: orders_pkey ✓ 7 buffers, 0.04 ms · partitioned: no created_at → all 24 partitions ✓ probed, 76 buffers, 0.22 ms',
+      summary: 'Without the partition key, there is nothing to prune.',
+      steps: [
+        {
+          title: 'Plain table',
+          note: 'One Index Scan on orders_pkey: 7 buffers, 0.04–0.05 ms, planning 0.16–0.21 ms.',
+          code: 'SELECT * FROM orders WHERE id = 4242424;',
+          active: ['q', 'planner', 'plain'],
+          edges: ['q-planner', 'planner-plain'],
+          subs: { plain: '✓ 7 buffers' },
+        },
+        {
+          title: 'Partitioned: probe every partition',
+          note: 'The planner cannot know which month order 4242424 is in: Append over 24 Index Scans, one per partition primary key, 23 of them finding nothing. 76 buffers, 0.22–0.24 ms, planning 2.0–3.7 ms in a new session.',
+          code: 'SELECT * FROM orders_m WHERE id = 4242424;',
+          active: ['planner', 'mar', 'others'],
+          edges: ['planner-mar', 'planner-others'],
+          subs: { mar: '✓ probed', others: '✓ 23 probes, 0 rows' },
+        },
+        {
+          title: 'Give it the month',
+          note: 'Adding the month to the WHERE clause prunes to orders_m_2025_09: one Index Scan, 7 buffers, 0.05 ms. Applications that know the order date should send it.',
+          code: "SELECT * FROM orders_m WHERE id = 4242424\n  AND created_at >= '2025-09-01' AND created_at < '2025-10-01';",
+          active: ['planner', 'others'],
+          edges: ['planner-others'],
+          subs: { others: '✓ only 2025_09, 7 buffers', mar: '✗ pruned' },
+        },
+      ],
+    },
+    {
+      title: 'Report by seller (no index)',
+      path: 'plain: one parallel seq scan ✓ 51–60 ms · partitioned: 24 seq scans ✓ 66–116 ms',
+      summary: 'A full scan split into 24 pieces is not faster, just more pieces.',
+      steps: [
+        {
+          title: 'Scan everything either way',
+          note: 'seller_id is not the partition key, so every partition is scanned. Plain table: 51–60 ms after the first run. Partitioned: 66–116 ms, with 2 ms of planning.',
+          code: 'SELECT sum(amount) FROM orders_m WHERE seller_id = 777;',
+          active: ['q', 'planner', 'plain', 'mar', 'others'],
+          edges: ['q-planner', 'planner-plain', 'planner-mar', 'planner-others'],
+          subs: { plain: '✓ 51–60 ms', mar: '✓ scanned', others: '✓ scanned' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL InnoDB
+
+| Query | `orders` (plain) | `orders_m` (24 partitions) |
+|---|---|---|
+| Sum of one month, index on `created_at` | 107–154 ms (secondary index range scan + a clustered-index lookup per row) | 25–31 ms (table scan of `p2025_03` only) |
+| Sum of one month, covering index `(created_at, amount)` | **25 ms** | (not needed) |
+| Lookup by `id` | `const`, 1 index read (`Handler_read_key` +1) | EXPLAIN `partitions`: all 24, `Handler_read_key` +24, 0.03 ms |
+| Sum for one seller (no index) | 0.35–0.42 s | 0.41 s |
+
+InnoDB is where partitioning looked best at first: a secondary-index range scan has to look up each of the 212,039 rows in the clustered index, so the partition scan was 4× faster. A covering index removes those lookups and closes the gap completely.
+
+<Flow
+  title="InnoDB: plain table with the right index vs monthly partitions"
+  height={290}
+  nodes={[
+    { id: 'q', label: 'Query', sub: 'sum, lookup', x: 20, y: 110, w: 180 },
+    { id: 'opt', label: 'Optimizer', sub: 'partition pruning', x: 260, y: 110, w: 200 },
+    { id: 'plain', label: 'orders', sub: 'plain, 5M rows', x: 540, y: 20, w: 240 },
+    { id: 'mar', label: 'p2025_03', sub: '212,039 rows', x: 540, y: 110, w: 240 },
+    { id: 'others', label: 'Other 23 partitions', sub: 'p2024_01 … p2025_12', x: 540, y: 200, w: 240 },
+  ]}
+  edges={[
+    { id: 'q-opt', from: 'q', to: 'opt' },
+    { id: 'opt-plain', from: 'opt', to: 'plain' },
+    { id: 'opt-mar', from: 'opt', to: 'mar' },
+    { id: 'opt-others', from: 'opt', to: 'others' },
+  ]}
+  cases={[
+    {
+      title: 'Sum of one month',
+      path: 'plain: secondary index ✗ 107–154 ms → covering index ✓ 25 ms · partitioned: p2025_03 ✓ 25 ms, 23 others ✗ pruned',
+      summary: 'The partition beat a plain secondary index, not a covering one.',
+      steps: [
+        {
+          title: 'Plain table, ordinary index',
+          note: 'Index range scan on orders_created_at_idx, then one clustered-index lookup per row to read amount: 107–154 ms.',
+          code: "SELECT SUM(amount) FROM orders\nWHERE created_at >= '2025-03-01' AND created_at < '2025-04-01';",
+          active: ['q', 'opt', 'plain'],
+          edges: ['q-opt', 'opt-plain'],
+          subs: { plain: '✗ 212,039 PK lookups' },
+        },
+        {
+          title: 'Partitioned: scan March only',
+          note: 'EXPLAIN partitions: p2025_03, type ALL. A table scan of one 212,039-row partition: 25–31 ms.',
+          code: "EXPLAIN SELECT SUM(amount) FROM orders_m\nWHERE created_at >= '2025-03-01' AND created_at < '2025-04-01';",
+          active: ['q', 'opt', 'mar', 'others'],
+          edges: ['q-opt', 'opt-mar'],
+          subs: { mar: '✓ table scan', others: '✗ pruned' },
+        },
+        {
+          title: 'Plain table, covering index',
+          note: 'Covering index range scan on (created_at, amount): no clustered-index lookups, 25 ms. Building it took 4.3 s.',
+          code: 'ALTER TABLE orders ADD INDEX orders_created_amount_idx (created_at, amount);',
+          active: ['opt', 'plain'],
+          edges: ['opt-plain'],
+          subs: { plain: '✓ index only, 25 ms' },
+        },
+      ],
+    },
+    {
+      title: 'Lookup by id',
+      path: 'plain: PRIMARY ✓ 1 read · partitioned: PRIMARY (id, created_at) of all 24 partitions ✓ 24 reads',
+      summary: 'Each partition has its own index; without created_at, all are probed.',
+      steps: [
+        {
+          title: 'Plain table',
+          note: 'type const: Handler_read_key went up by 1.',
+          code: 'SELECT id FROM orders WHERE id = 4242424;',
+          active: ['q', 'opt', 'plain'],
+          edges: ['q-opt', 'opt-plain'],
+          subs: { plain: '✓ 1 index read' },
+        },
+        {
+          title: 'Partitioned: every partition',
+          note: 'EXPLAIN lists all 24 partitions, type ref on PRIMARY. Handler_read_key went up by 24. Still 0.03 ms here, but it is 24× the index work for every such lookup.',
+          code: 'SELECT id FROM orders_m WHERE id = 4242424;',
+          active: ['opt', 'mar', 'others'],
+          edges: ['opt-mar', 'opt-others'],
+          subs: { mar: '✓ probed', others: '✓ 23 probes, 0 rows' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+MongoDB has no partitioned collections, so its answer to "one month is slow" is an index:
+
+| Query | Time | Plan |
+|---|---|---|
+| Sum of one month, no usable index (`hint: { $natural: 1 }`) | 711–1,255 ms | COLLSCAN, 5,000,000 documents examined |
+| Sum of one month, index `{ created_at: 1 }` | 65–82 ms | IXSCAN + FETCH, 212,039 keys and documents |
+| Sum of one month, index `{ created_at: 1, amount: 1 }` | 43 ms | IXSCAN + PROJECTION_COVERED, 0 documents examined |
+| Lookup by `_id` | 0 ms | 1 key |
+
+<Flow
+  title="MongoDB: the month sum with and without the right index"
+  height={290}
+  nodes={[
+    { id: 'q', label: 'aggregate', sub: '$match month, $group', x: 20, y: 110, w: 180 },
+    { id: 'planner', label: 'Query planner', sub: 'picks an index', x: 260, y: 110, w: 200 },
+    { id: 'coll', label: 'Collection scan', sub: '5,000,000 documents', x: 540, y: 20, w: 240 },
+    { id: 'ix', label: '{ created_at: 1 }', sub: 'keys + documents', x: 540, y: 110, w: 240 },
+    { id: 'cov', label: '{ created_at, amount }', sub: 'keys only', x: 540, y: 200, w: 240 },
+  ]}
+  edges={[
+    { id: 'q-planner', from: 'q', to: 'planner' },
+    { id: 'planner-coll', from: 'planner', to: 'coll' },
+    { id: 'planner-ix', from: 'planner', to: 'ix' },
+    { id: 'planner-cov', from: 'planner', to: 'cov' },
+  ]}
+  cases={[
+    {
+      title: 'Sum of one month',
+      path: 'collection scan ✗ 5M docs, 711 ms · created_at index ✓ 212,039 docs, 65 ms · covering index ✓ 0 docs, 43 ms',
+      summary: 'Indexes, not splitting, take the month sum from seconds to tens of milliseconds.',
+      steps: [
+        {
+          title: 'No usable index',
+          note: 'Forced with hint: { $natural: 1 }: COLLSCAN examines all 5,000,000 documents, 711–1,255 ms.',
+          code: "db.orders.aggregate(pipeline, { hint: { $natural: 1 } })",
+          active: ['q', 'planner', 'coll'],
+          edges: ['q-planner', 'planner-coll'],
+          subs: { coll: '✗ 5,000,000 examined' },
+        },
+        {
+          title: 'Index on created_at',
+          note: 'IXSCAN + FETCH: 212,039 keys and 212,039 documents examined, 65–82 ms.',
+          active: ['planner', 'ix'],
+          edges: ['planner-ix'],
+          subs: { ix: '✓ 212,039 docs fetched' },
+        },
+        {
+          title: 'Covering index',
+          note: 'With { created_at: 1, amount: 1 }: GROUP ← PROJECTION_COVERED ← IXSCAN, totalDocsExamined 0, 43 ms.',
+          code: "db.orders.createIndex({ created_at: 1, amount: 1 })",
+          active: ['planner', 'cov'],
+          edges: ['planner-cov'],
+          subs: { cov: '✓ 0 docs examined' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Comparison
+
+| | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| Month sum: best plain-table index | 7.4 ms | 25 ms | 43 ms |
+| Month sum: one partition | 8.2 ms | 25 ms | (no partitions) |
+| Lookup by id without the partition key | 24 index probes, 76 vs 7 buffers | 24 vs 1 index reads | n/a |
+| Full report without the partition key | slower (66–116 vs 51–60 ms) | same (0.41 vs 0.35–0.42 s) | n/a |
+
+## A checklist before splitting
+
+| Question | If yes |
+|---|---|
+| Are the slow queries fixed by an index (composite, covering)? | Add the index; do not split |
+| Do most queries filter on one column with a natural range (date, tenant)? | That column is a partition key candidate |
+| Is old data removed by age, in large amounts? | Partition by time (Concept 2) |
+| Do whole-table jobs (index builds, vacuum, backups) no longer fit their window? | Partition, so each job handles one partition |
+| Does one server lack CPU, disk or write throughput even with good indexes? | Sharding (Sessions 5–8), not partitioning |
+| Do many queries look rows up by a key that is **not** the partition key? | Expect them to probe every partition, or add the key to them |
+
+<Pitfall>
+The most common partitioning mistake is choosing a partition key that the queries do not use. Partitioning `orders` by month and then looking orders up by id, by seller or by customer turns each of those queries into one probe or one scan **per partition**: 24 here, hundreds with daily partitions (Session 2 measures planning time with ~730 partitions). Check the query mix first; partition on the column that most queries, and the retention job, filter on.
+</Pitfall>
+
+## Real-world scenario: partitioned for speed, got slower
+
+A team partitioned a 300M-row `orders` table by month "to make it faster". After the migration, the order detail page (lookup by `order_id`) got slower and CPU went up.
+
+| Finding | Fix |
+|---|---|
+| Order detail lookups by `order_id` probed 36 partitions | Encode the month in the order id, or keep a small `order_id → created_at` lookup table and add the date to the query |
+| Month dashboards were not faster | They were already served by a composite index; partitioning added nothing |
+| The real win was retention | Dropping a month went from a 6-hour delete to milliseconds |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Indexing Session 5](/blogs/databases/indexing/session-5-covering-partial-expression/concept-1-covering-include) | Covering indexes: why 820 buffers instead of 3,009 |
+| [Indexing Session 6](/blogs/databases/indexing/session-6-engine-differences/concept-2-innodb-secondary) | Why an InnoDB secondary-index range scan pays a primary-key lookup per row |
+| [Session 2 lab](/blogs/databases/partitioning-sharding/session-2-partitioning-postgresql/lab) | Pruning in detail, and when it fails |
+
+## Key takeaways
+
+1. With the right index, a plain table answered the month query as fast as a pruned partition in PostgreSQL and MySQL.
+2. Queries that do not constrain the partition key touch every partition: 24 index probes for one lookup by id.
+3. Partitioning adds planning work (2–4 ms in a new session for 24 partitions here).
+4. In InnoDB, a covering index removed the primary-key lookups that made the plain table 4× slower than the partition.
+5. Split data for retention, maintenance units or capacity, after the indexes are right.
+
+## Check questions
+
+1. Why did the PostgreSQL covering index read 820 buffers while the partition scan read 1,982?
+2. Why did the lookup by id read 76 buffers on `orders_m` but 7 on `orders`?
+3. Why was MySQL's month sum 4× slower on the plain table with a `created_at` index, and how did the covering index fix it?
+4. Why is the partitioned seller report not faster, even though each partition is 24× smaller?
+5. A query runs once per HTTP request on a new connection. Why does the 2–4 ms planning time matter more for it?
+6. Your application looks orders up by id far more often than by date. Give two ways to keep date partitioning without probing every partition.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-1-why-split-data/concept-4-when-not-to-split/answers">Worked answers to Q1–Q6</DeepDive>

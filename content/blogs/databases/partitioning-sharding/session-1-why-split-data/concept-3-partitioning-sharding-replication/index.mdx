@@ -1,0 +1,193 @@
+---
+title: "Concept 3: Partitioning, sharding and replication"
+description: "Three ways to split or copy data, and the problems each one does and does not fix. Partitioning splits one table into many on the same server (the lab's monthly orders_m: 24 partitions of 24–26 MB, 624 MB in total vs 596 MB unpartitioned); sharding splits data across servers; replication copies all of it to more servers. Which engine has which built in."
+type: "concept"
+tags: ["partitioning", "sharding", "replication", "postgresql", "mysql", "mongodb", "architecture"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/ddl-partitioning.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-overview.html"
+  - "https://www.mongodb.com/docs/manual/sharding/"
+  - "https://www.mongodb.com/docs/manual/replication/"
+  - "https://www.postgresql.org/docs/current/warm-standby.html"
+---
+
+<Tldr>
+**Partitioning** splits one table into smaller tables **inside one database server**; queries still use one table name, and the planner skips partitions that cannot match. It fixes whole-table and retention work (Concepts 1 and 2), not the limits of the server: the lab's monthly `orders_m` is 24 partitions of 24–26 MB, **624 MB** in total against **596 MB** for the plain table, all on the same disk and CPU. **Sharding** splits rows **across servers** by a shard key, so each server holds and writes only its part: it is the only one of the three that adds write capacity and disk space, and it makes every query that does not name the shard key go to every shard. **Replication** copies **all** the data to more servers: more read capacity and failover, but every copy applies every write and stores everything. PostgreSQL and MySQL have partitioning and replication built in and shard through add-ons (Citus, Vitess) or the application; MongoDB has no partitioning but built-in sharding.
+</Tldr>
+
+## Three different splits
+
+| Term | Meaning |
+|---|---|
+| Partition | One piece of a partitioned table, on the same server (e.g. `orders_m_2025_03`) |
+| Partition key | The column(s) that decide which partition a row goes to (`created_at` here) |
+| Pruning | The planner skipping partitions whose range cannot match the WHERE clause |
+| Shard | One server (normally a replica set) holding part of the rows |
+| Shard key | The field(s) that decide which shard a row lives on (e.g. `seller_id`) |
+| Router | Whatever sends a query to the right shard(s): `mongos`, the Citus coordinator, Vitess `vtgate`, or the application |
+| Replica | A full copy of the data on another server, kept up to date from the primary's log |
+| **✓ Touched / ✗ Skipped** | Whether a piece receives work for a given statement |
+
+<Flow
+  title="One query, three ways to split the data"
+  height={290}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'one SQL statement', x: 20, y: 110, w: 190 },
+    { id: 'router', label: 'Router', sub: 'decides where to go', x: 270, y: 110, w: 220 },
+    { id: 'p1', label: 'Piece 1', sub: 'part of the data', x: 560, y: 20, w: 220 },
+    { id: 'p2', label: 'Piece 2', sub: 'part of the data', x: 560, y: 110, w: 220 },
+    { id: 'p3', label: 'Piece 3', sub: 'part of the data', x: 560, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'app-router', from: 'app', to: 'router' },
+    { id: 'router-p1', from: 'router', to: 'p1' },
+    { id: 'router-p2', from: 'router', to: 'p2' },
+    { id: 'router-p3', from: 'router', to: 'p3' },
+  ]}
+  cases={[
+    {
+      title: 'Partitioning (one server)',
+      path: 'planner → orders_m_2024_01 ✗ pruned · orders_m_2025_02 ✗ pruned · orders_m_2025_03 ✓ scanned',
+      summary: 'Smaller tables, same server: same CPU, memory and disk.',
+      subs: { router: 'PostgreSQL planner', p1: 'orders_m_2024_01, 26 MB', p2: 'orders_m_2025_02, 24 MB', p3: 'orders_m_2025_03, 26 MB' },
+      steps: [
+        {
+          title: 'One table name',
+          note: 'The application queries orders_m like any table. The lab copy has 24 monthly partitions, 624 MB in total (the plain orders table: 596 MB). Everything is in database pt1 on one server.',
+          code: "SELECT sum(amount) FROM orders_m\nWHERE created_at >= '2025-03-01' AND created_at < '2025-04-01';",
+          active: ['app', 'router'],
+          edges: ['app-router'],
+        },
+        {
+          title: 'Prune to one partition',
+          note: 'The planner compares the WHERE range with each partition bound and keeps only orders_m_2025_03: EXPLAIN shows a scan of that partition only (Concept 4 measures it).',
+          active: ['router', 'p3'],
+          edges: ['router-p3'],
+          subs: { p1: '✗ pruned', p2: '✗ pruned', p3: '✓ scanned' },
+        },
+        {
+          title: 'Retention is a DROP',
+          note: 'Removing January 2024 is DROP TABLE orders_m_2024_01 (or DETACH first): the Concept 2 numbers for a drop, not for a delete.',
+          code: 'DROP TABLE orders_m_2024_01;',
+          active: ['router', 'p1'],
+          edges: ['router-p1'],
+          subs: { p1: '✓ dropped as a whole' },
+        },
+      ],
+    },
+    {
+      title: 'Sharding (several servers)',
+      path: 'router → shard with seller 777 ✓ · other shards ✗ — or, without the shard key, every shard ✓',
+      summary: 'Each server holds and writes only its rows; queries must name the shard key to stay on one.',
+      subs: { router: 'mongos / coordinator / app', p1: 'shard 1: sellers 1–1,666', p2: 'shard 2: sellers 1,667–3,333', p3: 'shard 3: sellers 3,334–5,000' },
+      steps: [
+        {
+          title: 'Route by shard key',
+          note: 'With seller_id as shard key, a query for seller 777 goes to the one shard that owns that range: one server does the work, the others are free for other sellers.',
+          code: 'db.orders.find({ seller_id: 777 })',
+          active: ['app', 'router', 'p1'],
+          edges: ['app-router', 'router-p1'],
+          subs: { p1: '✓ owns seller 777', p2: '✗ not asked', p3: '✗ not asked' },
+        },
+        {
+          title: 'No shard key: ask everyone',
+          note: 'A query by date only cannot be routed: the router sends it to every shard and merges the answers (scatter-gather). Sessions 5 and 6 measure this on a real sharded cluster.',
+          code: "db.orders.find({ created_at: { $gte: ISODate('2025-03-01') } })",
+          active: ['router', 'p1', 'p2', 'p3'],
+          edges: ['router-p1', 'router-p2', 'router-p3'],
+          subs: { p1: '✓ scanned', p2: '✓ scanned', p3: '✓ scanned' },
+        },
+      ],
+    },
+    {
+      title: 'Replication (copies)',
+      path: 'primary ✓ every write → replica 1 ✓ every write → replica 2 ✓ every write; reads may go to any copy',
+      summary: 'More copies, not smaller pieces.',
+      subs: { router: 'primary (takes writes)', p1: 'copy 1: all 5M rows', p2: 'copy 2: all 5M rows', p3: 'copy 3: all 5M rows' },
+      steps: [
+        {
+          title: 'Every copy applies every write',
+          note: 'The primary ships its log (WAL, binary log, oplog) to each replica, which applies all of it. The Concept 2 delete would be replayed on every copy.',
+          active: ['app', 'router', 'p1', 'p2', 'p3'],
+          edges: ['app-router', 'router-p1', 'router-p2', 'router-p3'],
+          subs: { p1: '✓ applies the write', p2: '✓ applies the write', p3: '✓ applies the write' },
+        },
+        {
+          title: 'Reads can be spread',
+          note: 'Read queries can go to replicas (with some lag), and a replica can take over when the primary fails. Data size per server and write work per server do not go down.',
+          active: ['router', 'p2'],
+          edges: ['router-p2'],
+          subs: { p2: '✓ serves a read' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## What each one fixes
+
+| Problem | Partitioning | Sharding | Replication |
+|---|---|---|---|
+| Deleting old data (Concept 2) | ✓ drop a partition | ✗ each shard still deletes rows (unless also partitioned) | ✗ every copy replays the deletes |
+| Whole-table maintenance (Concept 1) | ✓ one partition at a time | ✓ each shard does its share, in parallel | ✗ every copy holds everything |
+| Queries on one time range | ✓ pruning | only if the shard key matches | ✗ |
+| Read capacity | ✗ same server | ✓ | ✓ reads from replicas |
+| Write capacity | ✗ same server | ✓ writes spread across shards | ✗ every copy applies every write |
+| Data larger than one server | ✗ | ✓ | ✗ every copy holds it all |
+| Server failure | ✗ | ✗ by itself (each shard needs replicas) | ✓ failover |
+| New costs | rules for keys and indexes ([Session 3](/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/lab)), more objects to plan | cross-shard queries, joins and transactions, a router, rebalancing | more servers, replication lag |
+
+Real systems combine them: a production MongoDB sharded cluster is several shards, each one a replica set; a large PostgreSQL deployment is often a partitioned table on a primary with replicas.
+
+## What each engine has built in
+
+| | PostgreSQL 17 | MySQL 8.4 | MongoDB 8.0 |
+|---|---|---|---|
+| Partitioning | ✓ declarative RANGE / LIST / HASH | ✓ RANGE / LIST / HASH / KEY (no foreign keys) | ✗ none; time-series collections, TTL, one collection per period ([Session 3](/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/lab)) |
+| Sharding | ✗ not in core: Citus extension, `postgres_fdw`, the application | ✗ not in core: Vitess, the application | ✓ sharded clusters (`mongos`, config servers, chunks, balancer) |
+| Replication | ✓ streaming (physical) and logical | ✓ binary log replication, Group Replication | ✓ replica sets |
+
+The lab built the same monthly partitioned table in both SQL engines (Concept 4): PostgreSQL 624 MB vs 596 MB plain, MySQL 423 MB vs 392 MB plain. Partitioning **added** a little size in both (a wider primary key that must include `created_at`, and per-partition overhead): it organizes data, it does not shrink it.
+
+<Pitfall>
+"We'll partition it so it scales" mixes up two things. Partitioning keeps everything on one server: if the problem is CPU, memory, disk or write throughput of that server, partitioning does nothing for it (and Concept 4 shows it can make some queries slower). Only sharding adds servers to the write path. Replication adds servers for reads and availability, never for writes.
+</Pitfall>
+
+## Real-world scenario: picking the right split
+
+| Symptom on a marketplace orders database | First tool |
+|---|---|
+| Nightly retention delete takes hours, tables never shrink | Partition by month |
+| Dashboards slow down the checkout writes | Replica for the dashboards |
+| Primary at 90% CPU on writes after a 10× growth in sellers | Shard (by seller) |
+| Index builds and VACUUM no longer fit maintenance windows | Partition (smaller units of work) |
+| One region's primary fails, checkout is down | Replication with automatic failover |
+| A single 8 TB table, disk nearly full, 2 years of data needed online | Partition first (and compress or archive old partitions), shard if it still does not fit |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Transactions Session 8](/blogs/databases/transactions/session-8-when-transactions-hurt/concept-4-distributed-transactions) | Transactions across shards need two-phase commit or an outbox |
+| [Transactions Session 1](/blogs/databases/transactions/session-1-transaction-guarantees/concept-3-durability) | Replication rides on the same logs that make commits durable |
+| Concept 4 | What partitioning costs when queries do not use the partition key |
+
+## Key takeaways
+
+1. Partitioning: many tables, one server. Fixes retention and per-table maintenance; adds no capacity.
+2. Sharding: rows spread across servers by a shard key. Adds write capacity and storage; queries without the key go everywhere.
+3. Replication: full copies. Adds read capacity and availability; every copy does every write.
+4. PostgreSQL and MySQL: partitioning and replication built in, sharding by add-on. MongoDB: sharding and replication built in, no partitioning.
+5. Production designs usually combine two or three of them.
+
+## Check questions
+
+1. Your PostgreSQL primary is at 95% CPU from inserts. Which of the three helps, and why not the other two?
+2. Why does replicating a database not help with the nightly retention delete of Concept 2?
+3. A sharded cluster uses `seller_id` as the shard key. What happens to "all orders from yesterday"?
+4. Why did partitioning make the table slightly bigger instead of smaller?
+5. MongoDB has no table partitioning. How would you delete old orders cheaply in MongoDB?
+6. Give one problem that needs both sharding and replication.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-1-why-split-data/concept-3-partitioning-sharding-replication/answers">Worked answers to Q1–Q6</DeepDive>

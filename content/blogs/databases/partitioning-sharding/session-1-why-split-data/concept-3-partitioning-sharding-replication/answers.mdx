@@ -1,0 +1,67 @@
+---
+title: "Answers: Partitioning, sharding and replication"
+description: "Worked answers to the Session 1 Concept 3 check questions."
+companion: "answers"
+tags: ["partitioning", "sharding", "replication", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/ddl-partitioning.html"
+  - "https://www.mongodb.com/docs/manual/core/sharding-shard-key/"
+  - "https://www.mongodb.com/docs/manual/core/index-ttl/"
+---
+
+<Tldr>
+Partitioning organizes, sharding spreads, replication copies. Match the tool to the limit you hit.
+</Tldr>
+
+## Q1. 95% CPU from inserts
+
+**Question:** your PostgreSQL primary is at 95% CPU from inserts. Which of the three helps, and why not the other two?
+
+**Sharding**: it is the only option that sends different inserts to different servers. Replication does not help, because every replica must apply every insert as well, and replicas cannot accept writes. Partitioning does not help either: all partitions live on the same server, so the same CPU does the same inserts (plus a little routing work). Before any of them, check whether the CPU goes to the inserts themselves or to things around them: too many indexes ([Indexing Session 8](/blogs/databases/indexing/session-8-when-indexes-hurt/concept-1-write-amplification)), one commit per row, triggers.
+
+> **Common mistake:** adding read replicas for a write problem.
+
+## Q2. Replication and the retention delete
+
+**Question:** why does replicating a database not help with the nightly retention delete of Concept 2?
+
+The delete runs on the primary and is then replayed on each replica: the same 212,039 row changes, the same dead tuples or purge work, now on every server, plus replication lag while the burst is applied. Replication multiplies the cost of a row-by-row delete; it never removes it.
+
+> **Common mistake:** running the delete "on a replica". Replicas are read-only; the data must be deleted at the source.
+
+## Q3. "All orders from yesterday" with seller_id as shard key
+
+**Question:** a sharded cluster uses `seller_id` as the shard key. What happens to "all orders from yesterday"?
+
+The router cannot tell which shards hold yesterday's orders (every shard has some), so it sends the query to **every shard** and merges the results: a scatter-gather query. Each shard can still use its own index on `created_at`, but the total work, and the latency of the slowest shard, grows with the number of shards. Choosing a shard key is choosing which queries stay on one shard (Session 5).
+
+> **Common mistake:** assuming a sharded cluster makes every query faster. Only queries that name the shard key get the "one shard" benefit.
+
+## Q4. Bigger, not smaller
+
+**Question:** why did partitioning make the table slightly bigger instead of smaller?
+
+The rows are the same, so the heap is the same size. What grew: the primary key had to become `(id, created_at)`, because a unique key on a partitioned table must include the partition key, so each index entry is 8 bytes wider; and each of the 24 partitions has its own heap file and indexes with partly empty last pages, metapages and free space map. PostgreSQL: 596 MB → 624 MB; MySQL: 392 MB → 423 MB.
+
+> **Common mistake:** expecting partitioning to save space. It saves **work** on operations that can target one partition.
+
+## Q5. Cheap deletes in MongoDB
+
+**Question:** MongoDB has no table partitioning. How would you delete old orders cheaply in MongoDB?
+
+Options, each covered with measurements in Session 3:
+
+- **One collection per period** (`orders_2024_01`, …): retention is `drop()` (4 ms in Concept 2). The application, or a view with `$unionWith`, must query across collections.
+- A **TTL index** on `created_at`: a background thread deletes expired documents. It is still a row-by-row delete (same cost as `deleteMany`), only automatic and spread over time.
+- A **time-series collection** with `expireAfterSeconds`: data is stored in buckets, and expired buckets are removed as a whole, much cheaper than per document.
+
+> **Common mistake:** treating a TTL index as free. It does the same per-document work as `deleteMany`; it only hides it in the background.
+
+## Q6. Needs both
+
+**Question:** give one problem that needs both sharding and replication.
+
+"Write volume is more than one server can take, **and** checkout must survive a server failure." Sharding spreads the writes; but a shard is then a single point of failure for its part of the data, so each shard needs replicas for failover. This is why MongoDB requires every shard in production to be a replica set.
+
+> **Common mistake:** treating shards as redundancy. Three shards without replicas means three servers that can each lose a third of the data.

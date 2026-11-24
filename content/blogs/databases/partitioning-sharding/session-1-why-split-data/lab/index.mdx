@@ -1,0 +1,403 @@
+---
+title: "Lab and session quiz: Why split data"
+description: "Set up the Partitioning and sharding course lab (PostgreSQL 17, MySQL 8.4 and MongoDB 8.0 with a 5M-row orders table used by every session), then measure what grows with one big table, delete a month vs drop it, build a monthly partitioned copy and compare it with a plain table that has the right index."
+type: "how-to"
+tags: ["partitioning", "sharding", "postgresql", "mysql", "mongodb", "lab"]
+status: "draft"
+sources:
+  - "https://hub.docker.com/_/postgres"
+  - "https://hub.docker.com/_/mysql"
+  - "https://hub.docker.com/_/mongo"
+  - "https://www.postgresql.org/docs/current/pageinspect.html"
+  - "https://www.postgresql.org/docs/current/ddl-partitioning.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-range.html"
+---
+
+<Tldr>
+This lab builds the environment every later Partitioning and sharding lab reuses: a database called **`parts`** in each engine holding **`orders`**, **5,000,000 marketplace orders** from 2024-01-01 to 2025-12-31 (about 208,000 per month). Sessions 1–4 need only the three containers from the Indexing course; the sharding sessions add more containers later. Outputs below are from the lab runs; timings depend on your machine and its load, the ratios should not.
+</Tldr>
+
+## 1. Start the databases
+
+These are the containers from the [Indexing course lab](/blogs/databases/indexing/session-1-storage-basics/lab); start them if you do not have them yet.
+
+```bash
+docker run -d --name idx-pg    -e POSTGRES_PASSWORD=lab -p 5433:5432 postgres:17-alpine -c shared_buffers=128MB
+docker run -d --name idx-mysql -e MYSQL_ROOT_PASSWORD=lab -e MYSQL_DATABASE=lab -p 3307:3306 mysql:8.4
+docker run -d --name idx-mongo -p 27018:27017 mongo:8.0
+
+# The parts database in the SQL engines (MongoDB creates it on first write).
+docker exec idx-pg    psql -U postgres -c "CREATE DATABASE parts"
+docker exec idx-mysql mysql -uroot -plab -e "CREATE DATABASE parts"
+```
+
+Shortcuts used in every lab of this course:
+
+```bash
+alias ppg='docker exec -it idx-pg psql -U postgres -d parts'
+alias pmy='docker exec -it idx-mysql mysql -uroot -plab parts'
+alias pmg='docker exec -it idx-mongo mongosh --quiet parts'
+```
+
+## 2. Load the dataset
+
+| Column | Values |
+|---|---|
+| `id` (`_id` in MongoDB) | 1 … 5,000,000, increasing with `created_at` (primary key) |
+| `seller_id` | 1 … 5,000 (not indexed) |
+| `marketplace` | `shopee` 50%, `tiktok` 30%, `lazada` 20% |
+| `status` | `delivered` 85%, `cancelled` 10%, `returned` 5% |
+| `amount` | 1.00 … 500.99 |
+| `created_at` | 2024-01-01 00:00:00 … 2025-12-31 23:59:47 UTC, one order every 12.6 s (indexed) |
+
+`seller_id`, `marketplace` and `status` come from md5 hashes of the id, so they are independent of each other and of time, and the three engines get exactly the same rows. Loading took about 1.5–2 minutes per engine in the lab (with other loads running in parallel).
+
+### PostgreSQL
+
+Save as `pg-pt-seed.sql`, then `docker exec -i idx-pg psql -U postgres -d parts < pg-pt-seed.sql`.
+
+```sql
+-- Partitioning course dataset: 5,000,000 marketplace orders over two years (2024-01-01 .. 2025-12-31 UTC).
+-- id increases with created_at, like a real order table. seller, marketplace and status come from md5
+-- so they are independent of each other and of time.
+DROP TABLE IF EXISTS orders;
+CREATE TABLE orders (
+  id          bigint        PRIMARY KEY,
+  seller_id   integer       NOT NULL,               -- 1..5000, not indexed
+  marketplace text          NOT NULL,               -- shopee 50%, tiktok 30%, lazada 20%
+  status      text          NOT NULL,               -- delivered 85%, cancelled 10%, returned 5%
+  amount      numeric(12,2) NOT NULL,
+  created_at  timestamptz   NOT NULL
+);
+INSERT INTO orders
+SELECT g,
+       ('x' || substr(md5('s' || g), 1, 8))::bit(32)::bigint % 5000 + 1,
+       CASE WHEN ('x' || substr(md5('m' || g), 1, 8))::bit(32)::bigint % 10 < 5 THEN 'shopee'
+            WHEN ('x' || substr(md5('m' || g), 1, 8))::bit(32)::bigint % 10 < 8 THEN 'tiktok'
+            ELSE 'lazada' END,
+       CASE WHEN ('x' || substr(md5('t' || g), 1, 8))::bit(32)::bigint % 20 < 2 THEN 'cancelled'
+            WHEN ('x' || substr(md5('t' || g), 1, 8))::bit(32)::bigint % 20 = 2 THEN 'returned'
+            ELSE 'delivered' END,
+       (g * 7907) % 50000 / 100.0 + 1,
+       timestamptz '2024-01-01 00:00:00+00' + ((g - 1) * 1263168 / 100000) * interval '1 second'
+FROM generate_series(1::bigint, 5000000) AS g;
+CREATE INDEX orders_created_at_idx ON orders (created_at);
+VACUUM ANALYZE orders;
+```
+
+### MySQL
+
+Save as `mysql-pt-seed.sql`, then `docker exec -i idx-mysql mysql -uroot -plab parts < mysql-pt-seed.sql`.
+
+```sql
+-- Partitioning course dataset: 5,000,000 marketplace orders over two years (2024-01-01 .. 2025-12-31 UTC).
+-- id increases with created_at; seller, marketplace and status come from md5 (same formulas as PostgreSQL).
+DROP TABLE IF EXISTS orders;
+CREATE TABLE orders (
+  id          BIGINT        NOT NULL PRIMARY KEY,
+  seller_id   INT           NOT NULL,
+  marketplace VARCHAR(8)    NOT NULL,
+  status      VARCHAR(10)   NOT NULL,
+  amount      DECIMAL(12,2) NOT NULL,
+  created_at  DATETIME      NOT NULL,
+  KEY orders_created_at_idx (created_at)
+) ENGINE = InnoDB;
+SET SESSION cte_max_recursion_depth = 5000;
+INSERT INTO orders
+WITH RECURSIVE a(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM a WHERE n < 4999),
+               b(m) AS (SELECT 0 UNION ALL SELECT m + 1 FROM b WHERE m < 999),
+               s(g) AS (SELECT a.n * 1000 + b.m + 1 FROM a CROSS JOIN b)
+SELECT g,
+       CONV(SUBSTR(MD5(CONCAT('s', g)), 1, 8), 16, 10) % 5000 + 1,
+       CASE WHEN CONV(SUBSTR(MD5(CONCAT('m', g)), 1, 8), 16, 10) % 10 < 5 THEN 'shopee'
+            WHEN CONV(SUBSTR(MD5(CONCAT('m', g)), 1, 8), 16, 10) % 10 < 8 THEN 'tiktok'
+            ELSE 'lazada' END,
+       CASE WHEN CONV(SUBSTR(MD5(CONCAT('t', g)), 1, 8), 16, 10) % 20 < 2 THEN 'cancelled'
+            WHEN CONV(SUBSTR(MD5(CONCAT('t', g)), 1, 8), 16, 10) % 20 = 2 THEN 'returned'
+            ELSE 'delivered' END,
+       (g * 7907) % 50000 / 100 + 1,
+       TIMESTAMP '2024-01-01 00:00:00' + INTERVAL ((g - 1) * 1263168 DIV 100000) SECOND
+FROM s ORDER BY g;
+ANALYZE TABLE orders;
+```
+
+### MongoDB
+
+Save as `mongo-pt-seed.js`, then `docker cp mongo-pt-seed.js idx-mongo:/tmp/ && docker exec idx-mongo mongosh --quiet parts /tmp/mongo-pt-seed.js`.
+
+```js
+// Partitioning course dataset: 5,000,000 marketplace orders over two years (2024-01-01 .. 2025-12-31 UTC).
+// Run with: mongosh --quiet <db> mongo-pt-seed.js   (same formulas as the SQL seeds; _id is the order id)
+const md5n = s => parseInt(require('crypto').createHash('md5').update(s).digest('hex').slice(0, 8), 16);
+const t0 = new Date('2024-01-01T00:00:00Z').getTime();
+db.orders.drop();
+let batch = [];
+for (let g = 1; g <= 5000000; g++) {
+  const m = md5n('m' + g) % 10, t = md5n('t' + g) % 20;
+  batch.push({
+    _id: g,
+    seller_id: md5n('s' + g) % 5000 + 1,
+    marketplace: m < 5 ? 'shopee' : m < 8 ? 'tiktok' : 'lazada',
+    status: t < 2 ? 'cancelled' : t === 2 ? 'returned' : 'delivered',
+    amount: Decimal128(((g * 7907) % 50000 / 100 + 1).toFixed(2)),
+    created_at: new Date(t0 + Math.floor((g - 1) * 1263168 / 100000) * 1000)
+  });
+  if (batch.length === 10000) { db.orders.insertMany(batch, { ordered: false }); batch = []; }
+}
+db.orders.createIndex({ created_at: 1 });
+printjson({ orders: db.orders.countDocuments() });
+```
+
+Check that the three engines agree:
+
+```sql
+-- PostgreSQL and MySQL
+SELECT count(*), min(created_at), max(created_at), sum(amount) FROM orders;
+-- 5000000 | 2024-01-01 00:00:00 | 2025-12-31 23:59:47 | 1254975000.00
+SELECT marketplace, count(*) FROM orders GROUP BY marketplace ORDER BY 1;
+-- lazada 1000021 | shopee 2499789 | tiktok 1500190
+```
+
+```js
+db.orders.countDocuments()                                            // 5000000
+db.orders.aggregate([{ $group: { _id: '$marketplace', n: { $sum: 1 } } }, { $sort: { _id: 1 } }])   // same counts
+```
+
+## Exercise 1: what grows (Concept 1)
+
+Make two smaller copies and compare tree depth, lookups and whole-table work.
+
+```sql
+-- PostgreSQL
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+CREATE TABLE o500k AS SELECT * FROM orders WHERE id <= 500000;
+ALTER TABLE o500k ADD PRIMARY KEY (id); CREATE INDEX ON o500k (created_at);
+CREATE TABLE o50k AS SELECT * FROM orders WHERE id <= 50000;
+ALTER TABLE o50k ADD PRIMARY KEY (id); CREATE INDEX ON o50k (created_at);
+VACUUM ANALYZE o500k; VACUUM ANALYZE o50k;
+
+SELECT level FROM bt_metap('o50k_pkey');     -- 1
+SELECT level FROM bt_metap('o500k_pkey');    -- 2
+SELECT level FROM bt_metap('orders_pkey');   -- 2
+
+\timing on
+-- Repeat for o50k, o500k and orders; run each twice and keep the second.
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE id = 42;   -- lab: 7 buffers, 0.041 ms (o50k: 6, 0.035 ms)
+SELECT sum(amount) FROM orders;                                  -- lab: 70 ms (o50k: 2.3 ms)
+VACUUM (DISABLE_PAGE_SKIPPING) orders;                           -- lab: 91 ms (o50k: 2.7 ms)
+CREATE INDEX orders_seller_tmp ON orders (seller_id);            -- lab: 683 ms (o50k: 9.9 ms)
+DROP INDEX orders_seller_tmp;
+ANALYZE orders;                                                  -- lab: 73 ms (o50k: 22 ms)
+```
+
+```sql
+-- MySQL (the client prints times to 0.01 s)
+CREATE TABLE o500k LIKE orders; INSERT INTO o500k SELECT * FROM orders WHERE id <= 500000;
+CREATE TABLE o50k  LIKE orders; INSERT INTO o50k  SELECT * FROM orders WHERE id <= 50000;
+SELECT SUM(amount) FROM orders;                                  -- lab: 0.59 s (o500k: 0.03 s)
+ALTER TABLE orders ADD INDEX seller_tmp (seller_id);             -- lab: 3.14 s (o50k: 0.11 s)
+ALTER TABLE orders DROP INDEX seller_tmp;
+SELECT index_name, stat_value FROM mysql.innodb_index_stats
+WHERE database_name = 'parts' AND table_name = 'orders' AND stat_name = 'n_leaf_pages';
+```
+
+```js
+// MongoDB
+for (const [name, n] of [['o50k', 50000], ['o500k', 500000]]) {
+  db.orders.aggregate([{ $match: { _id: { $lte: n } } }, { $out: name }]);
+  db[name].createIndex({ created_at: 1 });
+}
+const ms = f => { const t = Date.now(); f(); return Date.now() - t; };
+ms(() => db.orders.createIndex({ seller_id: 1 }, { name: 'seller_tmp' }))   // lab: 4,273 ms (o50k: 40 ms)
+db.orders.dropIndex('seller_tmp')
+ms(() => db.orders.validate())                                             // lab: 5,600 ms (o50k: 48 ms)
+db.serverStatus().wiredTiger.cache['maximum bytes configured'] / 1048576   // lab: 5495
+```
+
+## Exercise 2: delete a month vs drop it (Concept 2)
+
+Keep a backup of January 2024, delete it from the big table, measure, and put it back.
+
+```sql
+-- PostgreSQL
+CREATE TABLE jan_backup AS SELECT * FROM orders WHERE created_at < '2024-02-01';   -- 212039 rows
+SELECT pg_current_wal_lsn() AS lsn0 \gset
+DELETE FROM orders WHERE created_at < '2024-02-01';                               -- lab: 75 ms
+SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), :'lsn0'));            -- lab: 27 MB
+SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname = 'orders';              -- 212039 (after a second)
+VACUUM (VERBOSE) orders;                                                          -- lab: 0.66 s, 10 MB of WAL
+SELECT pg_size_pretty(pg_relation_size('orders'));                                -- still 365 MB
+
+CREATE TABLE jan_copy AS SELECT * FROM jan_backup;
+ALTER TABLE jan_copy ADD PRIMARY KEY (id); CREATE INDEX ON jan_copy (created_at);
+SELECT pg_current_wal_lsn() AS lsn1 \gset
+DROP TABLE jan_copy;                                                              -- lab: 7 ms
+SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), :'lsn1');                            -- lab: 4288 bytes
+
+INSERT INTO orders SELECT * FROM jan_backup ORDER BY id;
+VACUUM ANALYZE orders;
+DROP TABLE jan_backup;
+```
+
+```sql
+-- MySQL
+CREATE TABLE jan_backup LIKE orders;
+INSERT INTO jan_backup SELECT * FROM orders WHERE created_at < '2024-02-01';
+SHOW BINARY LOG STATUS;                                       -- note File and Position
+DELETE FROM orders WHERE created_at < '2024-02-01';           -- lab: 0.60 s
+SHOW BINARY LOG STATUS;                                       -- lab: Position + 8.3 MB
+SHOW BINLOG EVENTS IN 'binlog.000013' FROM 8721289 LIMIT 5;   -- use your own File and Position
+INSERT INTO orders SELECT * FROM jan_backup;
+
+BEGIN; DELETE FROM orders WHERE created_at < '2024-02-01'; ROLLBACK;   -- lab: 0.63 s + 0.47 s
+
+CREATE TABLE jan_copy LIKE orders; INSERT INTO jan_copy SELECT * FROM jan_backup;
+DROP TABLE jan_copy;                                          -- lab: 0.04 s
+DROP TABLE jan_backup;
+```
+
+```js
+// MongoDB
+const feb = ISODate('2024-02-01T00:00:00Z');
+db.orders.aggregate([{ $match: { created_at: { $lt: feb } } }, { $out: 'jan_backup' }]);
+let t = Date.now(); db.orders.deleteMany({ created_at: { $lt: feb } }); Date.now() - t   // lab: 1,037–1,106 ms
+db.orders.stats().storageSize / 1048576                                                // unchanged
+db.jan_backup.aggregate([{ $merge: { into: 'orders', whenMatched: 'fail' } }]);
+db.jan_backup.aggregate([{ $out: 'jan_copy' }]); db.jan_copy.createIndex({ created_at: 1 });
+t = Date.now(); db.jan_copy.drop(); Date.now() - t                                     // lab: 4 ms
+db.jan_backup.drop()
+```
+
+## Exercise 3: build a monthly partitioned copy (Concepts 3 and 4)
+
+Session 2 explains every line; here the copy is only needed for the comparison.
+
+```sql
+-- PostgreSQL: 24 monthly partitions, generated with \gexec
+CREATE TABLE orders_m (LIKE orders INCLUDING DEFAULTS) PARTITION BY RANGE (created_at);
+SELECT format('CREATE TABLE orders_m_%s PARTITION OF orders_m FOR VALUES FROM (%L) TO (%L)',
+              to_char(m, 'YYYY_MM'), m, m + interval '1 month')
+FROM generate_series(timestamptz '2024-01-01 00:00+00', '2025-12-01 00:00+00', interval '1 month') AS m \gexec
+INSERT INTO orders_m SELECT * FROM orders;
+ALTER TABLE orders_m ADD PRIMARY KEY (id, created_at);   -- must include the partition key
+CREATE INDEX ON orders_m (created_at);
+VACUUM ANALYZE orders_m;
+SELECT pg_size_pretty(sum(pg_total_relation_size(inhrelid))) FROM pg_inherits
+WHERE inhparent = 'orders_m'::regclass;                   -- lab: 624 MB (orders: 596 MB)
+```
+
+```sql
+-- MySQL: the same 24 months
+CREATE TABLE orders_m (
+  id BIGINT NOT NULL, seller_id INT NOT NULL, marketplace VARCHAR(8) NOT NULL, status VARCHAR(10) NOT NULL,
+  amount DECIMAL(12,2) NOT NULL, created_at DATETIME NOT NULL,
+  PRIMARY KEY (id, created_at), KEY orders_m_created_at_idx (created_at)
+) ENGINE = InnoDB
+PARTITION BY RANGE COLUMNS (created_at) (
+  PARTITION p2024_01 VALUES LESS THAN ('2024-02-01'),
+  PARTITION p2024_02 VALUES LESS THAN ('2024-03-01'),
+  PARTITION p2024_03 VALUES LESS THAN ('2024-04-01'),
+  PARTITION p2024_04 VALUES LESS THAN ('2024-05-01'),
+  PARTITION p2024_05 VALUES LESS THAN ('2024-06-01'),
+  PARTITION p2024_06 VALUES LESS THAN ('2024-07-01'),
+  PARTITION p2024_07 VALUES LESS THAN ('2024-08-01'),
+  PARTITION p2024_08 VALUES LESS THAN ('2024-09-01'),
+  PARTITION p2024_09 VALUES LESS THAN ('2024-10-01'),
+  PARTITION p2024_10 VALUES LESS THAN ('2024-11-01'),
+  PARTITION p2024_11 VALUES LESS THAN ('2024-12-01'),
+  PARTITION p2024_12 VALUES LESS THAN ('2025-01-01'),
+  PARTITION p2025_01 VALUES LESS THAN ('2025-02-01'),
+  PARTITION p2025_02 VALUES LESS THAN ('2025-03-01'),
+  PARTITION p2025_03 VALUES LESS THAN ('2025-04-01'),
+  PARTITION p2025_04 VALUES LESS THAN ('2025-05-01'),
+  PARTITION p2025_05 VALUES LESS THAN ('2025-06-01'),
+  PARTITION p2025_06 VALUES LESS THAN ('2025-07-01'),
+  PARTITION p2025_07 VALUES LESS THAN ('2025-08-01'),
+  PARTITION p2025_08 VALUES LESS THAN ('2025-09-01'),
+  PARTITION p2025_09 VALUES LESS THAN ('2025-10-01'),
+  PARTITION p2025_10 VALUES LESS THAN ('2025-11-01'),
+  PARTITION p2025_11 VALUES LESS THAN ('2025-12-01'),
+  PARTITION p2025_12 VALUES LESS THAN ('2026-01-01')
+);
+INSERT INTO orders_m SELECT * FROM orders;                -- lab: 17 s
+ANALYZE TABLE orders_m;
+```
+
+## Exercise 4: the right index vs the partition (Concept 4)
+
+```sql
+-- PostgreSQL: run each query 3 times in a new psql session
+EXPLAIN (ANALYZE, BUFFERS) SELECT sum(amount) FROM orders
+WHERE created_at >= '2025-03-01' AND created_at < '2025-04-01';   -- lab: index scan, 3,009 buffers, 9.7 ms
+EXPLAIN (ANALYZE, BUFFERS) SELECT sum(amount) FROM orders_m
+WHERE created_at >= '2025-03-01' AND created_at < '2025-04-01';   -- lab: only orders_m_2025_03, 1,982 buffers, 8.2 ms
+CREATE INDEX orders_created_amount_idx ON orders (created_at) INCLUDE (amount);
+VACUUM ANALYZE orders;
+-- the first query again                                         -- lab: Index Only Scan, 820 buffers, 7.4 ms
+
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders   WHERE id = 4242424;   -- lab: 7 buffers
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders_m WHERE id = 4242424;   -- lab: Append of 24 index scans, 76 buffers
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders_m WHERE id = 4242424
+  AND created_at >= '2025-09-01' AND created_at < '2025-10-01';         -- lab: one partition, 7 buffers
+
+EXPLAIN ANALYZE SELECT sum(amount) FROM orders   WHERE seller_id = 777; -- lab: 51–60 ms
+EXPLAIN ANALYZE SELECT sum(amount) FROM orders_m WHERE seller_id = 777; -- lab: 66–116 ms
+```
+
+```sql
+-- MySQL
+EXPLAIN ANALYZE SELECT SUM(amount) FROM orders
+WHERE created_at >= '2025-03-01' AND created_at < '2025-04-01';   -- lab: 107–154 ms
+EXPLAIN ANALYZE SELECT SUM(amount) FROM orders_m
+WHERE created_at >= '2025-03-01' AND created_at < '2025-04-01';   -- lab: 25–31 ms, partitions: p2025_03
+ALTER TABLE orders ADD INDEX orders_created_amount_idx (created_at, amount);   -- lab: 4.3 s
+-- the first query again                                          -- lab: covering index range scan, 25 ms
+
+EXPLAIN SELECT * FROM orders_m WHERE id = 4242424;                -- partitions: all 24
+SHOW SESSION STATUS LIKE 'Handler_read_key';
+SELECT id FROM orders_m WHERE id = 4242424;
+SHOW SESSION STATUS LIKE 'Handler_read_key';                      -- lab: +24 (orders: +1)
+```
+
+```js
+// MongoDB
+const q = { created_at: { $gte: ISODate('2025-03-01'), $lt: ISODate('2025-04-01') } };
+const p = [{ $match: q }, { $group: { _id: null, s: { $sum: '$amount' } } }];
+const ms = f => { const t = Date.now(); f(); return Date.now() - t; };
+ms(() => db.orders.aggregate(p, { hint: { $natural: 1 } }).toArray())   // lab: 711–1,255 ms
+ms(() => db.orders.aggregate(p).toArray())                              // lab: 65–82 ms
+db.orders.createIndex({ created_at: 1, amount: 1 }, { name: 'created_amount' })
+ms(() => db.orders.aggregate(p, { hint: 'created_amount' }).toArray())  // lab: 43 ms
+db.orders.explain('executionStats').aggregate(p, { hint: 'created_amount' })   // PROJECTION_COVERED, totalDocsExamined 0
+```
+
+## Clean up
+
+Later sessions start from the plain `orders` table with its primary key and `created_at` index only.
+
+```sql
+-- PostgreSQL
+DROP TABLE IF EXISTS o50k, o500k, orders_m;
+DROP INDEX IF EXISTS orders_created_amount_idx;
+-- MySQL
+DROP TABLE IF EXISTS o50k, o500k, orders_m;
+ALTER TABLE orders DROP INDEX orders_created_amount_idx;
+```
+
+```js
+// MongoDB
+db.o50k.drop(); db.o500k.drop(); db.orders.dropIndex('created_amount')
+```
+
+## Session quiz
+
+1. A lookup by id cost 7 buffers at 5M rows. Roughly how many rows can the primary key hold before it needs an 8th, and why does that number grow so fast?
+2. Name two jobs whose time grew roughly 100× when the table grew 100×, and one that did not. Why the difference?
+3. Deleting one month cost PostgreSQL 27 MB of WAL plus a VACUUM; dropping the same rows as a table cost 4,288 bytes. Explain the difference in one sentence each.
+4. After the DELETE and VACUUM, the PostgreSQL heap was still 365 MB. When does deleted space become available, and when is it returned to the operating system?
+5. Which of partitioning, sharding and replication helps with: (a) slow retention deletes, (b) a primary at 95% CPU from writes, (c) reports slowing down checkout?
+6. Why did the lookup by id get more expensive on the partitioned table, and how can the application avoid it?
+7. MySQL's month sum was 4× faster on the partitioned table than on the plain one with a `created_at` index. Why, and what plain-table change made them equal?
+8. Your team proposes partitioning `orders` by month "for performance". Write the three measurements you would ask for before agreeing.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-1-why-split-data/lab/answers">Answers to the session quiz</DeepDive>
