@@ -1,0 +1,12 @@
+{
+  "title": "Session 4: MVCC internals",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-postgres-row-versions/index",
+    "concept-2-innodb-undo-read-views/index",
+    "concept-3-wiredtiger-history/index",
+    "concept-4-long-transactions/index",
+    "lab/index"
+  ]
+}

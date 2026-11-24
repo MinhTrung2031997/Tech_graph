@@ -1,0 +1,218 @@
+---
+title: "Concept 2: InnoDB undo logs and read views"
+description: "InnoDB updates rows in place and keeps the previous versions in the undo log. A reader whose read view is older than the row rebuilds the old version by walking the undo chain: 0.09 ms for a fresh read, 14.8 ms after 30,000 newer versions. The purge thread frees undo only behind the oldest read view: the history list grew from 22 to 30,007 while one transaction stayed open, and dropped to 0 within 5 s of its commit."
+type: "concept"
+tags: ["transactions", "mvcc", "mysql", "innodb", "undo-log", "purge", "read-view"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-undo-logs.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-purge-configuration.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/information-schema-innodb-trx-table.html"
+---
+
+<Tldr>
+InnoDB keeps **one** version of each row in the clustered index: the newest. Every change also writes an **undo record** describing how to go back, and the row's hidden **DB_ROLL_PTR** points to it. A **read view** (taken at the first consistent read, Session 3) lists which transactions it may see; when a row was changed by a transaction the read view cannot see, InnoDB applies undo records until it reaches a visible version. In the lab, account 1 was updated **30,000** times (one commit each) while T1 kept an older read view: T1's read of that row went from **0.088 ms** to **14.8 ms**, a fresh reader still took **0.14 ms**. Undo can only be purged behind the **oldest** read view: the history list length went from **22** to **30,007** while T1 was open and fell to **0** within 5 s after it committed.
+</Tldr>
+
+## Rows in place, history aside
+
+| Term | Meaning |
+|---|---|
+| `DB_TRX_ID` | Hidden 6-byte column: id of the last transaction that modified the row |
+| `DB_ROLL_PTR` | Hidden 7-byte column: pointer to the undo record holding the previous version |
+| Undo record | Enough information to rebuild the previous version (old column values, previous roll pointer) |
+| Undo chain | Newest row → undo record → older undo record → … |
+| Read view | Snapshot of active transaction ids at creation: ids below its low limit are visible, ids at or above its high limit and ids in its active list are not |
+| History list | Committed transactions whose update undo is not yet purged (`trx_rseg_history_len`) |
+| Purge | Background threads that delete undo (and delete-marked records) no read view can need |
+| **✓ Version found** | A visible version was returned |
+
+Unlike PostgreSQL (Concept 1), an UPDATE does not create a second row: the table and its indexes stay the same size, and the cost of history moves to the undo tablespaces and to readers of old versions.
+
+## Reading through the undo chain
+
+<Flow
+  title="InnoDB: fresh read vs read through 30,000 undo records"
+  height={270}
+  nodes={[
+    { id: 'rv', label: 'T1 read view', sub: 'created before the updates', x: 20, y: 20, w: 200 },
+    { id: 'rec', label: 'Clustered record id 1', sub: 'version 1', x: 300, y: 20, w: 200 },
+    { id: 'undo', label: 'Undo chain', sub: 'empty', x: 580, y: 20, w: 200 },
+    { id: 'fresh', label: 'Fresh reader', sub: 'new read view', x: 20, y: 180, w: 200 },
+    { id: 'newest', label: '✓ Newest version', sub: '', x: 300, y: 180, w: 200 },
+    { id: 'oldv', label: '✓ Rebuilt old version', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 'rv-rec', from: 'rv', to: 'rec', label: 'read' },
+    { id: 'rec-undo', from: 'rec', to: 'undo', label: 'roll ptr' },
+    { id: 'undo-oldv', from: 'undo', to: 'oldv' },
+    { id: 'fresh-rec', from: 'fresh', to: 'rec' },
+    { id: 'rec-newest', from: 'rec', to: 'newest' },
+  ]}
+  cases={[
+    {
+      title: 'Before the updates',
+      path: 'T1 read view → record version 1, DB_TRX_ID visible → ✓ 0.088 ms',
+      summary: 'Nothing changed since the read view: the record itself is the answer.',
+      steps: [
+        {
+          title: 'T1 creates its read view',
+          note: 'START TRANSACTION and a first consistent read: version 1. A second read in the same transaction took 0.088 ms.',
+          code: "START TRANSACTION;\nSELECT version FROM accounts WHERE id = 1;   -- 1, 0.088 ms",
+          active: ['rv', 'rec', 'newest'],
+          edges: ['rv-rec', 'rec-newest'],
+          subs: { newest: 'version 1 · 0.088 ms' },
+        },
+      ],
+    },
+    {
+      title: '30,000 newer versions',
+      path: 'another session commits 30,000 updates → record = version 30001 → T1: DB_TRX_ID not visible → apply 30,000 undo records → ✓ version 1 in 14.8 ms',
+      summary: 'The newest reader is unaffected; the old read view pays for every newer version.',
+      steps: [
+        {
+          title: 'Updates in place',
+          note: 'A stored procedure ran UPDATE accounts SET version = version + 1 WHERE id = 1 30,000 times, each its own committed transaction (40 s). The clustered record now holds version 30001; each update pushed one undo record onto the chain.',
+          code: "CALL churn(1, 30000);   -- 30,000 commits",
+          active: ['rec', 'undo'],
+          edges: ['rec-undo'],
+          subs: { rec: 'version 30001', undo: '30,000 undo records' },
+        },
+        {
+          title: 'A fresh reader',
+          note: 'A new read view sees every committed transaction, so the record itself is visible: version 30001 in 0.14 ms.',
+          active: ['fresh', 'rec', 'newest'],
+          edges: ['fresh-rec', 'rec-newest'],
+          subs: { newest: 'version 30001 · 0.14 ms' },
+        },
+        {
+          title: 'T1\'s old read view',
+          note: 'The record\'s DB_TRX_ID is not visible to T1, so InnoDB copies the record and applies undo records one by one, checking each version\'s transaction id against the read view, until it reaches version 1: 14.8 ms, 168× slower. Summing ids 1–100 (99 unchanged rows plus this one) took 15.4 ms.',
+          code: "SELECT version FROM accounts WHERE id = 1;   -- still 1, 14.8 ms",
+          active: ['rv', 'rec', 'undo', 'oldv'],
+          edges: ['rv-rec', 'rec-undo', 'undo-oldv'],
+          subs: { oldv: 'version 1 · 14.8 ms' },
+        },
+      ],
+    },
+    {
+      title: 'Transaction ids and read views',
+      path: 'read-only transaction: no real id · writer: id 704187 · 1 read view open',
+      summary: 'What INNODB_TRX and SHOW ENGINE INNODB STATUS show.',
+      steps: [
+        {
+          title: 'Who has an id',
+          note: 'A reading transaction and a writing transaction were open. INNODB_TRX listed the writer with trx_id 704187 and the reader with 562948025154776: read-only transactions get no real id (the large number is a placeholder InnoDB derives from the transaction object in memory), which keeps them cheap. The engine status showed "Trx id counter 704188" and "1 read views open inside InnoDB".',
+          code: "SELECT trx_id, trx_state, trx_rows_modified FROM information_schema.innodb_trx;\n-- 704187           RUNNING  1\n-- 562948025154776  RUNNING  0",
+          active: ['rv', 'fresh'],
+          subs: { rv: 'read-only: no real trx id' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Purge and the history list
+
+<Flow
+  title="InnoDB: purge stops at the oldest read view"
+  height={270}
+  nodes={[
+    { id: 'commits', label: '30,000 commits', sub: 'update undo logs', x: 20, y: 20, w: 200 },
+    { id: 'hist', label: 'History list', sub: 'length 22', x: 300, y: 20, w: 200 },
+    { id: 'purge', label: 'Purge threads', sub: 'oldest first', x: 580, y: 20, w: 200 },
+    { id: 'rv', label: 'T1 read view', sub: 'oldest open', x: 20, y: 180, w: 200 },
+    { id: 'blocked', label: '✗ Purge waits', sub: '', x: 300, y: 180, w: 200 },
+    { id: 'ok', label: '✓ Undo freed', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 'commits-hist', from: 'commits', to: 'hist', label: 'add' },
+    { id: 'hist-purge', from: 'hist', to: 'purge', label: 'consume' },
+    { id: 'rv-purge', from: 'rv', to: 'purge', quiet: true },
+    { id: 'purge-blocked', from: 'purge', to: 'blocked' },
+    { id: 'purge-ok', from: 'purge', to: 'ok' },
+  ]}
+  cases={[
+    {
+      title: 'Read view open',
+      path: '30,000 commits → history list 22 → 30,007 → purge must keep undo T1 may need → ✗ waits',
+      summary: 'One idle transaction holds back cleanup for the whole server.',
+      steps: [
+        {
+          title: 'Every commit adds to the list',
+          note: 'Each committed update transaction hands its undo log to the history list. Before the test: 22 (server-wide, other workloads included).',
+          code: "SELECT count FROM information_schema.innodb_metrics WHERE name = 'trx_rseg_history_len';",
+          active: ['commits', 'hist'],
+          edges: ['commits-hist'],
+          subs: { hist: 'length 22 → growing' },
+        },
+        {
+          title: 'Purge cannot pass T1',
+          note: 'Undo older than the oldest read view could still be needed by it (T1 did read version 1 through it). With T1 open the history list reached 30,007.',
+          active: ['rv', 'hist', 'purge', 'blocked'],
+          edges: ['rv-purge', 'hist-purge', 'purge-blocked'],
+          subs: { hist: 'length 30,007', blocked: 'held by T1' },
+        },
+      ],
+    },
+    {
+      title: 'Read view closed',
+      path: 'T1 commits → purge frees 30,000 undo logs → ✓ history list 0 within 5 s',
+      summary: 'Purge catches up quickly once nothing holds it back.',
+      steps: [
+        {
+          title: 'Catch-up',
+          note: 'Five seconds after T1\'s COMMIT, trx_rseg_history_len was 0, and it stayed 0 at 10 and 15 s. SHOW ENGINE INNODB STATUS reports the same value as "History list length".',
+          active: ['hist', 'purge', 'ok'],
+          edges: ['hist-purge', 'purge-ok'],
+          subs: { hist: 'length 0', ok: 'within 5 s' },
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+In InnoDB, **rollback is expensive** and **commit is cheap**, the opposite of PostgreSQL. Updating all 100,000 rows of `jobs` took 339 ms; `COMMIT` then took 20 ms, but `ROLLBACK` took **139 ms**, because it applies the undo record of every changed row. In PostgreSQL the same `ROLLBACK` took **0.9 ms** (mark the xid aborted, Concept 1). Killing a transaction that updated millions of rows does not free the server immediately: it starts a rollback proportional to the work done.
+</Pitfall>
+
+## Real-world scenario: the slow replica report
+
+A reporting job on a MySQL server opens a transaction at 08:00 for an export and is still open at 11:00. Meanwhile a hot table receives 2,000 updates per second.
+
+| Symptom | Cause |
+|---|---|
+| History list length in the millions, undo tablespaces growing | Purge cannot pass the 08:00 read view |
+| Queries on hot rows get slower over the morning for some sessions | Readers with old read views walk long undo chains (14.8 ms for 30,000 versions in the lab) |
+| Everything recovers minutes after the job is killed | Purge catches up (0 within 5 s for 30,000 in the lab) |
+
+Find it: `SELECT trx_id, trx_started, trx_mysql_thread_id FROM information_schema.innodb_trx ORDER BY trx_started LIMIT 5;` and watch `trx_rseg_history_len` (Concept 4).
+
+## Why this matters for transactions
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 4: long transactions | The history list is InnoDB's version of PostgreSQL's dead tuples |
+| Session 5: locks and indexes | Locking reads skip the undo chain and read the newest record |
+| Session 8: when transactions hurt | Undo growth, purge lag and slow rollbacks |
+
+## Key takeaways
+
+1. InnoDB stores the newest row in place and older versions in the undo log, linked by DB_ROLL_PTR.
+2. A read view decides visibility by transaction id; an invisible row is rebuilt by applying undo records.
+3. Old read views pay for every newer version: 0.088 ms → 14.8 ms after 30,000 updates; fresh readers do not.
+4. Purge frees undo only behind the oldest read view: history list 30,007 while T1 was open, 0 after.
+5. Read-only transactions get no real transaction id; rollback applies undo (139 ms for 100,000 rows vs 0.9 ms in PostgreSQL).
+
+## Check questions
+
+1. Where is the previous version of a row after an UPDATE in InnoDB, and how does a reader reach it?
+2. Why did T1's read of account 1 take 14.8 ms while a fresh reader took 0.14 ms?
+3. What is the history list length, and why did it grow to 30,007?
+4. Why does one idle transaction affect purge for every table on the server?
+5. Why is the read-only transaction's trx_id a huge number?
+6. Compare the cost of COMMIT and ROLLBACK in InnoDB and PostgreSQL.
+7. An UPDATE in InnoDB does not grow the table. Where does the space for history go instead?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-4-mvcc-internals/concept-2-innodb-undo-read-views/answers">Worked answers to Q1–Q7</DeepDive>

@@ -1,0 +1,300 @@
+---
+title: "Concept 1: PostgreSQL row versions and snapshots"
+description: "How PostgreSQL decides which version of a row a transaction sees: xmin and xmax in every tuple header, the snapshot xmin:xmax:in-progress list, the commit log, hint bits written by readers, and freezing against transaction-id wraparound. Read straight from heap pages with pageinspect."
+type: "concept"
+tags: ["transactions", "mvcc", "postgresql", "snapshot", "visibility", "freezing"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/mvcc-intro.html"
+  - "https://www.postgresql.org/docs/current/storage-page-layout.html"
+  - "https://www.postgresql.org/docs/current/functions-info.html#FUNCTIONS-PG-SNAPSHOT"
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html#VACUUM-FOR-WRAPAROUND"
+  - "https://www.postgresql.org/docs/current/pageinspect.html"
+---
+
+<Tldr>
+Every PostgreSQL tuple carries **xmin** (the transaction that created it) and **xmax** (the one that deleted or replaced it). An UPDATE by transaction 2343343 set the old version's xmax to 2343343 and wrote a new version with xmin 2343343 on another page; both stayed in the table. A reader's **snapshot**, printed as `2343357:2343365:2343357,2343362`, lists the oldest running transaction, the next transaction id, and the transactions still running; a version is visible if its xmin committed **before** the snapshot and its xmax did not. After a **rollback** nothing is undone: the new version just becomes dead. Readers record what they learn from the commit log as **hint bits** (infomask 0x0802 → 0x0902 after the first `SELECT`), and **VACUUM FREEZE** marks old tuples as visible to everyone (0x0B02) so that 32-bit transaction ids can wrap around safely.
+</Tldr>
+
+[Session 3](/blogs/databases/transactions/session-3-isolation-levels) used snapshots as a black box. This session opens them, one engine per concept. The index-side cost of PostgreSQL's design (new index entries for non-HOT updates) is covered in [Indexing Session 6](/blogs/databases/indexing/session-6-engine-differences/concept-1-postgres-mvcc).
+
+## The tuple header
+
+| Field | Meaning |
+|---|---|
+| `xmin` | Transaction id (xid) that inserted this version |
+| `xmax` | xid that deleted it, replaced it (UPDATE) or locked it; 0 if none |
+| `t_ctid` | Pointer to itself, or to the newer version after an UPDATE |
+| `t_infomask` | Flags, including hint bits: `0x0100` xmin committed, `0x0200` xmin aborted (both = frozen), `0x0400` xmax committed, `0x0800` xmax invalid/aborted, `0x2000` this version was produced by an UPDATE |
+| Snapshot `xmin:xmax:xip` | Oldest xid still running; first xid not yet assigned; list of xids running when the snapshot was taken |
+| `pg_xact` | The commit log: 2 bits per xid (in progress, committed, aborted) |
+
+Seen from SQL, `xmin`, `xmax` and `ctid` are hidden columns: `SELECT xmin, xmax, ctid, balance FROM accounts WHERE id = 1` returned `2343333 | 0 | (0,1) | 1000.00`. `pageinspect` shows every version on a page, including the ones no snapshot can see.
+
+## Reading a row while it is being updated
+
+<Flow
+  title="PostgreSQL: which version does T1 see?"
+  height={270}
+  nodes={[
+    { id: 't2', label: 'T2 (xid 2343343)', sub: 'UPDATE id 1, not committed', x: 20, y: 20, w: 200 },
+    { id: 'old', label: 'Old version (0,1)', sub: 'xmin 2343333 · xmax 0', x: 300, y: 20, w: 220 },
+    { id: 'new', label: 'New version', sub: 'not yet written', x: 580, y: 20, w: 200 },
+    { id: 'snap', label: 'T1 snapshot', sub: '', x: 20, y: 180, w: 200 },
+    { id: 'ok', label: '✓ Visible', sub: '', x: 300, y: 180, w: 220 },
+    { id: 'no', label: '✗ Invisible', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 't2-old', from: 't2', to: 'old', label: 'xmax' },
+    { id: 'old-new', from: 'old', to: 'new', label: 't_ctid' },
+    { id: 'snap-old', from: 'snap', to: 'old' },
+    { id: 'snap-new', from: 'snap', to: 'new', quiet: true },
+    { id: 'old-ok', from: 'old', to: 'ok' },
+    { id: 'new-no', from: 'new', to: 'no' },
+  ]}
+  cases={[
+    {
+      title: 'Update in progress',
+      path: 'T2 writes a new version → T1 snapshot 2343343:2343343: → old ✓ visible (1000), new ✗ invisible',
+      summary: 'Both versions exist on disk; the snapshot picks one.',
+      steps: [
+        {
+          title: 'T2 updates',
+          note: 'T2 (xid 2343343) runs UPDATE … balance − 100 and does not commit. PostgreSQL never changes the old tuple\'s data: it sets xmax = 2343343 and t_ctid = (73,73) on it, and writes a new tuple on page 73 (page 0 was full).',
+          code: "-- pageinspect while T2 is open\n-- page 0,  lp 1:  t_xmin 2343333  t_xmax 2343343  t_ctid (73,73)  infomask 0x0102\n-- page 73, lp 73: t_xmin 2343343  t_xmax 0        t_ctid (73,73)  infomask 0x2802",
+          active: ['t2', 'old', 'new'],
+          edges: ['t2-old', 'old-new'],
+          subs: { old: 'xmin 2343333 · xmax 2343343', new: '(73,73) xmin 2343343 · 900' },
+        },
+        {
+          title: 'T1 takes a snapshot',
+          note: 'pg_current_snapshot() in T1 returned 2343343:2343343: → every xid below 2343343 had finished, and 2343343 and above count as not yet committed for this snapshot.',
+          code: "SELECT pg_current_snapshot();   -- 2343343:2343343:",
+          active: ['snap'],
+          subs: { snap: '2343343:2343343:' },
+        },
+        {
+          title: 'Visibility check',
+          note: 'Old version: xmin 2343333 < 2343343 and committed (pg_xact) → created before the snapshot; xmax 2343343 is not below the snapshot\'s xmax → its deletion is invisible → ✓ visible, balance 1000, xmax 2343343 shown in the hidden column. New version: xmin 2343343 is not visible → ✗ skipped.',
+          code: "SELECT xmin, xmax, ctid, balance FROM accounts WHERE id = 1;\n-- 2343333 | 2343343 | (0,1) | 1000.00",
+          active: ['snap', 'old', 'new', 'ok', 'no'],
+          edges: ['snap-old', 'snap-new', 'old-ok', 'new-no'],
+          subs: { ok: 'balance 1000', no: 'xmin not committed' },
+        },
+      ],
+    },
+    {
+      title: 'Rollback',
+      path: 'T2 ROLLBACK → nothing undone → old xmax points to an aborted xid → ✓ old visible, new ✗ dead',
+      summary: 'Aborting is instant because there is nothing to put back.',
+      steps: [
+        {
+          title: 'Abort is one bit',
+          note: 'ROLLBACK only marks xid 2343343 as aborted in pg_xact. The old tuple still says xmax 2343343, but the deleter aborted, so readers ignore it: the old version is visible again (balance 1000).',
+          active: ['t2', 'old', 'snap', 'ok'],
+          edges: ['snap-old', 'old-ok'],
+          subs: { t2: 'aborted in pg_xact', old: 'xmax 2343343 (aborted) · 0x0902' },
+        },
+        {
+          title: 'The new version is garbage',
+          note: 'The tuple at (73,73) has an aborted xmin: no snapshot will ever see it. It waits for pruning or VACUUM. The old tuple\'s infomask carried 0x0800 (xmax invalid), so later readers skip the commit-log lookup.',
+          active: ['new', 'no'],
+          edges: ['new-no'],
+          subs: { new: 'xmin aborted: dead', no: 'dead tuple' },
+        },
+      ],
+    },
+    {
+      title: 'Commit',
+      path: 'T (xid 2343351) commits → new version visible to later snapshots → old version removable once no snapshot needs it',
+      summary: 'Committed account 2 went from 1000 to 900.',
+      steps: [
+        {
+          title: 'New version takes over',
+          note: 'UPDATE accounts SET balance = balance − 100 WHERE id = 2 in xid 2343351 (autocommit). Afterwards the visible version had xmin 2343351, xmax 0, ctid (73,73), balance 900: the slot freed from the rolled-back tuple had been reused.',
+          code: "SELECT xmin, xmax, ctid, balance FROM accounts WHERE id = 2;\n-- 2343351 | 0 | (73,73) | 900.00",
+          active: ['old', 'new', 'snap', 'ok'],
+          edges: ['old-new', 'snap-new'],
+          subs: { old: 'xmax 2343351 (committed)', new: 'xmin 2343351 · 900', ok: 'new version' },
+        },
+        {
+          title: 'The old version is dead',
+          note: 'No running snapshot could still need the old version, and the next access to page 0 pruned it: heap_page_items showed line pointer 2 with no tuple. With a long-running snapshot it would have stayed (Concept 4).',
+          active: ['old', 'no'],
+          subs: { no: 'old version pruned' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## The snapshot, field by field
+
+Three transactions were started one after another: A (xid 2343357) and C (2343362) stayed open, B (2343359) committed. A fourth session then took a snapshot.
+
+<Flow
+  title="PostgreSQL: reading pg_current_snapshot()"
+  height={360}
+  nodes={[
+    { id: 'a', label: 'A · xid 2343357', sub: 'running', x: 20, y: 20, w: 220 },
+    { id: 'b', label: 'B · xid 2343359', sub: 'committed', x: 290, y: 20, w: 220 },
+    { id: 'c', label: 'C · xid 2343362', sub: 'running', x: 560, y: 20, w: 220 },
+    { id: 'snap', label: 'Snapshot', sub: '2343357:2343365:2343357,2343362', x: 200, y: 150, w: 400 },
+    { id: 'vis', label: '✓ Visible', sub: '', x: 60, y: 290, w: 260 },
+    { id: 'inv', label: '✗ Invisible', sub: '', x: 480, y: 290, w: 260 },
+  ]}
+  edges={[
+    { id: 'a-snap', from: 'a', to: 'snap' },
+    { id: 'b-snap', from: 'b', to: 'snap' },
+    { id: 'c-snap', from: 'c', to: 'snap' },
+    { id: 'snap-vis', from: 'snap', to: 'vis' },
+    { id: 'snap-inv', from: 'snap', to: 'inv' },
+  ]}
+  cases={[
+    {
+      title: 'Three ranges of xids',
+      path: 'xid < 2343357 → finished · 2343357 ≤ xid < 2343365 → check the list · xid ≥ 2343365 → future',
+      summary: 'The snapshot is three numbers and a short list, not a copy of the data.',
+      steps: [
+        {
+          title: 'xmin = 2343357',
+          note: 'The oldest transaction still running (A). Every xid below it has finished; committed ones are visible.',
+          active: ['a', 'snap'],
+          edges: ['a-snap'],
+          subs: { snap: 'xmin 2343357' },
+        },
+        {
+          title: 'xip = 2343357, 2343362',
+          note: 'Between xmin and xmax, the listed xids (A and C) were running when the snapshot was taken: invisible, even if they commit a second later. B (2343359) is not in the list and committed: visible.',
+          active: ['a', 'b', 'c', 'snap', 'vis', 'inv'],
+          edges: ['b-snap', 'c-snap', 'snap-vis', 'snap-inv'],
+          subs: { vis: 'B 2343359', inv: 'A 2343357, C 2343362' },
+        },
+        {
+          title: 'xmax = 2343365',
+          note: 'The next xid to be assigned (the snapshotting session\'s own xid was 2343365). Anything ≥ xmax started after the snapshot: invisible. In READ COMMITTED a new snapshot is built for every statement; in REPEATABLE READ this one is kept for the whole transaction.',
+          active: ['snap', 'inv'],
+          edges: ['snap-inv'],
+          subs: { inv: 'A, C, and every xid ≥ 2343365' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Hint bits and freezing
+
+<Flow
+  title="PostgreSQL: what readers and VACUUM write into the header"
+  height={270}
+  nodes={[
+    { id: 'read', label: 'First reader', sub: 'SELECT count(*)', x: 20, y: 20, w: 200 },
+    { id: 'tup', label: 'Tuple header', sub: 'infomask 0x0802', x: 300, y: 20, w: 200 },
+    { id: 'clog', label: 'pg_xact', sub: 'commit log', x: 580, y: 20, w: 200 },
+    { id: 'freeze', label: 'VACUUM (FREEZE)', sub: '', x: 20, y: 180, w: 200 },
+    { id: 'hint', label: '✓ Hint bit set', sub: '', x: 300, y: 180, w: 200 },
+    { id: 'frozen', label: '✓ Frozen', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 'read-tup', from: 'read', to: 'tup', label: 'reads' },
+    { id: 'tup-clog', from: 'tup', to: 'clog', label: 'xmin?' },
+    { id: 'clog-hint', from: 'clog', to: 'hint' },
+    { id: 'freeze-tup', from: 'freeze', to: 'tup' },
+    { id: 'tup-frozen', from: 'tup', to: 'frozen' },
+  ]}
+  cases={[
+    {
+      title: 'Hint bits',
+      path: 'fresh INSERT 0x0802 → first SELECT asks pg_xact → writes XMIN_COMMITTED → 0x0902',
+      summary: 'A read can modify the page.',
+      steps: [
+        {
+          title: 'Fresh rows know nothing',
+          note: '200,000 rows inserted into hint_demo (autovacuum off). Every tuple on page 0: infomask 0x0802 = xmax invalid + variable width. Whether xmin committed is not recorded in the tuple yet.',
+          code: "SELECT to_hex(t_infomask), count(*) FROM heap_page_items(get_raw_page('hint_demo', 0)) GROUP BY 1;\n-- 802 | 120",
+          active: ['tup'],
+        },
+        {
+          title: 'The first reader asks pg_xact',
+          note: 'SELECT count(*) checked each tuple\'s xmin in the commit log, found it committed, and recorded that in the tuple (0x0100). Afterwards: 0x0902 on all 120 tuples of the page. Later readers skip the lookup. Setting hint bits dirties pages, so the first read after a bulk load can cause writes.',
+          code: "SELECT count(*) FROM hint_demo;\n-- page 0 afterwards: 902 | 120",
+          active: ['read', 'tup', 'clog', 'hint'],
+          edges: ['read-tup', 'tup-clog', 'clog-hint'],
+          subs: { tup: 'infomask 0x0902', hint: 'XMIN_COMMITTED' },
+        },
+      ],
+    },
+    {
+      title: 'Freezing',
+      path: 'VACUUM (FREEZE) → xmin marked frozen (0x0300) → visible to every snapshot, forever → 0x0B02',
+      summary: 'xids are 32-bit; old ones must be retired before the counter wraps around.',
+      steps: [
+        {
+          title: 'Why freeze',
+          note: 'xids compare circularly over about 2 billion values. A tuple with an old xmin would one day look like it is "in the future" and vanish. Freezing replaces the meaning of xmin with "committed long ago, visible to all".',
+          active: ['freeze', 'tup'],
+          edges: ['freeze-tup'],
+        },
+        {
+          title: 'Frozen header',
+          note: 'After VACUUM (FREEZE) hint_demo: infomask 0x0B02 = 0x0300 (frozen) + 0x0800 (xmax invalid) + 0x0002. age(relfrozenxid) for hint_demo dropped to 0; accounts was at 24, the tx34 database at 2,342,626 (the age of its oldest unfrozen xid). Autovacuum forces a freezing vacuum when a table reaches autovacuum_freeze_max_age = 200,000,000.',
+          code: "VACUUM (FREEZE) hint_demo;\n-- page 0: b02 | 120\nSELECT age(relfrozenxid) FROM pg_class WHERE relname = 'hint_demo';   -- 0",
+          active: ['freeze', 'tup', 'frozen'],
+          edges: ['freeze-tup', 'tup-frozen'],
+          subs: { tup: 'infomask 0x0B02', frozen: 'xmin frozen' },
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+Transaction-id wraparound is the one MVCC problem that stops a PostgreSQL database. If freezing falls behind (autovacuum blocked by a long transaction, disabled, or too slow), `age(datfrozenxid)` keeps climbing, PostgreSQL first warns and finally refuses new transactions until a VACUUM catches up. Watch `SELECT datname, age(datfrozenxid) FROM pg_database` and alert well before 200 million.
+</Pitfall>
+
+## Real-world scenario: the read that writes
+
+After a nightly bulk load of 50 million rows, the first morning report is slow and the server writes heavily although the report only reads.
+
+| Cause | Evidence | Fix |
+|---|---|---|
+| The report is the first reader: it sets hint bits on every page and dirties them | Pages change infomask 0x0802 → 0x0902; checkpoints write the whole table again | `VACUUM (FREEZE, ANALYZE)` right after the load, or load with `COPY … FREEZE` into a table created in the same transaction |
+| Later, autovacuum freezes the same pages again | Write spikes when tables reach the freeze age | Freezing right after the load does both jobs at once |
+
+## Comparison with the other engines
+
+| | PostgreSQL | InnoDB ([Concept 2](/blogs/databases/transactions/session-4-mvcc-internals/concept-2-innodb-undo-read-views)) | WiredTiger ([Concept 3](/blogs/databases/transactions/session-4-mvcc-internals/concept-3-wiredtiger-history)) |
+|---|---|---|---|
+| Where old versions live | In the table, next to new ones | Undo log | Update chain in memory, then history store |
+| What the newest-version reader does | Follows t_ctid forward | Reads the row in place | Reads the newest entry of the chain |
+| What an old snapshot does | Skips invisible tuples | Rebuilds the old version from undo | Walks the chain back |
+| Rollback | Mark xid aborted (instant) | Apply undo (work proportional to changes) | Discard uncommitted updates |
+| Cleanup | VACUUM / pruning | Purge thread | Eviction, history store cleanup |
+
+## Why this matters for transactions
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 4: long transactions | A snapshot's xmin keeps every newer dead tuple alive |
+| Session 5: locks | `xmax` also records row locks (`FOR UPDATE`) |
+| Session 8: when transactions hurt | Bloat and wraparound from transactions that never end |
+
+## Key takeaways
+
+1. Each tuple records its creator (xmin) and deleter (xmax); an UPDATE writes a new tuple and sets xmax on the old one.
+2. A snapshot is `xmin:xmax:running-list`; a version is visible if its creator committed before the snapshot and its deleter did not.
+3. Rollback is instant: the aborted versions become dead tuples for VACUUM.
+4. Hint bits cache commit-log answers in the tuple, so the first read of new data writes pages.
+5. Freezing retires old xids; falling behind leads to wraparound protection shutting writes down.
+
+## Check questions
+
+1. After T2's uncommitted UPDATE, what are xmin and xmax of the old and the new version of account 1?
+2. Explain each part of the snapshot `2343357:2343365:2343357,2343362`. Is a version with xmin 2343359 visible? With xmin 2343362?
+3. Why is ROLLBACK in PostgreSQL instant, and what does it leave behind?
+4. Why did `SELECT count(*)` change the tuple headers of `hint_demo`?
+5. What does freezing do, and why is it necessary?
+6. A version has xmin committed and xmax = an xid that is still running. Is it visible to a new snapshot?
+7. Where does PostgreSQL keep old versions, compared with InnoDB and WiredTiger?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-4-mvcc-internals/concept-1-postgres-row-versions/answers">Worked answers to Q1–Q7</DeepDive>

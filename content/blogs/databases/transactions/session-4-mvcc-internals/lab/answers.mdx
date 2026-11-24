@@ -1,0 +1,89 @@
+---
+title: "Answers: MVCC internals session quiz"
+description: "Worked answers to the Session 4 quiz."
+companion: "answers"
+tags: ["transactions", "mvcc", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-purge-configuration.html"
+  - "https://www.mongodb.com/docs/manual/reference/parameters/"
+---
+
+<Tldr>
+Each engine keeps history somewhere, pays for it in a different place, and needs the oldest transaction to end before it can let go.
+</Tldr>
+
+## Q1. Row updated by a running transaction
+
+**Question:** a row was updated by a transaction that is still running. Which version does a new PostgreSQL snapshot return, and how does it know?
+
+The **old** version. The new snapshot lists the updater's xid as in progress (in its xip list, or ≥ its xmax). The old tuple's xmin committed earlier, and its xmax (the updater) is not visible to the snapshot, so the deletion has not happened for this reader: visible. The new tuple's xmin is the in-progress xid: invisible.
+
+> **Common mistake:** assuming the reader waits for the updater; in PostgreSQL readers never wait for writers.
+
+## Q2. The first SELECT after a load
+
+**Question:** why can the first `SELECT` after a bulk load be slower and write more than later ones?
+
+Freshly loaded tuples lack hint bits; the first reader checks each tuple's xmin in `pg_xact` and sets XMIN_COMMITTED in the header (0x0802 → 0x0902), dirtying every page it reads. Those pages must be written again by the checkpointer or the background writer. Later readers find the hint bit and neither look up the commit log nor dirty the page. `VACUUM (FREEZE)` right after the load does this work once, together with freezing.
+
+> **Common mistake:** benchmarking a query once right after loading data.
+
+## Q3. Autovacuum disabled
+
+**Question:** what happens to xid wraparound protection if autovacuum is disabled on a large, rarely updated table?
+
+The table's `relfrozenxid` stops advancing while the cluster keeps consuming xids, so `age(relfrozenxid)` grows. At `autovacuum_freeze_max_age` (200 million) PostgreSQL launches an anti-wraparound autovacuum **even with autovacuum disabled** for the table; if freezing still cannot keep up, the server warns and eventually refuses to assign new xids until a VACUUM completes. Disabling autovacuum only postpones the work into one large, unscheduled pass.
+
+> **Common mistake:** "the table is never updated, so it needs no vacuum".
+
+## Q4. One session getting slower
+
+**Question:** an InnoDB report session sees one query get slower each hour, while other sessions running it are fast. What is going on?
+
+The report session has a **long-open read view** (one REPEATABLE READ transaction for hours). Every update committed since its read view was created adds an undo record that this session must apply to rebuild the old versions of the rows it reads (Concept 2: 0.088 ms → 14.8 ms for one row after 30,000 updates). Other sessions use fresh read views and read rows in place. The history list length will also be high. Fix: shorter transactions, or `START TRANSACTION WITH CONSISTENT SNAPSHOT` for exactly the reads that need it, then commit.
+
+> **Common mistake:** adding indexes for a slowdown that comes from version reconstruction.
+
+## Q5. Killing a long writer
+
+**Question:** why is killing a long InnoDB write transaction not an instant fix?
+
+`KILL` makes InnoDB **roll back** the transaction, which means applying the undo record for every change it made: 139 ms for 100,000 rows in the lab, and much longer for transactions that ran for hours. Locks are held until the rollback finishes, and `SHOW ENGINE INNODB STATUS` shows the transaction "ROLLING BACK". In PostgreSQL the same abort is instant (only the xid is marked aborted).
+
+> **Common mistake:** restarting the server to get rid of the rollback; crash recovery has to perform it anyway.
+
+## Q6. MongoDB export with NoSuchTransaction
+
+**Question:** a MongoDB export inside one transaction fails after a couple of minutes with NoSuchTransaction. Why, and how would you restructure it?
+
+Transactions older than `transactionLifetimeLimitSeconds` (60 s) are aborted by the periodic `abortExpiredTransactions` job; the next operation then fails with `NoSuchTransaction` (in the lab: survived 70 s, aborted by 130 s). Restructure: run the export as snapshot reads **outside** a transaction at one shared `atClusterTime` (consistent, nothing held open, must finish within the 300 s window), or page through with many short reads if exact consistency is not required, or export from a secondary or backup.
+
+> **Common mistake:** raising `transactionLifetimeLimitSeconds` to a large value.
+
+## Q7. Table doubled in size
+
+**Question:** your PostgreSQL table doubled in size this week but the write rate did not change. List the queries you would run, in order.
+
+1. `SELECT n_live_tup, n_dead_tup, last_autovacuum FROM pg_stat_user_tables WHERE relname = '…';` (many dead tuples, autovacuum running but not removing them?)
+2. `SELECT pid, state, now() - xact_start, backend_xmin FROM pg_stat_activity WHERE backend_xmin IS NOT NULL ORDER BY xact_start;` (oldest snapshot)
+3. `SELECT gid, prepared FROM pg_prepared_xacts;` and `SELECT slot_name, xmin, catalog_xmin, active FROM pg_replication_slots;`
+4. `VACUUM (VERBOSE) …;` to read "dead but not yet removable" and the removable cutoff, matching it to what step 2 or 3 found.
+5. End the holder, let VACUUM run, then decide whether the size must be given back (`pg_repack`) or will be reused.
+
+> **Common mistake:** starting with `VACUUM FULL`, which locks the table and cannot remove the dead tuples while the holder is still open.
+
+## Q8. Limits per engine
+
+**Question:** for each engine, which setting limits how long a forgotten transaction can hold back cleanup?
+
+| Engine | Setting | Default |
+|---|---|---|
+| PostgreSQL | `idle_in_transaction_session_timeout` (idle inside a transaction), `transaction_timeout` (whole transaction, 17+) | 0 = off |
+| MySQL | No transaction limit; `wait_timeout` closes connections idle between statements | 28,800 s |
+| MongoDB | `transactionLifetimeLimitSeconds` | 60 s |
+
+Set the PostgreSQL ones per role or database for application users, so maintenance sessions are not cut off.
+
+> **Common mistake:** assuming the connection pool's idle timeout ends transactions; a pooled connection can sit inside an open transaction indefinitely.

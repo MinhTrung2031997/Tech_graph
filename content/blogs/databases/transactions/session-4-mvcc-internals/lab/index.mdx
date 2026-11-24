@@ -1,0 +1,144 @@
+---
+title: "Lab and session quiz: MVCC internals"
+description: "Read xmin, xmax and hint bits from PostgreSQL heap pages, decode a snapshot, watch InnoDB rebuild a row through 30,000 undo records and its history list grow, read a MongoDB document at a past cluster time, and see one idle transaction stop VACUUM and purge."
+type: "how-to"
+tags: ["transactions", "mvcc", "postgresql", "mysql", "mongodb", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pageinspect.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html"
+  - "https://www.mongodb.com/docs/manual/reference/read-concern-snapshot/"
+---
+
+<Tldr>
+Uses the containers and the `bank` database from the [Session 1 lab](/blogs/databases/transactions/session-1-transaction-guarantees/lab), and the `pgb` / `myb` / `mgb` shortcuts from the [Session 3 lab](/blogs/databases/transactions/session-3-isolation-levels/lab). Several exercises need **two terminals**. Exercise 4 disables autovacuum on `accounts` for a few minutes: turn it back on at the end.
+</Tldr>
+
+## Exercise 1: PostgreSQL tuple headers (Concept 1)
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+SELECT xmin, xmax, ctid, balance FROM accounts WHERE id = 1;
+SELECT lp, t_xmin, t_xmax, t_ctid, to_hex(t_infomask)
+FROM heap_page_items(get_raw_page('accounts', 0)) WHERE lp <= 2;
+```
+
+T2: `BEGIN; SELECT pg_current_xact_id(); UPDATE accounts SET balance = balance - 100 WHERE id = 1;` and leave it open. T1:
+
+```sql
+SELECT pg_current_snapshot();
+SELECT xmin, xmax, ctid, balance FROM accounts WHERE id = 1;   -- old version, xmax = T2
+SELECT lp, t_xmin, t_xmax, t_ctid, to_hex(t_infomask)
+FROM heap_page_items(get_raw_page('accounts', 0)) WHERE lp = 1;   -- t_ctid → new version
+```
+
+Find the new version with the page and line number from `t_ctid`. Then `ROLLBACK` in T2 and read both tuples again. Predict first: which one is visible, and what does `xmax` of the old one say now?
+
+Snapshot decoding: start A and C with `BEGIN; SELECT pg_current_xact_id(); SELECT pg_sleep(30); COMMIT;`, and B in between with a short transaction. In a fourth terminal, `SELECT pg_current_snapshot();` and classify A, B and C.
+
+Hint bits and freezing:
+
+```sql
+CREATE TABLE hint_demo (id int, v text);
+ALTER TABLE hint_demo SET (autovacuum_enabled = off);
+INSERT INTO hint_demo SELECT g, md5(g::text) FROM generate_series(1, 200000) g;
+SELECT to_hex(t_infomask), count(*) FROM heap_page_items(get_raw_page('hint_demo', 0)) GROUP BY 1;   -- 802
+SELECT count(*) FROM hint_demo;
+SELECT to_hex(t_infomask), count(*) FROM heap_page_items(get_raw_page('hint_demo', 0)) GROUP BY 1;   -- 902
+VACUUM (FREEZE) hint_demo;
+SELECT to_hex(t_infomask), count(*) FROM heap_page_items(get_raw_page('hint_demo', 0)) GROUP BY 1;   -- b02
+SELECT relname, age(relfrozenxid) FROM pg_class WHERE relname IN ('accounts', 'hint_demo');
+DROP TABLE hint_demo;
+```
+
+## Exercise 2: InnoDB undo chain and purge (Concept 2)
+
+```sql
+DELIMITER //
+CREATE PROCEDURE churn(IN acct INT, IN n INT)
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  WHILE i < n DO
+    UPDATE accounts SET version = version + 1 WHERE id = acct;   -- one commit per update
+    SET i = i + 1;
+  END WHILE;
+END //
+DELIMITER ;
+```
+
+T1 (keep it open while T2 runs; the churn takes about 40 s):
+
+```sql
+START TRANSACTION;
+SELECT version FROM accounts WHERE id = 1;
+-- wait until T2 has finished, then:
+SELECT count FROM information_schema.innodb_metrics WHERE name = 'trx_rseg_history_len';
+SET @t = NOW(6); SELECT version INTO @v FROM accounts WHERE id = 1;
+SELECT @v, TIMESTAMPDIFF(MICROSECOND, @t, NOW(6)) / 1000 AS ms;    -- lab: 1, 14.8 ms
+COMMIT;
+```
+
+T2: `CALL churn(1, 30000);` then time the same read in T2 (lab: 30001, 0.14 ms). After T1's `COMMIT`, read the history list again every few seconds (lab: 30,007 → 0 within 5 s). Also look at `information_schema.innodb_trx` and the `TRANSACTIONS` section of `SHOW ENGINE INNODB STATUS` while T1 is open.
+
+Rollback cost: `START TRANSACTION; UPDATE jobs SET locked_by = 'w1'; ROLLBACK;` vs `COMMIT`, timed (lab: 139 ms vs 20 ms; PostgreSQL 0.9 ms vs 19 ms). Reset with `UPDATE jobs SET locked_by = NULL;`.
+
+## Exercise 3: WiredTiger history (Concept 3)
+
+T1:
+
+```js
+const s = db.getMongo().startSession(); const a = s.getDatabase('bank').accounts;
+s.startTransaction({ readConcern: { level: 'snapshot' } });
+let t = Date.now(); for (let i = 0; i < 100; i++) a.findOne({ _id: 1 }); print(Date.now() - t);
+// run T2 now, then within 60 s:
+t = Date.now(); for (let i = 0; i < 100; i++) a.findOne({ _id: 1 }); print(Date.now() - t, a.findOne({ _id: 1 }).version);
+s.commitTransaction();
+```
+
+T2:
+
+```js
+const hs = () => db.serverStatus().wiredTiger.cache['history store table insert calls'];
+const h0 = hs();
+db.accounts.bulkWrite(Array.from({ length: 30000 },
+  () => ({ updateOne: { filter: { _id: 1 }, update: { $inc: { version: 1 } } } })));
+print(hs() - h0);
+```
+
+Past reads: take `const now = db.adminCommand({ hello: 1 }).operationTime;` and run `db.runCommand({ find: 'accounts', filter: { _id: 1 }, readConcern: { level: 'snapshot', atClusterTime: Timestamp({ t: now.t - N, i: 0 }) } })` for N = 60, 290, 400. Lifetime: open a transaction, update one document, `sleep(70000)`, commit; then the same with `sleep(130000)`, and look for "Aborting transaction" in `docker logs tx-mongo`.
+
+## Exercise 4: one idle transaction (Concept 4)
+
+```sql
+-- PostgreSQL, setup
+ALTER TABLE accounts SET (autovacuum_enabled = off);
+SELECT pg_relation_size('accounts') / 8192 AS pages;          -- lab: 74
+```
+
+T1: `BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM accounts;` and leave it idle. T2:
+
+```sql
+SELECT pid, state, backend_xmin, now() - xact_start FROM pg_stat_activity WHERE backend_xmin IS NOT NULL;
+UPDATE accounts SET version = version + 1;   -- three times
+SELECT pg_relation_size('accounts') / 8192 AS pages;          -- lab: 295
+VACUUM (VERBOSE) accounts;                                    -- "30000 are dead but not yet removable"
+```
+
+`COMMIT` T1, `VACUUM (VERBOSE) accounts` again, run three more full updates and check the size. Then try both timeouts in a new session (`SET idle_in_transaction_session_timeout = '2s'` with `\! sleep 3` inside a transaction; `SET transaction_timeout = '2s'` with `SELECT pg_sleep(3)`). Finish with `ALTER TABLE accounts RESET (autovacuum_enabled); VACUUM accounts;`.
+
+MySQL: `SET SESSION wait_timeout = 2; START TRANSACTION; UPDATE accounts SET version = version + 1 WHERE id = 5;`, wait 4 s (`\! sleep 4` in the mysql client), run any statement (ERROR 4031), reconnect and check that the update is gone.
+
+MongoDB: open a transaction in T1 and, from T2, list it with `$currentOp` (`idleSessions: true`), reading `timeOpenMicros` and `expiryTime`.
+
+## Session quiz
+
+1. A row was updated by a transaction that is still running. Which version does a new PostgreSQL snapshot return, and how does it know?
+2. Why can the first `SELECT` after a bulk load be slower and write more than later ones?
+3. What happens to xid wraparound protection if autovacuum is disabled on a large, rarely updated table?
+4. An InnoDB report session sees one query get slower each hour, while other sessions running it are fast. What is going on?
+5. Why is killing a long InnoDB write transaction not an instant fix?
+6. A MongoDB export inside one transaction fails after a couple of minutes with NoSuchTransaction. Why, and how would you restructure it?
+7. Your PostgreSQL table doubled in size this week but the write rate did not change. List the queries you would run, in order.
+8. For each engine, which setting limits how long a forgotten transaction can hold back cleanup?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-4-mvcc-internals/lab/answers">Answers to the session quiz</DeepDive>

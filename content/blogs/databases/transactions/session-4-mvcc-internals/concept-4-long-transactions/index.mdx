@@ -1,0 +1,283 @@
+---
+title: "Concept 4: How one long transaction stops cleanup"
+description: "Old versions can only be removed when no snapshot can need them, so the oldest open transaction sets the cleanup horizon for everyone. Measured: an idle PostgreSQL transaction kept 30,000 dead tuples and grew the table from 74 to 295 pages; an open InnoDB read view kept 30,007 undo logs unpurged; MongoDB aborts the transaction instead. How to find the culprit and which timeouts end it."
+type: "concept"
+tags: ["transactions", "mvcc", "vacuum", "purge", "long-transactions", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html"
+  - "https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-IDLE-IN-TRANSACTION-SESSION-TIMEOUT"
+  - "https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-TRANSACTION-TIMEOUT"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-purge-configuration.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html#sysvar_wait_timeout"
+  - "https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.transactionLifetimeLimitSeconds"
+---
+
+<Tldr>
+Every engine can only throw away an old version once **no open snapshot** could still read it, so the **oldest** transaction decides what cleanup may do for the whole database (PostgreSQL) or server (InnoDB). In PostgreSQL, one session left **idle in transaction** while 10,000 accounts were updated three times: `VACUUM` reported **30,000 dead tuples "not yet removable"** and the table grew from **74 to 295 pages**; after the session committed, `VACUUM` removed all 30,000 and three more rounds of updates fit in the same 295 pages. In InnoDB, one open read view let the **history list** reach **30,007** (Concept 2). MongoDB caps the damage by **aborting** transactions older than 60 s (Concept 3). PostgreSQL can end such sessions itself (`idle_in_transaction_session_timeout`, `transaction_timeout`: both killed the lab session after 2 s); MySQL has no idle-transaction timeout, only `wait_timeout` for idle connections (default 8 hours), which closed a 2 s test session and rolled its update back.
+</Tldr>
+
+## The horizon
+
+| Engine | What the oldest transaction holds back | Where it shows | Built-in limit |
+|---|---|---|---|
+| PostgreSQL | VACUUM and page pruning of dead tuples newer than its snapshot xmin (in that database) | `pg_stat_activity.backend_xmin`, `VACUUM VERBOSE` "dead but not yet removable" | `idle_in_transaction_session_timeout`, `transaction_timeout` (17+), `statement_timeout` (default 0 = off) |
+| InnoDB | Purge of undo logs (server-wide) | `trx_rseg_history_len`, `information_schema.innodb_trx.trx_started` | None for idle transactions; `wait_timeout` closes idle connections (28,800 s by default) |
+| MongoDB | Update chains and history store entries newer than its read timestamp | `$currentOp` `transaction.timeOpenMicros` | `transactionLifetimeLimitSeconds` (60 s) aborts it |
+
+| Term | Meaning |
+|---|---|
+| Cleanup horizon | The oldest snapshot still open; versions replaced before it are removable, versions replaced after it are not |
+| Idle in transaction | A session that ran `BEGIN` and some statements and is now waiting for the client, holding its snapshot |
+| **✓ Space reused** | Cleanup removed the old versions; new versions fill the freed space |
+| **✗ Not removable** | Old versions must stay because a snapshot might read them |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: an idle transaction and VACUUM"
+  height={270}
+  nodes={[
+    { id: 'writers', label: '3 × UPDATE accounts', sub: '10,000 rows each', x: 20, y: 20, w: 200 },
+    { id: 'dead', label: 'Dead tuples', sub: '0', x: 300, y: 20, w: 200 },
+    { id: 'vac', label: 'VACUUM', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'long', label: 'Idle transaction', sub: 'REPEATABLE READ', x: 20, y: 180, w: 200 },
+    { id: 'blocked', label: '✗ Not removable', sub: '', x: 300, y: 180, w: 200 },
+    { id: 'freed', label: '✓ Space reused', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 'writers-dead', from: 'writers', to: 'dead', label: 'create' },
+    { id: 'dead-vac', from: 'dead', to: 'vac', label: 'scan' },
+    { id: 'long-vac', from: 'long', to: 'vac', quiet: true },
+    { id: 'vac-blocked', from: 'vac', to: 'blocked' },
+    { id: 'vac-freed', from: 'vac', to: 'freed' },
+  ]}
+  cases={[
+    {
+      title: 'Idle transaction open',
+      path: 'snapshot xmin 2356631 held → 30,000 dead tuples → VACUUM ✗ "30000 are dead but not yet removable" → 74 → 295 pages',
+      summary: 'Autovacuum was off for accounts in this test, so only the manual VACUUM ran.',
+      steps: [
+        {
+          title: 'A session goes idle',
+          note: 'A client ran BEGIN ISOLATION LEVEL REPEATABLE READ and one SELECT, then waited 60 s. pg_stat_activity: state "idle in transaction", backend_xmin 2356631.',
+          code: "SELECT pid, state, backend_xmin, now() - xact_start AS xact_age\nFROM pg_stat_activity WHERE backend_xmin IS NOT NULL;\n-- 56004 | idle in transaction | 2356631 | 00:00:02",
+          active: ['long'],
+          subs: { long: 'backend_xmin 2356631' },
+        },
+        {
+          title: 'Updates create dead tuples',
+          note: 'Three UPDATE accounts SET version = version + 1 (no WHERE): 30,000 old versions. Each update needs new space: the table grew from 74 to 295 pages.',
+          active: ['writers', 'dead'],
+          edges: ['writers-dead'],
+          subs: { dead: '30,000 · table 295 pages' },
+        },
+        {
+          title: 'VACUUM must keep them',
+          note: 'The idle session\'s snapshot could still read the versions it saw, so VACUUM may remove nothing replaced after xid 2356631.',
+          code: "VACUUM (VERBOSE) accounts;\n-- tuples: 0 removed, 40000 remain, 30000 are dead but not yet removable\n-- removable cutoff: 2356631, which was 3 XIDs old when operation ended",
+          active: ['long', 'dead', 'vac', 'blocked'],
+          edges: ['long-vac', 'dead-vac', 'vac-blocked'],
+          subs: { blocked: '30,000 kept' },
+        },
+      ],
+    },
+    {
+      title: 'After the transaction ends',
+      path: 'COMMIT → cutoff advances → VACUUM ✓ 30,000 removed → 3 more full updates stay at 295 pages',
+      summary: 'The space is not returned to the OS, but it is reused.',
+      steps: [
+        {
+          title: 'VACUUM removes them',
+          note: 'Once the session committed, the next VACUUM removed all 30,000 dead tuples (removable cutoff 2356636).',
+          code: "-- tuples: 30000 removed, 10000 remain, 0 are dead but not yet removable",
+          active: ['dead', 'vac', 'freed'],
+          edges: ['dead-vac', 'vac-freed'],
+          subs: { dead: '0', freed: '30,000 removed' },
+        },
+        {
+          title: 'New versions reuse the space',
+          note: 'Three more full-table updates: still 295 pages. The table stays at its bloated size (VACUUM FULL or pg_repack would shrink it), but it stops growing.',
+          active: ['writers', 'dead', 'freed'],
+          edges: ['writers-dead'],
+          subs: { freed: '3 more updates: 295 pages' },
+        },
+      ],
+    },
+    {
+      title: 'Timeouts end the session',
+      path: 'idle_in_transaction_session_timeout 2 s / transaction_timeout 2 s → ✗ FATAL, connection closed, snapshot released',
+      summary: 'PostgreSQL can enforce what code review cannot.',
+      steps: [
+        {
+          title: 'Idle timeout',
+          note: 'With idle_in_transaction_session_timeout = 2s, a session idle inside a transaction for 3 s was terminated. Its transaction rolled back and its snapshot no longer held VACUUM.',
+          code: "SET idle_in_transaction_session_timeout = '2s';\nBEGIN; SELECT 1;   -- then 3 s of client silence\n-- FATAL:  terminating connection due to idle-in-transaction timeout",
+          active: ['long', 'vac', 'freed'],
+          edges: ['long-vac', 'vac-freed'],
+          subs: { long: 'terminated after 2 s idle' },
+        },
+        {
+          title: 'Transaction timeout',
+          note: 'transaction_timeout (PostgreSQL 17) limits the whole transaction, busy or idle: with 2s, a transaction running SELECT pg_sleep(3) was terminated. Both settings default to 0 (off); set them per role or database rather than globally.',
+          code: "SET transaction_timeout = '2s';\nBEGIN; SELECT 1; SELECT pg_sleep(3);\n-- FATAL:  terminating connection due to transaction timeout",
+          active: ['long', 'vac', 'freed'],
+          edges: ['long-vac', 'vac-freed'],
+          subs: { long: 'terminated after 2 s total' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL InnoDB
+
+<Flow
+  title="InnoDB: an open read view and purge"
+  height={270}
+  nodes={[
+    { id: 'writers', label: '30,000 commits', sub: 'UPDATE id 1', x: 20, y: 20, w: 200 },
+    { id: 'dead', label: 'History list', sub: '22', x: 300, y: 20, w: 200 },
+    { id: 'vac', label: 'Purge', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'long', label: 'Open transaction', sub: 'read view', x: 20, y: 180, w: 200 },
+    { id: 'blocked', label: '✗ Not purgeable', sub: '', x: 300, y: 180, w: 200 },
+    { id: 'freed', label: '✓ Undo freed', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 'writers-dead', from: 'writers', to: 'dead', label: 'undo' },
+    { id: 'dead-vac', from: 'dead', to: 'vac', label: 'consume' },
+    { id: 'long-vac', from: 'long', to: 'vac', quiet: true },
+    { id: 'vac-blocked', from: 'vac', to: 'blocked' },
+    { id: 'vac-freed', from: 'vac', to: 'freed' },
+  ]}
+  cases={[
+    {
+      title: 'Read view open',
+      path: 'T1 read view → 30,000 commits → history list 22 → 30,007 ✗ → T1 commits → 0 ✓ within 5 s',
+      summary: 'Measured in Concept 2; here as the cleanup side of the story.',
+      steps: [
+        {
+          title: 'Purge is held back',
+          note: 'T1 kept a REPEATABLE READ read view while another session committed 30,000 updates: the history list reached 30,007, and T1\'s own read of the row took 14.8 ms.',
+          code: "SELECT trx_id, trx_started, trx_mysql_thread_id\nFROM information_schema.innodb_trx ORDER BY trx_started LIMIT 5;",
+          active: ['long', 'writers', 'dead', 'vac', 'blocked'],
+          edges: ['writers-dead', 'long-vac', 'dead-vac', 'vac-blocked'],
+          subs: { dead: '30,007', blocked: 'held by T1' },
+        },
+        {
+          title: 'Purge catches up',
+          note: 'After T1\'s COMMIT the history list was 0 within 5 s.',
+          active: ['dead', 'vac', 'freed'],
+          edges: ['dead-vac', 'vac-freed'],
+          subs: { dead: '0', freed: 'within 5 s' },
+        },
+      ],
+    },
+    {
+      title: 'wait_timeout',
+      path: 'session idle 4 s with wait_timeout 2 → ✗ disconnected (error 4031) → transaction rolled back',
+      summary: 'The only server-side limit for an idle transaction in MySQL is the idle-connection timeout.',
+      steps: [
+        {
+          title: 'Idle connection closed',
+          note: 'A session set wait_timeout = 2, started a transaction (trx_id 724390) that updated account 5, and went silent for 4 s. Its next statement failed with ERROR 4031, and account 5\'s version was unchanged: the update was rolled back. The global default is 28,800 s (8 hours), so in practice an application can hold a read view for hours. MySQL has no idle-in-transaction or whole-transaction timeout; max_execution_time limits single SELECT statements only.',
+          code: "SET SESSION wait_timeout = 2;\nSTART TRANSACTION;\nUPDATE accounts SET version = version + 1 WHERE id = 5;\n-- 4 s of client silence\n-- ERROR 4031 (HY000): The client was disconnected by the server because of inactivity.",
+          active: ['long', 'vac', 'freed'],
+          edges: ['long-vac', 'vac-freed'],
+          subs: { long: 'disconnected after 2 s idle' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: the transaction is aborted instead"
+  height={270}
+  nodes={[
+    { id: 'writers', label: 'Updates', sub: 'newer versions', x: 20, y: 20, w: 200 },
+    { id: 'dead', label: 'Update chains', sub: 'history store', x: 300, y: 20, w: 200 },
+    { id: 'vac', label: 'Expiry job', sub: 'abortExpiredTransactions', x: 580, y: 20, w: 200 },
+    { id: 'long', label: 'Open transaction', sub: 'read timestamp', x: 20, y: 180, w: 200 },
+    { id: 'blocked', label: '✗ Transaction aborted', sub: '', x: 300, y: 180, w: 200 },
+    { id: 'freed', label: '✓ History released', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 'writers-dead', from: 'writers', to: 'dead', label: 'append' },
+    { id: 'dead-vac', from: 'dead', to: 'vac', quiet: true },
+    { id: 'long-vac', from: 'long', to: 'vac' },
+    { id: 'vac-blocked', from: 'vac', to: 'blocked' },
+    { id: 'vac-freed', from: 'vac', to: 'freed' },
+  ]}
+  cases={[
+    {
+      title: 'Lifetime limit',
+      path: 'transaction open past 60 s → expiry job aborts it → ✗ NoSuchTransaction for the client · ✓ history released',
+      summary: 'MongoDB sacrifices the long transaction to protect everyone else.',
+      steps: [
+        {
+          title: 'Find old transactions',
+          note: '$currentOp with idleSessions: true lists open transactions with timeOpenMicros, timeInactiveMicros and expiryTime (start + 60 s). An idle transaction showed active: false and 2.49 s open.',
+          code: "db.getSiblingDB('admin').aggregate([\n  { $currentOp: { idleSessions: true } },\n  { $match: { 'transaction.parameters.txnNumber': { $exists: true } } },\n  { $project: { active: 1, 'transaction.timeOpenMicros': 1, 'transaction.expiryTime': 1 } }])",
+          active: ['long', 'writers', 'dead'],
+          edges: ['writers-dead'],
+          subs: { long: 'timeOpenMicros 2,487,748' },
+        },
+        {
+          title: 'The job aborts it',
+          note: 'The transaction open for 130 s was aborted by abortExpiredTransactions; the client\'s next operation got NoSuchTransaction. Its read timestamp no longer pins update chains, so the cache and history store can drop those versions.',
+          active: ['long', 'dead', 'vac', 'blocked', 'freed'],
+          edges: ['long-vac', 'dead-vac', 'vac-blocked', 'vac-freed'],
+          subs: { blocked: 'NoSuchTransaction at 130 s' },
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+The classic culprit is not a long query but an **idle** transaction: an application that opens a transaction, then waits for a user, a queue message or an HTTP call, or a connection pool that returns a connection with a transaction still open. It uses no CPU and holds no obvious locks, yet in PostgreSQL and InnoDB it stops cleanup for everyone. Alert on transaction age, not just query time.
+</Pitfall>
+
+## Real-world scenario: the growing table nobody writes more to
+
+A PostgreSQL `orders` table receives a steady update rate, but its size doubles in a week and queries slow down. Autovacuum runs every few minutes and logs that it removed almost nothing.
+
+| Step | Query | Finding |
+|---|---|---|
+| Who holds the horizon | `SELECT pid, state, now() - xact_start, backend_xmin FROM pg_stat_activity ORDER BY xact_start LIMIT 5;` | A worker "idle in transaction" for 6 days |
+| Confirm | `VACUUM (VERBOSE) orders;` | "N are dead but not yet removable", removable cutoff equal to that backend_xmin |
+| Fix now | `SELECT pg_terminate_backend(pid);` then let autovacuum run | Dead tuples removed; size stops growing |
+| Prevent | `ALTER ROLE app SET idle_in_transaction_session_timeout = '60s';` and fix the code path | Idle transactions cannot outlive a minute |
+
+Other horizon holders to check in PostgreSQL: prepared transactions (`pg_prepared_xacts`), replication slots (`pg_replication_slots.xmin`) and standbys with `hot_standby_feedback` on.
+
+## Why this matters for transactions
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 5: locks | Long transactions also hold their locks to the end |
+| Session 7: application patterns | Keep transactions short; never wait for the user inside one |
+| Session 8: [idle in transaction](/blogs/databases/transactions/session-8-when-transactions-hurt/concept-1-idle-in-transaction) and [long transactions stop cleanup](/blogs/databases/transactions/session-8-when-transactions-hurt/concept-2-long-transactions-cleanup) | The operational side: which transactions hold the horizon on a busy table, how to find them, and the production timeouts |
+
+## Key takeaways
+
+1. The oldest open snapshot sets the cleanup horizon: nothing replaced after it can be removed.
+2. PostgreSQL: one idle transaction kept 30,000 dead tuples; the table grew from 74 to 295 pages and stayed that size after cleanup.
+3. InnoDB: an open read view let the history list reach 30,007; purge cleared it within 5 s of the commit.
+4. MongoDB aborts transactions past their lifetime instead of keeping history for them.
+5. Use timeouts (`idle_in_transaction_session_timeout`, `transaction_timeout`, `wait_timeout`) and alert on transaction age.
+
+## Check questions
+
+1. Why could VACUUM not remove the 30,000 dead tuples while the idle session was open, although that session never read them again?
+2. After the session committed, VACUUM removed everything, but the table stayed at 295 pages. Why, and is that a problem?
+3. In InnoDB, which number tells you purge is falling behind, and how do you find the transaction responsible?
+4. What did `wait_timeout` do to the open MySQL transaction, and why is it a weak protection?
+5. How does MongoDB avoid the problem, and what does the application see?
+6. Name three things besides an open session that can hold back the PostgreSQL cleanup horizon.
+7. What is the difference between `idle_in_transaction_session_timeout` and `transaction_timeout`?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-4-mvcc-internals/concept-4-long-transactions/answers">Worked answers to Q1–Q7</DeepDive>
