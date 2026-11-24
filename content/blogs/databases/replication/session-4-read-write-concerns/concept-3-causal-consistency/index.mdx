@@ -1,0 +1,187 @@
+---
+title: "Concept 3: Causally consistent sessions"
+description: "A causally consistent session carries the operationTime of its last write to its next read, and a secondary answers only once it has caught up to it. With rpb-mongo3 frozen for 5 s, a read pinned to it outside a session returned the old value after 2 ms; inside a causal session it waited and returned the new value after 5,044 ms; with maxTimeMS 1000 it failed with MaxTimeMSExpired after 1,012 ms. On a healthy set both took 2 ms."
+type: "concept"
+tags: ["replication", "consistency", "causal-consistency", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/causal-consistency-read-write-concerns/"
+  - "https://www.mongodb.com/docs/manual/core/read-isolation-consistency-recency/#causal-consistency"
+  - "https://www.mongodb.com/docs/manual/reference/method/Session/"
+---
+
+<Tldr>
+A **causally consistent session** is MongoDB's built-in read-your-writes for secondaries. Every operation returns an `operationTime`; the session sends the latest one with its next read as `afterClusterTime`, and the member that serves the read waits until it has data at least that new. In the lab, `rpb-mongo3` was frozen for 5 s and each read was pinned to it with a tag. Outside a session: the read returned the **old value after 2 ms**. Inside a causal session: it **waited 5,044 ms** and returned the new value. With `maxTimeMS(1000)`: **MaxTimeMSExpired after 1,012 ms**. On a healthy set both forms took 2 ms. The guarantees (read your writes, monotonic reads, monotonic writes, writes follow reads) hold when the session uses `readConcern: "majority"` and `writeConcern: "majority"` (from the documentation); this is the MongoDB counterpart of waiting for an LSN or GTID set in [Session 3](/blogs/databases/replication/session-3-replica-lag/concept-4-reading-your-own-writes).
+</Tldr>
+
+## How it works
+
+| Term | Meaning |
+|---|---|
+| Session | A client-side context (`startSession()`) that groups operations |
+| `operationTime` | The cluster time of the session's last operation, returned by the server |
+| `afterClusterTime` | Sent with a read: "do not answer before you have data at least this new" |
+| Causal consistency | Inside one session: you see your own writes, reads never go backwards, writes apply in session order, a write that follows a read sees that read's data |
+| **✓ / ✗** | Read returns the session's own write / does not |
+
+```js
+const c = new Mongo('mongodb://rpb-mongo1:27017,rpb-mongo2:27017,rpb-mongo3:27017/shop?replicaSet=rpbrs');
+const s = c.startSession({ causalConsistency: true });
+const sdb = s.getDatabase('shop');
+sdb.orders.updateOne({ _id: 12 }, { $set: { note: v } }, { writeConcern: { w: 'majority' } });
+s.getOperationTime();   // {"$timestamp":"7711767256329355265"}
+sdb.orders.find({ _id: 12 }).readPref('secondary', [{ name: 'm3' }]).readConcern('majority').toArray();
+```
+
+The members carry tags `m1`, `m2`, `m3` so the read can be pinned to the lagging member. `rpb-mongo3` is frozen with `db.fsyncLock()` and released by `db.fsyncUnlock()` 5 s later; the write's majority comes from the primary and `rpb-mongo2`.
+
+<Flow
+  title="MongoDB: the same read with and without a causal session"
+  height={400}
+  nodes={[
+    { id: 'app', label: 'Client session', sub: 'keeps operationTime', x: 20, y: 20, w: 200 },
+    { id: 'pri', label: 'Primary rpb-mongo1', sub: 'write w: majority', x: 20, y: 170, w: 200 },
+    { id: 'm3', label: 'rpb-mongo3 (tag m3)', sub: 'frozen 5 s', x: 300, y: 20, w: 220 },
+    { id: 'stale', label: '✗ Old value', sub: 'answered at once', x: 580, y: 20, w: 200 },
+    { id: 'wait', label: 'Waits for', sub: 'afterClusterTime', x: 300, y: 170, w: 220 },
+    { id: 'err', label: '✗ MaxTimeMSExpired', sub: 'limit reached first', x: 580, y: 170, w: 200 },
+    { id: 'fresh', label: '✓ New value', sub: 'after catching up', x: 300, y: 300, w: 220 },
+  ]}
+  edges={[
+    { id: 'app-pri', from: 'app', to: 'pri', label: 'write' },
+    { id: 'app-m3', from: 'app', to: 'm3', label: 'read' },
+    { id: 'pri-m3', from: 'pri', to: 'm3', label: 'oplog' },
+    { id: 'm3-stale', from: 'm3', to: 'stale' },
+    { id: 'm3-wait', from: 'm3', to: 'wait' },
+    { id: 'wait-fresh', from: 'wait', to: 'fresh' },
+    { id: 'wait-err', from: 'wait', to: 'err' },
+  ]}
+  cases={[
+    {
+      title: 'No causal session',
+      path: 'write ✓ majority → read on rpb-mongo3 ✗ old value after 2 ms',
+      summary: 'The secondary answers from whatever it has.',
+      steps: [
+        {
+          title: 'Write, then read the frozen member',
+          note: 'startSession({ causalConsistency: false }): no operationTime is attached to the read (getOperationTime() printed nothing). rpb-mongo3 answered from its frozen state: old value, 2 ms.',
+          active: ['app', 'pri', 'm3', 'stale'],
+          edges: ['app-pri', 'app-m3', 'm3-stale'],
+          subs: { stale: 'after 2 ms' },
+        },
+      ],
+    },
+    {
+      title: 'Causal session',
+      path: 'write → operationTime → read with afterClusterTime → rpb-mongo3 waits → ✓ new value after 5,044 ms',
+      summary: 'The wait happens on the server; the client just sends a time.',
+      steps: [
+        {
+          title: 'The write returns a time',
+          note: 'The session records operationTime {"$timestamp":"7711767256329355265"} from the majority write.',
+          active: ['app', 'pri'],
+          edges: ['app-pri'],
+          subs: { app: 'operationTime saved' },
+        },
+        {
+          title: 'The read carries it',
+          note: 'The find on rpb-mongo3 is sent with readConcern { level: "majority", afterClusterTime: … }. rpb-mongo3 has not applied that far, so it blocks the read.',
+          active: ['app', 'm3', 'wait'],
+          edges: ['app-m3', 'm3-wait'],
+          subs: { wait: 'blocked on rpb-mongo3' },
+        },
+        {
+          title: 'Unfreeze, answer',
+          note: 'fsyncUnlock 5 s after the lock: rpb-mongo3 applies the oplog, reaches the operationTime, and returns the new value. Total read time 5,044 ms.',
+          active: ['pri', 'm3', 'wait', 'fresh'],
+          edges: ['pri-m3', 'wait-fresh'],
+          subs: { fresh: 'after 5,044 ms' },
+        },
+      ],
+    },
+    {
+      title: 'Causal session with maxTimeMS 1000',
+      path: 'read with afterClusterTime → waits → ✗ MaxTimeMSExpired after 1,012 ms',
+      summary: 'Bound the wait, then fall back to the primary.',
+      steps: [
+        {
+          title: 'Limit the wait',
+          note: 'Same read with .maxTimeMS(1000): MaxTimeMSExpired after 1,012 ms. The application can retry with readPreference primary, which always has the session\'s writes.',
+          code: "sdb.orders.find({ _id: 12 }).readPref('secondary', [{ name: 'm3' }]).readConcern('majority').maxTimeMS(1000)",
+          active: ['app', 'm3', 'wait', 'err'],
+          edges: ['app-m3', 'm3-wait', 'wait-err'],
+          subs: { err: 'after 1,012 ms' },
+        },
+      ],
+    },
+    {
+      title: 'Healthy set',
+      path: 'causal and non-causal reads on rpb-mongo3 ✓ 2 ms',
+      summary: 'When the secondary is current, the session costs nothing measurable.',
+      steps: [
+        {
+          title: 'Three runs each',
+          note: 'With rpb-mongo3 not frozen: causal 2, 2, 2 ms; non-causal 2, 2, 2 ms, all fresh (the majority write had reached rpb-mongo3 too). The session only adds a wait when the chosen member is behind.',
+          active: ['app', 'pri', 'm3', 'wait', 'fresh'],
+          edges: ['app-pri', 'pri-m3', 'app-m3', 'm3-wait', 'wait-fresh'],
+          subs: { m3: 'current', fresh: '2 ms' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Which concerns make it causal
+
+| Session read / write concern | Read your own writes | Guarantees survive failover |
+|---|---|---|
+| `majority` / `majority` | ✓ | ✓ all four guarantees |
+| `majority` / `w: 1` | ✓ while no failover | ✗ a `w: 1` write can be rolled back |
+| `local` / `majority` | ✓ while no failover | ✗ a read can return data that is later rolled back |
+| `local` / `w: 1` | ✓ while no failover | ✗ |
+
+The lab measured only `majority` / `majority`; the other rows are from the documentation. Outside a failover, any combination makes the read wait for the session's operationTime. Only majority/majority keeps the guarantees across an election, because both sides then deal only in data that cannot disappear (Concept 4).
+
+## Across processes
+
+A session lives in one client. When a web request writes and a later request (another process) reads, pass the times along: read `session.getClusterTime()` and `session.getOperationTime()` after the write, store them (cookie, cache), and in the reader call `session.advanceClusterTime(…)` and `session.advanceOperationTime(…)` before reading (from the documentation; the lab used one process). This is the same pattern as carrying an LSN or GTID set in Session 3.
+
+<Pitfall>
+A causal read on a lagging secondary waits as long as the lag: 5 s here, minutes during an incident. Always set `maxTimeMS` on causal secondary reads and fall back to the primary on MaxTimeMSExpired, or combine with `maxStalenessSeconds` so a badly lagging member is not chosen in the first place.
+</Pitfall>
+
+## Real-world scenario: "edit listing" then "view listing"
+
+A seller's browser session writes a listing change through one API server and, a moment later, loads the listing through another. Product reads go to secondaries. The write handler returns the session's `operationTime` and `clusterTime` to the client; the read handler advances a new causal session to them and reads with `readConcern: "majority"`, `readPreference: "secondaryPreferred"`, `maxTimeMS: 200`, falling back to the primary on timeout. Buyers' reads skip the token and get plain secondary reads.
+
+| Piece | Role |
+|---|---|
+| `operationTime` + `clusterTime` in the response | The position of the seller's write |
+| `advanceOperationTime` in the reader | Makes the secondary wait for that position |
+| `maxTimeMS: 200` + primary fallback | Bounds the wait when a secondary lags |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 3, Concept 4](/blogs/databases/replication/session-3-replica-lag/concept-4-reading-your-own-writes) | The same idea done by hand with LSNs and GTIDs |
+| Concept 1 | `majority` read concern, required for the full guarantees |
+| Concept 4 | Why `w: 1` breaks causal guarantees in a failover |
+
+## Key takeaways
+
+1. A causal session sends its last `operationTime` as `afterClusterTime`; the serving member waits until it has caught up.
+2. On a member frozen for 5 s: plain read stale after 2 ms, causal read fresh after 5,044 ms.
+3. On a healthy set the session added no measurable time (2 ms either way).
+4. Bound causal reads with `maxTimeMS` (MaxTimeMSExpired after 1,012 ms with 1000) and fall back to the primary.
+5. Use majority read and write concerns for guarantees that survive failover.
+
+## Check questions
+
+1. What does a causal session send with a read, and who does the waiting?
+2. Why did the non-causal read return the old value although the write was acknowledged by a majority?
+3. Why do the full causal guarantees need `majority` on both reads and writes?
+4. How do you keep causal consistency when the write and the read happen in different processes?
+5. What should the application do when a causal read on a secondary hits `maxTimeMS`?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-4-read-write-concerns/concept-3-causal-consistency/answers">Worked answers to Q1–Q5</DeepDive>

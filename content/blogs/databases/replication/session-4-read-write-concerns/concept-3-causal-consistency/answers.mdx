@@ -1,0 +1,54 @@
+---
+title: "Answers: Causally consistent sessions"
+description: "Worked answers to the Session 4 Concept 3 check questions."
+companion: "answers"
+tags: ["replication", "causal-consistency", "mongodb", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/causal-consistency-read-write-concerns/"
+  - "https://www.mongodb.com/docs/manual/reference/method/Session/"
+---
+
+<Tldr>
+The session carries a position; the server waits for it. Bound the wait and use majority concerns.
+</Tldr>
+
+## Q1. What is sent, who waits
+
+**Question:** what does a causal session send with a read, and who does the waiting?
+
+The client sends `afterClusterTime` (the session's latest `operationTime`) inside the read concern, plus the cluster time it has seen. The server that receives the read, here `rpb-mongo3`, does the waiting: it holds the read until its own data reaches that time, then answers. The driver does not poll; it only attaches the time. In the lab the read on the frozen member returned after 5,044 ms, as soon as the member caught up.
+
+> **Common mistake:** thinking the driver routes the read to a member that is already current. It does not; the chosen member waits.
+
+## Q2. Majority acknowledged, still stale
+
+**Question:** why did the non-causal read return the old value although the write was acknowledged by a majority?
+
+The majority was the primary and `rpb-mongo2`. The read was pinned to `rpb-mongo3`, which was frozen and outside that majority. Without `afterClusterTime` a secondary answers from what it has, so it returned the old value after 2 ms. Majority acknowledgement says nothing about the particular member that serves a later read.
+
+> **Common mistake:** expecting `w: "majority"` + any secondary read to give read-your-writes.
+
+## Q3. Why majority on both sides
+
+**Question:** why do the full causal guarantees need `majority` on both reads and writes?
+
+The guarantees must hold even if the primary changes. A `w: 1` write can be rolled back in a failover (Concept 4), so a session could "read its own write" and later find it gone, breaking read-your-writes and monotonic reads. A `local` read can return data that is later rolled back, so a following write could depend on something that disappears. With majority on both sides, every value the session writes or reads is majority-committed and survives any election (from the documentation; the lab tested majority/majority).
+
+> **Common mistake:** enabling `causalConsistency: true` with default `local` reads and assuming the guarantees are complete.
+
+## Q4. Different processes
+
+**Question:** how do you keep causal consistency when the write and the read happen in different processes?
+
+After the write, take `session.getOperationTime()` and `session.getClusterTime()` and hand them to the reader (response header, cookie, cache). The reader starts its own causal session, calls `advanceClusterTime()` and `advanceOperationTime()` with those values, and reads. The secondary then waits for that position exactly as if the same session had written (from the documentation).
+
+> **Common mistake:** creating a fresh causal session in the reader without advancing it; it has no position to wait for.
+
+## Q5. Hitting maxTimeMS
+
+**Question:** what should the application do when a causal read on a secondary hits `maxTimeMS`?
+
+Treat it as "this secondary is behind" and retry the read on the primary (`readPreference: "primary"`), which always has the session's writes. In the lab the limited read failed with MaxTimeMSExpired after 1,012 ms with `maxTimeMS(1000)`; a 100–200 ms limit is a better default for user-facing pages.
+
+> **Common mistake:** retrying the same secondary read in a loop, multiplying the wait.

@@ -1,0 +1,54 @@
+---
+title: "Answers: Read concern levels"
+description: "Worked answers to the Session 4 Concept 1 check questions."
+companion: "answers"
+tags: ["replication", "read-concern", "mongodb", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/reference/read-concern/"
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+---
+
+<Tldr>
+A read concern chooses between "newest" and "cannot be rolled back". Linearizable adds "and confirmed right now", at the cost of a round trip and a possible wait.
+</Tldr>
+
+## Q1. Old value, no error
+
+**Question:** both secondaries are frozen. Why does a `majority` read return the old value instead of an error?
+
+A `majority` read returns the data as of the majority commit point: the newest state that a majority of members has applied. With both secondaries frozen, that point stayed at the last write before the freeze, where order 9 was `delivered`. That value is committed and cannot be rolled back, so it is a correct answer to "what is the majority-committed state?". The newer `cancelled` exists only on the primary. Nothing is wrong from the server's point of view, so there is no error.
+
+> **Common mistake:** reading the older value as data loss and "fixing" it by switching to `local`, which then exposes writes that can be rolled back.
+
+## Q2. linearizable waits
+
+**Question:** why did the `linearizable` read wait, and what must every linearizable read include?
+
+A linearizable read must reflect every write acknowledged with `w: "majority"` before the read started, even if this node has just lost its primary role without knowing it. To make sure, the primary confirms with a majority (it waits for a majority acknowledgement of a no-op) before returning. With both secondaries frozen no majority could acknowledge, so the read waited until `maxTimeMS` and failed with MaxTimeMSExpired after 3006 ms. Every linearizable read needs a `maxTimeMS`, must go to the primary, and should filter on a unique field (from the documentation).
+
+> **Common mistake:** using `linearizable` for ordinary reads: 1.91 ms instead of 0.21 ms on a healthy set, and a hang when the majority is unreachable.
+
+## Q3. majority as cheap as local
+
+**Question:** why were `majority` reads as cheap as `local` reads on the healthy set?
+
+The storage engine keeps a snapshot at the majority commit point; a `majority` read simply reads at that timestamp. There is no extra network round trip. Medians: `majority` 0.19 ms, `local` 0.21 ms, `snapshot` 0.25 ms. The cost of majority reads is that they may be older, not slower; the cost to the server is keeping older versions in cache while the commit point lags (from the documentation).
+
+> **Common mistake:** avoiding `majority` reads for performance reasons that do not exist on a healthy set.
+
+## Q4. After a wtimeout
+
+**Question:** a `w: "majority"` write failed after its `wtimeout`. What is the state of the data?
+
+The write was applied on the primary; only the confirmation from a majority is missing. It will reach the majority when the secondaries recover, unless the primary fails first, in which case it can be rolled back (Concept 4). `local` reads on the primary see it now; `majority` reads do not yet. The client must treat the outcome as unknown and retry idempotently or check.
+
+> **Common mistake:** compensating for a "failed" write that actually happened (for example re-issuing a payment).
+
+## Q5. Order confirmation page
+
+**Question:** which read concern would you use for an order confirmation page, and with which write concern?
+
+Write the order with `w: "majority"` (and a `wtimeout`), and read the confirmation with `readConcern: "majority"` from the primary or within a causally consistent session (Concept 3). The page then shows an order only if it survives a failover, and shows the buyer's own order as soon as its write is acknowledged, because the write's majority acknowledgement moves the commit point past it.
+
+> **Common mistake:** `w: 1` for speed with `majority` reads: the buyer's own order may not appear until the secondaries catch up.

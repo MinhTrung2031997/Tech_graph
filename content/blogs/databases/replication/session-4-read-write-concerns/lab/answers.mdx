@@ -1,0 +1,85 @@
+---
+title: "Answers: Read and write concerns session quiz"
+description: "Worked answers to the Session 4 quiz, with the lab's measured values."
+companion: "answers"
+tags: ["replication", "read-concern", "write-concern", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/reference/read-concern/"
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+  - "https://www.postgresql.org/docs/17/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT"
+---
+
+<Tldr>
+Pick the server (read preference), the version (read concern), how long the writer waits (write concern), and, for your own writes, carry the position (causal session).
+</Tldr>
+
+## Q1. Four read concerns, majority frozen
+
+**Question:** with both secondaries frozen, what do `local`, `majority`, `snapshot` and `linearizable` reads return after a `w: 1` write?
+
+`local` (and `available`): the new value (`cancelled`), the newest data on the primary. `majority` and `snapshot`: the previous value (`delivered`), the newest majority-committed data, with no error. `linearizable`: no answer until `maxTimeMS`, then MaxTimeMSExpired (3006 ms with a 3 s limit), because it cannot confirm with a majority.
+
+> **Common mistake:** reading the `majority` result as data loss.
+
+## Q2. wtimeout 0
+
+**Question:** why is the default `w: "majority"` with `wtimeout: 0` dangerous during an outage of the secondaries?
+
+`wtimeout: 0` means no timeout: if a majority cannot acknowledge, the write waits indefinitely while holding its client connection. In the lab a script using the default hung for over three minutes until it was stopped. Under load that exhausts connection pools. Set a `wtimeout` (or a client-side timeout) and treat WriteConcernFailed as an unknown outcome.
+
+> **Common mistake:** relying on the default and discovering the hang during the first real outage.
+
+## Q3. Half the reads stale
+
+**Question:** one secondary is 2 minutes behind. Why did `readPreference: secondary` return stale data in about half the reads, and what fixed it?
+
+Read preference picks randomly among eligible secondaries within the latency window and does not look at lag; both secondaries were eligible, so reads split 21 fresh / 19 stale. Adding `maxStalenessSeconds=90` made the driver exclude the member whose estimated staleness was above 90 s: 40 of 40 fresh.
+
+> **Common mistake:** assuming drivers prefer the freshest secondary.
+
+## Q4. maxStalenessSeconds limits
+
+**Question:** why must `maxStalenessSeconds` be at least 90, and why can it not give read-your-writes?
+
+Staleness is estimated from `hello` responses that arrive every 10 s and from no-op writes every 10 s on idle primaries, so the estimate is only accurate to tens of seconds; the driver rejects smaller values (`must be at least 90 seconds`). A member 1 s behind passes any allowed bound, and 1 s is enough to miss your own write. Read-your-writes needs a position (causal session) or the primary.
+
+> **Common mistake:** using `maxStalenessSeconds` as a freshness guarantee.
+
+## Q5. The causal session on a frozen member
+
+**Question:** what does a causally consistent session send with a read, and what happened when the chosen member was frozen?
+
+It sends `afterClusterTime`, the `operationTime` of the session's last operation. The frozen `rp-mongo3` (in the lab `rpb-mongo3`) held the read until it had applied up to that time: the read returned the new value after 5,044 ms, when the member was unfrozen. With `maxTimeMS(1000)` it failed with MaxTimeMSExpired after 1,012 ms; without the session it returned the old value after 2 ms.
+
+> **Common mistake:** causal reads on secondaries without `maxTimeMS` and a primary fallback.
+
+## Q6. An order that never existed
+
+**Question:** why did a `local` read show an order that never officially existed?
+
+The isolated primary accepted `lost-1` with `w: 1` (7 ms) before it noticed it had lost its majority. A `local` read returns the newest data on the node, so it returned `lost-1`. The rest of the set elected `rp-mongo2` without that write; when the old primary rejoined it rolled `lost-1` back (218 ms) into a BSON file. A `majority` read on the same node at the same time did not return it.
+
+> **Common mistake:** believing rollbacks only affect writers. Every reader that acted on the document is affected too.
+
+## Q7. PostgreSQL write concerns
+
+**Question:** which PostgreSQL setting corresponds to `w: 1`, `w: "majority"` and `w: <all, applied>`?
+
+`w: 1`: `synchronous_commit = local` (or `on` with no synchronous standby). `w: "majority"`: `synchronous_commit = on` with synchronous standbys, for example `synchronous_standby_names = 'ANY 1 (s1, s2)'` with two standbys (the WAL is flushed on enough servers to survive losing the primary). `w: <all, applied>`: `synchronous_commit = remote_apply` (5,003–5,011 ms against a standby 5 s behind in the lab).
+
+> **Common mistake:** expecting `on` to make standby reads fresh: it waits for flush, not apply.
+
+## Q8. Designing an order service
+
+**Question:** design the concerns for an order service: writing an order, showing the confirmation, and a seller dashboard.
+
+| Operation | Choice | Reason |
+|---|---|---|
+| Write the order | `w: "majority"`, `wtimeout` of a few seconds, idempotent retry on WriteConcernFailed | Survives failover; bounded wait; unknown outcomes handled |
+| Show the confirmation | `readConcern: "majority"` on the primary, or a causal session on secondaries with `maxTimeMS` about 200 ms and a primary fallback | Buyer sees their own order and never a rolled-back one |
+| Seller dashboard | `readPreference: secondaryPreferred`, `maxStalenessSeconds` about 120, `readConcern: "local"` | Offloads the primary; minutes-old data acceptable but bounded |
+
+In PostgreSQL or MySQL: commit orders with a synchronous standby or semi-sync, read the confirmation from the primary or with an LSN/GTID wait, route dashboards to replicas whose measured lag is under a bound.
+
+> **Common mistake:** one setting for the whole application; each operation has its own needs.

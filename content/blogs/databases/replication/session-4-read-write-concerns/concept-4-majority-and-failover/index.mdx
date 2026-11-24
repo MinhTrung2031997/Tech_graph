@@ -1,0 +1,182 @@
+---
+title: "Concept 4: What majority guarantees across a failover"
+description: "The primary was cut off from the network. A w:1 insert on it was acknowledged in 7 ms; readConcern local returned it, readConcern majority did not. A w:majority insert failed with WriteConcernFailed after 5,013 ms. The old primary stepped down 7.6–9.2 s after the cut and rpb-mongo2 was primary by 10.9 s; neither insert existed there. When the old primary rejoined it rolled both back in 218 ms into a rollback file. A local read had shown a document that never officially existed; a majority read never did."
+type: "concept"
+tags: ["replication", "failover", "rollback", "read-concern", "write-concern", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/replica-set-rollbacks/"
+  - "https://www.mongodb.com/docs/manual/reference/read-concern-majority/"
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+---
+
+<Tldr>
+"Majority" is the line between data that survives a failover and data that may not. In the lab the primary `rpb-mongo1` was disconnected from the network and, still believing it was primary, accepted a `w: 1` insert (`lost-1`) in **7 ms**. On that node, **`readConcern: "local"` returned `lost-1`; `readConcern: "majority"` did not.** A `w: "majority"` insert (`lost-2`) on the same node failed with **WriteConcernFailed after 5,013 ms**, yet was applied locally too. The isolated node stepped down 7.6–9.2 s after the cut and `rpb-mongo2` was primary by 10.9 s: neither document existed there. When `rpb-mongo1` rejoined, it **rolled back both in 218 ms** and wrote them to `/data/db/rollback/…/removed.*.bson`. Anyone who read `lost-1` with `local` saw an order that, as far as the replica set is concerned, never happened; no `majority` read could have. Session 5 measures the rollback itself at scale.
+</Tldr>
+
+## The guarantee
+
+| Term | Meaning |
+|---|---|
+| Majority-committed | Applied on a majority of voting members; any newly elected primary must have it, because an election needs votes from a majority and members only vote for a candidate at least as up to date as themselves |
+| Rollback | A former primary undoing writes that the new primary never received, after it rejoins |
+| Dirty read across failover | Reading a write that is later rolled back; possible with `local`, impossible with `majority` |
+| **✓ / ✗** | The document is visible / not visible |
+
+| Data | After a failover |
+|---|---|
+| Acknowledged with `w: "majority"` | kept (from the documentation; Session 5 kept all 1,000 such documents) |
+| Acknowledged with `w: 1` only | may be rolled back |
+| Write that failed its `w: "majority"` timeout | may be kept or rolled back: unknown outcome |
+| Returned by a `majority` read | kept |
+| Returned by a `local` read | may be rolled back |
+
+## Experiment
+
+```bash
+docker network disconnect rpb-net rpb-mongo1     # the primary loses both secondaries
+```
+
+Then, on `rpb-mongo1` through its local shell, immediately:
+
+```js
+db.orders.insertOne({ _id: 'lost-1', status: 'paid', amount: NumberDecimal('99.00') }, { writeConcern: { w: 1 } });
+db.runCommand({ find: 'orders', filter: { _id: 'lost-1' }, readConcern: { level: 'local' } });
+db.runCommand({ find: 'orders', filter: { _id: 'lost-1' }, readConcern: { level: 'majority' } });
+db.orders.insertOne({ _id: 'lost-2', status: 'paid' }, { writeConcern: { w: 'majority', wtimeout: 5000 } });
+```
+
+<Flow
+  title="MongoDB: an isolated primary, two inserts, two read concerns"
+  height={420}
+  nodes={[
+    { id: 'old', label: 'rpb-mongo1', sub: 'isolated, still primary', x: 20, y: 20, w: 220 },
+    { id: 'new', label: 'rpb-mongo2 + 3', sub: 'majority side', x: 560, y: 20, w: 220 },
+    { id: 'local', label: 'readConcern local', sub: 'on rpb-mongo1', x: 20, y: 160, w: 220 },
+    { id: 'maj', label: 'readConcern majority', sub: 'on rpb-mongo1', x: 290, y: 160, w: 220 },
+    { id: 'elect', label: 'Election', sub: 'new primary', x: 560, y: 160, w: 220 },
+    { id: 'rb', label: 'Rollback', sub: 'on rejoin', x: 20, y: 300, w: 220 },
+    { id: 'file', label: 'removed.*.bson', sub: '/data/db/rollback/', x: 290, y: 300, w: 220 },
+  ]}
+  edges={[
+    { id: 'old-local', from: 'old', to: 'local' },
+    { id: 'old-maj', from: 'old', to: 'maj' },
+    { id: 'new-elect', from: 'new', to: 'elect' },
+    { id: 'local-rb', from: 'local', to: 'rb' },
+    { id: 'rb-file', from: 'rb', to: 'file' },
+  ]}
+  cases={[
+    {
+      title: 'Inside the isolated primary',
+      path: 'w:1 insert ✓ 7 ms → local ✓ sees lost-1 → majority ✗ does not → w:majority insert ✗ WriteConcernFailed 5,013 ms',
+      summary: 'One node can confirm a write; only a majority can make it permanent.',
+      steps: [
+        {
+          title: 'w:1 insert',
+          note: 'Acknowledged in 7 ms: rpb-mongo1 has not noticed it lost its majority. The order lost-1 now exists on exactly one node.',
+          code: "db.orders.insertOne({ _id: 'lost-1', status: 'paid' }, { writeConcern: { w: 1 } })",
+          active: ['old'],
+          subs: { old: 'lost-1 written' },
+        },
+        {
+          title: 'Two reads of lost-1',
+          note: 'readConcern local: found (true). readConcern majority: not found (false). The majority read returned the data as of the last majority-committed point, before the cut.',
+          active: ['old', 'local', 'maj'],
+          edges: ['old-local', 'old-maj'],
+          subs: { local: '✓ sees lost-1', maj: '✗ does not' },
+        },
+        {
+          title: 'w:majority insert',
+          note: 'lost-2 with w: "majority", wtimeout 5000: WriteConcernFailed after 5,013 ms. The insert was applied locally anyway; only the acknowledgement failed.',
+          active: ['old'],
+          subs: { old: 'lost-1, lost-2 local only' },
+        },
+      ],
+    },
+    {
+      title: 'The other side elects',
+      path: 'rpb-mongo1 steps down (7.6–9.2 s) → rpb-mongo2 primary (by 10.9 s) ✗ no lost-1, no lost-2',
+      summary: 'The new primary was elected from data that never contained the two inserts.',
+      steps: [
+        {
+          title: 'Polling each node\'s isWritablePrimary',
+          note: 'Cut at 22:56:08.63. rpb-mongo1 still primary at 22:56:16.23, secondary at 22:56:17.87 (it steps down when it cannot see a majority for electionTimeoutMillis = 10 s). rpb-mongo2 primary at 22:56:19.51. On rpb-mongo2: countDocuments lost-1 = 0, lost-2 = 0. A new write (order 13) went to rpb-mongo2.',
+          active: ['new', 'elect'],
+          edges: ['new-elect'],
+          subs: { elect: '✓ rpb-mongo2 primary', new: 'no lost-1 / lost-2' },
+        },
+      ],
+    },
+    {
+      title: 'Rejoin and roll back',
+      path: 'network back → rpb-mongo1 finds the common point → ✗ rolls back lost-1 and lost-2 in 218 ms → saved to a BSON file',
+      summary: 'The local read had shown a document that the set then erased.',
+      steps: [
+        {
+          title: 'docker network connect',
+          note: 'Until reconnection, rpb-mongo1 still had lost-1 = 1 and lost-2 = 1. Log "Rollback summary": syncSource rpb-mongo2, startTime 15:56:29.074, endTime 15:56:29.292 (218 ms). Afterwards: SECONDARY, lost-1 = 0, lost-2 = 0.',
+          active: ['local', 'rb'],
+          edges: ['local-rb'],
+          subs: { rb: '218 ms' },
+        },
+        {
+          title: 'Where the data went',
+          note: 'bsondump of /data/db/rollback/<uuid>/removed.2026-11-24T15-56-29.0.bson: {"_id":"lost-2","status":"paid"} and {"_id":"lost-1","status":"paid","amount":{"$numberDecimal":"99.00"}}. Recovering them is a manual job.',
+          active: ['rb', 'file'],
+          edges: ['rb-file'],
+          subs: { file: 'lost-1, lost-2' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## What each reader saw
+
+| Reader | Saw `lost-1`? | Correct in hindsight? |
+|---|---|---|
+| `local` read on `rpb-mongo1` during the cut | yes | ✗ it was rolled back |
+| `majority` read on `rpb-mongo1` during the cut | no | ✓ |
+| Any read on `rpb-mongo2` after the election | no | ✓ |
+| Client of the `w: "majority"` insert (`lost-2`) | got an error | ✓ "unknown", and it was in fact rolled back |
+| Client of the `w: 1` insert (`lost-1`) | got success | ✗ success for a write that was undone |
+
+<Pitfall>
+A `w: 1` acknowledgement and a `local` read can both report data that a failover will erase, with no error to anyone. Rollbacks need a network partition or a crash at the wrong moment, so they are rare and therefore untested. If an order, payment or stock change must not "un-happen", write it with `w: "majority"` (the default since 5.0) and read it with `majority` where the read leads to action; do not lower the write concern for speed on those collections.
+</Pitfall>
+
+## Real-world scenario: the voucher that was used twice
+
+A promotions service writes "voucher used" with `w: 1` and checks vouchers with default `local` reads. During a network blip the primary is isolated for 9 s. A buyer redeems a voucher on the isolated primary (acknowledged). The new primary never sees it, and the same voucher is redeemed again on the new primary by a second buyer. When the old primary rejoins, the first redemption is rolled back into a BSON file nobody reads. The ledger shows one redemption; two orders got the discount.
+
+| Fix | Effect |
+|---|---|
+| `w: "majority"` for redemptions | The first redemption could not be acknowledged during the partition |
+| Unique index on the redemption record, written in the order transaction | The second redemption fails on the new primary if the first survived |
+| Alert on rollback files (log id 21612 "Rollback summary") | Rollbacks are noticed and reconciled |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 5, Concept 2](/blogs/databases/replication/session-5-failover/concept-2-lost-writes-and-rollback) | The same rollback with 19,333 writes |
+| Concept 1 | `majority` reads did not show the doomed insert |
+| Concept 3 | Why causal sessions need majority concerns |
+
+## Key takeaways
+
+1. Only majority-committed data is guaranteed to survive a failover.
+2. An isolated primary accepted a `w: 1` insert in 7 ms; a `local` read showed it, a `majority` read did not.
+3. A `w: "majority"` insert failed after its `wtimeout` but was applied locally; its outcome was unknown until the rollback.
+4. The rejoining node rolled back both inserts in 218 ms and saved them to a BSON file.
+5. Use majority writes, and majority reads where the read leads to an action.
+
+## Check questions
+
+1. Why is a majority-committed write guaranteed to be on any newly elected primary?
+2. During the cut, why did the `majority` read on the isolated primary not return `lost-1`?
+3. `lost-2` failed with WriteConcernFailed. Why was it in the rollback file?
+4. Which clients received a wrong answer during this experiment?
+5. What would you change in the voucher service, and why is a unique index not enough on its own?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-4-read-write-concerns/concept-4-majority-and-failover/answers">Worked answers to Q1–Q5</DeepDive>

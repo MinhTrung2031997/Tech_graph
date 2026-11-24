@@ -1,0 +1,54 @@
+---
+title: "Answers: What majority guarantees across a failover"
+description: "Worked answers to the Session 4 Concept 4 check questions."
+companion: "answers"
+tags: ["replication", "failover", "rollback", "mongodb", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/replica-set-rollbacks/"
+  - "https://www.mongodb.com/docs/manual/core/replica-set-elections/"
+---
+
+<Tldr>
+Majorities overlap. That overlap is the whole guarantee; everything outside it can be undone.
+</Tldr>
+
+## Q1. Why majority-committed writes survive
+
+**Question:** why is a majority-committed write guaranteed to be on any newly elected primary?
+
+An election needs votes from a majority of voting members, and a member only votes for a candidate whose oplog is at least as recent as its own. Any two majorities of the same set share at least one member. So among the voters of any new primary there is at least one member that has every majority-committed write, and it will not vote for a candidate that lacks them. The new primary therefore has them, and nothing forces it to roll them back (from the documentation; the lab's new primary simply never had the two non-majority inserts).
+
+> **Common mistake:** thinking "majority" is about durability on disk. It is about overlap between the set that has the write and the set that elects the next primary.
+
+## Q2. The majority read on the isolated node
+
+**Question:** during the cut, why did the `majority` read on the isolated primary not return `lost-1`?
+
+A `majority` read returns data as of the node's majority commit point. The isolated primary could not get acknowledgements from either secondary after the cut, so its commit point stayed at the last write the secondaries had confirmed before it. `lost-1` was newer than that point and therefore invisible to `majority` reads, while `local` reads (newest data on the node) returned it.
+
+> **Common mistake:** expecting the isolated node to return an error. It answered correctly from the older majority snapshot.
+
+## Q3. A failed majority write in the rollback file
+
+**Question:** `lost-2` failed with WriteConcernFailed. Why was it in the rollback file?
+
+A write concern controls when the client is told "ok", not whether the write is applied. The primary applied `lost-2` locally and then waited for a majority acknowledgement that never came; after 5,000 ms it returned WriteConcernFailed. The insert stayed in the isolated node's oplog, beyond the common point with the new primary, so when the node rejoined it was rolled back together with `lost-1` and written to `removed.*.bson`.
+
+> **Common mistake:** assuming a write-concern error means the write did not happen and can be retried as if new.
+
+## Q4. Who got a wrong answer
+
+**Question:** which clients received a wrong answer during this experiment?
+
+The client of the `w: 1` insert (told "success" for a write that was later undone) and any client that read `lost-1` with `readConcern: "local"` on the isolated node (shown a document that the set erased). The `w: "majority"` client got an error, which was honest: the outcome was unknown. `majority` readers and readers on the new primary never saw either document, which matched the final state.
+
+> **Common mistake:** counting only the writer as affected. Readers who acted on a rolled-back document (shipped an order, sent an email) are the costly part.
+
+## Q5. The voucher service
+
+**Question:** what would you change in the voucher service, and why is a unique index not enough on its own?
+
+Write redemptions with `w: "majority"` (with `wtimeout`, treating timeouts as unknown and checking before retrying), read voucher status with `majority` when deciding to accept it, and keep a unique index on the redemption record. The unique index alone only works on one history: the first redemption existed only on the isolated primary, so the new primary's index never saw it and accepted the second. Majority writes make the first redemption either impossible to acknowledge during the partition or guaranteed to be present on the new primary, where the index then rejects the duplicate.
+
+> **Common mistake:** relying on constraints to protect data that may itself be rolled back.

@@ -1,0 +1,13 @@
+{
+  "title": "Session 4: Read and write concerns",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-read-concern-levels/index",
+    "concept-2-read-preference/index",
+    "concept-3-causal-consistency/index",
+    "concept-4-majority-and-failover/index",
+    "concept-5-postgresql-and-mysql/index",
+    "lab/index"
+  ]
+}

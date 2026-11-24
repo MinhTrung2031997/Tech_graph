@@ -1,0 +1,197 @@
+---
+title: "Lab and session quiz: Read and write concerns"
+description: "Freeze MongoDB secondaries and read one document at every read concern; count stale answers per read preference with one secondary two minutes behind, with and without maxStalenessSeconds; make a causally consistent session wait on a lagging member; isolate the primary, write with w:1 and w:majority, and find both writes in the rollback file; compare PostgreSQL synchronous_commit levels against a delayed standby."
+type: "how-to"
+tags: ["replication", "read-concern", "write-concern", "read-preference", "mongodb", "postgresql", "lab"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/reference/read-concern/"
+  - "https://www.mongodb.com/docs/manual/core/read-preference-staleness/"
+  - "https://www.mongodb.com/docs/manual/core/causal-consistency-read-write-concerns/"
+  - "https://www.mongodb.com/docs/manual/core/replica-set-rollbacks/"
+  - "https://www.postgresql.org/docs/17/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT"
+---
+
+<Tldr>
+Uses the clusters and `orders` data from the [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab): MongoDB replica set `rprs` (`rp-mongo1` primary, `rp-mongo2`, `rp-mongo3`, database `shop`) for Exercises 1–4 and PostgreSQL `rp-pg1` → `rp-pg2` for Exercise 5. Scripts run inside `rp-mongo1` (`docker cp x.js rp-mongo1:/tmp/ && docker exec rp-mongo1 mongosh --quiet /tmp/x.js`), where the member names resolve. `fsyncLock` stops a member from applying the oplog; always run the matching `fsyncUnlock`. Exercise 4 causes a failover and a rollback: run it last. The quoted results come from the same steps run with another prefix on one laptop.
+</Tldr>
+
+## Setup
+
+```bash
+alias rmg1='docker exec -it rp-mongo1 mongosh --quiet'
+alias rmg2='docker exec -it rp-mongo2 mongosh --quiet'
+alias rmg3='docker exec -it rp-mongo3 mongosh --quiet'
+```
+
+Tag the members so reads can be pinned to one of them:
+
+```js
+// rmg1
+const c = rs.conf();
+c.members[0].tags = { name: 'm1' }; c.members[1].tags = { name: 'm2' }; c.members[2].tags = { name: 'm3' };
+rs.reconfig(c);
+db.adminCommand({ getDefaultRWConcern: 1 })   // defaultReadConcern local, defaultWriteConcern majority, wtimeout 0
+```
+
+## Exercise 1: read concerns with the majority frozen (Concept 1)
+
+`rc.js`:
+
+```js
+// Read order 9 at each read concern with a 3 s limit.
+const shop = db.getSiblingDB('shop');
+for (const level of ['local', 'available', 'majority', 'linearizable', 'snapshot']) {
+  const t0 = Date.now();
+  const r = shop.runCommand({ find: 'orders', filter: { _id: 9 }, readConcern: { level }, maxTimeMS: 3000 });
+  print(level, r.ok ? r.cursor.firstBatch[0].status : 'ERROR ' + r.codeName, Date.now() - t0, 'ms');
+}
+```
+
+```js
+// rmg1
+db.getSiblingDB('shop').orders.updateOne({ _id: 9 }, { $set: { status: 'delivered' } }, { writeConcern: { w: 3 } })
+// rmg2 and rmg3
+db.fsyncLock()
+// rmg1
+db.getSiblingDB('shop').orders.updateOne({ _id: 9 }, { $set: { status: 'cancelled' } }, { writeConcern: { w: 1 } })
+load('/tmp/rc.js')
+try { db.getSiblingDB('shop').orders.updateOne({ _id: 10 }, { $set: { status: 'cancelled' } },
+      { writeConcern: { w: 'majority', wtimeout: 3000 } }) } catch (e) { print(e.codeName) }
+db.hello().isWritablePrimary
+// rmg2 and rmg3
+db.fsyncUnlock()
+// rmg1, one second later
+load('/tmp/rc.js')
+```
+
+Lab: local and available `cancelled`; majority and snapshot `delivered`; linearizable `ERROR MaxTimeMSExpired` after 3006 ms; the majority write WriteConcernFailed after 3014 ms; still primary. After unlocking, every level `cancelled`. Do **not** try a `w: "majority"` write without `wtimeout` while frozen: it waits indefinitely.
+
+Healthy latency per level (50 reads each):
+
+```js
+// rmg1
+for (const level of ['local', 'majority', 'linearizable', 'snapshot']) {
+  const t = [];
+  for (let i = 0; i < 50; i++) { const t0 = process.hrtime.bigint();
+    db.getSiblingDB('shop').runCommand({ find: 'orders', filter: { _id: 9 }, readConcern: { level } });
+    t.push(Number(process.hrtime.bigint() - t0) / 1e6); }
+  t.sort((a, b) => a - b); print(level, 'median', t[25].toFixed(2), 'ms');
+}
+```
+
+Lab: local 0.21, majority 0.19, linearizable 1.91, snapshot 0.25 ms.
+
+## Exercise 2: read preference and maxStalenessSeconds (Concept 2)
+
+`rp.js` (pass the options as `OPTS`):
+
+```js
+// 40 reads of order 11 right after a write, through a replica-set connection with the given options.
+const URI = 'mongodb://rp-mongo1:27017,rp-mongo2:27017,rp-mongo3:27017/shop?replicaSet=rprs';
+let c;
+try { c = new Mongo(URI + OPTS); } catch (e) { print(OPTS, '-> client error:', e.message); quit(); }
+const v = 'v' + Date.now();
+db.getSiblingDB('shop').orders.updateOne({ _id: 11 }, { $set: { note: v } }, { writeConcern: { w: 1 } });
+let fresh = 0, stale = 0;
+for (let i = 0; i < 40; i++) { try { c.getDB('shop').orders.findOne({ _id: 11 }).note === v ? fresh++ : stale++; }
+  catch (e) { print(OPTS, '->', e.message); quit(); } }
+print(OPTS || '(primary)', '-> fresh', fresh, 'stale', stale);
+```
+
+```bash
+docker exec rp-mongo3 mongosh --quiet --eval 'db.fsyncLock()'
+sleep 110     # let rp-mongo3 fall about 2 minutes behind
+for o in "" "&readPreference=secondary" "&readPreference=secondaryPreferred" "&readPreference=nearest" \
+         "&readPreference=secondary&maxStalenessSeconds=90" "&readPreference=secondary&maxStalenessSeconds=30"; do
+  docker exec rp-mongo1 mongosh --quiet --eval "var OPTS = '$o'" /tmp/rp.js
+done
+```
+
+Lab: primary 40/0; secondary 21 fresh, 19 stale; secondaryPreferred 17/23; nearest 33/7; maxStalenessSeconds=90 40/0; =30 refused: `Option "maxStalenessSeconds" must be at least 90 seconds`.
+
+Then freeze `rp-mongo2` too, wait about 100 s, and run with `&readPreference=secondaryPreferred&serverSelectionTimeoutMS=5000`, the same plus `&maxStalenessSeconds=90`, and `&readPreference=secondary&maxStalenessSeconds=90&serverSelectionTimeoutMS=5000`. Lab: 40/40 stale; 40/40 fresh (primary); `Server selection timed out after 5000 ms`. Unlock both members.
+
+Optional: give `rp-mongo3` `priority: 0, secondaryDelaySecs: 120`, look at `db.hello().hosts` on the primary (it is missing), and try `find(…).readPref('secondary', [{ name: 'm3' }])` (server selection times out after 30 s). Reset the delay to 0 and priority to 1.
+
+## Exercise 3: a causally consistent session (Concept 3)
+
+`causal.js` (set `CAUSAL` and optionally `MAX_MS`):
+
+```js
+const c = new Mongo('mongodb://rp-mongo1:27017,rp-mongo2:27017,rp-mongo3:27017/shop?replicaSet=rprs');
+const s = c.startSession({ causalConsistency: CAUSAL });
+const sdb = s.getDatabase('shop');
+const v = 'v' + Date.now();
+sdb.orders.updateOne({ _id: 12 }, { $set: { note: v } }, { writeConcern: { w: 'majority' } });
+print('operationTime', JSON.stringify(s.getOperationTime()));
+const t0 = Date.now();
+try {
+  const cur = sdb.orders.find({ _id: 12 }).readPref('secondary', [{ name: 'm3' }]).readConcern('majority');
+  if (typeof MAX_MS !== 'undefined') cur.maxTimeMS(MAX_MS);
+  print(cur.toArray()[0].note === v ? 'fresh' : 'stale', 'after', Date.now() - t0, 'ms');
+} catch (e) { print('ERROR', e.codeName, 'after', Date.now() - t0, 'ms'); }
+```
+
+Freeze `rp-mongo3` for 5 s around each run:
+
+```bash
+for args in "var CAUSAL = false" "var CAUSAL = true" "var CAUSAL = true; var MAX_MS = 1000"; do
+  docker exec rp-mongo3 mongosh --quiet --eval 'db.fsyncLock()' >/dev/null
+  ( sleep 5; docker exec rp-mongo3 mongosh --quiet --eval 'db.fsyncUnlock()' >/dev/null ) &
+  docker exec rp-mongo1 mongosh --quiet --eval "$args" /tmp/causal.js
+  wait; sleep 2
+done
+```
+
+Lab: stale after 2 ms; fresh after 5,044 ms; `ERROR MaxTimeMSExpired after 1012 ms`. Run once more without freezing: 2 ms either way.
+
+## Exercise 4: an isolated primary and a rollback (Concept 4)
+
+```bash
+docker network disconnect rp-net rp-mongo1
+docker exec rp-mongo1 mongosh --quiet shop --eval '
+  print(db.orders.insertOne({ _id: "lost-1", status: "paid" }, { writeConcern: { w: 1 } }).acknowledged);
+  print("local", db.runCommand({ find: "orders", filter: { _id: "lost-1" }, readConcern: { level: "local" } }).cursor.firstBatch.length);
+  print("majority", db.runCommand({ find: "orders", filter: { _id: "lost-1" }, readConcern: { level: "majority" } }).cursor.firstBatch.length);
+  try { db.orders.insertOne({ _id: "lost-2", status: "paid" }, { writeConcern: { w: "majority", wtimeout: 5000 } }) }
+  catch (e) { print(e.codeName) }'
+# watch who is primary, once a second
+for i in $(seq 20); do for n in 1 2 3; do echo -n "m$n=$(docker exec rp-mongo$n mongosh --quiet --eval 'db.hello().isWritablePrimary') "; done; echo; sleep 1; done
+docker exec rp-mongo2 mongosh --quiet shop --eval 'db.orders.countDocuments({ _id: { $in: ["lost-1", "lost-2"] } })'
+docker network connect rp-net rp-mongo1
+sleep 15
+docker exec rp-mongo1 sh -c 'bsondump --quiet /data/db/rollback/*/removed.*.bson'
+docker logs rp-mongo1 2>&1 | grep '"Rollback summary"'
+```
+
+Lab: acknowledged in 7 ms; local 1, majority 0; WriteConcernFailed after 5,013 ms; old primary secondary 7.6–9.2 s after the cut, `rp-mongo2` primary by 10.9 s; 0 on the new primary; rollback of both documents in 218 ms. If you want `rp-mongo1` primary again: `rs.stepDown()` on the current primary.
+
+## Exercise 5: PostgreSQL synchronous_commit against a delayed standby (Concept 5)
+
+```sql
+-- rpg2
+ALTER SYSTEM SET recovery_min_apply_delay = '5s'; SELECT pg_reload_conf();
+-- rpg1
+ALTER SYSTEM SET synchronous_standby_names = 'walreceiver'; SELECT pg_reload_conf();
+\timing on
+SET synchronous_commit = local;         UPDATE orders SET amount = amount + 0.01 WHERE id = 5 RETURNING amount;
+SET synchronous_commit = on;            UPDATE orders SET amount = amount + 0.01 WHERE id = 5 RETURNING amount;
+SET synchronous_commit = remote_apply;  UPDATE orders SET amount = amount + 0.01 WHERE id = 5 RETURNING amount;
+-- rpg2, right after each: SELECT amount FROM orders WHERE id = 5;
+```
+
+Lab: `local` 2.3–3.6 ms and `on` 2.7–5.8 ms with stale standby reads; `remote_apply` 5,003–5,011 ms with fresh ones. Reset: `ALTER SYSTEM RESET synchronous_standby_names` on `rpg1`, `ALTER SYSTEM RESET recovery_min_apply_delay` on `rpg2`, `SELECT pg_reload_conf()` on both.
+
+## Session quiz
+
+1. With both secondaries frozen, what do `local`, `majority`, `snapshot` and `linearizable` reads return after a `w: 1` write?
+2. Why is the default `w: "majority"` with `wtimeout: 0` dangerous during an outage of the secondaries?
+3. One secondary is 2 minutes behind. Why did `readPreference: secondary` return stale data in about half the reads, and what fixed it?
+4. Why must `maxStalenessSeconds` be at least 90, and why can it not give read-your-writes?
+5. What does a causally consistent session send with a read, and what happened when the chosen member was frozen?
+6. Why did a `local` read show an order that never officially existed?
+7. Which PostgreSQL setting corresponds to `w: 1`, `w: "majority"` and `w: <all, applied>`?
+8. Design the concerns for an order service: writing an order, showing the confirmation, and a seller dashboard.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-4-read-write-concerns/lab/answers">Answers to the session quiz</DeepDive>
