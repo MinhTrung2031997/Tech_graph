@@ -201,7 +201,7 @@ The slot's promise is that WAL stays until the consumer confirms it. Nothing che
   ]}
 />
 
-A logical slot also holds `catalog_xmin`: VACUUM cannot remove old rows of the **system catalogs** that the slot might need to decode old changes. It does not hold back VACUUM on ordinary tables (a physical slot with `hot_standby_feedback` does, see Session 6).
+A logical slot also holds `catalog_xmin`: VACUUM cannot remove old rows of the **system catalogs** that the slot might need to decode old changes. It does not hold back VACUUM on ordinary tables (a physical slot with `hot_standby_feedback` does, see [Session 6](/blogs/databases/replication/session-6-queries-on-replicas/concept-2-hot-standby-feedback)).
 
 ## Slots and failover
 

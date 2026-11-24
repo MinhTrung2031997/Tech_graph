@@ -79,7 +79,7 @@ Remove everything with `bash rp-teardown.sh rp`:
 #!/bin/bash
 # Remove every container of one prefix and its network. Usage: rp-teardown.sh <prefix>
 P=$1
-docker rm -f $(docker ps -aq --filter "name=^$P-") >/dev/null 2>&1; docker network rm $P-net >/dev/null 2>&1; echo "removed $P"
+docker rm -fv $(docker ps -aq --filter "name=^$P-") >/dev/null 2>&1; docker network rm $P-net >/dev/null 2>&1; echo "removed $P"
 ```
 
 Shortcuts used in the exercises:
