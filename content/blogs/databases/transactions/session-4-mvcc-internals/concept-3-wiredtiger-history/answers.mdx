@@ -1,0 +1,76 @@
+---
+title: "Answers: WiredTiger update chains and the history store"
+description: "Worked answers to the Session 4 Concept 3 check questions."
+companion: "answers"
+tags: ["transactions", "mvcc", "mongodb", "answers"]
+status: "draft"
+sources:
+  - "https://source.wiredtiger.com/develop/arch-hs.html"
+  - "https://www.mongodb.com/docs/manual/reference/parameters/"
+---
+
+<Tldr>
+WiredTiger keeps history in memory and bounds it in time; old snapshots either read cheaply or are refused.
+</Tldr>
+
+## Q1. Where recent versions live
+
+**Question:** where does WiredTiger keep the versions created by 30,000 updates while they are recent, and where do they go later?
+
+In the document's **update chain**, a list of updates attached to the key on the in-memory page, newest first, each with its commit timestamp. When the page is reconciled (evicted or checkpointed) and older versions are still needed by some snapshot or the history window, they are written to the **history store** table; otherwise they are discarded. In the lab, `history store table insert calls` rose by 0 during the 30,000 updates: the chain was still in cache.
+
+> **Common mistake:** assuming MongoDB has an undo log like InnoDB.
+
+## Q2. Still version 1, but slower
+
+**Question:** why did T1 still read version 1, and why did its reads become slower?
+
+T1's snapshot has a read timestamp from before the bulk write. Every one of the 30,000 updates on the chain has a later commit timestamp, so T1 skips them and returns the base value, version 1. Skipping costs a walk over the chain on every read: 100 reads took 84 ms instead of 30 ms.
+
+> **Common mistake:** expecting a snapshot transaction to see committed changes because readConcern is "local".
+
+## Q3. 2.8× vs 168×
+
+**Question:** why was the slowdown in MongoDB (2.8×) smaller than in InnoDB (168×) for the same number of versions?
+
+WiredTiger only **compares timestamps** along an in-memory list until it finds a visible entry; each step is cheap. InnoDB **rebuilds** the row by applying each undo record to a copy, reading undo pages through the buffer pool, so each step does more work. Once WiredTiger versions are evicted to the history store, old reads become more expensive too (disk reads in the history store table).
+
+> **Common mistake:** treating the two numbers as a general engine comparison; they measure one row in one test.
+
+## Q4. SnapshotTooOld
+
+**Question:** what does SnapshotTooOld tell you, and which parameter sets the limit?
+
+The requested read timestamp is older than the oldest history the server still keeps, so it cannot reconstruct the data as of that time. The guaranteed history is `minSnapshotHistoryWindowInSeconds` (300 s by default): a read 290 s back worked, 400 s back failed. Increasing it lets older snapshot reads succeed at the cost of more history in cache and the history store.
+
+> **Common mistake:** retrying the same `atClusterTime`; it only gets older.
+
+## Q5. 70 s vs 130 s
+
+**Question:** a transaction stayed open 70 s and committed, another 130 s and was aborted. Explain.
+
+The 60 s `transactionLifetimeLimitSeconds` is enforced by a background job (`abortExpiredTransactions`) that runs periodically and aborts transactions whose expiry time has passed. A transaction just past 60 s can survive until the job's next run: the 70 s one committed. By 130 s the job had run and aborted it (server log: "Aborting transaction because it has been running for longer than 'transactionLifetimeLimitSeconds'"), so the client got `NoSuchTransaction`.
+
+> **Common mistake:** relying on transactions slightly over 60 s working because they did in a test.
+
+## Q6. Consistent totals without one transaction
+
+**Question:** how can a long job get consistent totals in MongoDB without one long transaction?
+
+Pick one cluster time at the start (for example `db.adminCommand({ hello: 1 }).operationTime`) and run every read as a **snapshot read at that `atClusterTime`** outside a transaction (find and aggregate support it). All reads see the same point in time, each read is short, and nothing is locked. The whole job must finish within the 300 s history window. For longer jobs, read from a dedicated secondary or a backup restore.
+
+> **Common mistake:** splitting into many transactions with default read concern and expecting the totals to match.
+
+## Q7. Bounds on history
+
+**Question:** compare how PostgreSQL, InnoDB and MongoDB bound the history an old snapshot can force them to keep.
+
+| Engine | Bound |
+|---|---|
+| PostgreSQL | None by default: dead tuples accumulate until the transaction ends; optional `idle_in_transaction_session_timeout`, `transaction_timeout` |
+| InnoDB | None: the history list grows until the read view closes; only `wait_timeout` closes idle connections |
+| MongoDB | Time: transactions aborted after `transactionLifetimeLimitSeconds` (60 s), snapshot reads limited to `minSnapshotHistoryWindowInSeconds` (300 s) |
+
+MongoDB protects the server and fails the client; the SQL engines protect the client and let the server degrade.
+
+> **Common mistake:** assuming every database has a built-in limit on transaction duration.

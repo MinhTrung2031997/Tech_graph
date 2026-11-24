@@ -1,0 +1,73 @@
+---
+title: "Answers: InnoDB undo logs and read views"
+description: "Worked answers to the Session 4 Concept 2 check questions."
+companion: "answers"
+tags: ["transactions", "mvcc", "innodb", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-purge-configuration.html"
+---
+
+<Tldr>
+InnoDB keeps the newest row in place and the past in undo. Old readers pay to rebuild it, and purge waits for the oldest reader.
+</Tldr>
+
+## Q1. Where the previous version is
+
+**Question:** where is the previous version of a row after an UPDATE in InnoDB, and how does a reader reach it?
+
+The clustered index record is updated **in place**; the previous values go into an **undo record** in an undo tablespace. The record's hidden `DB_ROLL_PTR` points to that undo record, which points to the one before it, forming a chain. A reader whose read view cannot see the record's `DB_TRX_ID` copies the record and applies undo records along the chain until it reaches a version whose transaction id is visible.
+
+> **Common mistake:** thinking InnoDB writes a new row version into the table like PostgreSQL.
+
+## Q2. 14.8 ms vs 0.14 ms
+
+**Question:** why did T1's read of account 1 take 14.8 ms while a fresh reader took 0.14 ms?
+
+The fresh reader's read view includes all 30,000 committed updates, so the current record is visible as is. T1's read view predates all of them: InnoDB had to apply **30,000 undo records** to rebuild version 1. The cost grows with the number of versions newer than the reader's view, not with the table size.
+
+> **Common mistake:** blaming the table or index for slow reads that only some sessions see.
+
+## Q3. History list length
+
+**Question:** what is the history list length, and why did it grow to 30,007?
+
+The number of committed transactions' update undo logs waiting to be purged (`trx_rseg_history_len`, also "History list length" in `SHOW ENGINE INNODB STATUS`). Each of the 30,000 committed updates added one. Purge may only remove undo that no read view can need, and T1's read view was older than all of them, so none could go: 22 + 30,000 ≈ 30,007 (the rest came from other activity on the server).
+
+> **Common mistake:** reading the history list as "rows changed"; it counts undo logs (roughly committed write transactions).
+
+## Q4. Server-wide effect
+
+**Question:** why does one idle transaction affect purge for every table on the server?
+
+Purge processes the history list in commit order across all tables and schemas, and stops at the oldest active read view, because any table's undo could be needed by it. InnoDB does not track which tables a read view will read. So one forgotten read view in one schema lets undo pile up for the whole instance.
+
+> **Common mistake:** looking for the culprit only among sessions that use the slow table.
+
+## Q5. The huge trx_id
+
+**Question:** why is the read-only transaction's trx_id a huge number?
+
+Transactions that only read are not assigned a transaction id from the counter; they do not need one because they write no `DB_TRX_ID` and no undo. `INNODB_TRX` shows a placeholder number derived from the transaction object instead (562948025154776 in the lab), while the writer had a real id (704187, just below the counter 704188).
+
+> **Common mistake:** using trx_id order to find the oldest transaction; use `trx_started`.
+
+## Q6. COMMIT vs ROLLBACK
+
+**Question:** compare the cost of COMMIT and ROLLBACK in InnoDB and PostgreSQL.
+
+| | COMMIT | ROLLBACK (after updating 100,000 rows) |
+|---|---|---|
+| InnoDB | Cheap: write and flush the redo/commit record (20 ms) | Expensive: apply 100,000 undo records (139 ms here; minutes for very large transactions) |
+| PostgreSQL | Cheap: flush WAL commit record (19 ms) | Cheap: mark the xid aborted (0.9 ms); dead tuples left for VACUUM |
+
+> **Common mistake:** killing a huge InnoDB transaction to "free resources quickly".
+
+## Q7. Where the space goes
+
+**Question:** an UPDATE in InnoDB does not grow the table. Where does the space for history go instead?
+
+Into the **undo tablespaces** (in MySQL 8.4, `undo_001` and `undo_002` by default). While purge keeps up, undo pages are reused; when a long read view blocks purge, the undo tablespaces grow. They can be truncated automatically once purge has freed them (`innodb_undo_log_truncate`, on by default), but only after the blocking transaction ends.
+
+> **Common mistake:** checking only table size when looking for MVCC bloat in MySQL.

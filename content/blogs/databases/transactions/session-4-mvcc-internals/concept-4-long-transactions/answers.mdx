@@ -1,0 +1,81 @@
+---
+title: "Answers: How one long transaction stops cleanup"
+description: "Worked answers to the Session 4 Concept 4 check questions."
+companion: "answers"
+tags: ["transactions", "mvcc", "vacuum", "purge", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html"
+  - "https://www.postgresql.org/docs/current/runtime-config-client.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html#sysvar_wait_timeout"
+---
+
+<Tldr>
+Find the oldest snapshot, end it, and set a timeout so it cannot happen again.
+</Tldr>
+
+## Q1. Dead but not removable
+
+**Question:** why could VACUUM not remove the 30,000 dead tuples while the idle session was open, although that session never read them again?
+
+VACUUM cannot know what a transaction will read next. The idle session held a REPEATABLE READ snapshot with xmin 2356631; for that snapshot the versions replaced after 2356631 are still the current ones, and it could query them at any moment. So every version deleted by a transaction newer than the horizon must stay: "30000 are dead but not yet removable", "removable cutoff: 2356631". In READ COMMITTED the same applies while a statement is running, and to the transaction's xid if it has written anything.
+
+> **Common mistake:** "the transaction is idle, so it holds nothing". It holds its snapshot.
+
+## Q2. Still 295 pages
+
+**Question:** after the session committed, VACUUM removed everything, but the table stayed at 295 pages. Why, and is that a problem?
+
+Plain VACUUM marks the space of removed tuples as free inside the pages (and in the free space map) but does not give pages back to the operating system, except empty pages at the very end of the table. New versions then reuse that space: three more full updates kept the table at 295 pages. It is a problem only if the extra space is never needed again (scans read 295 pages instead of 74); then `VACUUM FULL` (exclusive lock) or `pg_repack` (online) rewrites the table.
+
+> **Common mistake:** running VACUUM FULL routinely; it locks the table and the space is usually reused anyway.
+
+## Q3. InnoDB: finding the culprit
+
+**Question:** in InnoDB, which number tells you purge is falling behind, and how do you find the transaction responsible?
+
+The **history list length** (`trx_rseg_history_len` in `information_schema.innodb_metrics`, or "History list length" in `SHOW ENGINE INNODB STATUS`) rising steadily. The culprit is usually the oldest transaction:
+
+```sql
+SELECT trx_id, trx_started, trx_state, trx_mysql_thread_id, trx_query
+FROM information_schema.innodb_trx ORDER BY trx_started LIMIT 5;
+```
+
+Join `trx_mysql_thread_id` to `performance_schema.threads` or `processlist` for user and host, then `KILL` it if needed (remember the rollback cost, Concept 2).
+
+> **Common mistake:** ordering by trx_id; read-only transactions have placeholder ids.
+
+## Q4. wait_timeout
+
+**Question:** what did `wait_timeout` do to the open MySQL transaction, and why is it a weak protection?
+
+With `wait_timeout = 2`, the server closed the connection after 2 s without a statement (ERROR 4031 on the next statement) and rolled back the open transaction: account 5's update was gone. It is weak because it measures **connection** idleness, defaults to 8 hours, applies to idle connections whether or not they are inside a transaction, and does nothing against a transaction that keeps sending statements for hours. MySQL has no setting that limits transaction duration.
+
+> **Common mistake:** lowering wait_timeout globally, which also closes healthy idle pool connections.
+
+## Q5. MongoDB's approach
+
+**Question:** how does MongoDB avoid the problem, and what does the application see?
+
+It limits transaction lifetime (`transactionLifetimeLimitSeconds`, 60 s) and snapshot reads (300 s window). A periodic job aborts expired transactions, releasing their read timestamps so history can be discarded. The application sees `NoSuchTransaction` (labelled `TransientTransactionError`) on its next operation, or `SnapshotTooOld` for an old `atClusterTime`, and has to retry or restructure the work.
+
+> **Common mistake:** catching NoSuchTransaction and retrying a job that will always run longer than 60 s.
+
+## Q6. Other horizon holders
+
+**Question:** name three things besides an open session that can hold back the PostgreSQL cleanup horizon.
+
+- **Prepared transactions** (`PREPARE TRANSACTION`, two-phase commit) left uncommitted: `pg_prepared_xacts`.
+- **Replication slots** whose consumer is behind or gone: `pg_replication_slots.xmin` / `catalog_xmin`.
+- **Standbys with `hot_standby_feedback = on`** running long queries: their snapshot is reported to the primary.
+- Also: a long-running query on the primary (its statement snapshot), and `CREATE INDEX CONCURRENTLY` waiting phases.
+
+> **Common mistake:** checking only `pg_stat_activity` on the primary.
+
+## Q7. Two timeouts
+
+**Question:** what is the difference between `idle_in_transaction_session_timeout` and `transaction_timeout`?
+
+`idle_in_transaction_session_timeout` ends a session that has been **idle inside an open transaction** for longer than the limit: it catches forgotten transactions while letting long busy ones run. `transaction_timeout` (PostgreSQL 17) limits the **total duration** of a transaction, busy or idle: it caught a transaction whose `pg_sleep(3)` ran past 2 s. Both terminate the session (FATAL) and roll the transaction back. `statement_timeout` limits single statements only.
+
+> **Common mistake:** relying on statement_timeout to stop long transactions made of many short statements.

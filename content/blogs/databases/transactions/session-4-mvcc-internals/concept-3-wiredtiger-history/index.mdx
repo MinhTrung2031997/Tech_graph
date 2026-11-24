@@ -1,0 +1,224 @@
+---
+title: "Concept 3: WiredTiger update chains and the history store"
+description: "MongoDB's storage engine keeps recent versions of a document as an update chain in memory and moves older ones to the history store. A snapshot transaction read its document after 30,000 newer versions at about 2.8× the normal cost. MongoDB bounds history in time instead of letting it grow: reads older than minSnapshotHistoryWindowInSeconds (300 s) fail with SnapshotTooOld, and transactions older than transactionLifetimeLimitSeconds (60 s) are aborted by a background job."
+type: "concept"
+tags: ["transactions", "mvcc", "mongodb", "wiredtiger", "history-store", "snapshot"]
+status: "draft"
+sources:
+  - "https://source.wiredtiger.com/develop/arch-transaction.html"
+  - "https://source.wiredtiger.com/develop/arch-hs.html"
+  - "https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.minSnapshotHistoryWindowInSeconds"
+  - "https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.transactionLifetimeLimitSeconds"
+  - "https://www.mongodb.com/docs/manual/reference/read-concern-snapshot/"
+---
+
+<Tldr>
+WiredTiger stores each document's committed versions as an **update chain** hanging off the on-disk value in cache, newest first, each update stamped with a **commit timestamp**. A reader with a snapshot timestamp walks the chain until it finds a version committed at or before its timestamp; versions evicted from cache go to the **history store** (`WiredTigerHS.wt`). After a bulk write of **30,000** updates to account 1 (481 ms), a transaction that had started before them still read version **1**: 100 reads took **84 ms** instead of 30 ms, while a fresh reader took 27 ms; the history store received **0** inserts, so the whole chain was still in memory. Instead of letting old snapshots grow history without bound, MongoDB limits it in time: a read with `atClusterTime` 290 s in the past returned the old version, 400 s back failed with **SnapshotTooOld** (`minSnapshotHistoryWindowInSeconds` = 300), and a transaction left open for 130 s was aborted by the `abortExpiredTransactions` job (`transactionLifetimeLimitSeconds` = 60; one open for 70 s still committed).
+</Tldr>
+
+## Versions in memory, stamped with time
+
+| Term | Meaning |
+|---|---|
+| Update chain | List of updates to one key, newest first, attached to the page in cache |
+| Commit timestamp | Cluster time at which an update committed (the same timeline as the oplog) |
+| Read timestamp | The point in time a snapshot reads at; versions committed later are skipped |
+| History store | WiredTiger table holding older versions when a page is evicted or written by a checkpoint |
+| `minSnapshotHistoryWindowInSeconds` | How much history (in seconds) the server keeps for snapshot reads; default 300 |
+| `transactionLifetimeLimitSeconds` | Transactions older than this are aborted; default 60 |
+| **✓ Version found** | A version committed at or before the read timestamp |
+| **✗ Refused** | SnapshotTooOld or NoSuchTransaction |
+
+| | PostgreSQL | InnoDB | WiredTiger |
+|---|---|---|---|
+| Visibility by | Transaction ids (xmin / xmax) | Transaction ids (read view) | Timestamps (plus transaction ids inside the server) |
+| Old versions | In the table | Undo log | Update chain → history store |
+| Bound on history | None (VACUUM waits) | None (purge waits) | Time: 300 s window, 60 s transactions |
+
+## Reading an old snapshot
+
+<Flow
+  title="WiredTiger: fresh read vs old snapshot after 30,000 updates"
+  height={270}
+  nodes={[
+    { id: 't1', label: 'T1 transaction', sub: 'snapshot before the updates', x: 20, y: 20, w: 200 },
+    { id: 'doc', label: 'accounts _id 1', sub: 'version 1', x: 300, y: 20, w: 200 },
+    { id: 'chain', label: 'Update chain', sub: 'empty', x: 580, y: 20, w: 200 },
+    { id: 'fresh', label: 'Fresh reader', sub: 'latest timestamp', x: 20, y: 180, w: 200 },
+    { id: 'newest', label: '✓ Newest version', sub: '', x: 300, y: 180, w: 200 },
+    { id: 'oldv', label: '✓ Old version', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-doc', from: 't1', to: 'doc', label: 'read' },
+    { id: 'doc-chain', from: 'doc', to: 'chain', label: 'walk' },
+    { id: 'chain-oldv', from: 'chain', to: 'oldv' },
+    { id: 'fresh-doc', from: 'fresh', to: 'doc' },
+    { id: 'doc-newest', from: 'doc', to: 'newest' },
+  ]}
+  cases={[
+    {
+      title: 'Before the updates',
+      path: 'T1 snapshot → newest version is visible → ✓ 100 reads in 30 ms',
+      summary: 'The transaction\'s first operation fixes its read timestamp.',
+      steps: [
+        {
+          title: 'T1 starts reading',
+          note: 'startTransaction with readConcern snapshot, then 100 findOne calls on _id 1: 30 ms, version 1.',
+          code: "s.startTransaction({ readConcern: { level: 'snapshot' } });\nfor (let i = 0; i < 100; i++) a.findOne({ _id: 1 });   // 30 ms",
+          active: ['t1', 'doc', 'newest'],
+          edges: ['t1-doc', 'doc-newest'],
+          subs: { newest: 'version 1 · 30 ms / 100' },
+        },
+      ],
+    },
+    {
+      title: '30,000 newer versions',
+      path: 'bulkWrite of 30,000 $inc → chain of 30,000 updates in cache → fresh ✓ 27 ms / 100 · T1 walks the chain ✓ version 1, 84 ms / 100',
+      summary: 'Same pattern as InnoDB, smaller penalty, all in memory.',
+      steps: [
+        {
+          title: 'The chain grows',
+          note: 'One ordered bulkWrite applied 30,000 separate updates ($inc version) in 481 ms. Each committed with its own timestamp and became an entry on the document\'s update chain. history store table insert calls (server-wide) rose by 0: nothing was evicted yet.',
+          code: "db.accounts.bulkWrite(Array.from({ length: 30000 },\n  () => ({ updateOne: { filter: { _id: 1 }, update: { $inc: { version: 1 } } } })));",
+          active: ['doc', 'chain'],
+          edges: ['doc-chain'],
+          subs: { doc: 'version 30001', chain: '30,000 updates, in cache' },
+        },
+        {
+          title: 'A fresh reader',
+          note: 'The newest update on the chain is visible: 100 reads in 27 ms.',
+          active: ['fresh', 'doc', 'newest'],
+          edges: ['fresh-doc', 'doc-newest'],
+          subs: { newest: 'version 30001 · 27 ms / 100' },
+        },
+        {
+          title: 'T1 walks back',
+          note: 'Every update on the chain has a commit timestamp later than T1\'s read timestamp, so T1 skips them all and returns version 1: 100 reads in 84 ms, about 2.8× the earlier cost. InnoDB paid 168× for the same number of versions (Concept 2) because it rebuilds the row from undo records; the history store adds disk reads once versions are evicted.',
+          active: ['t1', 'doc', 'chain', 'oldv'],
+          edges: ['t1-doc', 'doc-chain', 'chain-oldv'],
+          subs: { oldv: 'version 1 · 84 ms / 100' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Bounded in time
+
+<Flow
+  title="MongoDB: how old a snapshot may be"
+  height={230}
+  nodes={[
+    { id: 'req', label: 'Old snapshot', sub: 'read or transaction', x: 20, y: 20, w: 220 },
+    { id: 'win', label: 'History window', sub: '300 s', x: 300, y: 20, w: 220 },
+    { id: 'lim', label: 'Lifetime limit', sub: '60 s per transaction', x: 300, y: 140, w: 220 },
+    { id: 'ok', label: '✓ Served', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'err', label: '✗ Refused', sub: '', x: 580, y: 140, w: 200 },
+  ]}
+  edges={[
+    { id: 'req-win', from: 'req', to: 'win', label: 'read at T' },
+    { id: 'req-lim', from: 'req', to: 'lim' },
+    { id: 'win-ok', from: 'win', to: 'ok' },
+    { id: 'win-err', from: 'win', to: 'err' },
+    { id: 'lim-ok', from: 'lim', to: 'ok' },
+    { id: 'lim-err', from: 'lim', to: 'err' },
+  ]}
+  cases={[
+    {
+      title: 'Reads at a past time',
+      path: 'atClusterTime −290 s ✓ old version · −400 s ✗ SnapshotTooOld',
+      summary: 'readConcern "snapshot" can name a point in time, but only inside the window.',
+      steps: [
+        {
+          title: 'Inside the window',
+          note: 'find with readConcern { level: "snapshot", atClusterTime } 290 s before now returned account 1 with version 1, its value before the update tests; 60 s back returned version 27176, from the middle of an earlier run of updates.',
+          code: "db.runCommand({ find: 'accounts', filter: { _id: 1 },\n  readConcern: { level: 'snapshot', atClusterTime: Timestamp({ t: now - 290, i: 0 }) } });\n// ok, version 1",
+          active: ['req', 'win', 'ok'],
+          edges: ['req-win', 'win-ok'],
+          subs: { ok: '−290 s: version 1' },
+        },
+        {
+          title: 'Outside the window',
+          note: 'At 400 s back the server no longer guarantees the history: SnapshotTooOld. The window is what lets the server discard old versions without waiting for readers.',
+          code: "// atClusterTime now - 400\n// SnapshotTooOld: Read timestamp … is older than the oldest available timestamp.",
+          active: ['req', 'win', 'err'],
+          edges: ['req-win', 'win-err'],
+          subs: { err: '−400 s: SnapshotTooOld' },
+        },
+      ],
+    },
+    {
+      title: 'Transactions that stay open',
+      path: 'open 70 s → ✓ committed · open 130 s → ✗ aborted by abortExpiredTransactions',
+      summary: 'The 60 s limit is enforced by a periodic background job.',
+      steps: [
+        {
+          title: 'A transaction is given an expiry',
+          note: '$currentOp for an open transaction showed startWallClockTime 10:25:05.154 and expiryTime 10:26:05.154: start + 60 s.',
+          code: "db.aggregate([{ $currentOp: { idleSessions: true } }, { $match: { 'transaction.parameters.txnNumber': { $exists: true } } }])\n// transaction.timeOpenMicros, transaction.expiryTime",
+          active: ['req', 'lim'],
+          edges: ['req-lim'],
+          subs: { lim: 'expiryTime = start + 60 s' },
+        },
+        {
+          title: '70 s: still committed',
+          note: 'A transaction that updated _id 3 and then slept 70 s committed normally: the expiry is checked by a periodic job, not at the exact deadline.',
+          active: ['lim', 'ok'],
+          edges: ['lim-ok'],
+          subs: { ok: '70 s: committed' },
+        },
+        {
+          title: '130 s: aborted',
+          note: 'After 130 s the next operation failed with NoSuchTransaction (label TransientTransactionError). The server log: "Aborting transaction because it has been running for longer than \'transactionLifetimeLimitSeconds\'" from the abortExpiredTransactions thread.',
+          code: "// NoSuchTransaction - Transaction with { txnNumber: 1 } has been aborted.",
+          active: ['lim', 'err'],
+          edges: ['lim-err'],
+          subs: { err: '130 s: NoSuchTransaction' },
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+MongoDB protects itself from long transactions by **killing them**, not by slowing everyone down. A batch job that does a lot of work inside one transaction can run fine in testing and start failing with `NoSuchTransaction` once production data makes it take longer than about a minute. Split long work into many short transactions, and do not raise `transactionLifetimeLimitSeconds` to hide the problem: that brings back the cache pressure the limit exists to prevent.
+</Pitfall>
+
+## Real-world scenario: the nightly reconciliation
+
+A reconciliation job reads 2 million orders and their payments in one transaction so the totals are consistent.
+
+| Approach | Result |
+|---|---|
+| One transaction for everything | Aborted with NoSuchTransaction once it outlives the limit (the lab's transaction survived 70 s, not 130 s) |
+| Many short transactions | Each one consistent, but the totals may mix moments |
+| One `atClusterTime` shared by many short reads (each a snapshot read at the same timestamp, outside a transaction) | Consistent totals, as long as the whole job finishes within the 300 s window |
+| Read from a hidden secondary or a backup snapshot | No pressure on the primary; consistent to that point in time |
+
+## Why this matters for transactions
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 4: long transactions | MongoDB bounds history; PostgreSQL and InnoDB let it grow |
+| Session 7: application patterns | Retrying `TransientTransactionError`, including NoSuchTransaction |
+| Session 8: when transactions hurt | Transaction size and time limits |
+
+## Key takeaways
+
+1. WiredTiger keeps a document's recent versions as an update chain in cache, each with a commit timestamp; older ones move to the history store.
+2. A snapshot reads at a timestamp and walks back to the newest version committed before it: 2.8× the read cost after 30,000 updates, all in memory.
+3. History is bounded in time: `minSnapshotHistoryWindowInSeconds` (300 s) for snapshot reads, SnapshotTooOld beyond it.
+4. Transactions older than `transactionLifetimeLimitSeconds` (60 s) are aborted by a periodic job (70 s survived, 130 s did not).
+5. Long work belongs in many short transactions or in timestamped snapshot reads, not in one big transaction.
+
+## Check questions
+
+1. Where does WiredTiger keep the versions created by 30,000 updates while they are recent, and where do they go later?
+2. Why did T1 still read version 1, and why did its reads become slower?
+3. Why was the slowdown in MongoDB (2.8×) smaller than in InnoDB (168×) for the same number of versions?
+4. What does SnapshotTooOld tell you, and which parameter sets the limit?
+5. A transaction stayed open 70 s and committed, another 130 s and was aborted. Explain.
+6. How can a long job get consistent totals in MongoDB without one long transaction?
+7. Compare how PostgreSQL, InnoDB and MongoDB bound the history an old snapshot can force them to keep.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-4-mvcc-internals/concept-3-wiredtiger-history/answers">Worked answers to Q1–Q7</DeepDive>

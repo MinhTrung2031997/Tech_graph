@@ -1,0 +1,83 @@
+---
+title: "Answers: PostgreSQL row versions and snapshots"
+description: "Worked answers to the Session 4 Concept 1 check questions."
+companion: "answers"
+tags: ["transactions", "mvcc", "postgresql", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/mvcc-intro.html"
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html#VACUUM-FOR-WRAPAROUND"
+---
+
+<Tldr>
+Visibility = creator committed before my snapshot, and deleter did not. Everything else (rollback, hint bits, freezing) follows from that rule.
+</Tldr>
+
+## Q1. Headers during an uncommitted update
+
+**Question:** after T2's uncommitted UPDATE, what are xmin and xmax of the old and the new version of account 1?
+
+| Version | xmin | xmax | t_ctid |
+|---|---|---|---|
+| Old, page 0 line 1 | 2343333 (the loader) | 2343343 (T2) | (73,73) → new version |
+| New, page 73 line 73 | 2343343 (T2) | 0 | (73,73) itself |
+
+Both are physically in the table; which one a reader sees depends on its snapshot.
+
+> **Common mistake:** thinking the old row is overwritten and only kept in some log.
+
+## Q2. Reading the snapshot
+
+**Question:** explain each part of the snapshot `2343357:2343365:2343357,2343362`. Is a version with xmin 2343359 visible? With xmin 2343362?
+
+- `2343357` (xmin): oldest transaction still running; all lower xids have finished.
+- `2343365` (xmax): first unassigned xid; xids ≥ 2343365 are in the future for this snapshot.
+- `2343357,2343362` (xip): xids between the two that were running when the snapshot was taken.
+
+xmin 2343359 lies between xmin and xmax and is **not** in the list, so it had finished; if it committed (it did, B), the version is **visible**. xmin 2343362 is in the list: **invisible**, even if C commits a moment later.
+
+> **Common mistake:** treating every xid below xmax as visible and forgetting the in-progress list.
+
+## Q3. Instant rollback
+
+**Question:** why is ROLLBACK in PostgreSQL instant, and what does it leave behind?
+
+PostgreSQL never modified the old version's data; it only added new tuples and set xmax on old ones. ROLLBACK records "aborted" for the xid in `pg_xact` (two bits). Readers then ignore that xid: old versions with xmax = aborted xid are visible again, new versions with xmin = aborted xid are dead. Measured: `ROLLBACK` of a 100,000-row update took 0.9 ms. It leaves **dead tuples** behind (the 100,000 new versions) for pruning and VACUUM.
+
+> **Common mistake:** expecting a rollback to clean up; it leaves the same garbage a commit leaves, just in the other versions.
+
+## Q4. A SELECT that writes
+
+**Question:** why did `SELECT count(*)` change the tuple headers of `hint_demo`?
+
+Freshly inserted tuples do not record whether their xmin committed (infomask 0x0802). The first reader looked each xmin up in `pg_xact`, found it committed, and set the **hint bit** XMIN_COMMITTED (0x0100) in the tuple so later readers can skip the lookup: 0x0902 afterwards. Setting a hint bit marks the page dirty, so the page will be written again.
+
+> **Common mistake:** assuming read-only queries never cause disk writes.
+
+## Q5. Freezing
+
+**Question:** what does freezing do, and why is it necessary?
+
+Transaction ids are 32-bit and compared in a circle of about 4 billion values, so each xid has about 2 billion "past" and 2 billion "future" xids. Without action, a tuple created long ago would eventually appear to have a future xmin and disappear. Freezing marks the tuple's xmin as **frozen** (infomask bits 0x0300, 0x0B02 in the lab): visible to every snapshot regardless of the xid value. VACUUM does it for tuples older than `vacuum_freeze_min_age` (50,000,000), and autovacuum forces it when a table's age reaches `autovacuum_freeze_max_age` (200,000,000).
+
+> **Common mistake:** disabling autovacuum on a large, rarely updated table: its xids still age and must still be frozen.
+
+## Q6. Committed creator, running deleter
+
+**Question:** a version has xmin committed and xmax = an xid that is still running. Is it visible to a new snapshot?
+
+**Yes.** The deleting transaction has not committed, so for any snapshot its deletion has not happened: the version is still the current one. This is exactly what T1 saw while T2's update was open (balance 1000, xmax 2343343). If the deleter commits, snapshots taken afterwards will not see this version.
+
+> **Common mistake:** reading a non-zero xmax as "deleted".
+
+## Q7. Where old versions live
+
+**Question:** where does PostgreSQL keep old versions, compared with InnoDB and WiredTiger?
+
+| Engine | Old versions | Consequence |
+|---|---|---|
+| PostgreSQL | In the heap, as complete tuples next to the new ones | Table and indexes grow with updates; VACUUM reclaims; rollback is free |
+| InnoDB | In the undo log, as change records | Table stays the same size; old readers rebuild versions; rollback applies undo |
+| WiredTiger | Update chains in cache, then the history store | Bounded in time (300 s window, 60 s transactions) |
+
+> **Common mistake:** assuming MVCC means the same storage design in every engine.
