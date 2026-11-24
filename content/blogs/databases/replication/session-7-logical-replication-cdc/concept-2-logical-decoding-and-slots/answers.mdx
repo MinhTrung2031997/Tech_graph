@@ -58,6 +58,6 @@ Slots are local to a server and are not part of the WAL a physical standby repla
 
 **Question:** what does a logical slot hold back besides WAL, and what does it not hold back?
 
-It holds `catalog_xmin`: VACUUM keeps old versions of system-catalog rows the decoder may need to interpret old WAL with the table definition that was current then. It does not set `xmin`, so ordinary user tables are vacuumed normally. A physical slot used with `hot_standby_feedback = on` is different: it reports the standby's oldest snapshot as `xmin` and holds back cleanup of every table (Session 6).
+It holds `catalog_xmin`: VACUUM keeps old versions of system-catalog rows the decoder may need to interpret old WAL with the table definition that was current then. It does not set `xmin`, so ordinary user tables are vacuumed normally. A physical slot used with `hot_standby_feedback = on` is different: it reports the standby's oldest snapshot as `xmin` and holds back cleanup of every table ([Session 6](/blogs/databases/replication/session-6-queries-on-replicas/concept-2-hot-standby-feedback)).
 
 > **Common mistake:** blaming an idle logical slot for table bloat. Look at long transactions and physical slots with feedback first.

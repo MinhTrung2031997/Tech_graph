@@ -51,7 +51,7 @@ Alert on inactive slots and on retained bytes against free space on the WAL volu
 
 1. A lock on the replica blocking the applier: in Session 3 one locked row held 6 transactions and pushed `Seconds_Behind_Source` to 17 s.
 2. An apply error: a duplicate key from a write on a writable replica (Session 1, error 1062), or a logical subscription missing a column (Session 7).
-3. A query on a PostgreSQL hot standby holding back replay up to `max_standby_streaming_delay` (Session 6; recovery conflicts).
+3. A query on a PostgreSQL hot standby holding back replay up to `max_standby_streaming_delay` ([Session 6](/blogs/databases/replication/session-6-queries-on-replicas/concept-1-hot-standby-conflicts); recovery conflicts).
 A deliberate delay (`recovery_min_apply_delay`, `SOURCE_DELAY`, a delayed MongoDB member) looks the same and is not a fault.
 
 > **Common mistake:** restarting the replica. That clears a lock but not an apply error, and loses the evidence.
