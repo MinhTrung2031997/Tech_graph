@@ -1,0 +1,84 @@
+---
+title: "Answers: Anomalies session quiz"
+description: "Worked answers to the Session 2 quiz."
+companion: "answers"
+tags: ["transactions", "isolation", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-consistent-read.html"
+---
+
+<Tldr>
+Same level name, different guarantees: know your engine's snapshot rules, and which statements read the snapshot vs the latest data.
+</Tldr>
+
+## Q1. The surprising cell
+
+**Question:** which measured cell of the matrix surprised you most, and which mechanism explains it?
+
+A common pick is **MySQL REPEATABLE READ** in the lost-update and phantom rows: the default level silently wrote 950 and updated 10,001 rows. Mechanism: InnoDB's plain SELECTs read the snapshot (consistent reads), but UPDATE, DELETE and locking reads read and lock the latest committed rows (current reads), without checking whether the snapshot was stale. Other good answers: MongoDB transactions allowing write skew (snapshot isolation only), or MySQL SERIALIZABLE preventing write skew through a deadlock.
+
+> **Common mistake:** expecting the SQL standard's level names to predict behaviour; the standard defines what is forbidden, each engine chooses how much more to forbid.
+
+## Q2. No dirty reads in PostgreSQL
+
+**Question:** why can't a dirty read happen in PostgreSQL at any level?
+
+Every tuple records the id of the transaction that created it (xmin). A reader's visibility check skips tuples whose creator has not committed (unless it is the reader itself). There is no code path that returns another transaction's uncommitted tuple, so `READ UNCOMMITTED` is accepted and treated as `READ COMMITTED`.
+
+> **Common mistake:** setting `READ UNCOMMITTED` in PostgreSQL expecting faster reads; nothing changes.
+
+## Q3. Two related rows in two statements
+
+**Question:** T1 at PostgreSQL READ COMMITTED reads two related rows in two statements. Name the anomaly and two fixes.
+
+**Read skew** (the transfer between 40 and 41 gave a total of 2,100). Fixes: read both rows in **one statement**; run the transaction at **REPEATABLE READ** so both statements share a snapshot; or lock both rows (`FOR SHARE`) if the transaction will also write based on them.
+
+> **Common mistake:** wrapping the two statements in `BEGIN … COMMIT` at READ COMMITTED and expecting that to help; the snapshot is still per statement.
+
+## Q4. 10,000 vs 10,001 in MySQL
+
+**Question:** in MySQL REPEATABLE READ, T1's count stayed 10,000 but its UPDATE changed 10,001 rows. Explain in two sentences.
+
+The count was a consistent read from T1's read view, which predates T2's insert. The UPDATE was a current read that found and locked every **latest committed** row matching the condition, including job 100,001.
+
+> **Common mistake:** blaming the count; the count was correct for the snapshot.
+
+## Q5. Ranking the lost-update fixes
+
+**Question:** rank the fixes for the lost update by how much concurrency they allow: atomic UPDATE, `FOR UPDATE`, REPEATABLE READ + retry.
+
+1. **Atomic UPDATE** (`balance = balance - 50`): the row is locked only for the duration of the write, and no work is repeated.
+2. **REPEATABLE READ + retry** (PostgreSQL) or a MongoDB transaction: no waiting while reading, but the losing transaction does all its work again; good when conflicts are rare, poor when they are frequent.
+3. **`FOR UPDATE`**: the row is locked from the read until commit, including application think time; simplest to reason about, least concurrent.
+
+> **Common mistake:** reaching for `FOR UPDATE` when the whole read-modify-write fits in one UPDATE statement.
+
+## Q6. Lost update yes, write skew no
+
+**Question:** why did PostgreSQL REPEATABLE READ catch the lost update but not the write skew?
+
+REPEATABLE READ checks **write-write** conflicts: updating a row changed by a transaction that committed after your snapshot raises 40001. In the lost update both wrote account 20. In the write skew T1 wrote 30 and T2 wrote 31; the conflict was read-write, which only SERIALIZABLE (SSI) tracks.
+
+> **Common mistake:** concluding that RR + retry makes all read-modify-write code safe; it covers only writes to the same rows.
+
+## Q7. MongoDB and write skew
+
+**Question:** why does MongoDB need a guard document (or a different data model) to prevent write skew?
+
+MongoDB transactions provide snapshot isolation and detect conflicts per written document; there is no serializable level that tracks reads. To make the conflict visible, both transactions must write a common document (the guard), or the data that the rule covers must live in **one document** so the check and the change are a single atomic update.
+
+> **Common mistake:** assuming `readConcern: "snapshot"` means serializable; it only fixes what the transaction reads.
+
+## Q8. MySQL + ORM
+
+**Question:** your service runs on MySQL with default settings and an ORM that loads, modifies and saves rows. Which anomalies from this session should you look for first?
+
+1. **Lost updates**: load-modify-save is exactly read-modify-write, and REPEATABLE READ in InnoDB does not stop it (950 in the lab). Look for counters, balances, stock levels and JSON blobs updated through the ORM.
+2. **Write skew** in "check then insert/update" logic (limits, uniqueness by query, bookings).
+3. **Stale snapshot reads followed by writes by condition** (the 10,001-row update), for example batch jobs that count and then update.
+
+Fixes: atomic updates, optimistic locking with a version column (most ORMs support it), `SELECT … FOR UPDATE` where needed, and real constraints.
+
+> **Common mistake:** raising the level to SERIALIZABLE globally in MySQL, which turns every read into a shared lock and adds deadlocks everywhere.

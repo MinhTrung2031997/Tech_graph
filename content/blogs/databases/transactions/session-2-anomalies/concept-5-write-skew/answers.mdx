@@ -1,0 +1,70 @@
+---
+title: "Answers: Write skew"
+description: "Worked answers to the Session 2 Concept 5 check questions."
+companion: "answers"
+tags: ["transactions", "isolation", "write-skew", "serializable", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html#XACT-SERIALIZABLE"
+  - "https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-EXCLUSION"
+---
+
+<Tldr>
+Write skew is a conflict between what one transaction read and what another wrote. Catch it with SERIALIZABLE, turn it into a write conflict, or replace the check with a constraint.
+</Tldr>
+
+## Q1. No write conflict
+
+**Question:** why did neither transaction get a write conflict at REPEATABLE READ?
+
+Snapshot isolation (and MySQL's row locks) detect two transactions writing the **same row**. T1 wrote only account 30 and T2 only account 31. Their conflict was between T1's **read** of account 31 and T2's **write** of it (and vice versa), which REPEATABLE READ does not track.
+
+> **Common mistake:** "REPEATABLE READ is serializable in practice". Write skew is exactly the gap between the two.
+
+## Q2. What SSI detected
+
+**Question:** what did PostgreSQL SERIALIZABLE detect, and what must the application do with the error?
+
+SSI records what each serializable transaction read (SIRead predicate locks). It found a cycle of read/write dependencies: T1 read data that T2 wrote and T2 read data that T1 wrote, so neither "T1 then T2" nor "T2 then T1" explains the outcome. It aborted T2 as the pivot with SQLSTATE 40001 ("could not serialize access due to read/write dependencies among transactions"). The application must retry T2 from the start; the retry sees total 1,100 and refuses the withdrawal.
+
+> **Common mistake:** switching to SERIALIZABLE without a retry loop; then the 40001 errors simply become user-facing failures.
+
+## Q3. A deadlock in MySQL
+
+**Question:** why did MySQL SERIALIZABLE end in a deadlock rather than a serialization error?
+
+InnoDB has no dependency tracking. Its SERIALIZABLE turns plain SELECTs into `SELECT … FOR SHARE`, so both transactions held shared locks on rows 30 and 31. Each then needed an exclusive lock on a row the other held shared: T1 waited for T2, T2 for T1. InnoDB's deadlock detector rolled back T2 (ERROR 1213, SQLSTATE 40001). The effect is the same as PostgreSQL's (one transaction retries), reached through locks instead of tracking.
+
+> **Common mistake:** treating MySQL deadlock errors as bugs to eliminate at any cost; under SERIALIZABLE they are how conflicts surface, and the answer is a retry.
+
+## Q4. Lock both rows
+
+**Question:** why does `FOR UPDATE` need to cover both accounts, not just the one being debited?
+
+The decision depends on **both** balances. If T1 locks only account 30 and T2 only account 31, they never wait for each other and both still see 2,000. Locking every row the decision reads makes the second transaction wait until the first commits and then read the new total (1,100 in the lab), so it refuses. Lock in a fixed order (`ORDER BY id`) so two such transactions cannot deadlock.
+
+> **Common mistake:** locking only the row you are about to write.
+
+## Q5. The guard document
+
+**Question:** how does the guard document fix write skew in MongoDB, and what is the simpler data-model alternative?
+
+Both transactions also update one shared document (`pairs` `30-31`). Now they write the same document, so the second gets `WriteConflict` (TransientTransactionError) and retries, seeing the new total. The simpler alternative: store both balances of the pair in **one document** and do the withdrawal as one conditional single-document update, for example a filter that requires the combined balance to stay at least 1,000 via `$expr`. A single-document update is atomic without a transaction.
+
+> **Common mistake:** hoping a transaction's snapshot alone protects a rule across documents.
+
+## Q6. Double booking
+
+**Question:** explain the double-booking bug as write skew, and give the PostgreSQL constraint that removes it.
+
+Each transaction reads the bookings for room 12 in the requested time range, finds none, and inserts its own booking. The rule "no overlap" depended on the read; the writes were two different new rows, so nothing conflicted. In PostgreSQL an exclusion constraint makes the database check overlaps on every insert, atomically:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+ALTER TABLE bookings ADD CONSTRAINT no_overlap
+  EXCLUDE USING gist (room WITH =, during WITH &&);
+```
+
+In a lab run, T2 inserted an overlapping slot while T1's insert was uncommitted: T2 waited ≈ 0.7 s until T1 committed, then failed with `ERROR: conflicting key value violates exclusion constraint "no_overlap"`. One booking, no double booking.
+
+> **Common mistake:** adding an index on `(room, during)` and expecting it to prevent overlaps; only a constraint enforces the rule.

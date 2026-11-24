@@ -1,0 +1,224 @@
+---
+title: "Concept 1: Dirty reads"
+description: "Reading a change that is later rolled back. Reproduced with two sessions: MySQL READ UNCOMMITTED returned a balance of 0.00 that never existed, while PostgreSQL (even when asked for READ UNCOMMITTED) and MongoDB (inside or outside a transaction) returned the committed 1,000.00. The map of anomalies this session reproduces."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "isolation", "dirty-read"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html"
+  - "https://www.mongodb.com/docs/manual/reference/read-concern/"
+---
+
+<Tldr>
+Session 1 made one transaction all-or-nothing. This session asks what happens when **two** run at once. An **anomaly** is a result that no one-at-a-time order of the transactions could have produced. The mildest is the **dirty read**: seeing another transaction's change **before it commits**, then watching it disappear in a rollback. In the lab, T1 set account 10 to 0 and rolled back two seconds later; meanwhile T2 under MySQL `READ UNCOMMITTED` read **0.00**, a balance that never existed. Under MySQL `READ COMMITTED`, under every PostgreSQL level (PostgreSQL treats `READ UNCOMMITTED` as `READ COMMITTED`) and in MongoDB, T2 read **1,000.00**.
+</Tldr>
+
+## The anomalies in this session
+
+| Anomaly | What goes wrong | Concept |
+|---|---|---|
+| Dirty read | Read a change that is later rolled back | This one |
+| Non-repeatable read / read skew | The same read, or two related reads, give inconsistent answers within one transaction | [Concept 2](/blogs/databases/transactions/session-2-anomalies/concept-2-non-repeatable-reads-and-read-skew) |
+| Phantom | A repeated query returns new rows that match its condition | [Concept 3](/blogs/databases/transactions/session-2-anomalies/concept-3-phantoms) |
+| Lost update | Two read-modify-write cycles overwrite each other | [Concept 4](/blogs/databases/transactions/session-2-anomalies/concept-4-lost-updates) |
+| Write skew | Two transactions check a rule across rows and each changes a different row, breaking it together | [Concept 5](/blogs/databases/transactions/session-2-anomalies/concept-5-write-skew) |
+
+Isolation levels decide which of these each engine allows; [Session 3](/blogs/databases/transactions/session-3-isolation-levels/lab) explains the mechanisms. Default levels: PostgreSQL **READ COMMITTED**, MySQL **REPEATABLE READ**, MongoDB **snapshot** inside a transaction (outside one, each read sees committed data at its own moment).
+
+| Term | Meaning |
+|---|---|
+| T1, T2 | Two sessions, started in this order; the steps below are in time order |
+| Uncommitted change | Written by a transaction that has not committed yet |
+| **✓ Committed value** | T2 read 1,000.00, the last committed balance |
+| **✗ Dirty value** | T2 read 0.00, a value T1 later rolled back |
+
+## MySQL: the only engine that shows it
+
+<Flow
+  title="MySQL: T2 reads a balance that never existed"
+  height={300}
+  nodes={[
+    { id: 't1', label: 'T1', sub: 'sets balance 0, rolls back', x: 20, y: 20, w: 220 },
+    { id: 'row', label: 'Account 10', sub: 'committed 1,000.00', x: 300, y: 90, w: 200 },
+    { id: 't2', label: 'T2', sub: 'reads during T1', x: 20, y: 180, w: 220 },
+    { id: 'ok', label: '✓ Committed value', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'bad', label: '✗ Dirty value', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row' },
+    { id: 't2-row', from: 't2', to: 'row' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-bad', from: 'row', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'T2 at READ UNCOMMITTED',
+      path: 't0 T1 sets 0 → t0.5 T2 reads ✗ 0.00 → t2 T1 rolls back → the 0.00 never existed',
+      summary: 'READ UNCOMMITTED reads the newest version of the row, committed or not.',
+      subs: { bad: 'T2 read 0.00' },
+      steps: [
+        {
+          title: 't0 · T1 changes the row',
+          note: 'T1 sets account 10 to 0 and keeps the transaction open (SLEEP 2). The new value is in the buffer pool; the old one is in the undo log.',
+          code: 'START TRANSACTION;\nUPDATE accounts SET balance = 0 WHERE id = 10;\nSELECT SLEEP(2);\nROLLBACK;',
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+          subs: { row: 'newest: 0.00, uncommitted' },
+        },
+        {
+          title: 't0.5 · T2 reads it',
+          note: 'At READ UNCOMMITTED, InnoDB returns the latest version without checking whether it is committed: 0.00.',
+          code: 'SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;\nSTART TRANSACTION;\nSELECT balance FROM accounts WHERE id = 10;   -- 0.00',
+          active: ['t2', 'row', 'bad'],
+          edges: ['t2-row', 'row-bad'],
+          subs: { row: 'newest: 0.00, uncommitted' },
+        },
+        {
+          title: 't2 · T1 rolls back',
+          note: 'The balance goes back to 1,000.00. T2 acted on a value that no committed state ever had: a report, an email "your balance is 0", a refused payment.',
+          active: ['t1', 'row', 'bad'],
+          edges: ['t1-row'],
+          subs: { row: 'back to 1,000.00' },
+        },
+      ],
+    },
+    {
+      title: 'T2 at READ COMMITTED',
+      path: 't0 T1 sets 0 → t0.5 T2 reads ✓ 1,000.00 (from the undo log)',
+      summary: 'READ COMMITTED and above build the committed version from the undo log.',
+      subs: { ok: 'T2 read 1,000.00' },
+      steps: [
+        {
+          title: 'T2 reads the committed version',
+          note: 'Same timing. T2 sees that the newest version belongs to an uncommitted transaction and reconstructs the previous one from the undo log: 1,000.00. No lock, no waiting.',
+          code: 'SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;\nSTART TRANSACTION;\nSELECT balance FROM accounts WHERE id = 10;   -- 1000.00',
+          active: ['t1', 't2', 'row', 'ok'],
+          edges: ['t1-row', 't2-row', 'row-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## PostgreSQL: no dirty reads at any level
+
+<Flow
+  title="PostgreSQL: READ UNCOMMITTED behaves as READ COMMITTED"
+  height={300}
+  nodes={[
+    { id: 't1', label: 'T1', sub: 'sets balance 0, rolls back', x: 20, y: 20, w: 220 },
+    { id: 'row', label: 'Account 10', sub: 'two row versions', x: 300, y: 90, w: 200 },
+    { id: 't2', label: 'T2', sub: 'READ UNCOMMITTED', x: 20, y: 180, w: 220 },
+    { id: 'ok', label: '✓ Committed value', sub: 'T2 read 1,000.00', x: 580, y: 20, w: 200 },
+    { id: 'bad', label: '✗ Dirty value', sub: 'impossible', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row' },
+    { id: 't2-row', from: 't2', to: 'row' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+  ]}
+  cases={[
+    {
+      title: 'T2 asks for READ UNCOMMITTED',
+      path: 't0 T1 writes a new version → t0.5 T2 checks visibility → ✓ 1,000.00',
+      summary: 'PostgreSQL accepts the level name but never shows uncommitted versions.',
+      steps: [
+        {
+          title: 't0 · T1 creates a new version',
+          note: 'The UPDATE writes a new tuple with balance 0 and marks the old one as replaced, both stamped with T1\'s transaction id (Session 4 shows the xmin/xmax fields).',
+          code: 'BEGIN; UPDATE accounts SET balance = 0 WHERE id = 10; SELECT pg_sleep(2); ROLLBACK;',
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+        },
+        {
+          title: 't0.5 · T2 sees only committed versions',
+          note: 'T2 skips the version whose creator has not committed and returns the old one: 1,000.00. The documentation says READ UNCOMMITTED is treated as READ COMMITTED.',
+          code: 'BEGIN ISOLATION LEVEL READ UNCOMMITTED;\nSELECT balance FROM accounts WHERE id = 10;   -- 1000.00',
+          active: ['t2', 'row', 'ok', 'bad'],
+          edges: ['t2-row', 'row-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: uncommitted transaction writes are invisible
+
+<Flow
+  title="MongoDB: reads see only committed data"
+  height={300}
+  nodes={[
+    { id: 't1', label: 'T1 transaction', sub: 'sets balance 0, aborts', x: 20, y: 20, w: 220 },
+    { id: 'row', label: 'accounts _id 10', sub: 'committed 1,000.00', x: 300, y: 90, w: 200 },
+    { id: 't2', label: 'T2', sub: 'outside a transaction', x: 20, y: 180, w: 220 },
+    { id: 'ok', label: '✓ Committed value', sub: 'T2 read 1,000.00', x: 580, y: 20, w: 200 },
+    { id: 'bad', label: '✗ Dirty value', sub: 'not possible', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row' },
+    { id: 't2-row', from: 't2', to: 'row' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+  ]}
+  cases={[
+    {
+      title: 'Read concern local and available',
+      path: 't0 T1 updates inside a transaction → t0.5 T2 findOne → ✓ 1,000.00 (local and available)',
+      summary: 'Writes made inside a transaction become visible only at commit, to everyone at once.',
+      steps: [
+        {
+          title: 't0 · T1 writes in a transaction',
+          code: 's.startTransaction();\ns.getDatabase("bank").accounts.updateOne({ _id: 10 }, { $set: { balance: NumberDecimal("0") } });\nsleep(2000); s.abortTransaction();',
+          note: 'The change exists only inside T1\'s transaction until commitTransaction().',
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+        },
+        {
+          title: 't0.5 · T2 reads',
+          note: 'Both the default read concern local and the weakest one, available, returned 1,000.00. MongoDB has no equivalent of READ UNCOMMITTED for transaction writes. (A single multi-document write outside a transaction, such as updateMany, is different: other readers can see it half done.)',
+          code: 'db.accounts.findOne({ _id: 10 }).balance                              // 1000.00\ndb.accounts.find({ _id: 10 }).readConcern("available").next().balance   // 1000.00',
+          active: ['t2', 'row', 'ok', 'bad'],
+          edges: ['t2-row', 'row-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+`READ UNCOMMITTED` is sometimes used in MySQL (or `WITH (NOLOCK)` in SQL Server) to "avoid locks" in reports. InnoDB reads at READ COMMITTED and REPEATABLE READ do not take locks either; they read old versions from the undo log. Dirty reads buy almost nothing in InnoDB and can return totals that never existed.
+</Pitfall>
+
+## Real-world scenario: the report that showed a negative stock
+
+A dashboard query in MySQL runs at `READ UNCOMMITTED` "for speed". During a bulk import that later fails and rolls back, it shows 3,000 SKUs at zero stock; the purchasing team reorders. Nothing in the database ever committed those zeros.
+
+| Fix | Effect |
+|---|---|
+| Use the default level (REPEATABLE READ) or READ COMMITTED | Consistent reads from undo, still without locks |
+| Point reports at a replica | Removes load from the primary without dirty data |
+
+## Why this matters for transactions
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 2: non-repeatable reads | Committed-only reads can still change between two statements |
+| [Session 4: MVCC](/blogs/databases/transactions/session-4-mvcc-internals/lab) | How old versions are kept so readers never need dirty data |
+
+## Key takeaways
+
+1. A dirty read sees a change before its transaction commits; if it rolls back, the reader saw a value that never existed.
+2. Only MySQL `READ UNCOMMITTED` showed it in the lab (0.00).
+3. PostgreSQL accepts `READ UNCOMMITTED` but runs it as `READ COMMITTED` (1,000.00).
+4. MongoDB transaction writes are invisible until commit, even to read concern `available`.
+5. InnoDB consistent reads take no locks, so `READ UNCOMMITTED` is rarely worth it.
+
+## Check questions
+
+1. Define a dirty read and give the lab's example.
+2. How did MySQL at `READ COMMITTED` return 1,000.00 while T1's change was in place, without waiting?
+3. What does PostgreSQL do when you ask for `READ UNCOMMITTED`?
+4. Can a MongoDB reader ever see a partial multi-document change? Distinguish transactions from `updateMany`.
+5. Why is "use READ UNCOMMITTED to avoid locking" a poor reason in InnoDB?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-2-anomalies/concept-1-dirty-reads/answers">Worked answers to Q1–Q5</DeepDive>

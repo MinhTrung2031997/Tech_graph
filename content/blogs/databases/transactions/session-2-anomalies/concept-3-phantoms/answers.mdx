@@ -1,0 +1,72 @@
+---
+title: "Answers: Phantoms"
+description: "Worked answers to the Session 2 Concept 3 check questions."
+companion: "answers"
+tags: ["transactions", "isolation", "phantom", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-consistent-read.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-next-key-locking.html"
+---
+
+<Tldr>
+Phantoms are about the set of rows a condition matches. Snapshots hide them from reads; only PostgreSQL and MongoDB also hide them from writes, and locking reads prevent them by blocking inserts.
+</Tldr>
+
+## Q1. Phantom vs non-repeatable read
+
+**Question:** how is a phantom different from a non-repeatable read?
+
+A non-repeatable read changes the **values** of a row you already read. A phantom changes the **membership** of a result set: a row that did not match before (because it did not exist, or had other values) now matches. Preventing it with locks requires locking rows that do not exist yet, i.e. ranges or gaps.
+
+> **Common mistake:** treating "locking the rows I read" as enough; it cannot cover rows inserted later.
+
+## Q2. Why the INSERT never waited
+
+**Question:** why did T2's INSERT not wait for T1 in any of the runs?
+
+T1's counts were plain reads, which take no locks in any of the three engines. Nothing stood between T2 and the table. Only a locking read (or, in MySQL SERIALIZABLE, plain reads that become locking reads) makes inserts wait: the second MySQL run with `FOR UPDATE` made T2 wait 1.3 s.
+
+> **Common mistake:** expecting REPEATABLE READ to block concurrent inserts. It hides them (or not, for MySQL writes) but does not prevent them.
+
+## Q3. 10,001 rows updated
+
+**Question:** in MySQL REPEATABLE READ, why did the UPDATE change 10,001 rows while the count said 10,000?
+
+InnoDB uses two kinds of read. A **consistent read** (plain `SELECT`) reads the transaction's read view, which predates job 100,001. A **current read** (`UPDATE`, `DELETE`, `SELECT … FOR UPDATE`) reads and locks the **latest committed** version of each row, because you can only change the current row. So the UPDATE found 10,001 matching rows.
+
+> **Common mistake:** thinking "REPEATABLE READ" applies to every statement in the transaction; in InnoDB it applies to plain reads.
+
+## Q4. The count after the UPDATE
+
+**Question:** why did T1's count become 10,001 after its own UPDATE?
+
+A transaction always sees its own changes. Job 100,001 now carries a change made by T1, so the read view shows T1's version of it, and the count includes it. The snapshot is "committed data as of the read view, plus my own writes".
+
+> **Common mistake:** expecting the read view to hide rows the transaction itself modified.
+
+## Q5. With a locking read
+
+**Question:** how would a locking read have changed the MySQL run, and what would T2 have experienced?
+
+`SELECT count(*) FROM jobs WHERE status = 'queued' FOR UPDATE` is a current read: it locks every index record it scans plus the gaps before them (next-key locks). With no index on `status`, it scanned the clustered index and held 100,466 locks, covering all 100,000 rows and the gaps between them. T2's INSERT needed an insert intention lock in one of those gaps and waited until T1 committed (1.3 s in the lab). T1's later UPDATE and counts all saw 10,000. With an index on `status`, only the `queued` range would be locked.
+
+> **Common mistake:** adding `FOR UPDATE` to a query on an unindexed column in production: it locks the whole table's rows and gaps.
+
+## Q6. The payout job
+
+**Question:** rewrite the payout job so the transfer total always matches the invoices marked paid.
+
+Make one statement the source of truth for both the total and the change. For example, in PostgreSQL:
+
+```sql
+BEGIN;
+WITH paid AS (
+  UPDATE invoices SET status = 'paid' WHERE status = 'approved' RETURNING id, amount)
+SELECT count(*), sum(amount) FROM paid;   -- transfer exactly this sum
+COMMIT;
+```
+
+In MySQL: `SELECT id, amount FROM invoices WHERE status = 'approved' FOR UPDATE`, compute the total from that result, then `UPDATE invoices SET status = 'paid' WHERE id IN (…)`, all in one transaction. In MongoDB, read the ids in a transaction and update by `_id: { $in: ids }` in the same transaction.
+
+> **Common mistake:** keeping "count first, update by condition later", which is correct only if nothing can change in between.

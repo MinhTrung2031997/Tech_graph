@@ -1,0 +1,274 @@
+---
+title: "Concept 2: Non-repeatable reads and read skew"
+description: "Committed changes that land between two reads of one transaction. Reading account 11 twice returned 1,000.00 then 500.00 at READ COMMITTED (and in MongoDB outside a transaction), and the same value twice at REPEATABLE READ or inside a MongoDB transaction. Reading two accounts during a transfer showed a total of 2,100 that never existed. Per-statement vs per-transaction snapshots."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "isolation", "non-repeatable-read", "read-skew"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-consistent-read.html"
+  - "https://www.mongodb.com/docs/manual/reference/read-concern-snapshot/"
+---
+
+<Tldr>
+At **READ COMMITTED** each statement takes a fresh snapshot of committed data, so two reads in one transaction can disagree. Reading account 11 twice while T2 committed a new balance returned **1,000.00 then 500.00** in PostgreSQL and MySQL at READ COMMITTED and in MongoDB outside a transaction: a **non-repeatable read**. Its multi-row cousin is **read skew**: T1 read account 40 (1,000.00), T2 moved 100 from 40 to 41 and committed, T1 read account 41 (1,100.00) and saw a total of **2,100** that never existed. One snapshot for the whole transaction (PostgreSQL and MySQL **REPEATABLE READ**, a MongoDB **transaction**) returned 1,000.00 twice and a total of 2,000.
+</Tldr>
+
+## Statement snapshot vs transaction snapshot
+
+| Level | Snapshot taken | Two reads of the same row |
+|---|---|---|
+| READ COMMITTED (PostgreSQL default) | At the start of **each statement** | Can differ |
+| REPEATABLE READ (MySQL default) | At the **first read** of the transaction | Always equal |
+| MongoDB outside a transaction | Per operation | Can differ |
+| MongoDB transaction (`snapshot`) | At the first operation of the transaction | Always equal |
+
+| Term | Meaning |
+|---|---|
+| Non-repeatable read | The same row, read twice in one transaction, has changed |
+| Read skew | Two different rows read at different moments, so together they reflect no single committed state |
+| **✓ Consistent** | Every read in T1 reflects the same committed state |
+| **✗ Inconsistent** | T1's reads mix states from before and after T2's commit |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: one transaction, two reads"
+  height={300}
+  nodes={[
+    { id: 't1', label: 'T1', sub: 'reads twice, 1.5 s apart', x: 20, y: 20, w: 220 },
+    { id: 'row', label: 'Account 11', sub: 'committed 1,000.00', x: 300, y: 90, w: 200 },
+    { id: 't2', label: 'T2', sub: 'commits in between', x: 20, y: 180, w: 220 },
+    { id: 'ok', label: '✓ Consistent', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'bad', label: '✗ Inconsistent', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row' },
+    { id: 't2-row', from: 't2', to: 'row' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-bad', from: 'row', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'READ COMMITTED',
+      path: 't0 T1 reads 1,000.00 → t0.5 T2 commits 500 → t1.5 T1 reads ✗ 500.00',
+      summary: 'Each SELECT gets a new snapshot, so the second one sees T2\'s commit.',
+      subs: { bad: '1,000.00 then 500.00' },
+      steps: [
+        {
+          title: 't0 · first read',
+          code: "BEGIN ISOLATION LEVEL READ COMMITTED;\nSELECT balance FROM accounts WHERE id = 11;   -- 1000.00",
+          note: 'The statement takes a snapshot: all transactions committed before this moment.',
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+        },
+        {
+          title: 't0.5 · T2 commits',
+          code: 'UPDATE accounts SET balance = 500 WHERE id = 11;   -- autocommit',
+          note: 'T1 holds no lock on the row (plain reads never lock), so T2 updates and commits immediately.',
+          active: ['t2', 'row'],
+          edges: ['t2-row'],
+          subs: { row: 'committed 500.00' },
+        },
+        {
+          title: 't1.5 · second read',
+          code: 'SELECT balance FROM accounts WHERE id = 11;   -- 500.00',
+          note: 'A new statement, a new snapshot, which now includes T2. Same transaction, different answer.',
+          active: ['t1', 'row', 'bad'],
+          edges: ['t1-row', 'row-bad'],
+          subs: { row: 'committed 500.00' },
+        },
+      ],
+    },
+    {
+      title: 'REPEATABLE READ',
+      path: 't0 T1 reads 1,000.00 (snapshot fixed) → T2 commits 500 → T1 reads ✓ 1,000.00',
+      summary: 'The snapshot from the first statement is reused until COMMIT.',
+      subs: { ok: '1,000.00 twice' },
+      steps: [
+        {
+          title: 'The snapshot is kept',
+          code: "BEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT balance FROM accounts WHERE id = 11;   -- 1000.00\n-- T2 commits 500\nSELECT balance FROM accounts WHERE id = 11;   -- 1000.00",
+          note: 'T2 committed exactly as before, but its transaction id is not in T1\'s snapshot, so T1 keeps reading the old version.',
+          active: ['t1', 't2', 'row', 'ok'],
+          edges: ['t1-row', 't2-row', 'row-ok'],
+        },
+      ],
+    },
+    {
+      title: 'Read skew',
+      path: 'T1 reads 40 = 1,000 → T2 moves 100 from 40 to 41 → T1 reads 41 = 1,100 → ✗ total 2,100 at READ COMMITTED, ✓ 2,000 at REPEATABLE READ',
+      summary: 'Each value is correct when read; together they describe no real moment.',
+      subs: { row: 'accounts 40 and 41', bad: 'READ COMMITTED: 2,100', ok: 'REPEATABLE READ: 2,000' },
+      steps: [
+        {
+          title: 'Read account 40',
+          code: 'SELECT balance FROM accounts WHERE id = 40;   -- 1000.00',
+          active: ['t1', 'row'],
+          edges: ['t1-row'],
+          note: 'T1 is computing the total of accounts 40 and 41, which should always be 2,000.',
+        },
+        {
+          title: 'T2 transfers 100',
+          code: 'BEGIN;\nUPDATE accounts SET balance = balance - 100 WHERE id = 40;\nUPDATE accounts SET balance = balance + 100 WHERE id = 41;\nCOMMIT;',
+          note: 'An atomic transfer: every committed state has total 2,000.',
+          active: ['t2', 'row'],
+          edges: ['t2-row'],
+        },
+        {
+          title: 'Read account 41',
+          code: 'SELECT balance FROM accounts WHERE id = 41;   -- RC: 1100.00 · RR: 1000.00',
+          note: 'READ COMMITTED: 1,000 (before) + 1,100 (after) = 2,100. REPEATABLE READ: 1,000 + 1,000 = 2,000, the state before the transfer. Reading both in one statement (SUM over both rows) is consistent even at READ COMMITTED.',
+          active: ['t1', 'row', 'ok', 'bad'],
+          edges: ['t1-row', 'row-ok', 'row-bad'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL
+
+<Flow
+  title="MySQL: the same two reads"
+  height={300}
+  nodes={[
+    { id: 't1', label: 'T1', sub: 'reads twice, 1.5 s apart', x: 20, y: 20, w: 220 },
+    { id: 'row', label: 'Account 11', sub: 'committed 1,000.00', x: 300, y: 90, w: 200 },
+    { id: 't2', label: 'T2', sub: 'commits in between', x: 20, y: 180, w: 220 },
+    { id: 'ok', label: '✓ Consistent', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'bad', label: '✗ Inconsistent', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row' },
+    { id: 't2-row', from: 't2', to: 'row' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-bad', from: 'row', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'READ COMMITTED',
+      path: 'T1 reads 1,000.00 → T2 commits 500 → T1 reads ✗ 500.00',
+      summary: 'A new read view for each consistent read.',
+      subs: { bad: '1,000.00 then 500.00' },
+      steps: [
+        {
+          title: 'Fresh read view per statement',
+          code: 'SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;\nSTART TRANSACTION;\nSELECT balance FROM accounts WHERE id = 11;   -- 1000.00\n-- T2: UPDATE accounts SET balance = 500 WHERE id = 11;\nSELECT balance FROM accounts WHERE id = 11;   -- 500.00',
+          note: 'InnoDB creates a read view (its snapshot) at each SELECT under READ COMMITTED.',
+          active: ['t1', 't2', 'row', 'bad'],
+          edges: ['t1-row', 't2-row', 'row-bad'],
+        },
+      ],
+    },
+    {
+      title: 'REPEATABLE READ (default)',
+      path: 'T1 reads 1,000.00 (read view created) → T2 commits 500 → T1 reads ✓ 1,000.00',
+      summary: 'The read view from the first consistent read lasts until COMMIT.',
+      subs: { ok: '1,000.00 twice' },
+      steps: [
+        {
+          title: 'One read view for the transaction',
+          code: 'START TRANSACTION;\nSELECT balance FROM accounts WHERE id = 11;   -- 1000.00\n-- T2 commits 500\nSELECT balance FROM accounts WHERE id = 11;   -- 1000.00',
+          note: 'The second read rebuilds the old version from the undo log. The same held for read skew: 1,000 + 1,000 = 2,000 at REPEATABLE READ, 1,000 + 1,100 = 2,100 at READ COMMITTED.',
+          active: ['t1', 't2', 'row', 'ok'],
+          edges: ['t1-row', 't2-row', 'row-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+MySQL's REPEATABLE READ has a catch for **writes**: an `UPDATE` or a locking read (`SELECT … FOR UPDATE`) inside the transaction reads the **latest committed** row, not the snapshot. [Concept 3](/blogs/databases/transactions/session-2-anomalies/concept-3-phantoms) shows the consequence.
+
+## MongoDB
+
+<Flow
+  title="MongoDB: per-operation reads vs a transaction"
+  height={300}
+  nodes={[
+    { id: 't1', label: 'T1', sub: 'reads twice, 1.5 s apart', x: 20, y: 20, w: 220 },
+    { id: 'row', label: 'accounts _id 11', sub: 'committed 1,000.00', x: 300, y: 90, w: 200 },
+    { id: 't2', label: 'T2', sub: 'updateOne in between', x: 20, y: 180, w: 220 },
+    { id: 'ok', label: '✓ Consistent', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'bad', label: '✗ Inconsistent', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-row', from: 't1', to: 'row' },
+    { id: 't2-row', from: 't2', to: 'row' },
+    { id: 'row-ok', from: 'row', to: 'ok' },
+    { id: 'row-bad', from: 'row', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'Outside a transaction',
+      path: 'findOne 1,000.00 → T2 sets 500 → findOne ✗ 500',
+      summary: 'Each operation reads the latest committed data; there is no transaction to hold a snapshot.',
+      subs: { bad: '1,000.00 then 500' },
+      steps: [
+        {
+          title: 'Two independent reads',
+          code: 'db.accounts.findOne({ _id: 11 }).balance   // 1000.00\n// T2: db.accounts.updateOne({ _id: 11 }, { $set: { balance: NumberDecimal("500") } })\ndb.accounts.findOne({ _id: 11 }).balance   // 500',
+          note: 'Read skew showed the same way: _id 40 read 1,000.00, then _id 41 read 1,100.00 after T2\'s transfer transaction committed.',
+          active: ['t1', 't2', 'row', 'bad'],
+          edges: ['t1-row', 't2-row', 'row-bad'],
+        },
+      ],
+    },
+    {
+      title: 'Inside a transaction',
+      path: 'startTransaction (snapshot) → findOne 1,000.00 → T2 sets 500 → findOne ✓ 1,000.00',
+      summary: 'Read concern snapshot: all reads of the transaction see the same point in time.',
+      subs: { ok: '1,000.00 twice' },
+      steps: [
+        {
+          title: 'One snapshot',
+          code: 's.startTransaction({ readConcern: { level: "snapshot" } });\na.accounts.findOne({ _id: 11 }).balance   // 1000.00\n// T2 commits 500\na.accounts.findOne({ _id: 11 }).balance   // 1000.00',
+          note: 'Also for read skew: inside a transaction, _id 40 and _id 41 both read 1,000.00 while T2\'s transfer committed in between. Old versions for the snapshot come from WiredTiger\'s history store; the transaction itself is aborted after transactionLifetimeLimitSeconds (60 s here) (Session 4).',
+          active: ['t1', 't2', 'row', 'ok'],
+          edges: ['t1-row', 't2-row', 'row-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+READ COMMITTED is the PostgreSQL default, and most ORMs run each request in it. Any code that reads related rows in **separate** statements and combines them (a balance sheet, "total of the order and its items", a consistency check) can see read skew. Use one statement, or REPEATABLE READ for that transaction.
+</Pitfall>
+
+## Real-world scenario: the audit that found missing money
+
+A nightly audit job in PostgreSQL sums balances branch by branch with ten separate queries, at the default READ COMMITTED, while transfers between branches keep running. Some nights the grand total is off by a few thousand. Nothing is wrong with the data: each branch was summed at a different moment.
+
+| Fix | Effect |
+|---|---|
+| `BEGIN ISOLATION LEVEL REPEATABLE READ` around the ten queries | All ten see one snapshot |
+| One `SELECT branch, sum(balance) … GROUP BY branch` | One statement, one snapshot, even at READ COMMITTED |
+| MongoDB: run the reads in one transaction, or one aggregation | Same snapshot for all |
+
+## Why this matters for transactions
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 4: lost updates | A snapshot that does not move also hides concurrent writes from read-modify-write code |
+| [Session 3: isolation levels](/blogs/databases/transactions/session-3-isolation-levels/lab) | How each engine builds and keeps snapshots |
+
+## Key takeaways
+
+1. READ COMMITTED takes a new snapshot per statement: two reads of one row returned 1,000.00 then 500.00.
+2. Read skew mixes two moments across rows: a total of 2,100 that never existed.
+3. REPEATABLE READ (PostgreSQL, MySQL) and MongoDB transactions keep one snapshot: 1,000.00 twice, total 2,000.
+4. MongoDB reads outside a transaction behave like READ COMMITTED.
+5. A single statement is always consistent with itself, even at READ COMMITTED.
+
+## Check questions
+
+1. Why did T1 see 500.00 on its second read at READ COMMITTED although T1 never changed anything?
+2. Did T2 have to wait for T1 in any of these runs? Why not?
+3. Explain read skew with the lab's numbers, and why each individual read was correct.
+4. Give two ways to make the branch audit consistent in PostgreSQL without changing the default level.
+5. When does InnoDB create the read view in a REPEATABLE READ transaction?
+6. What limits how long a MongoDB transaction can keep its snapshot?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-2-anomalies/concept-2-non-repeatable-reads-and-read-skew/answers">Worked answers to Q1–Q6</DeepDive>

@@ -1,0 +1,242 @@
+---
+title: "Concept 3: Phantoms"
+description: "A new row appears in a repeated query because another transaction inserted it. 10,000 queued jobs became 10,001 at READ COMMITTED; PostgreSQL REPEATABLE READ and MongoDB transactions kept 10,000 for reads and writes alike; MySQL REPEATABLE READ kept 10,000 for reads, then its UPDATE changed 10,001 rows and the next count said 10,001."
+type: "concept"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "isolation", "phantom"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-consistent-read.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-next-key-locking.html"
+---
+
+<Tldr>
+A **phantom** is a row that matches a query's condition but was not there the first time the query ran, because another transaction inserted (or updated a row into) the range. In the lab, T1 counted the 10,000 `queued` jobs, T2 inserted job 100,001 as `queued`, and T1 counted again: **10,001** at READ COMMITTED in PostgreSQL and MySQL. At PostgreSQL REPEATABLE READ and in a MongoDB transaction, both the count and T1's `UPDATE … WHERE status = 'queued'` saw **10,000**. MySQL REPEATABLE READ is different: the reads stayed at 10,000, but the `UPDATE` changed **10,001** rows (writes read the latest data), and afterwards T1's own count jumped to **10,001**.
+</Tldr>
+
+## Phantoms vs non-repeatable reads
+
+| | Non-repeatable read (Concept 2) | Phantom |
+|---|---|---|
+| What changes | An existing row's values | The **set** of rows matching a condition |
+| Caused by | UPDATE of a row T1 read | INSERT (or an UPDATE/DELETE that moves rows into or out of the condition) |
+| Locks that could prevent it | Lock on the rows read | A lock on the **range** (rows that do not exist yet) |
+
+| Term | Meaning |
+|---|---|
+| Consistent read | A plain SELECT that reads from the snapshot |
+| Current read (MySQL) | `UPDATE`, `DELETE`, `SELECT … FOR UPDATE`: reads the latest committed version and locks it |
+| **✓ Stable set** | T1's queries and writes all saw the same 10,000 jobs |
+| **✗ Phantom** | Job 100,001 appeared in T1's results or was changed by T1 |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: count, insert, count, update"
+  height={300}
+  nodes={[
+    { id: 't1', label: 'T1', sub: 'count · wait · count · UPDATE', x: 20, y: 20, w: 220 },
+    { id: 'set', label: "status = 'queued'", sub: '10,000 jobs', x: 300, y: 90, w: 200 },
+    { id: 't2', label: 'T2', sub: 'INSERT job 100,001', x: 20, y: 180, w: 220 },
+    { id: 'ok', label: '✓ Stable set', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'bad', label: '✗ Phantom', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-set', from: 't1', to: 'set' },
+    { id: 't2-set', from: 't2', to: 'set' },
+    { id: 'set-ok', from: 'set', to: 'ok' },
+    { id: 'set-bad', from: 'set', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'READ COMMITTED',
+      path: 'count 10,000 → T2 inserts → count ✗ 10,001 → UPDATE 10,001',
+      summary: 'Each statement sees everything committed before it started.',
+      subs: { bad: '10,000 → 10,001' },
+      steps: [
+        {
+          title: 't0 · first count',
+          code: "BEGIN;\nSELECT count(*) FROM jobs WHERE status = 'queued';   -- 10000",
+          note: 'T1 plans to claim all queued jobs.',
+          active: ['t1', 'set'],
+          edges: ['t1-set'],
+        },
+        {
+          title: 't0.5 · T2 inserts a queued job',
+          code: "INSERT INTO jobs VALUES (100001, 'queued', 'new', now(), NULL);",
+          note: 'No lock prevents it: T1 only read.',
+          active: ['t2', 'set'],
+          edges: ['t2-set'],
+          subs: { set: '10,001 committed' },
+        },
+        {
+          title: 't1.5 · the phantom appears',
+          code: "SELECT count(*) FROM jobs WHERE status = 'queued';   -- 10001\nUPDATE jobs SET locked_by = 'T1' WHERE status = 'queued';   -- UPDATE 10001",
+          note: 'The second count and the UPDATE both include job 100,001.',
+          active: ['t1', 'set', 'bad'],
+          edges: ['t1-set', 'set-bad'],
+          subs: { set: '10,001 committed' },
+        },
+      ],
+    },
+    {
+      title: 'REPEATABLE READ',
+      path: 'count 10,000 → T2 inserts → count ✓ 10,000 → UPDATE 10,000',
+      summary: 'In PostgreSQL the snapshot covers writes too: rows not in the snapshot are invisible to UPDATE.',
+      subs: { ok: 'count and UPDATE: 10,000' },
+      steps: [
+        {
+          title: 'Reads and writes use the snapshot',
+          code: "BEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT count(*) FROM jobs WHERE status = 'queued';   -- 10000\n-- T2 inserts job 100001\nSELECT count(*) …;   -- 10000\nUPDATE jobs SET locked_by = 'T1' WHERE status = 'queued';   -- UPDATE 10000",
+          note: 'Job 100,001 was inserted after T1\'s snapshot, so neither the count nor the UPDATE sees it. PostgreSQL\'s REPEATABLE READ is snapshot isolation and prevents phantoms, which the SQL standard does not require at this level.',
+          active: ['t1', 't2', 'set', 'ok'],
+          edges: ['t1-set', 't2-set', 'set-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL
+
+<Flow
+  title="MySQL: the snapshot does not cover UPDATE"
+  height={300}
+  nodes={[
+    { id: 't1', label: 'T1', sub: 'count · wait · count · UPDATE', x: 20, y: 20, w: 220 },
+    { id: 'set', label: "status = 'queued'", sub: '10,000 jobs', x: 300, y: 90, w: 200 },
+    { id: 't2', label: 'T2', sub: 'INSERT job 100,001', x: 20, y: 180, w: 220 },
+    { id: 'ok', label: '✓ Stable set', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'bad', label: '✗ Phantom', sub: '', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-set', from: 't1', to: 'set' },
+    { id: 't2-set', from: 't2', to: 'set' },
+    { id: 'set-ok', from: 'set', to: 'ok' },
+    { id: 'set-bad', from: 'set', to: 'bad' },
+  ]}
+  cases={[
+    {
+      title: 'READ COMMITTED',
+      path: 'count 10,000 → T2 inserts → count ✗ 10,001 → UPDATE 10,001',
+      summary: 'Same as PostgreSQL READ COMMITTED.',
+      subs: { bad: '10,000 → 10,001' },
+      steps: [
+        {
+          title: 'New read view per statement',
+          code: "SELECT count(*) FROM jobs WHERE status = 'queued';   -- 10000\n-- T2 inserts\nSELECT count(*) …;   -- 10001\nUPDATE jobs SET locked_by = 'T1' WHERE status = 'queued';   -- ROW_COUNT() = 10001",
+          note: 'Both the read and the write see the new job.',
+          active: ['t1', 't2', 'set', 'bad'],
+          edges: ['t1-set', 't2-set', 'set-bad'],
+        },
+      ],
+    },
+    {
+      title: 'REPEATABLE READ (default)',
+      path: 'count 10,000 → T2 inserts → count ✓ 10,000 → UPDATE ✗ 10,001 rows → count ✗ 10,001',
+      summary: 'Reads use the read view; UPDATE is a current read of the latest data.',
+      subs: { set: 'view 10,000 · latest 10,001', ok: 'reads before UPDATE', bad: 'UPDATE 10,001 · count 10,001' },
+      steps: [
+        {
+          title: 'Reads are stable',
+          code: "START TRANSACTION;\nSELECT count(*) FROM jobs WHERE status = 'queued';   -- 10000\n-- T2 inserts job 100001 (not blocked: plain reads set no locks)\nSELECT count(*) …;   -- 10000",
+          note: 'The read view from the first SELECT hides job 100,001.',
+          active: ['t1', 't2', 'set', 'ok'],
+          edges: ['t1-set', 't2-set', 'set-ok'],
+        },
+        {
+          title: 'The UPDATE sees the phantom',
+          code: "UPDATE jobs SET locked_by = 'T1' WHERE status = 'queued';\nSELECT ROW_COUNT();   -- 10001",
+          note: 'UPDATE and DELETE (and SELECT … FOR UPDATE) are current reads: they find and lock the latest committed rows, including job 100,001. T1 just claimed a job it never counted.',
+          active: ['t1', 'set', 'bad'],
+          edges: ['t1-set', 'set-bad'],
+        },
+        {
+          title: 'Then the read changes too',
+          code: "SELECT count(*) FROM jobs WHERE status = 'queued';   -- 10001",
+          note: 'T1\'s own changes are always visible to T1, so job 100,001, now modified by T1, enters its snapshot. Under one "REPEATABLE READ" transaction, the same count returned 10,000 and then 10,001.',
+          active: ['t1', 'set', 'bad'],
+          edges: ['t1-set', 'set-bad'],
+        },
+      ],
+    },
+  ]}
+/>
+
+If T1 starts with a **locking** read instead, InnoDB places **next-key locks** (a row plus the gap before it) on everything it scans, and inserts into those gaps wait. In a second run, T1's `SELECT count(*) … WHERE status = 'queued' FOR UPDATE` returned 10,000 and held **100,466 locks** in `performance_schema.data_locks`: `status` has no index, so InnoDB scanned and locked all 100,000 rows. T2's insert waited **1.3 s**, until T1 committed. That is how InnoDB prevents phantoms for current reads, and why it needs an index to do so cheaply ([Session 5](/blogs/databases/transactions/session-5-locks-and-indexes/lab)).
+
+## MongoDB
+
+<Flow
+  title="MongoDB: a transaction keeps its snapshot for writes too"
+  height={300}
+  nodes={[
+    { id: 't1', label: 'T1 transaction', sub: 'count · wait · count · updateMany', x: 20, y: 20, w: 240 },
+    { id: 'set', label: "status: 'queued'", sub: '10,000 jobs', x: 320, y: 90, w: 180 },
+    { id: 't2', label: 'T2', sub: 'insertOne job 100,001', x: 20, y: 180, w: 240 },
+    { id: 'ok', label: '✓ Stable set', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'bad', label: '✗ Phantom', sub: 'not seen', x: 580, y: 180, w: 200 },
+  ]}
+  edges={[
+    { id: 't1-set', from: 't1', to: 'set' },
+    { id: 't2-set', from: 't2', to: 'set' },
+    { id: 'set-ok', from: 'set', to: 'ok' },
+  ]}
+  cases={[
+    {
+      title: 'Inside a transaction',
+      path: 'countDocuments 10,000 → T2 inserts → countDocuments ✓ 10,000 → updateMany modified 10,000',
+      summary: 'Like PostgreSQL REPEATABLE READ: reads and writes see the snapshot.',
+      subs: { ok: 'count and updateMany: 10,000' },
+      steps: [
+        {
+          title: 'One snapshot for everything',
+          code: 's.startTransaction({ readConcern: { level: "snapshot" } });\na.jobs.countDocuments({ status: "queued" })   // 10000\n// T2: db.jobs.insertOne({ _id: 100001, status: "queued", … })\na.jobs.countDocuments({ status: "queued" })   // 10000\na.jobs.updateMany({ status: "queued" }, { $set: { locked_by: "T1" } }).modifiedCount   // 10000',
+          note: 'The inserted job is newer than the transaction\'s snapshot, so updateMany does not see it. Outside a transaction, a second countDocuments would of course return 10,001.',
+          active: ['t1', 't2', 'set', 'ok', 'bad'],
+          edges: ['t1-set', 't2-set', 'set-ok'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+"The count matched, so my UPDATE touched those rows" is not safe in MySQL REPEATABLE READ: reads come from the snapshot, writes from the latest data. Code that counts, then updates "the same" rows, can act on rows it never saw. Use a locking read for the first step, or make the write's own result (`ROW_COUNT()`, `RETURNING` in PostgreSQL) the source of truth.
+</Pitfall>
+
+## Real-world scenario: the batch that paid one invoice twice
+
+A payout job in MySQL counts approved invoices, computes the total to transfer, then marks them `paid` with `UPDATE … WHERE status = 'approved'`. An invoice approved between the count and the update is marked paid but was not in the transfer total; next month's reconciliation finds it.
+
+| Fix | Effect |
+|---|---|
+| `SELECT … FOR UPDATE` for the first read (MySQL) | Locks the matching rows and the gaps; new approvals wait |
+| Select the ids once, then `UPDATE … WHERE id IN (…)` | The write acts exactly on what was read |
+| PostgreSQL REPEATABLE READ or a MongoDB transaction | Writes ignore rows outside the snapshot |
+
+## Why this matters for transactions
+
+| Later topic | Why this concept matters |
+|---|---|
+| [Session 3: isolation levels](/blogs/databases/transactions/session-3-isolation-levels/lab) | Consistent read vs locking read in InnoDB |
+| [Session 5: locks and indexes](/blogs/databases/transactions/session-5-locks-and-indexes/lab) | Next-key and gap locks, and why an unindexed condition locks everything |
+
+## Key takeaways
+
+1. A phantom is a new row matching a condition that a transaction already evaluated.
+2. READ COMMITTED shows phantoms in both SQL engines (10,000 → 10,001).
+3. PostgreSQL REPEATABLE READ and MongoDB transactions hide them from reads and writes alike.
+4. MySQL REPEATABLE READ hides them from plain reads only: the UPDATE changed 10,001 rows and the next count said 10,001.
+5. Locking reads in InnoDB prevent phantoms with next-key locks, at the cost of blocking inserts.
+
+## Check questions
+
+1. How is a phantom different from a non-repeatable read?
+2. Why did T2's INSERT not wait for T1 in any of the runs?
+3. In MySQL REPEATABLE READ, why did the UPDATE change 10,001 rows while the count said 10,000?
+4. Why did T1's count become 10,001 after its own UPDATE?
+5. How would a locking read have changed the MySQL run, and what would T2 have experienced?
+6. Rewrite the payout job so the transfer total always matches the invoices marked paid.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-2-anomalies/concept-3-phantoms/answers">Worked answers to Q1–Q6</DeepDive>

@@ -1,0 +1,13 @@
+{
+  "title": "Session 2: Anomalies, reproduced live",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-dirty-reads/index",
+    "concept-2-non-repeatable-reads-and-read-skew/index",
+    "concept-3-phantoms/index",
+    "concept-4-lost-updates/index",
+    "concept-5-write-skew/index",
+    "lab/index"
+  ]
+}

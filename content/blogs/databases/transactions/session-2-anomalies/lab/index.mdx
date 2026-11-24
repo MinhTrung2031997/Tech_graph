@@ -1,0 +1,153 @@
+---
+title: "Lab and session quiz: Anomalies, reproduced live"
+description: "Reproduce dirty reads, non-repeatable reads, read skew, phantoms, lost updates and write skew with two sessions in PostgreSQL, MySQL and MongoDB, at the isolation levels that allow and prevent each one, and fill in the anomaly matrix yourself."
+type: "how-to"
+tags: ["transactions", "postgresql", "mysql", "mongodb", "isolation", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions/"
+---
+
+<Tldr>
+Uses the containers, the `bank` database and the aliases (`tpg`, `tmy`, `tmg`) from the [Session 1 lab](/blogs/databases/transactions/session-1-transaction-guarantees/lab). Every exercise needs **two terminals** (T1 and T2) on the same engine. Follow the time column; the sleeps give you a few seconds to switch windows (lengthen them if you are slow to switch). Before each run, predict the final value; the lab's results are in the matrix at the end.
+</Tldr>
+
+## Reset between exercises
+
+```sql
+-- PostgreSQL and MySQL
+UPDATE accounts SET balance = 1000 WHERE id BETWEEN 1 AND 100;
+DELETE FROM jobs WHERE id > 100000;
+UPDATE jobs SET locked_by = NULL WHERE locked_by IS NOT NULL;
+```
+
+```js
+// MongoDB
+db.accounts.updateMany({ _id: { $lte: 100 } }, { $set: { balance: NumberDecimal("1000.00") } });
+db.jobs.deleteMany({ _id: { $gt: 100000 } });
+db.jobs.updateMany({ locked_by: { $ne: null } }, { $set: { locked_by: null } });
+```
+
+In mongosh, a transaction is opened like this (used in several exercises):
+
+```js
+const s = db.getMongo().startSession();
+const a = s.getDatabase("bank");
+s.startTransaction({ readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
+// … a.accounts.find(…), a.accounts.updateOne(…) …
+s.commitTransaction();
+```
+
+## Exercise 1: dirty read (Concept 1)
+
+| Time | T1 | T2 |
+|---|---|---|
+| 0 s | `BEGIN; UPDATE accounts SET balance = 0 WHERE id = 10;` | |
+| 2 s | | MySQL: `SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SELECT balance FROM accounts WHERE id = 10;` · PostgreSQL: `BEGIN ISOLATION LEVEL READ UNCOMMITTED; SELECT …;` |
+| 5 s | `ROLLBACK;` | |
+
+MongoDB: T1 runs the update inside a transaction and aborts; T2 runs `db.accounts.findOne({ _id: 10 })` and `db.accounts.find({ _id: 10 }).readConcern("available")`.
+
+Repeat MySQL with `READ COMMITTED` for T2.
+
+## Exercise 2: non-repeatable read and read skew (Concept 2)
+
+| Time | T1 | T2 |
+|---|---|---|
+| 0 s | `BEGIN ISOLATION LEVEL READ COMMITTED;` (MySQL: `SET SESSION … READ COMMITTED; START TRANSACTION;`) `SELECT balance FROM accounts WHERE id = 11;` | |
+| 2 s | | `UPDATE accounts SET balance = 500 WHERE id = 11;` |
+| 4 s | `SELECT balance FROM accounts WHERE id = 11; COMMIT;` | |
+
+Repeat at `REPEATABLE READ`. MongoDB: two `findOne` calls outside a transaction, then two inside one.
+
+Read skew, same pattern: T1 reads account 40, T2 transfers 100 from 40 to 41 in one transaction and commits, T1 reads account 41. Add the two values.
+
+## Exercise 3: phantom (Concept 3)
+
+| Time | T1 | T2 |
+|---|---|---|
+| 0 s | Begin at the level under test; `SELECT count(*) FROM jobs WHERE status = 'queued';` | |
+| 2 s | | `INSERT INTO jobs VALUES (100001, 'queued', 'new', now(), NULL);` (MySQL: `NOW()`) |
+| 4 s | Count again; `UPDATE jobs SET locked_by = 'T1' WHERE status = 'queued';` (MySQL: then `SELECT ROW_COUNT();`); count again; `ROLLBACK;` | |
+
+Run at READ COMMITTED and REPEATABLE READ in both SQL engines, and inside a MongoDB transaction (`countDocuments`, `updateMany(…).modifiedCount`). Then, in MySQL REPEATABLE READ, make T1's first query `SELECT count(*) … FOR UPDATE` and watch T2's insert wait. While it waits, in a third terminal:
+
+```sql
+SELECT count(*) FROM performance_schema.data_locks WHERE OBJECT_NAME = 'jobs';   -- lab: 100,466
+```
+
+## Exercise 4: lost update (Concept 4)
+
+Both sessions run the same read-modify-write; T1 adds 100, T2 subtracts 50.
+
+```sql
+-- PostgreSQL (psql: \gset stores the result in :b)
+BEGIN;                                         -- or BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT balance AS b FROM accounts WHERE id = 20 \gset
+SELECT pg_sleep(3);
+UPDATE accounts SET balance = :b + 100 WHERE id = 20;   -- T2: :b - 50
+COMMIT;
+```
+
+```sql
+-- MySQL
+START TRANSACTION;
+SELECT balance INTO @b FROM accounts WHERE id = 20;   -- then try … FOR UPDATE
+SELECT SLEEP(3);
+UPDATE accounts SET balance = @b + 100 WHERE id = 20;  -- T2: @b - 50
+COMMIT;
+```
+
+Start T2 about one second after T1. Then try the atomic form in both sessions: `UPDATE accounts SET balance = balance + 100 WHERE id = 20` (T2: `- 50`). In MongoDB, compare a `findOne` + `$set` outside a transaction, the same inside two transactions, and `$inc`.
+
+## Exercise 5: write skew (Concept 5)
+
+Rule: `balance(30) + balance(31) >= 1000`. Each session checks it, then withdraws 900 from its own account.
+
+```sql
+BEGIN ISOLATION LEVEL REPEATABLE READ;   -- then SERIALIZABLE
+SELECT sum(balance) FROM accounts WHERE id IN (30, 31);
+SELECT pg_sleep(2);
+UPDATE accounts SET balance = balance - 900 WHERE id = 30;   -- T2: id = 31
+COMMIT;
+SELECT sum(balance) FROM accounts WHERE id IN (30, 31);
+```
+
+MySQL: `SET SESSION TRANSACTION ISOLATION LEVEL …; START TRANSACTION;` and `SLEEP(2)`. MongoDB: two transactions with `$inc: { balance: NumberDecimal("-900") }`; then add `a.pairs.updateOne({ _id: "30-31" }, { $inc: { v: 1 } }, { upsert: true })` at the start of both.
+
+Fix with locks at READ COMMITTED: replace the first SELECT with
+
+```sql
+SELECT sum(balance) FROM (SELECT balance FROM accounts WHERE id IN (30, 31) ORDER BY id FOR UPDATE) x;
+```
+
+## The matrix
+
+Lab results (✗ = anomaly observed, ✓ = prevented):
+
+| Anomaly | PG RC | PG RR | PG SER | MySQL RC | MySQL RR | MySQL SER | Mongo, no txn | Mongo txn |
+|---|---|---|---|---|---|---|---|---|
+| Dirty read | ✓ (RU = RC) | ✓ | ✓ | ✓ (RU: ✗ 0.00) | ✓ | ✓ | ✓ | ✓ |
+| Non-repeatable read | ✗ 1,000 → 500 | ✓ 1,000 twice | ✓ | ✗ 1,000 → 500 | ✓ 1,000 twice | ✓ | ✗ 1,000 → 500 | ✓ 1,000 twice |
+| Read skew | ✗ 2,100 | ✓ 2,000 | ✓ | ✗ 2,100 | ✓ 2,000 | ✓ | ✗ 2,100 | ✓ 2,000 |
+| Phantom (reads) | ✗ 10,001 | ✓ | ✓ | ✗ 10,001 | ✓ | ✓ | ✗ | ✓ |
+| Phantom (UPDATE) | ✗ 10,001 | ✓ 10,000 | ✓ | ✗ 10,001 | **✗ 10,001** | ✓ | ✗ | ✓ 10,000 |
+| Lost update | ✗ 950 | ✓ error 40001 | ✓ | ✗ 950 | **✗ 950** | ✓ | ✗ 950 | ✓ WriteConflict |
+| Write skew | ✗ 200 | ✗ 200 | ✓ error 40001 | ✗ | ✗ 200 | ✓ deadlock | ✗ | ✗ 200 |
+
+Cells with a number or an error were measured; cells without one follow from the level's definition and were not run separately (for example SERIALIZABLE preventing a non-repeatable read, or a MongoDB count outside a transaction seeing a new document).
+
+## Session quiz
+
+1. Which measured cell of the matrix surprised you most, and which mechanism explains it?
+2. Why can't a dirty read happen in PostgreSQL at any level?
+3. T1 at PostgreSQL READ COMMITTED reads two related rows in two statements. Name the anomaly and two fixes.
+4. In MySQL REPEATABLE READ, T1's count stayed 10,000 but its UPDATE changed 10,001 rows. Explain in two sentences.
+5. Rank the fixes for the lost update by how much concurrency they allow: atomic UPDATE, `FOR UPDATE`, REPEATABLE READ + retry.
+6. Why did PostgreSQL REPEATABLE READ catch the lost update but not the write skew?
+7. Why does MongoDB need a guard document (or a different data model) to prevent write skew?
+8. Your service runs on MySQL with default settings and an ORM that loads, modifies and saves rows. Which anomalies from this session should you look for first?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/transactions/session-2-anomalies/lab/answers">Answers to the session quiz</DeepDive>

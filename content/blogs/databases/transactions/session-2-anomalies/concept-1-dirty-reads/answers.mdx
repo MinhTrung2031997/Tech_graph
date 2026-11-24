@@ -1,0 +1,54 @@
+---
+title: "Answers: Dirty reads"
+description: "Worked answers to the Session 2 Concept 1 check questions."
+companion: "answers"
+tags: ["transactions", "isolation", "dirty-read", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-consistent-read.html"
+---
+
+<Tldr>
+Dirty reads need an engine that returns uncommitted versions; of the three, only MySQL at READ UNCOMMITTED does.
+</Tldr>
+
+## Q1. Definition
+
+**Question:** define a dirty read and give the lab's example.
+
+A dirty read returns data written by a transaction that has not committed. If that transaction rolls back, the reader used a value that never belonged to any committed state. Lab: T1 set account 10 to 0 and rolled back two seconds later; T2 at MySQL READ UNCOMMITTED read 0.00 in between.
+
+> **Common mistake:** calling any stale or changing read "dirty". Reading committed data that later changes is a non-repeatable read (Concept 2).
+
+## Q2. READ COMMITTED without waiting
+
+**Question:** how did MySQL at `READ COMMITTED` return 1,000.00 while T1's change was in place, without waiting?
+
+InnoDB keeps the previous version of a changed row in the **undo log**. A consistent read sees that the newest version belongs to a transaction not yet committed and follows the row's undo pointer to rebuild the last committed version. It takes no lock, so T1's row lock did not block it.
+
+> **Common mistake:** expecting READ COMMITTED readers to wait for writers. In InnoDB (and PostgreSQL, MongoDB) plain reads never wait for row locks.
+
+## Q3. PostgreSQL READ UNCOMMITTED
+
+**Question:** what does PostgreSQL do when you ask for `READ UNCOMMITTED`?
+
+It accepts the syntax and runs the transaction at READ COMMITTED. Its MVCC visibility check never returns a tuple whose creating transaction is uncommitted (other than the reader's own), so a dirty read is impossible at every level. The lab's T2 read 1,000.00.
+
+> **Common mistake:** porting a MySQL report that relies on READ UNCOMMITTED and expecting different numbers in PostgreSQL; there are none.
+
+## Q4. Partial changes in MongoDB
+
+**Question:** can a MongoDB reader ever see a partial multi-document change? Distinguish transactions from `updateMany`.
+
+Inside a **transaction**, no: all writes become visible together at commit; the lab's reader saw 1,000.00 with read concern `local` and `available` while the transaction had written 0. Outside a transaction, **`updateMany` is not atomic across documents**: a concurrent reader can see some documents updated and others not, and a failure can leave it half applied. That is not a dirty read (each document change is committed), but it is a partial view of the operation.
+
+> **Common mistake:** relying on `updateMany` to flip a set of documents "at once".
+
+## Q5. READ UNCOMMITTED to avoid locks
+
+**Question:** why is "use READ UNCOMMITTED to avoid locking" a poor reason in InnoDB?
+
+Plain `SELECT` statements at READ COMMITTED and REPEATABLE READ are **consistent nonlocking reads**: they read from undo and take no row locks. So READ UNCOMMITTED avoids no locks; it only skips reconstructing old versions, which is cheap unless the undo chain is very long (Session 4). In exchange it returns values that may never commit.
+
+> **Common mistake:** copying SQL Server's `NOLOCK` habit, where default reads do take shared locks, into MySQL, where they don't.

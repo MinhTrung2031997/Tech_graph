@@ -1,0 +1,73 @@
+---
+title: "Answers: Lost updates"
+description: "Worked answers to the Session 2 Concept 4 check questions."
+companion: "answers"
+tags: ["transactions", "isolation", "lost-update", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/transaction-iso.html#XACT-REPEATABLE-READ"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html"
+  - "https://www.mongodb.com/docs/manual/core/transactions-in-applications/"
+---
+
+<Tldr>
+Either let the database compute the new value, lock the row while you read it, or let the database detect the conflict and retry. Writing back a value computed from a plain read is the bug.
+</Tldr>
+
+## Q1. Why 950
+
+**Question:** why is the final balance 950 and not 1,050 at PostgreSQL READ COMMITTED?
+
+T2 read 1,000 before T1 committed, computed 950 in the client, and sent `UPDATE … SET balance = 950`. That statement contains a constant, not an expression on the current balance, so when it ran it replaced T1's 1,100 with 950. READ COMMITTED applies an UPDATE to the latest committed row without asking whether the transaction's earlier reads are still valid.
+
+> **Common mistake:** blaming the database for "losing" T1's write. It applied exactly the two writes it received, in order.
+
+## Q2. MySQL RR vs PostgreSQL RR
+
+**Question:** why does MySQL REPEATABLE READ allow the lost update while PostgreSQL REPEATABLE READ rejects it?
+
+Both give T2 a snapshot that shows 1,000. PostgreSQL's REPEATABLE READ is snapshot isolation with a "first updater wins" rule: an UPDATE of a row that another transaction changed and committed after the snapshot fails with SQLSTATE 40001. InnoDB's UPDATE is a **current read**: it locks and modifies the latest committed row, with no check against the snapshot, so T2's stale constant overwrites T1's change without an error.
+
+> **Common mistake:** assuming the same level name means the same guarantees across engines.
+
+## Q3. Handling 40001 and TransientTransactionError
+
+**Question:** what must the application do when it gets error 40001 or a `TransientTransactionError`?
+
+Roll back (PostgreSQL has already aborted the transaction; MongoDB's must be aborted) and **retry the whole transaction from the beginning**, including the reads, usually with a small random backoff and a retry limit. The retry reads 1,100 and writes 1,050. MongoDB's `session.withTransaction()` retries on `TransientTransactionError` automatically.
+
+> **Common mistake:** retrying only the failed UPDATE with the old computed value, which reproduces the lost update.
+
+## Q4. FOR UPDATE returns 1,100
+
+**Question:** why does `SELECT … FOR UPDATE` return 1,100 in MySQL REPEATABLE READ, when a plain SELECT returns 1,000?
+
+A locking read is a **current read**: it must lock the row as it is now, so it waits for T1's lock and returns the latest committed version (1,100). A plain SELECT is a consistent read from the transaction's read view (1,000). Both kinds can appear in the same transaction, which is why mixing them is confusing.
+
+> **Common mistake:** reading with a plain SELECT, then locking with `FOR UPDATE` later and trusting the first value.
+
+## Q5. Buy the last unit
+
+**Question:** write the "buy the last unit" logic as one atomic statement in each engine.
+
+```sql
+-- PostgreSQL and MySQL: succeed only if stock is still positive; check the affected row count.
+UPDATE inventory SET stock = stock - 1 WHERE sku = 'SKU-000123' AND stock > 0;
+```
+
+```js
+// MongoDB: check modifiedCount.
+db.inventory.updateOne({ _id: "SKU-000123", stock: { $gt: 0 } }, { $inc: { stock: -1 } })
+```
+
+Run concurrently on a SKU with stock 1: PostgreSQL T1 `UPDATE 1`, T2 `UPDATE 0`; MySQL `ROW_COUNT()` 1 and 0; MongoDB `modifiedCount` 1 and 0. Final stock 0 in all three, and the second buyer knows it failed.
+
+> **Common mistake:** relying on the CHECK `stock >= 0` alone: it prevents negative stock but turns a sold-out item into an error instead of a clean "0 rows".
+
+## Q6. Wait vs fail in MongoDB
+
+**Question:** in MongoDB, why did T2 wait in the `$inc` case but fail in the transaction case?
+
+Inside a transaction, a write that hits a document locked or changed by another transaction gets `WriteConflict` immediately; the driver is expected to retry the whole transaction (fail fast keeps transactions short and avoids deadlocks). A write **outside** a transaction that hits a document locked by a transaction is retried internally by the server until the transaction commits or aborts: T2's `$inc` waited 0.66 s and then applied to 1,100.
+
+> **Common mistake:** expecting MongoDB transactions to queue behind each other like PostgreSQL row locks.
