@@ -1,0 +1,61 @@
+---
+title: "Answers: Range, list and hash partitions"
+description: "Worked answers to the Session 2 Concept 1 check questions."
+companion: "answers"
+tags: ["partitioning", "postgresql", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html"
+---
+
+<Tldr>
+The parent routes, the partitions store. Pick the method by how you will query and how you will delete.
+</Tldr>
+
+## Q1. A parent of 0 bytes
+
+**Question:** `pg_relation_size('orders_p')` returned 0. Where are the 5M rows, and how do you see which partition a row is in?
+
+In the 24 partitions. A partitioned table has no storage of its own; each partition is an ordinary heap table with its own indexes. Select the system column `tableoid` and cast it to `regclass` to get the partition's name: `SELECT tableoid::regclass, * FROM orders_p WHERE id = 777777` returned `orders_p_2024_04`. To size the whole table, sum `pg_total_relation_size` over `pg_inherits` (474 MB in the lab), or use `pg_partition_tree('orders_p')`.
+
+> **Common mistake:** concluding from `\dt+` or `pg_relation_size` on the parent that a partitioned table is empty.
+
+## Q2. Inserting into a month that does not exist
+
+**Question:** what exactly happens to an INSERT for 2026-01-05, and what would change if a `DEFAULT` partition existed?
+
+No partition's `[FROM, TO)` range contains the value, so the statement fails with `ERROR: no partition of relation "orders_p" found for row` and a DETAIL line giving the key. Nothing is written; in a multi-row INSERT, the whole statement is rolled back. With a `DEFAULT` partition, the row goes there instead and the insert succeeds. The lab showed it with list partitioning: `'amazon'` failed, then succeeded once `orders_l_other` was created as `DEFAULT`.
+
+> **Common mistake:** adding a `DEFAULT` partition "so inserts never fail" and then forgetting it. Session 4 shows how rows in the default partition get in the way of adding new partitions.
+
+## Q3. The slow UPDATE that moved a row
+
+**Question:** why did `UPDATE … SET created_at = '2025-07-01' WHERE id = 777777` take 596 ms, and what did it do to the row?
+
+Two separate things. The time went into **finding** the row: `orders_p` has no index on `id` and the filter does not mention `created_at`, so all 24 partitions were scanned. The UPDATE itself **moved** the row: the new key belongs to `orders_p_2025_07`, so PostgreSQL deleted it from `orders_p_2024_04` and inserted it into `orders_p_2025_07` in the same statement. `tableoid` showed the new partition afterwards.
+
+> **Common mistake:** expecting an UPDATE of the partition key to fail. PostgreSQL (since version 11) moves the row. The documentation warns that a concurrent UPDATE or DELETE of the same row can then fail with a serialization error instead of following the row to its new partition (not reproduced in the lab).
+
+## Q4. "Partitioning made the load slower"
+
+**Question:** a colleague says partitioning made their nightly load slower. What did the lab measure, and what would you check first?
+
+The lab measured no real difference: medians of 2.90 s (plain) and 2.95 s (partitioned) for 5M rows, with run-to-run spread larger than that. Routing is a binary search over the bounds. Check what else changed: indexes on the partitioned table that the old table did not have, a load that now crosses many partitions per batch with triggers or foreign keys on each, or simply a single noisy run. Compare medians of several runs.
+
+> **Common mistake:** comparing one run of each. On a shared server, the lab's plain-table loads ranged from 2.51 s to 4.50 s.
+
+## Q5. Hash partitions and ranges
+
+**Question:** why does `WHERE seller_id BETWEEN 1 AND 10` scan all 8 hash partitions while `seller_id IN (1, 2)` scans 2?
+
+A hash partition holds the sellers whose hash value has a given remainder modulo 8. Neighbouring seller ids have unrelated hashes, so a range of ids can be in any partition. For `IN (1, 2)` PostgreSQL hashes each listed value and keeps only the matching partitions: the plan kept `orders_h_2` and `orders_h_0`, the remainders of those two hashes (not `orders_h_1` and `orders_h_2`, as the ids might suggest).
+
+> **Common mistake:** hash-partitioning a column that queries filter by range. Hash only prunes on equality and `IN`.
+
+## Q6. Choosing a method for 24-month retention
+
+**Question:** you need to keep 24 months of orders and drop the oldest month every month. Which partitioning method fits, and why not hash?
+
+Range partitioning by `created_at`, one partition per month: the oldest month is exactly one partition, so retention is `DROP TABLE` (or `DETACH` then drop) instead of a DELETE of 200k+ rows (Session 4 measures the difference). With hash partitioning, every partition contains rows from every month, so deleting a month means a DELETE in all of them.
+
+> **Common mistake:** choosing hash "for even partitions" when the main reason to partition is retention.

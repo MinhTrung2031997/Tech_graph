@@ -1,0 +1,180 @@
+---
+title: "Concept 3: When pruning fails"
+description: "Query shapes that make PostgreSQL read every partition of orders_p: a function on the key (date_trunc, ::date, extract), a filter on a non-key column such as id, an OR with a non-key condition, and a join that reaches the key through a hash join. Measured on 24 monthly partitions: a one-day query took 99.0 ms with created_at::date and 0.3 ms written as a range."
+type: "concept"
+tags: ["partitioning", "postgresql", "partition-pruning", "query-tuning"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html#DDL-PARTITION-PRUNING"
+  - "https://www.postgresql.org/docs/17/xfunc-volatility.html"
+---
+
+<Tldr>
+Pruning works only when the WHERE clause compares the **bare partition key** with a value of a compatible type, using operators the partitioning understands (`=`, `<`, `>=`, `IN`, …). Wrap the key in a function and every partition is read: `date_trunc('month', created_at) = '2025-03-01'` **24 partitions, 131.5 ms**; `created_at::date = '2025-03-15'` **24, 99.0 ms**; the same day as a range **1 partition, 0.3 ms**. A filter on another column cannot prune either: `WHERE id = 777777` read all 24 (55.2 ms; the plain table's primary key answers in microseconds). `… OR seller_id = 42` read 24 (70.9 ms), while an OR of two months read 2. A `timestamp` literal against the `timestamptz` key still pruned, but only at executor startup. On list partitions by marketplace, reaching the key through a **hash join** read all 4 partitions (70.7 ms) instead of 1 (21.7 ms).
+</Tldr>
+
+## The setup
+
+`orders_p` (24 monthly partitions by `created_at`, index on `created_at` in each) and, for the join, `orders_l` (list partitions by `marketplace`, index on `marketplace`). Times are medians of 3 runs; "scanned" counts partitions that were actually read (EXPLAIN ANALYZE).
+
+| Term | Meaning |
+|---|---|
+| Bare key | The partition key column on its own on one side of the comparison: `created_at >= …` |
+| Expression on the key | `date_trunc('month', created_at)`, `created_at::date`, `extract(year FROM created_at)`: the planner cannot map these back to bounds |
+| Immutable / stable | Immutable functions always return the same result for the same input; stable ones can depend on settings such as `TimeZone` (pruned only at execution) |
+| **✓ Pruned / ✗ Not pruned** | The query reads only matching partitions / it reads all of them |
+
+## What defeats pruning
+
+<Flow
+  title="PostgreSQL: query shapes on orders_p"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Query on orders_p', sub: 'shape varies', x: 20, y: 20, w: 200 },
+    { id: 'plan', label: 'Planner', sub: 'maps WHERE to bounds', x: 300, y: 20, w: 200 },
+    { id: 'exec', label: 'Executor', sub: 'Append', x: 580, y: 20, w: 200 },
+    { id: 'match', label: 'Matching month', sub: 'e.g. 2025_03', x: 140, y: 200, w: 200 },
+    { id: 'rest', label: 'Other 23 months', sub: 'cannot match', x: 460, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'q-plan', from: 'q', to: 'plan' },
+    { id: 'plan-exec', from: 'plan', to: 'exec' },
+    { id: 'exec-match', from: 'exec', to: 'match', quiet: true },
+    { id: 'exec-rest', from: 'exec', to: 'rest', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Function on the key',
+      path: 'created_at::date = … → Planner ✗ cannot map to bounds → Executor scans 24 → 99.0 ms',
+      summary: 'The planner prunes on the column, not on what you compute from it.',
+      subs: { plan: '✗ no bounds to compare', match: '✓ scanned', rest: '✓ scanned (0 rows)' },
+      steps: [
+        {
+          title: 'A cast hides the key',
+          note: 'created_at::date is a timestamptz → date conversion, which depends on TimeZone (stable). The planner has bounds for created_at, not for created_at::date, so all 24 partitions are scanned. date_trunc(\'month\', created_at) = \'2025-03-01\' behaved the same (131.5 ms) and so did extract(year FROM created_at) = 2025 (153.1 ms).',
+          code: "SELECT count(*) FROM orders_p WHERE created_at::date = '2025-03-15';   -- 24 partitions, 99.0 ms",
+          active: ['q', 'plan', 'exec', 'match', 'rest'],
+          edges: ['q-plan', 'plan-exec', 'exec-match', 'exec-rest'],
+        },
+        {
+          title: 'Write the range instead',
+          note: 'The same day as a half-open range on the bare key: plan-time pruning to one partition and an index range scan inside it. 0.3 ms. On the plain orders table, the ::date form took 86.8 ms (full scan): an expression on the column defeats ordinary indexes too.',
+          code: "SELECT count(*) FROM orders_p\nWHERE created_at >= '2025-03-15' AND created_at < '2025-03-16';   -- 1 partition, 0.3 ms",
+          subs: { plan: '✓ 1 of 24', match: '✓ scanned', rest: '✗ pruned' },
+          active: ['q', 'plan', 'exec', 'match'],
+          edges: ['q-plan', 'plan-exec', 'exec-match'],
+        },
+      ],
+    },
+    {
+      title: 'Filter on a non-key column',
+      path: 'WHERE id = 777777 → Planner ✗ id says nothing about created_at → Executor scans 24 → 55.2 ms',
+      summary: 'Partitions are chosen by the key and nothing else.',
+      subs: { plan: '✗ id is not the key', match: '✓ scanned (1 row)', rest: '✓ scanned (0 rows)' },
+      steps: [
+        {
+          title: 'Look up an order by id',
+          note: 'Nothing tells the planner which month order 777777 is in. orders_p has no index on id (Session 3 explains why a primary key on id alone is not allowed), so each partition is scanned in full. On the plain table, the primary key finds it in 0.009 ms.',
+          code: "SELECT * FROM orders_p WHERE id = 777777;   -- 24 partitions, 55.2 ms",
+          active: ['q', 'plan', 'exec', 'match', 'rest'],
+          edges: ['q-plan', 'plan-exec', 'exec-match', 'exec-rest'],
+        },
+        {
+          title: 'OR with a non-key condition',
+          note: 'A month OR seller 42: rows of seller 42 can be in any month, so all 24 partitions are needed (70.9 ms). An OR of two month ranges is fine: 2 partitions, 10.8 ms.',
+          code: "WHERE (created_at >= '2025-03-01' AND created_at < '2025-04-01') OR seller_id = 42    -- 24\nWHERE (created_at >= '2025-03-01' AND created_at < '2025-04-01')\n   OR (created_at >= '2024-03-01' AND created_at < '2024-04-01')                     -- 2",
+          active: ['q', 'plan', 'exec', 'match', 'rest'],
+          edges: ['q-plan', 'plan-exec', 'exec-match', 'exec-rest'],
+        },
+      ],
+    },
+    {
+      title: 'Type mismatch: pruned late, not lost',
+      path: "timestamp literal vs timestamptz key → Planner keeps 24 → Executor startup ✓ removes 23 → 8.5 ms",
+      summary: 'A cross-type comparison depends on TimeZone, so it waits for execution.',
+      subs: { plan: 'keeps all 24', exec: '✓ Subplans Removed: 23', match: '✓ scanned', rest: '✗ pruned at startup' },
+      steps: [
+        {
+          title: 'timestamp vs timestamptz',
+          note: "timestamp '2025-03-01' (without time zone) compared with a timestamptz column means 2025-03-01 in the session's TimeZone, which is only fixed at run time. The plan contains all 24 partitions and the executor removes 23 at startup. Still fast (8.5 ms), but the plan is larger and, in a generic plan, all partitions are locked first.",
+          code: "SELECT count(*) FROM orders_p\nWHERE created_at >= timestamp '2025-03-01' AND created_at < timestamp '2025-04-01';\n--  Parallel Append\n--    Subplans Removed: 23",
+          active: ['q', 'plan', 'exec', 'match'],
+          edges: ['q-plan', 'plan-exec', 'exec-match'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Summary of measured shapes
+
+| WHERE clause on `orders_p` | Partitions read | Median |
+|---|---|---|
+| `created_at >= '2025-03-01' AND created_at < '2025-04-01'` | 1 (plan time) | 7.2 ms |
+| `date_trunc('month', created_at) = '2025-03-01'` | 24 | 131.5 ms |
+| `created_at::date = '2025-03-15'` | 24 | 99.0 ms |
+| `created_at >= '2025-03-15' AND created_at < '2025-03-16'` | 1 | 0.3 ms |
+| `extract(year FROM created_at) = 2025` | 24 | 153.1 ms |
+| `timestamp` literals instead of `timestamptz` | 1 (executor startup) | 8.5 ms |
+| `id = 777777` | 24 | 55.2 ms |
+| month range `OR seller_id = 42` | 24 | 70.9 ms |
+| two month ranges joined by `OR` | 2 | 10.8 ms |
+
+## Joins that reach the key indirectly
+
+Pruning through a join needs the key's value to arrive as a parameter, which only a nested loop does. On `orders_l` (list partitions by marketplace):
+
+```sql
+SELECT count(*) FROM orders_l o JOIN marketplaces m ON o.marketplace = m.code
+WHERE m.owner = 'alibaba';                                  -- lazada only
+```
+
+| Form | Plan | Partitions read | Median |
+|---|---|---|---|
+| Join as written | Hash Join | all 4 (5M index entries) | 70.7 ms |
+| `WHERE o.marketplace = ANY (ARRAY(SELECT code FROM marketplaces WHERE owner = 'alibaba'))` | value computed first | 1 with rows, 3 probed and empty | 15.0 ms |
+| `WHERE o.marketplace = 'lazada'` | plan-time pruning | 1 | 21.7 ms |
+
+(The ARRAY form was faster than the literal here only because the planner chose a parallel index-only scan for it and a parallel sequential scan of `orders_l_lazada` for the literal; both read one partition's worth of rows.)
+
+<Pitfall>
+Reports and dashboards are where pruning silently disappears: `GROUP BY date_trunc('day', created_at)` is fine, but `WHERE date_trunc('month', created_at) = $1` or `WHERE created_at::date BETWEEN $1 AND $2` reads every partition. Write filters as half-open ranges on the bare key: `created_at >= $1 AND created_at < $2`.
+</Pitfall>
+
+## Real-world scenario: "order detail is slow since we partitioned"
+
+The order detail page runs `SELECT … FROM orders WHERE id = $1`. After partitioning by month, it went from a primary-key lookup to 24 scans. Options, from best to worst:
+
+| Option | Effect |
+|---|---|
+| Carry `created_at` (or the month) with the id wherever orders are referenced, and query `WHERE id = $1 AND created_at = $2` | 1 partition, index lookup |
+| Encode time in the id (e.g. UUIDv7 or a sequence per month) and derive the partition from it | 1 partition, but only if the query also states the derived range |
+| An index on `id` in every partition | 24 index probes instead of 24 scans: fast enough at 24 partitions, worse at 700 |
+| Leave it | 55 ms per page view |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Indexing Session 5, expression indexes](/blogs/databases/indexing/session-5-covering-partial-expression/concept-4-expression-indexes) | The same rule: a function on the column hides it from a plain index |
+| [Indexing Session 3, ignored index](/blogs/databases/indexing/session-3-query-planner/concept-5-ignored-index) | Other reasons the planner cannot use what you built |
+| Concept 4 | What scanning every partition costs in planning time and locks with 731 partitions |
+
+## Key takeaways
+
+1. Pruning needs the bare key compared with a value: no function, cast or expression around the column.
+2. A filter on another column (`id`, `seller_id`) never prunes; every partition is searched.
+3. `OR` keeps pruning only if every branch restricts the key.
+4. A type mismatch such as `timestamp` vs `timestamptz` moves pruning to execution time.
+5. Joins prune only through a nested loop; a hash join reads every partition.
+
+## Check questions
+
+1. Why does `created_at::date = '2025-03-15'` read 24 partitions? Rewrite it so it reads 1.
+2. `WHERE id = 777777` on `orders_p` took 55.2 ms. What would you change in the schema or the query?
+3. Which of these prune: (a) a month `OR` another month, (b) a month `OR seller_id = 42`, (c) `created_at IN ('2025-03-15 10:00+00', '2025-07-01 00:00+00')`?
+4. Why does a `timestamp` literal prune at executor startup but a `timestamptz` literal prune while planning?
+5. The marketplace join read all four list partitions. Why, and what are two ways to make it read one?
+6. A dashboard filters with `date_trunc('month', created_at) = $1`. Explain to its author what it costs and what to write instead.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-2-partitioning-postgresql/concept-3-when-pruning-fails/answers">Worked answers to Q1–Q6</DeepDive>

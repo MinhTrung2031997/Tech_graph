@@ -1,6 +1,7 @@
 {
   "title": "Partitioning and sharding",
   "pages": [
-    "session-1-why-split-data"
+    "session-1-why-split-data",
+    "session-2-partitioning-postgresql"
   ]
 }

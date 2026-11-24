@@ -1,0 +1,65 @@
+---
+title: "Answers: When pruning fails"
+description: "Worked answers to the Session 2 Concept 3 check questions."
+companion: "answers"
+tags: ["partitioning", "postgresql", "partition-pruning", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html#DDL-PARTITION-PRUNING"
+---
+
+<Tldr>
+Give the planner the bare key and a comparable value, on every branch of the WHERE clause.
+</Tldr>
+
+## Q1. The cast to date
+
+**Question:** why does `created_at::date = '2025-03-15'` read 24 partitions? Rewrite it so it reads 1.
+
+The partition bounds are defined on `created_at`. The planner can only compare bounds with conditions of the form `created_at <op> value`; `created_at::date` is a different expression whose relation to the bounds it does not derive (and the cast depends on `TimeZone`). Rewrite as a half-open range on the bare key:
+
+```sql
+WHERE created_at >= '2025-03-15' AND created_at < '2025-03-16'   -- 1 partition, 0.3 ms (vs 99.0 ms)
+```
+
+> **Common mistake:** `created_at BETWEEN '2025-03-15' AND '2025-03-15 23:59:59'`. It prunes, but drops rows in the last second's fractions; use `<` the next day.
+
+## Q2. Looking up by id
+
+**Question:** `WHERE id = 777777` on `orders_p` took 55.2 ms. What would you change in the schema or the query?
+
+Best: make queries that know the order also know its time, and pass both (`WHERE id = $1 AND created_at = $2`, or a range around it), so PostgreSQL prunes to one partition and uses an index there. If callers only have the id, add an index on `id` (it becomes one index per partition): 24 cheap index probes instead of 24 full scans. A time-ordered id (UUIDv7, or a sequence you can map to a date) lets the application compute the range from the id.
+
+> **Common mistake:** expecting a primary key on `id` to fix it. PostgreSQL rejects a primary key that does not include the partition key (Session 3).
+
+## Q3. Which of these prune?
+
+**Question:** which of these prune: (a) a month `OR` another month, (b) a month `OR seller_id = 42`, (c) `created_at IN ('2025-03-15 10:00+00', '2025-07-01 00:00+00')`?
+
+(a) Yes: each branch restricts `created_at`, so the union of their partitions is kept (2 partitions, 10.8 ms). (b) No: the `seller_id` branch can match rows in any month, so all 24 are read (70.9 ms). (c) Yes: an `IN` list of constants of the key's type prunes to the partitions of each value; the plan contained only `orders_p_2025_03` and `orders_p_2025_07`.
+
+> **Common mistake:** assuming one restricted branch is enough. An OR is only as selective as its least selective branch.
+
+## Q4. timestamp vs timestamptz
+
+**Question:** why does a `timestamp` literal prune at executor startup but a `timestamptz` literal prune while planning?
+
+Comparing `timestamptz` with `timestamptz` is immutable: the planner can evaluate it against the bounds immediately. Comparing `timestamptz` with `timestamp` (without time zone) requires interpreting the `timestamp` in the session's `TimeZone`, so the comparison is only stable. A plan may be cached and run later under another `TimeZone`, so the planner defers pruning to executor startup (`Subplans Removed: 23`).
+
+> **Common mistake:** concluding pruning failed because the plan is long. Look for `Subplans Removed`.
+
+## Q5. The marketplace join
+
+**Question:** the marketplace join read all four list partitions. Why, and what are two ways to make it read one?
+
+The planner chose a hash join: it built a hash table from the one matching `marketplaces` row and streamed all of `orders_l` through it. Pruning needs the key's value before scanning, which only a nested loop (per outer row) or a precomputed value provides. Two fixes: compute the value first (`marketplace = ANY (ARRAY(SELECT code …))`, 15.0 ms, one partition with rows), or put the literal key in the query (`marketplace = 'lazada'`, plan-time pruning, 21.7 ms).
+
+> **Common mistake:** forcing a nested loop with `enable_hashjoin = off`. In the lab that produced a plan with `orders_l` as the outer side and took 163.8 ms, worse than the hash join.
+
+## Q6. The dashboard filter
+
+**Question:** a dashboard filters with `date_trunc('month', created_at) = $1`. Explain to its author what it costs and what to write instead.
+
+The function hides the key from the planner, so every partition is read: 131.5 ms in the lab for a month that pruned to one partition in 7.2 ms written as a range, and it grows with every month of history. Write `created_at >= $1 AND created_at < $1 + interval '1 month'`, with `$1` as a `timestamptz`. (With a generic plan, `$1 + interval '1 month'` is stable, so pruning happens at executor startup; passing both bounds as parameters lets a custom plan prune while planning, Concept 4.)
+
+> **Common mistake:** trying to fix it with an expression index on `date_trunc('month', created_at)`. PostgreSQL refuses (`ERROR: functions in index expression must be marked IMMUTABLE`, because the result depends on `TimeZone` for a `timestamptz`), and an index would not stop all partitions being opened anyway.

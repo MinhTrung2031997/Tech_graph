@@ -1,0 +1,220 @@
+---
+title: "Concept 5: The same table in MySQL, and why MongoDB has no partitions"
+description: "MySQL 8.4 partitions the 5M orders by RANGE COLUMNS(created_at) only after the primary key is widened to include created_at; EXPLAIN's partitions column shows pruning, and a month read one partition in 19.1 ms where the plain table's secondary index took 103.9 ms. DATE() and YEAR() on the key read all 24. MongoDB has no table partitioning: the same month is an index range scan of 212,039 keys in 62 ms."
+type: "concept"
+tags: ["partitioning", "mysql", "innodb", "mongodb", "partition-pruning"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-columns-range.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-pruning.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-limitations-partitioning-keys-unique-keys.html"
+  - "https://www.mongodb.com/docs/manual/core/timeseries-collections/"
+---
+
+<Tldr>
+**MySQL** has partitioning built into InnoDB tables, with stricter rules than PostgreSQL. `PRIMARY KEY (id)` was rejected: `ERROR 1503: A PRIMARY KEY must include all columns in the table's partitioning function`; with `PRIMARY KEY (id, created_at)` the 24 monthly partitions loaded 5M rows in 14.6–16.6 s (plain copy: 10.8–12.3 s). A row for 2026 failed with `ERROR 1526: Table has no partition for value from column_list`. `EXPLAIN` lists the partitions read: a month read **only `p2025_03`, 19.1 ms**, while the plain table used its secondary index plus a primary-key lookup per row, **103.9 ms**. Prepared statements prune with their parameters. `DATE(created_at) = …` and `YEAR(created_at) = 2025` read all 24 partitions. **MongoDB** has no table partitioning: a collection is one set of documents and indexes (sharding, Sessions 5–8, splits it across servers). The month query was an index range scan of 212,039 keys and documents, 62 ms. Its single-server alternatives (time-series collections, TTL indexes, a collection per month) are Session 3.
+</Tldr>
+
+## The setup
+
+Database `pt2` in `idx-mysql` and `idx-mongo`, same 5M `orders` as in PostgreSQL. The MySQL partitioned copy:
+
+```sql
+CREATE TABLE orders_p (
+  id BIGINT NOT NULL, seller_id INT NOT NULL, marketplace VARCHAR(8) NOT NULL, status VARCHAR(10) NOT NULL,
+  amount DECIMAL(12,2) NOT NULL, created_at DATETIME NOT NULL,
+  PRIMARY KEY (id, created_at),
+  KEY orders_p_created_at_idx (created_at)
+) PARTITION BY RANGE COLUMNS (created_at) (
+  PARTITION p2024_01 VALUES LESS THAN ('2024-02-01'),
+  -- … one per month …
+  PARTITION p2025_12 VALUES LESS THAN ('2026-01-01')
+);
+INSERT INTO orders_p SELECT * FROM orders;
+```
+
+| Term | Meaning |
+|---|---|
+| `RANGE COLUMNS` | Range partitioning directly on column values (dates, strings), instead of an integer expression like `TO_DAYS(created_at)` |
+| `VALUES LESS THAN` | Each partition's exclusive upper bound; partitions must be listed in increasing order |
+| `partitions` column | In `EXPLAIN`, the partitions the statement will read; `NULL` for a non-partitioned table |
+| Clustered index | InnoDB stores rows in primary-key order; a secondary index entry holds the primary key, so each match needs a second lookup |
+| **✓ Read / ✗ Pruned** | Partition listed in `EXPLAIN` / not listed |
+
+## MySQL
+
+<Flow
+  title="MySQL InnoDB: orders_p by RANGE COLUMNS (created_at)"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Statement', sub: 'SELECT or INSERT', x: 20, y: 20, w: 200 },
+    { id: 'opt', label: 'Optimizer', sub: 'pruning in EXPLAIN', x: 300, y: 20, w: 200 },
+    { id: 'err', label: 'No partition', sub: 'ERROR 1526', x: 580, y: 20, w: 200 },
+    { id: 'mar', label: 'p2025_03', sub: '211,603 rows (est.)', x: 140, y: 200, w: 200 },
+    { id: 'rest', label: 'Other 23', sub: 'p2024_01 … p2025_12', x: 460, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'q-opt', from: 'q', to: 'opt' },
+    { id: 'opt-err', from: 'opt', to: 'err' },
+    { id: 'opt-mar', from: 'opt', to: 'mar' },
+    { id: 'opt-rest', from: 'opt', to: 'rest' },
+  ]}
+  cases={[
+    {
+      title: 'Month on the bare key',
+      path: 'created_at range → Optimizer ✓ partitions = p2025_03 → full scan of 1 partition → 19.1 ms',
+      summary: 'Reading one whole partition beats 212k secondary-index lookups.',
+      subs: { mar: '✓ type ALL, 19.1 ms', rest: '✗ pruned' },
+      steps: [
+        {
+          title: 'EXPLAIN shows the partition',
+          note: 'partitions: p2025_03, type: ALL. The optimizer reads the whole March partition rather than use the created_at index, because the month is the whole partition.',
+          code: "EXPLAIN SELECT count(*), sum(amount) FROM orders_p\nWHERE created_at >= '2025-03-01' AND created_at < '2025-04-01';\n-- partitions: p2025_03 | type: ALL | rows: 211603",
+          active: ['q', 'opt', 'mar'],
+          edges: ['q-opt', 'opt-mar'],
+        },
+        {
+          title: 'Compared with the plain table',
+          note: 'On orders (no partitions) the same query used a range scan of orders_created_at_idx: each of the 212,039 entries holds the id, and InnoDB then looks the row up in the clustered primary key to read amount. 103.9 ms vs 19.1 ms (medians of 3). A prepared statement with ? placeholders also showed partitions: p2025_03 when executed.',
+          code: "PREPARE s FROM 'EXPLAIN SELECT … FROM orders_p WHERE created_at >= ? AND created_at < ?';\nSET @a = '2025-03-01', @b = '2025-04-01'; EXECUTE s USING @a, @b;   -- partitions: p2025_03",
+          active: ['opt', 'mar'],
+          edges: ['opt-mar'],
+        },
+      ],
+    },
+    {
+      title: 'Function on the key',
+      path: 'DATE(created_at) = … → Optimizer ✗ cannot prune → all 24 partitions → 535.7 ms',
+      summary: 'Same rule as PostgreSQL.',
+      subs: { mar: '✓ scanned', rest: '✓ scanned' },
+      steps: [
+        {
+          title: 'DATE() and YEAR()',
+          note: 'Both listed all 24 partitions. DATE(created_at) = \'2025-03-15\': 535.7 ms (plain table: 393.3 ms, a full scan). YEAR(created_at) = 2025: 488.3 ms (plain: 441.4 ms). The day as a range: p2025_03 only, 2.6 ms.',
+          code: "EXPLAIN SELECT count(*) FROM orders_p WHERE DATE(created_at) = '2025-03-15';\n-- partitions: p2024_01,p2024_02,…,p2025_12 | type: ALL",
+          active: ['q', 'opt', 'mar', 'rest'],
+          edges: ['q-opt', 'opt-mar', 'opt-rest'],
+        },
+      ],
+    },
+    {
+      title: 'Rules at creation and insert',
+      path: 'PRIMARY KEY (id) → ✗ ERROR 1503 · INSERT for 2026 → ✗ ERROR 1526',
+      summary: 'MySQL enforces the key rules at CREATE TABLE.',
+      subs: { err: '✗ ERROR 1503 / 1526' },
+      steps: [
+        {
+          title: 'The primary key must contain the partition column',
+          note: 'Each partition has its own indexes, so a unique key that does not include created_at could not be checked across partitions. MySQL refuses the table; PostgreSQL has the same rule (Session 3).',
+          code: "CREATE TABLE orders_p (… PRIMARY KEY (id)) PARTITION BY RANGE COLUMNS (created_at) (…);\n-- ERROR 1503 (HY000): A PRIMARY KEY must include all columns in the table's\n--   partitioning function (prefixed columns are not considered).",
+          active: ['q', 'opt', 'err'],
+          edges: ['q-opt', 'opt-err'],
+        },
+        {
+          title: 'No partition for January 2026',
+          note: 'The last partition ends below 2026-01-01, and there is no MAXVALUE partition, so the row is rejected.',
+          code: "INSERT INTO orders_p VALUES (5000001, 1, 'shopee', 'delivered', 10, '2026-01-05 10:00:00');\n-- ERROR 1526 (HY000): Table has no partition for value from column_list",
+          active: ['q', 'opt', 'err'],
+          edges: ['q-opt', 'opt-err'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: the same month on one collection"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'aggregate', sub: '$match March', x: 20, y: 20, w: 200 },
+    { id: 'plan', label: 'Query planner', sub: 'picks an index', x: 300, y: 20, w: 200 },
+    { id: 'parts', label: 'Partitions', sub: 'none in MongoDB', x: 580, y: 20, w: 200 },
+    { id: 'idx', label: 'created_at index', sub: 'IXSCAN', x: 140, y: 200, w: 200 },
+    { id: 'docs', label: 'orders collection', sub: '5M documents', x: 460, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'q-plan', from: 'q', to: 'plan' },
+    { id: 'plan-parts', from: 'plan', to: 'parts' },
+    { id: 'plan-idx', from: 'plan', to: 'idx' },
+    { id: 'idx-docs', from: 'idx', to: 'docs' },
+  ]}
+  cases={[
+    {
+      title: 'One month',
+      path: 'no partitions ✗ → IXSCAN created_at ✓ 212,039 keys → FETCH 212,039 documents → 62 ms',
+      summary: 'Skipping data on one server is the index\'s job.',
+      subs: { parts: '✗ nothing to prune', idx: '✓ 212,039 keys', docs: '✓ 212,039 fetched' },
+      steps: [
+        {
+          title: 'No partition layer',
+          note: 'A MongoDB collection is one storage table plus one per index in WiredTiger. There is no PARTITION BY. Sharding (Sessions 5–8) splits a collection across servers by a shard key, and its chunk routing resembles pruning, but on one server there is nothing to prune.',
+          active: ['q', 'plan', 'parts'],
+          edges: ['q-plan', 'plan-parts'],
+        },
+        {
+          title: 'Index range scan',
+          note: 'explain("executionStats"): totalKeysExamined 212,039, totalDocsExamined 212,039. Median of 5 runs: 62 ms. The whole collection: 752 ms.',
+          code: 'db.orders.aggregate([\n  { $match: { created_at: { $gte: ISODate("2025-03-01"), $lt: ISODate("2025-04-01") } } },\n  { $group: { _id: null, n: { $sum: 1 }, s: { $sum: "$amount" } } }\n])',
+          active: ['plan', 'idx', 'docs'],
+          edges: ['plan-idx', 'idx-docs'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Three engines side by side
+
+| | PostgreSQL 17 | MySQL 8.4 | MongoDB 8.0 |
+|---|---|---|---|
+| Table partitioning | Declarative: range, list, hash; sub-partitions | Range, list, hash, key (+ `COLUMNS` variants), sub-partitions; InnoDB and NDB tables only | None (sharding instead, across servers) |
+| Primary key without the partition column | ✗ rejected (Session 3) | ✗ ERROR 1503 | n/a |
+| Insert with no partition | ✗ `no partition of relation … found for row` | ✗ ERROR 1526 | n/a |
+| Where to see pruning | Plan shape, `Subplans Removed`, `(never executed)` | `partitions` column of `EXPLAIN` | n/a |
+| Month query (212,039 rows), plain vs partitioned | 8.6 ms vs 8.4 ms | 103.9 ms vs 19.1 ms | 62 ms (index, no partitions) |
+| Load 5M rows, plain vs partitioned | 2.90 s vs 2.95 s (medians) | 10.8–12.3 s vs 14.6–16.6 s (2 runs) | not compared |
+
+Why MySQL gained more from pruning: InnoDB secondary indexes point to the primary key, so 212,039 index matches meant 212,039 lookups in the clustered index ([Indexing Session 6](/blogs/databases/indexing/session-6-engine-differences/concept-2-innodb-secondary)). PostgreSQL's index points straight at heap pages, which were already in time order. The partitioned load was slower in MySQL partly because its primary key is wider (`id, created_at`), which also widens every secondary index entry.
+
+<Pitfall>
+In MySQL, adding `created_at` to the primary key to satisfy ERROR 1503 changes what the key promises: `(id, created_at)` allows two rows with the same `id` in different months. If `id` must be unique, something else has to enforce it (Session 3 covers the options).
+</Pitfall>
+
+## Real-world scenario: one schema, two engines
+
+A data team runs the same orders schema on PostgreSQL (operational) and MySQL (a legacy reporting replica). After partitioning both by month:
+
+| Report | PostgreSQL | MySQL |
+|---|---|---|
+| Monthly sales for one month | About as fast as before | About 5× faster: one partition scan instead of a secondary index plus lookups |
+| Order lookup by id | Slower: 24 partitions searched | Still fast with `PRIMARY KEY (id, created_at)`: 24 primary-key probes, 0.063 ms vs 0.035 ms |
+| `WHERE DATE(created_at) = ?` | All partitions | All partitions |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 3 | The same "function on the key" rule in PostgreSQL |
+| [Indexing Session 6, InnoDB secondary indexes](/blogs/databases/indexing/session-6-engine-differences/concept-2-innodb-secondary) | Why a range on a secondary index costs a lookup per row in InnoDB |
+| [Indexing Session 6, MongoDB explain](/blogs/databases/indexing/session-6-engine-differences/concept-5-mongodb-explain) | Reading keys and documents examined |
+
+## Key takeaways
+
+1. MySQL partitions InnoDB tables with `PARTITION BY RANGE COLUMNS` and shows pruning in `EXPLAIN`'s `partitions` column.
+2. MySQL rejects a primary key that lacks the partition column (ERROR 1503) and inserts with no partition (ERROR 1526).
+3. Pruning helped MySQL more (103.9 → 19.1 ms) because its secondary-index range scans pay a primary-key lookup per row.
+4. Functions on the key (`DATE()`, `YEAR()`) defeat pruning in MySQL as in PostgreSQL.
+5. MongoDB has no table partitioning; on one server, indexes do the skipping, and sharding splits data across servers.
+
+## Check questions
+
+1. Why does MySQL require `created_at` in the primary key of `orders_p`, and what does adding it change about uniqueness?
+2. Where in MySQL do you see which partitions a query reads? What did it show for `DATE(created_at) = '2025-03-15'`?
+3. The month query was 5× faster partitioned in MySQL but not in PostgreSQL. Explain the difference.
+4. Does MySQL prune when the bounds come from a prepared statement's `?` placeholders? How was it checked?
+5. Why is there no `PARTITION BY` in MongoDB, and what did the month query use instead?
+6. The partitioned MySQL load was slower than the plain one. Give one reason related to the table definition.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-2-partitioning-postgresql/concept-5-mysql-and-mongodb/answers">Worked answers to Q1–Q6</DeepDive>

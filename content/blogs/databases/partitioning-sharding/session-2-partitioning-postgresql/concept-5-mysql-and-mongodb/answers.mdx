@@ -1,0 +1,62 @@
+---
+title: "Answers: The same table in MySQL, and why MongoDB has no partitions"
+description: "Worked answers to the Session 2 Concept 5 check questions."
+companion: "answers"
+tags: ["partitioning", "mysql", "mongodb", "answers"]
+status: "draft"
+sources:
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-limitations-partitioning-keys-unique-keys.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-pruning.html"
+---
+
+<Tldr>
+MySQL and PostgreSQL share the rules (key in unique constraints, bare key for pruning); MongoDB leaves splitting data to sharding.
+</Tldr>
+
+## Q1. created_at in the primary key
+
+**Question:** why does MySQL require `created_at` in the primary key of `orders_p`, and what does adding it change about uniqueness?
+
+Every partition has its own copy of each index. A unique check therefore only sees one partition. If the unique key contains the partitioning column, two rows with the same key value must land in the same partition, so a per-partition check is enough; otherwise MySQL could not guarantee uniqueness and refuses the table (ERROR 1503). Adding it changes the promise from "`id` is unique" to "the pair `(id, created_at)` is unique": the database would now accept the same `id` twice with different dates.
+
+> **Common mistake:** treating `PRIMARY KEY (id, created_at)` as equivalent to `PRIMARY KEY (id)`.
+
+## Q2. Seeing pruning in MySQL
+
+**Question:** where in MySQL do you see which partitions a query reads? What did it show for `DATE(created_at) = '2025-03-15'`?
+
+The `partitions` column of `EXPLAIN` (also in `EXPLAIN FORMAT=JSON`). For the month range it showed `p2025_03`; for `DATE(created_at) = '2025-03-15'` it listed all 24 partitions with `type: ALL`, and the query took 535.7 ms against 2.6 ms for the same day written as a range.
+
+> **Common mistake:** expecting `EXPLAIN FORMAT=TREE` to list partitions; it shows the access path but not the partition list.
+
+## Q3. 5× in MySQL, 1× in PostgreSQL
+
+**Question:** the month query was 5× faster partitioned in MySQL but not in PostgreSQL. Explain the difference.
+
+Both partitioned tables read one partition in full. The difference is the unpartitioned baseline. In InnoDB, the `created_at` index stores the primary key, so a range of 212,039 entries means 212,039 lookups into the clustered index to fetch `amount` (103.9 ms). In PostgreSQL, the index points at heap pages, and because rows were inserted in time order those pages are consecutive: the index scan read 3,113 buffers, close to the partition's 1,982 (8.6 ms vs 8.4 ms).
+
+> **Common mistake:** generalising "partitioning makes range queries N× faster" from one engine or one data layout.
+
+## Q4. Prepared statements in MySQL
+
+**Question:** does MySQL prune when the bounds come from a prepared statement's `?` placeholders? How was it checked?
+
+Yes. `PREPARE s FROM 'EXPLAIN SELECT … WHERE created_at >= ? AND created_at < ?'`, then `EXECUTE s USING @a, @b` with March's bounds showed `partitions: p2025_03`. MySQL applies pruning when the statement is executed with the values.
+
+> **Common mistake:** carrying PostgreSQL's generic-plan behaviour (lock everything, prune at startup) over to MySQL without checking.
+
+## Q5. No PARTITION BY in MongoDB
+
+**Question:** why is there no `PARTITION BY` in MongoDB, and what did the month query use instead?
+
+MongoDB splits large collections across servers with sharding; on one server, a collection is one WiredTiger table and one table per index, and there is no feature that divides it by a key. The month query used the `created_at` index: an IXSCAN over 212,039 keys and a FETCH of 212,039 documents, 62 ms. For time-based retention on one server, MongoDB offers TTL indexes, time-series collections, or a collection per period (Session 3).
+
+> **Common mistake:** calling time-series collections "partitions". They bucket documents by time inside one collection, but you cannot drop or attach a bucket range the way you drop a partition.
+
+## Q6. The slower MySQL load
+
+**Question:** the partitioned MySQL load was slower than the plain one. Give one reason related to the table definition.
+
+The primary key grew from `(id)` to `(id, created_at)`, and every InnoDB secondary index entry stores the primary key, so the `created_at` index entries became wider too: the partitioned table took 423 MB against 392 MB. Loading also writes into 24 separate B-trees per index instead of one. The two runs measured 14.6 and 16.6 s against 10.8 and 12.3 s.
+
+> **Common mistake:** attributing the whole difference to "routing". In PostgreSQL, where the definitions were otherwise equal, routing cost was within noise.

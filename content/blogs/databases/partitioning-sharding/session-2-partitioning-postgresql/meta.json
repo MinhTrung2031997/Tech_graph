@@ -1,0 +1,13 @@
+{
+  "title": "Session 2: Partitioning in PostgreSQL",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-declarative-partitioning/index",
+    "concept-2-pruning-plan-vs-execution/index",
+    "concept-3-when-pruning-fails/index",
+    "concept-4-how-many-partitions/index",
+    "concept-5-mysql-and-mongodb/index",
+    "lab/index"
+  ]
+}

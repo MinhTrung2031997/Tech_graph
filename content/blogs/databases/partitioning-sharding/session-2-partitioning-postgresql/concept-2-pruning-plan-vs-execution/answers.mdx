@@ -1,0 +1,65 @@
+---
+title: "Answers: Partition pruning, at plan time and at execution time"
+description: "Worked answers to the Session 2 Concept 2 check questions."
+companion: "answers"
+tags: ["partitioning", "postgresql", "partition-pruning", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html#DDL-PARTITION-PRUNING"
+---
+
+<Tldr>
+Pruning is decided as soon as the value is known: while planning, when execution starts, or per row.
+</Tldr>
+
+## Q1. Three moments
+
+**Question:** name the three moments PostgreSQL can prune, and what EXPLAIN shows for each.
+
+| Moment | When the value is known | EXPLAIN shows |
+|---|---|---|
+| Planning | Constants in the query | Only the surviving partitions are in the plan |
+| Executor startup | Parameters of a generic plan, stable functions such as `now()`, values from an InitPlan in some shapes | `Subplans Removed: N` under the Append |
+| During execution | Values that change per outer row (nested loop), or computed by a sub-select | `(never executed)` on the skipped partitions, only with ANALYZE |
+
+> **Common mistake:** looking only for a short plan. A plan listing all 24 partitions can still read only one.
+
+## Q2. now() and Subplans Removed
+
+**Question:** why does `created_at >= now() - interval '11 months'` print `Subplans Removed: 23` even without ANALYZE?
+
+`now()` is **stable**, not immutable: it returns the same value throughout a statement but is not known when the plan is made (a plan may be reused later). So the planner keeps all 24 partitions, and pruning happens at executor startup, when `now()` is evaluated. Plain EXPLAIN performs executor startup too (it initialises the plan tree without running it), so the removal is already reported.
+
+> **Common mistake:** replacing `now()` with a function you wrote and marking it `VOLATILE`. Volatile expressions cannot be used for pruning at all.
+
+## Q3. Two promo days, two partitions
+
+**Question:** in the promo-days join, why did only 2 partitions run, and why would a plain EXPLAIN mislead you?
+
+The planner chose a nested loop: for each of the two `promo_days` rows it runs the inner Append with that row's `day_start` and `day_end` as parameters, and the Append prunes for those values. 11.11 hit `orders_p_2024_11`, 12.12 hit `orders_p_2024_12`; the other 22 were never executed. A plain EXPLAIN can only show the plan, which contains all 24 partitions, because which ones run depends on the data in `promo_days`.
+
+> **Common mistake:** "the join scans every partition" based on EXPLAIN without ANALYZE.
+
+## Q4. 8.6 ms vs 71.0 ms with pruning off
+
+**Question:** pruning off still took 8.6 ms with indexes and 71.0 ms without. What does that tell you about where pruning pays off?
+
+With an index on `created_at` in every partition, a partition that cannot match costs one index descent that finds nothing, a few buffers each, so skipping 23 of them saves little. Without such an index, each non-matching partition would be read in full: 46,736 buffers instead of 1,982. Pruning pays off when the query cannot otherwise rule a partition out cheaply: no index on the key, or a filter on the key plus other columns that would make the planner read whole partitions.
+
+> **Common mistake:** judging pruning only by query speed in a fully indexed lab. It also limits locks and planning (Concept 4).
+
+## Q5. Why the plain table kept up
+
+**Question:** the month query was as fast on the plain `orders` table. Why, and would that hold if rows were stored in random time order?
+
+`orders` was loaded in id order and ids increase with `created_at`, so March's rows sit in consecutive heap pages. The index range scan on `created_at` therefore read 3,113 buffers, close to the 1,982 of the March partition. If the same rows were scattered randomly in time, the index scan would visit about 212k rows spread over almost every page of the table, and the planner would likely switch to a full scan, while the partitioned table would still read only the March partition. Partitioning by time makes the "correlated with time" layout guaranteed instead of accidental.
+
+> **Common mistake:** benchmarking partitioning on a freshly loaded, perfectly ordered table and concluding it never helps reads.
+
+## Q6. Generic plans on 731 partitions
+
+**Question:** what does a generic plan cost on a table with 731 partitions, even though it prunes correctly?
+
+Before executor-startup pruning, PostgreSQL 17 locks every partition and index in the generic plan: Concept 4 measured 1,466 locks for a one-day query on `orders_d`, against 6 with a custom plan. Locks beyond the 16 fast-path slots per backend go into the shared lock table, which is sized from `max_locks_per_transaction`. The first execution also took 42.9 ms instead of 4.9 ms.
+
+> **Common mistake:** assuming "Subplans Removed: 730" means the removed partitions cost nothing.
