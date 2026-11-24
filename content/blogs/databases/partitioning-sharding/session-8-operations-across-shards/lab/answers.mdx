@@ -1,0 +1,78 @@
+---
+title: "Answers: Operations across shards session quiz"
+description: "Worked answers to the Session 8 quiz, with the lab's measured values."
+companion: "answers"
+tags: ["sharding", "transactions", "ids", "rebalancing", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/transactions-sharded-clusters/"
+  - "https://docs.citusdata.com/en/stable/develop/api_udf.html"
+---
+
+<Tldr>
+Everything that crosses shards costs more: commits become two-phase, uniqueness needs a claim, ids need a scheme, moves need a pause. A shard key that keeps the common operations on one shard avoids most of it.
+</Tldr>
+
+## Q1. Sellers 10 and 3010
+
+**Question:** a MongoDB transaction updates sellers 10 and 3010, whose balances live on different shards. Which commit protocol runs, and which node coordinates it?
+
+Two-phase commit: two participants. The first shard the transaction wrote to (the one holding seller 10, written first) becomes the coordinator; it records the participants, gets `prepareTransaction` from both, writes the commit decision, then commits on both. mongos counts it under `commitTypes.twoPhaseCommit`. Lab cost: median 22–23 ms against 3.1–4.5 ms on one shard.
+
+> **Common mistake:** naming mongos or the config servers as the coordinator.
+
+## Q2. Two shards on one worker
+
+**Question:** on Citus, a transaction updates two shards that both live on `pt-citus-w1`. How many rows does it add to `pg_dist_transaction`, and why?
+
+None. Citus writes both shards over the same connection to w1, so the worker commits them in one local transaction. 2PC, and its rows in `pg_dist_transaction` (one per worker), only appear when writes reach a second worker: +2 rows per transaction for sellers 8 and 1.
+
+> **Common mistake:** assuming any multi-shard write is two-phase.
+
+## Q3. Prepared but undecided
+
+**Question:** what does a prepared but undecided transaction hold, and what resolves it on each engine?
+
+Its locks and its changes, durably, on every participant: other writers to those rows or documents must wait (Citus) or get write conflicts (MongoDB) until it ends. MongoDB: the coordinator shard keeps its decision in `config.transaction_coordinators` and resumes after a failover, then commits or aborts on the participants. Citus: the coordinator's `pg_dist_transaction` rows record which prepared transactions committed; the maintenance daemon (every `citus.recover_2pc_interval`, 1 min) or `recover_prepared_transactions()` commits those and rolls back the rest.
+
+> **Common mistake:** running `ROLLBACK PREPARED` by hand on a worker without checking the coordinator's record.
+
+## Q4. Unique `order_no`, duplicate `_id`
+
+**Question:** why does MongoDB refuse a unique index on `order_no` for a collection sharded by `seller_id`, and which `_id` behaviour shows the same limit?
+
+Each shard's unique index covers only its own documents; two equal `order_no` values for different sellers go to different shards, and neither shard can see the other's. MongoDB refuses the index (CannotCreateIndex 67) rather than enforce it partly. `_id` shows what happens when it cannot refuse: its index is always unique per shard, so a second document with `_id: 1` for a seller on the other shard was accepted, and `find({ _id: 1 })` returned two documents.
+
+> **Common mistake:** relying on `_id` uniqueness when `_id` is not the shard key.
+
+## Q5. Claims on eight shards
+
+**Question:** the claim-collection pattern made about half the inserts two-phase on two shards. Roughly what share would it be on eight shards?
+
+About 7 in 8 (87.5%). The claim goes to the shard of `hash(order id)` and the order to the shard of its seller; with eight equally loaded shards, the chance they coincide is 1 in 8. The two-shard lab measured 47–52%, matching 1 − 1/2.
+
+> **Common mistake:** extrapolating the 2-shard cost to production clusters with more shards.
+
+## Q6. Smallest index, largest index
+
+**Question:** which primary key kept the PostgreSQL index smallest, and why was the bulk UUIDv7 index the largest?
+
+The bigint identity: 21 MB at 90.1% leaf density, because 8-byte keys arrive in increasing order and only the rightmost leaf is written (rightmost splits leave pages 90% full). The bulk UUIDv7 index was 40 MB at 68.2%: the insert made 423 rows per millisecond, which share a timestamp prefix and differ only in random bits, so within each millisecond they arrived in random order and caused 50/50 splits among the newest pages, on top of keys twice as wide. At one row per millisecond the same layout gave 30 MB at 90.0%.
+
+> **Common mistake:** assuming every UUIDv7 generator is monotonic within a millisecond.
+
+## Q7. Who waited during `block_writes`
+
+**Question:** during `block_writes`, which traffic waited and which did not?
+
+Writes to the moving shard group waited: the seller-8 writer's worst transactions were 1.73 s and 0.98 s, matching the 1.83 s and 1.16 s moves. Reads of the moving shard did not wait (worst 156 ms), and writes to other shards were unaffected (worst 217 ms, normal noise on the emulated cluster). The colocated `seller_balances` shard moved and was blocked with it.
+
+> **Common mistake:** reading `block_writes` as "the cluster is read-only". Only the shard group being moved is.
+
+## Q8. The key, and what to move off
+
+**Question:** give the shard key you would choose for marketplace orders, and one workload you would move off the shards because it fans out under any key.
+
+`seller_id`, made compound (`seller_id` + `created_at` or order id) if one seller could outgrow a shard. Seller dashboards hit one shard (0.61 ms, 7 docs, against 1.05 ms on two shards with hashed ids), and a seller's order, wallet and fee writes commit on one shard. Platform-wide reports filtered only by date (GMV per marketplace per day) fan out under seller, hashed id and marketplace keys alike: run them on a replica or a warehouse fed by change streams or CDC.
+
+> **Common mistake:** choosing `marketplace` because the reports group by it: three values, at most three shards, and Shopee alone is half the data.

@@ -1,0 +1,62 @@
+---
+title: "Answers: Rebalancing: moving data between shards"
+description: "Worked answers to the Session 8 Concept 4 check questions."
+companion: "answers"
+tags: ["sharding", "rebalancing", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-balancer-administration/#chunk-migration-procedure"
+  - "https://docs.citusdata.com/en/stable/develop/api_udf.html#citus-move-shard-placement"
+---
+
+<Tldr>
+A good move copies while serving and pauses only to switch. How long the pause lasts depends on whether changes during the copy can be streamed.
+</Tldr>
+
+## Q1. Inserts during the clone
+
+**Question:** why did inserts into the moving MongoDB range keep working during the 1.77 s clone?
+
+During the clone the donor, sh2, still owns the range. mongos keeps routing inserts for seller 100 to sh2, which applies them and records them in a transfer log. The recipient pulls the bulk of the data, then repeatedly pulls the recorded changes until it is nearly caught up. Only then does the donor pause writes. The writer's median stayed at 3.06 ms.
+
+> **Common mistake:** assuming a range is read-only while it migrates. It is fully writable until the critical section.
+
+## Q2. The 12 ms of step 5
+
+**Question:** what were the 12 ms of the donor's step 5?
+
+The critical section: sh2 stops accepting writes to the range, the recipient applies the last recorded changes, and the donor prepares the commit of the new owner. Step 6 (61 ms) then committed the change to `config.chunks` on the config servers. Writes that arrived in that window waited and then were retried by mongos against the new owner, which is where the 218 ms worst case came from.
+
+> **Common mistake:** reading the total moveRange time (2.03 s) as downtime.
+
+## Q3. A balances shard moved too
+
+**Question:** why did the Citus move also move a `seller_balances` shard?
+
+`orders_dist` and `seller_balances` are both distributed by an integer seller id with 32 shards, so Citus put them in the same colocation group (3). Shard 102136 of `orders_dist` and shard 102072 of `seller_balances` cover the same hash range and must stay on the same worker, otherwise joins and transactions on one seller would stop being local. `citus_move_shard_placement` therefore moves the whole shard group.
+
+> **Common mistake:** estimating move time from one table's shard size. Add every colocated table.
+
+## Q4. `force_logical`
+
+**Question:** what would `shard_transfer_mode := 'force_logical'` have changed, and why could the lab not use it?
+
+It copies the shard, then uses logical replication to stream the changes made during the copy, and only blocks writes for the final switch, like MongoDB's critical section. The writers for seller 8 would have kept running instead of stalling up to 1.73 s. It needs `wal_level = logical` on the workers; the lab's Citus workers run `wal_level = replica`, and changing it means `ALTER SYSTEM` plus a restart, which the shared lab did not allow. The default mode `auto` tried logical replication and failed with the same message.
+
+> **Common mistake:** leaving `wal_level` at `replica` on a Citus cluster that will need rebalancing, then finding out during an incident.
+
+## Q5. Reading a shard directly
+
+**Question:** a report reads the shard's `mongod` directly instead of going through `mongos`. What does it see right after a migration?
+
+Both the new data it owns and the orphans of ranges it gave away. After the first move, sh2 still physically held 499,276 orders of sellers 2501–5000 for between 11 and 16 minutes; a direct count would have counted them twice (once on sh1, once on sh2). Through mongos, every shard filters by the ownership it knows, so orphans are invisible.
+
+> **Common mistake:** pointing analytics jobs or backups-by-query at individual shards to "spread the load".
+
+## Q6. One seller with 40% of the orders
+
+**Question:** shard sh1 is at 80% CPU and holds a single seller with 40% of all orders. Will adding a shard and rebalancing help?
+
+No. With `seller_id` as the shard key, all of that seller's orders share one shard key value, and one value cannot be split across shards (it becomes a jumbo range). Rebalancing can move the other sellers off sh1, which helps a little, but the 40% stays together. The fix is in the key: a compound key such as `(seller_id, order_id)` or `(seller_id, created_at)` lets the big seller's data span several ranges, at the cost of some queries for that seller touching several shards.
+
+> **Common mistake:** buying more shards for a hot key problem.

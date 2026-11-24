@@ -1,0 +1,13 @@
+{
+  "title": "Session 8: Operations across shards",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-cross-shard-transactions/index",
+    "concept-2-uniqueness-across-shards/index",
+    "concept-3-generating-ids/index",
+    "concept-4-rebalancing/index",
+    "concept-5-ecommerce-case-study/index",
+    "lab/index"
+  ]
+}

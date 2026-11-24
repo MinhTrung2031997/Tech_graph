@@ -1,0 +1,288 @@
+---
+title: "Lab and session quiz: Operations across shards"
+description: "Measure single-shard vs two-phase commits on MongoDB and Citus, create a duplicate _id on a sharded collection and fix it with a claim collection, compare bigint, snowflake, UUIDv4 and UUIDv7 primary keys, move a range and a shard group under write load, and route four marketplace queries under three shard keys."
+type: "how-to"
+tags: ["sharding", "transactions", "ids", "rebalancing", "mongodb", "citus", "postgresql", "lab"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/transactions-sharded-clusters/"
+  - "https://www.mongodb.com/docs/manual/reference/command/moveRange/"
+  - "https://docs.citusdata.com/en/stable/develop/api_udf.html"
+  - "https://www.postgresql.org/docs/17/pgstattuple.html"
+---
+
+<Tldr>
+Uses the sharded MongoDB cluster (`pt-mongos`, shards `sh1` and `sh2`) and the Citus cluster (`pt-citus`, workers `pt-citus-w1` and `pt-citus-w2`) built in the [Session 5 lab](/blogs/databases/partitioning-sharding/session-5-choosing-a-shard-key/lab), with database `parts` holding the 1,000,000-row `orders`; Exercise 4 uses `idx-pg` from the [Session 1 lab](/blogs/databases/partitioning-sharding/session-1-why-split-data/lab). The Citus image runs under x86 emulation on ARM Macs: compare Citus numbers with each other only. Exercises 4 and 5 build on the collection made in Exercise 2. The numbers quoted are from the course machine with other loads running.
+</Tldr>
+
+## Setup
+
+```bash
+alias pmg='docker exec -it pt-mongos mongosh --quiet parts'
+alias pcs='docker exec -it pt-citus psql -U postgres -d parts'
+alias ppg='docker exec -it idx-pg psql -U postgres -d parts'
+```
+
+The data in `parts` on both clusters is the 1M-row variant of the course seed: the same formulas, with rows 63.1584 s apart so they still cover 2024–2025. On MongoDB it is an unsharded collection on the database's primary shard; on Citus a plain table on the coordinator. Check:
+
+```js
+// pmg
+db.orders.countDocuments()                                            // 1000000
+db.getSiblingDB('config').databases.findOne({ _id: 'parts' }).primary  // sh1 or sh2
+```
+
+Write down which shard is primary: the commands below say "the primary shard" where it matters.
+
+## Exercise 1: one shard vs two (Concept 1)
+
+```js
+// pmg: a balances collection split in two ranges, one per shard
+db.seller_balances.insertMany(Array.from({ length: 5000 }, (_, i) => ({ _id: i + 1, balance: NumberDecimal('1000.00') })));
+sh.enableSharding('parts');
+sh.shardCollection('parts.seller_balances', { _id: 1 });
+sh.disableBalancing('parts.seller_balances');
+sh.splitAt('parts.seller_balances', { _id: 2501 });
+// move the upper range to the shard that is NOT the primary shard:
+db.adminCommand({ moveRange: 'parts.seller_balances', min: { _id: 2501 }, toShard: 'sh1' });  // or 'sh2'
+```
+
+Time 300 transfers of each kind (paste into `pmg`):
+
+```js
+function pct(a, p) { const s = [...a].sort((x, y) => x - y); return s[Math.floor(p * (s.length - 1))]; }
+function run(label, pick) {
+  const lat = [];
+  for (let i = 0; i < 300; i++) {
+    const [a, b] = pick(i); const t = process.hrtime.bigint();
+    const s = db.getMongo().startSession();
+    s.withTransaction(() => {
+      const c = s.getDatabase('parts').seller_balances;
+      c.updateOne({ _id: a }, { $inc: { balance: NumberDecimal('-1.00') } });
+      c.updateOne({ _id: b }, { $inc: { balance: NumberDecimal('1.00') } });
+    });
+    s.endSession();
+    lat.push(Number(process.hrtime.bigint() - t) / 1e6);
+  }
+  print(label, 'median', pct(lat, 0.5).toFixed(2), 'ms, p95', pct(lat, 0.95).toFixed(2), 'ms');
+}
+const before = db.serverStatus().transactions.commitTypes;
+run('one shard ', i => [1 + (i % 2000), 1001 + (i % 1000)]);
+run('two shards', i => [1 + (i % 2000), 2501 + (i % 2000)]);
+const after = db.serverStatus().transactions.commitTypes;
+print('singleShard +', after.singleShard.successful - before.singleShard.successful,
+      ' twoPhaseCommit +', after.twoPhaseCommit.successful - before.twoPhaseCommit.successful);
+```
+
+Lab: one shard median 3.1–4.5 ms, two shards 22.1–23.3 ms; +300 and +300.
+
+Now Citus:
+
+```sql
+-- pcs
+CREATE TABLE seller_balances (seller_id int PRIMARY KEY, balance numeric(12,2) NOT NULL CHECK (balance >= 0));
+SELECT create_distributed_table('seller_balances', 'seller_id');
+INSERT INTO seller_balances SELECT s, 1000000000 FROM generate_series(1, 5000) s;
+-- which worker holds which seller?
+SELECT s, get_shard_id_for_distribution_column('seller_balances', s) AS shard, n.nodename
+FROM generate_series(1, 40) s
+JOIN pg_dist_placement p ON p.shardid = get_shard_id_for_distribution_column('seller_balances', s)
+JOIN pg_dist_node n ON n.groupid = p.groupid ORDER BY shard;
+```
+
+Pick three pairs: same shard, two shards on the same worker, two workers (the lab: 8 and 20, 8 and 31, 8 and 1). For each pair, run 20 transactions and count the 2PC records:
+
+```sql
+-- pcs
+SELECT count(*) FROM pg_dist_transaction;
+BEGIN;
+UPDATE seller_balances SET balance = balance - 1 WHERE seller_id = 8;
+UPDATE seller_balances SET balance = balance + 1 WHERE seller_id = 1;
+COMMIT;
+SELECT groupid, gid FROM pg_dist_transaction;   -- two rows: one per worker
+```
+
+For timings, put each transaction in a file and run `docker exec pt-citus pgbench -U postgres -n -T 10 -f /tmp/two_workers.sql parts` a few times. Lab medians: 2.3 ms, 1.9 ms and 6.0 ms.
+
+Then make two transactions collide in MongoDB:
+
+```js
+// pmg
+const a = db.getMongo().startSession(), b = db.getMongo().startSession();
+a.startTransaction(); b.startTransaction();
+a.getDatabase('parts').seller_balances.updateOne({ _id: 3020 }, { $inc: { balance: NumberDecimal('-5.00') } });
+try { b.getDatabase('parts').seller_balances.updateOne({ _id: 3020 }, { $inc: { balance: NumberDecimal('1.00') } }); }
+catch (e) { print(e.codeName, e.code, JSON.stringify(e.errorLabels)); }   // WriteConflict 112 ["TransientTransactionError"]
+b.abortTransaction(); a.commitTransaction();
+```
+
+## Exercise 2: duplicate ids on a sharded collection (Concept 2)
+
+```js
+// pmg: a copy sharded by seller, upper sellers on the other shard
+db.orders.aggregate([{ $out: 'orders_by_seller' }]);
+db.orders_by_seller.createIndex({ seller_id: 1 });
+sh.shardCollection('parts.orders_by_seller', { seller_id: 1 });
+sh.disableBalancing('parts.orders_by_seller');
+sh.splitAt('parts.orders_by_seller', { seller_id: 2501 });
+db.adminCommand({ moveRange: 'parts.orders_by_seller', min: { seller_id: 2501 }, toShard: 'sh1' });  // the non-primary shard
+
+db.orders_by_seller.createIndex({ order_no: 1 }, { unique: true });   // CannotCreateIndex (67)
+
+// order 1 belongs to seller 1673 (lower range). Give a seller in the upper range an order with _id 1:
+db.orders_by_seller.insertOne({ _id: 1, seller_id: 4000, marketplace: 'shopee', status: 'delivered',
+                                amount: NumberDecimal('9.99'), created_at: new Date('2025-06-01') });
+db.orders_by_seller.find({ _id: 1 }, { seller_id: 1 })               // two documents
+db.orders_by_seller.deleteOne({ _id: 1, seller_id: 4000 });
+```
+
+Order 1 never moved, so this works at once. The opposite direction can fail for a while: take an order from the **moved** range (order 5, seller 3945) and insert a duplicate for a lower-range seller, and the primary shard rejects it with E11000 because the orphan copy of order 5 is still there until range deletion runs, 15 minutes after the move (Concept 2's pitfall).
+
+Citus refuses the equivalent:
+
+```sql
+-- pcs
+CREATE TABLE orders_d (LIKE orders INCLUDING DEFAULTS);
+SELECT create_distributed_table('orders_d', 'seller_id');
+ALTER TABLE orders_d ADD PRIMARY KEY (id);              -- ERROR: cannot create constraint on "orders_d"
+ALTER TABLE orders_d ADD PRIMARY KEY (seller_id, id);   -- ok
+DROP TABLE orders_d;
+```
+
+The claim collection (300 orders with and without it; the lab measured 7.7–12.2 ms against 1.4–5.5 ms median, half the transactions two-phase):
+
+```js
+// pmg
+sh.shardCollection('parts.order_claims', { _id: 'hashed' });
+const s = db.getMongo().startSession();
+s.withTransaction(() => {
+  s.getDatabase('parts').order_claims.insertOne({ _id: 2000001 });
+  s.getDatabase('parts').orders_by_seller.insertOne({ _id: 2000001, seller_id: 42, marketplace: 'lazada',
+    status: 'delivered', amount: NumberDecimal('10.00'), created_at: new Date() });
+});
+// the same id again, for any seller: E11000 on order_claims, and the order insert is rolled back
+```
+
+## Exercise 3: id generators (Concept 3)
+
+```sql
+-- ppg (idx-pg). Create the uuid_v7() and snowflake() functions from Concept 3 first.
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+CREATE TABLE id_seq   (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, seller_id int NOT NULL, amount numeric(12,2));
+CREATE TABLE id_uuid4 (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), seller_id int NOT NULL, amount numeric(12,2));
+CREATE TABLE id_uuid7 (id uuid PRIMARY KEY DEFAULT uuid_v7(), seller_id int NOT NULL, amount numeric(12,2));
+CREATE TABLE id_snow  (id bigint PRIMARY KEY DEFAULT snowflake(1), seller_id int NOT NULL, amount numeric(12,2));
+-- for each table (repeat 3 times with TRUNCATE in between):
+EXPLAIN (ANALYZE, WAL, COSTS OFF, TIMING OFF)
+  INSERT INTO id_uuid4 (seller_id, amount) SELECT 1 + g % 5000, (g % 50000) / 100.0 FROM generate_series(1, 1000000) g;
+SELECT pg_size_pretty(pg_relation_size('id_uuid4_pkey')), (pgstatindex('id_uuid4_pkey')).avg_leaf_density;
+-- how many UUIDv7 values shared each millisecond?
+SELECT count(*) / count(DISTINCT substr(id::text, 1, 13)) FROM id_uuid7;
+SELECT uuidv7();   -- PostgreSQL 17: ERROR: function uuidv7() does not exist
+```
+
+Lab: 21 MB / 90.1% (bigint), 23 MB / 82.7% (snowflake), 38 MB / 70.8% (UUIDv4), 40 MB / 68.2% (UUIDv7 at 423 rows per ms).
+
+Citus `bigserial` through a worker:
+
+```bash
+docker exec pt-citus psql -U postgres -d parts -c "CREATE TABLE id_test (id bigserial, seller_id int NOT NULL, PRIMARY KEY (seller_id, id))" \
+  -c "SELECT create_distributed_table('id_test', 'seller_id')" -c "INSERT INTO id_test (seller_id) VALUES (1), (2) RETURNING id"
+docker exec pt-citus-w1 psql -U postgres -d parts -c "INSERT INTO id_test (seller_id) VALUES (4) RETURNING id, id >> 48 AS node_group"
+```
+
+## Exercise 4: move data under load (Concept 4)
+
+Terminal 1, a writer into the range that will move (30 s):
+
+```js
+// pmg
+const lat = []; const end = Date.now() + 30000; let id = 3000000;
+while (Date.now() < end) { const t = process.hrtime.bigint();
+  db.orders_by_seller.insertOne({ _id: id++, seller_id: 100, marketplace: 'shopee', status: 'delivered', amount: NumberDecimal('10.00'), created_at: new Date() });
+  lat.push(Number(process.hrtime.bigint() - t) / 1e6); }
+lat.sort((a, b) => a - b); print('median', lat[lat.length >> 1].toFixed(2), 'max', lat[lat.length - 1].toFixed(1));
+```
+
+Terminal 2, a few seconds later:
+
+```js
+// pmg
+sh.splitAt('parts.orders_by_seller', { seller_id: 1 });
+sh.splitAt('parts.orders_by_seller', { seller_id: 1250 });
+db.adminCommand({ moveRange: 'parts.orders_by_seller', min: { seller_id: 1 }, max: { seller_id: 1250 }, toShard: 'sh1' });  // the non-primary shard
+db.getSiblingDB('config').changelog.find({ ns: 'parts.orders_by_seller', what: { $in: ['moveChunk.from', 'moveChunk.commit'] } }).sort({ time: -1 }).limit(2)
+```
+
+On the old shard, count the orphans and the pending deletion:
+
+```bash
+docker exec pt-shard2 mongosh --quiet parts --eval 'db.orders_by_seller.countDocuments({ seller_id: { $gte: 1, $lt: 1250 } });
+  db.getSiblingDB("config").rangeDeletions.find({ nss: "parts.orders_by_seller" })'
+```
+
+Citus: distribute the orders, then move the shard group of one seller with a pgbench writer running (`-l` logs every transaction):
+
+```sql
+-- pcs
+CREATE TABLE orders_dist (LIKE orders INCLUDING DEFAULTS, PRIMARY KEY (seller_id, id));
+SELECT create_distributed_table('orders_dist', 'seller_id');
+INSERT INTO orders_dist SELECT * FROM orders;
+SELECT get_shard_id_for_distribution_column('orders_dist', 8);          -- e.g. 102136
+SELECT shardid, table_name, nodename FROM citus_shards WHERE shardid = 102136;
+SELECT citus_move_shard_placement(102136, 'pt-citus-w1', 5432, 'pt-citus-w2', 5432);   -- default mode: wal_level error
+SELECT citus_move_shard_placement(102136, 'pt-citus-w1', 5432, 'pt-citus-w2', 5432, shard_transfer_mode := 'block_writes');
+SELECT shardid, table_name, nodename FROM citus_shards WHERE nodename = 'pt-citus-w2' AND shardid IN (102136, get_shard_id_for_distribution_column('seller_balances', 8));
+```
+
+Lab: MongoDB 252,264 docs in 2.03 s, writer max 218 ms; Citus 1.16–1.83 s, writer to that shard max 1.73 s.
+
+## Exercise 5: three shard keys, four queries (Concept 5)
+
+```js
+// pmg
+sh.shardCollection('parts.orders_by_id', { _id: 'hashed' });
+sh.shardCollection('parts.orders_by_mkt', { marketplace: 1 });
+sh.disableBalancing('parts.orders_by_mkt');
+sh.splitAt('parts.orders_by_mkt', { marketplace: 'shopee' });
+sh.splitAt('parts.orders_by_mkt', { marketplace: 'tiktok' });
+db.adminCommand({ moveRange: 'parts.orders_by_mkt', min: { marketplace: 'shopee' }, toShard: 'sh1' });  // the non-primary shard
+db.orders.aggregate([{ $merge: { into: 'orders_by_id' } }]);
+db.orders.aggregate([{ $merge: { into: 'orders_by_mkt' } }]);
+for (const c of ['orders_by_seller', 'orders_by_id', 'orders_by_mkt']) {
+  db[c].createIndex({ seller_id: 1, created_at: 1 }); db[c].createIndex({ marketplace: 1, created_at: 1 }); db[c].createIndex({ created_at: 1 });
+}
+const june = { $gte: ISODate('2025-06-01'), $lt: ISODate('2025-07-01') };
+for (const c of ['orders_by_seller', 'orders_by_id', 'orders_by_mkt']) {
+  const ex = db[c].find({ seller_id: 1234, created_at: june }).explain('executionStats');
+  print(c, ex.executionStats.executionStages.shards.map(s => s.shardName + ':' + s.totalDocsExamined));
+}
+```
+
+Repeat with `find({ _id: 777777 })`, the Lazada GMV aggregate and the one-day report (Concept 5), and on Citus compare `EXPLAIN` of `WHERE seller_id = 1234` with `WHERE id = 777777` (Task Count 1 vs 32).
+
+## Cleanup
+
+```js
+// pmg
+['seller_balances', 'orders_by_seller', 'order_claims', 'orders_by_id', 'orders_by_mkt'].forEach(c => db[c].drop());
+```
+
+```sql
+-- pcs
+DROP TABLE IF EXISTS seller_balances, orders_dist, id_test;
+-- ppg
+DROP TABLE IF EXISTS id_seq, id_uuid4, id_uuid7, id_snow;
+```
+
+## Session quiz
+
+1. A MongoDB transaction updates sellers 10 and 3010, whose balances live on different shards. Which commit protocol runs, and which node coordinates it?
+2. On Citus, a transaction updates two shards that both live on `pt-citus-w1`. How many rows does it add to `pg_dist_transaction`, and why?
+3. What does a prepared but undecided transaction hold, and what resolves it on each engine?
+4. Why does MongoDB refuse a unique index on `order_no` for a collection sharded by `seller_id`, and which `_id` behaviour shows the same limit?
+5. The claim-collection pattern made about half the inserts two-phase on two shards. Roughly what share would it be on eight shards?
+6. Which primary key kept the PostgreSQL index smallest, and why was the bulk UUIDv7 index the largest?
+7. During `block_writes`, which traffic waited and which did not?
+8. Give the shard key you would choose for marketplace orders, and one workload you would move off the shards because it fans out under any key.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-8-operations-across-shards/lab/answers">Worked answers to the session quiz</DeepDive>

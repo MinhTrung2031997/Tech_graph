@@ -1,0 +1,253 @@
+---
+title: "Concept 1: Transactions across shards"
+description: "Moving money between two sellers' balances: when both sellers live on one shard, a MongoDB transaction took a median 3.1–4.5 ms; across two shards it took 22–23 ms, because mongos switched to two-phase commit (commitTypes: 50 single-shard, 50 twoPhaseCommit for 50 + 50 transactions). On Citus a transaction inside one worker committed in 1.9–2.3 ms and one across two workers in 6.0 ms, writing two rows to pg_dist_transaction. A concurrent write to the same document failed at once with WriteConflict (112), labelled TransientTransactionError."
+type: "concept"
+tags: ["sharding", "transactions", "two-phase-commit", "mongodb", "citus", "postgresql"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/transactions-sharded-clusters/"
+  - "https://www.mongodb.com/docs/manual/core/transactions-production-consideration/"
+  - "https://docs.citusdata.com/en/stable/develop/reference_ddl.html"
+  - "https://www.citusdata.com/blog/2017/11/22/how-citus-executes-distributed-transactions/"
+  - "https://www.postgresql.org/docs/17/sql-prepare-transaction.html"
+---
+
+<Tldr>
+A transaction that writes to **one shard** commits like a transaction on one server. A transaction that writes to **two shards** needs **two-phase commit** (2PC): every shard prepares, a coordinator records the decision, then every shard commits. Measured on the lab clusters (two shards, all containers on one laptop):
+
+- **MongoDB**, transfer between two sellers' balances (300 transactions per run, 3 runs): same shard **3.1–4.5 ms** median, two shards **22.1–23.3 ms** median. mongos counted 50 `singleShard` and 50 `twoPhaseCommit` commits for 50 + 50 transactions; the commit step alone averaged **2.6 ms** vs **14.9 ms**.
+- **Citus**, the same transfer (pgbench, median of 6 runs): same shard **2.3 ms**, two shards on the same worker **1.9 ms**, two workers **6.0 ms**. Only the last one wrote 2PC records: **2 rows per transaction** in `pg_dist_transaction`.
+- A second transaction writing the same document got **WriteConflict (112)** at once, with the label **TransientTransactionError**: retry, do not wait.
+
+Cross-shard transactions work. They cost several times more, and they fail more often, so a good shard key keeps the usual transaction on one shard.
+</Tldr>
+
+## The setup
+
+A `seller_balances` table, one row per seller (5,000 sellers, balance 1,000.00), sharded by seller id. The balance moves when an order is refunded from one seller and credited to another, or when a platform fee moves between accounts.
+
+- **MongoDB** (database `pt8` on `pt-mongos`): `seller_balances` sharded on `_id` (the seller id), split at 2501, sellers 1–2500 on shard **sh2**, 2501–5000 on **sh1**. Balancing is off for this collection, so the ranges stay put.
+- **Citus** (database `pt8` on `pt-citus`): `create_distributed_table('seller_balances', 'seller_id')`, 32 shards, 16 on each worker. Seller 8 and seller 20 are in the same shard (102072 on `pt-citus-w1`), seller 31 is in another shard on the same worker, seller 1 is on `pt-citus-w2`.
+
+The lab builds both: [Session 8 lab](/blogs/databases/partitioning-sharding/session-8-operations-across-shards/lab). The Citus containers run under x86 emulation on the lab's ARM laptop, so compare Citus numbers with each other, not with MongoDB.
+
+| Term | Meaning |
+|---|---|
+| Participant | A shard that the transaction wrote to |
+| Single-shard commit | Only one participant: the router just tells it to commit |
+| Two-phase commit (2PC) | Phase 1: every participant **prepares** (makes the changes durable but not visible). Phase 2: once all said yes, the coordinator records "commit" and every participant commits |
+| Coordinator | Who decides and remembers the outcome. MongoDB: the first shard the transaction wrote to. Citus: the coordinator node |
+| In-doubt transaction | Prepared but not yet committed or aborted, for example after a crash; it keeps its locks until resolved |
+| **✓ / ✗** | Stays on one shard / needs work on several shards |
+
+## MongoDB
+
+<Flow
+  title="MongoDB: transfer between two sellers"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'withTransaction()', x: 20, y: 20, w: 200 },
+    { id: 'mongos', label: 'mongos', sub: 'routes, starts commit', x: 300, y: 20, w: 200 },
+    { id: 'sh2', label: 'sh2', sub: 'sellers 1–2500', x: 120, y: 200, w: 220 },
+    { id: 'sh1', label: 'sh1', sub: 'sellers 2501–5000', x: 460, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'app-mongos', from: 'app', to: 'mongos' },
+    { id: 'mongos-sh2', from: 'mongos', to: 'sh2' },
+    { id: 'mongos-sh1', from: 'mongos', to: 'sh1' },
+    { id: 'sh2-sh1', from: 'sh2', to: 'sh1', label: 'prepare / commit' },
+  ]}
+  cases={[
+    {
+      title: 'Both sellers on one shard',
+      path: 'transfer seller 1 → seller 1001 → ✓ both writes on sh2 → ✓ single-shard commit, median 3.1–4.5 ms',
+      summary: 'One participant, so no prepare phase.',
+      steps: [
+        {
+          title: 't1: two updates, one shard',
+          note: 'Both _id values are below 2501, so mongos sends both updates to sh2. sh1 is not involved.',
+          code: "s.withTransaction(() => {\n  c.updateOne({ _id: 1 },    { $inc: { balance: NumberDecimal('-1.00') } });\n  c.updateOne({ _id: 1001 }, { $inc: { balance: NumberDecimal('1.00') } });\n});",
+          active: ['app', 'mongos', 'sh2'],
+          edges: ['app-mongos', 'mongos-sh2'],
+        },
+        {
+          title: 't2: commit on sh2 only',
+          note: 'commitTransaction goes to the only participant. 300 transactions per run, 3 runs: median 3.09, 4.20, 4.46 ms. mongos serverStatus().transactions.commitTypes.singleShard grew by 50 for 50 transactions; the commit step averaged 2.6 ms.',
+          subs: { sh2: 'commit (one participant)' },
+          active: ['mongos', 'sh2'],
+          edges: ['mongos-sh2'],
+        },
+      ],
+    },
+    {
+      title: 'Sellers on two shards',
+      path: 'transfer seller 1 → seller 2501 → ✗ writes on sh2 and sh1 → ✗ two-phase commit, median 22.1–23.3 ms',
+      summary: 'The same two updates, five to seven times slower.',
+      steps: [
+        {
+          title: 't1: one update on each shard',
+          note: 'Seller 1 is on sh2, seller 2501 on sh1. Each shard holds its half of the transaction in its own snapshot.',
+          active: ['app', 'mongos', 'sh2', 'sh1'],
+          edges: ['app-mongos', 'mongos-sh2', 'mongos-sh1'],
+        },
+        {
+          title: 't2: sh2 coordinates, both prepare',
+          note: 'mongos hands the commit to the first participant, sh2, which becomes the coordinator. It writes the participant list durably, sends prepareTransaction to sh1 and prepares itself. serverStatus on the shards: totalPrepared +50 on sh1 and +50 on sh2 for 50 transactions.',
+          subs: { sh2: 'coordinator, prepared', sh1: 'prepared' },
+          active: ['mongos', 'sh2', 'sh1'],
+          edges: ['mongos-sh2', 'sh2-sh1'],
+        },
+        {
+          title: 't3: decision, then commit everywhere',
+          note: 'The coordinator writes the commit decision, then sends commitTransaction to both. commitTypes.twoPhaseCommit grew by 50; the commit step averaged 14.9 ms against 2.6 ms for one shard. Whole transaction: median 22.09, 23.28, 23.04 ms, p95 34–39 ms.',
+          subs: { sh2: 'decision: commit', sh1: 'committed' },
+          active: ['sh2', 'sh1'],
+          edges: ['sh2-sh1'],
+        },
+      ],
+    },
+    {
+      title: 'Two transactions, one document',
+      path: 'T1 updates seller 3020 (not committed) → T2 updates seller 3020 → ✗ WriteConflict 112, TransientTransactionError',
+      summary: 'MongoDB transactions do not wait for each other; the second writer fails.',
+      steps: [
+        {
+          title: 't1: T1 writes sellers 20 and 3020',
+          note: 'T1 is open on both shards and holds the write on seller 3020 (sh1).',
+          active: ['app', 'mongos', 'sh2', 'sh1'],
+          edges: ['app-mongos', 'mongos-sh2', 'mongos-sh1'],
+        },
+        {
+          title: 't2: T2 writes seller 3020',
+          note: 'Fails immediately: "Encountered error from pt-shard1:27017 during a transaction :: caused by :: Write conflict during plan execution and yielding is disabled." codeName WriteConflict, code 112, errorLabels ["TransientTransactionError"]. T2 must abort and run again; withTransaction does that for you. T1 then committed normally.',
+          subs: { sh1: 'WriteConflict for T2' },
+          active: ['mongos', 'sh1'],
+          edges: ['mongos-sh1'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Citus
+
+<Flow
+  title="Citus: transfer between two sellers"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'BEGIN … COMMIT', x: 20, y: 20, w: 200 },
+    { id: 'coord', label: 'Coordinator', sub: 'pt-citus', x: 300, y: 20, w: 200 },
+    { id: 'w1', label: 'pt-citus-w1', sub: 'sellers 8, 20, 31', x: 120, y: 200, w: 220 },
+    { id: 'w2', label: 'pt-citus-w2', sub: 'seller 1', x: 460, y: 200, w: 220 },
+    { id: 'log', label: 'pg_dist_transaction', sub: 'commit records', x: 580, y: 20, w: 200 },
+  ]}
+  edges={[
+    { id: 'app-coord', from: 'app', to: 'coord' },
+    { id: 'coord-w1', from: 'coord', to: 'w1' },
+    { id: 'coord-w2', from: 'coord', to: 'w2' },
+    { id: 'coord-log', from: 'coord', to: 'log' },
+  ]}
+  cases={[
+    {
+      title: 'One shard (router transaction)',
+      path: 'sellers 8 → 20 → ✓ same shard 102072 on w1 → ✓ ordinary commit, median 2.3 ms',
+      summary: 'Citus forwards the whole transaction to one worker.',
+      steps: [
+        {
+          title: 'Both updates go to one shard',
+          note: 'Median of 6 pgbench runs (10 s each): 2.35 ms per transaction; two updates without a transaction: 2.46 ms. pg_dist_transaction: no new rows.',
+          code: 'BEGIN;\nUPDATE seller_balances SET balance = balance - 1 WHERE seller_id = 8;\nUPDATE seller_balances SET balance = balance + 1 WHERE seller_id = 20;\nCOMMIT;',
+          active: ['app', 'coord', 'w1'],
+          edges: ['app-coord', 'coord-w1'],
+        },
+      ],
+    },
+    {
+      title: 'Two shards, one worker',
+      path: 'sellers 8 → 31 → ✓ two shards, both on w1, one connection → ✓ ordinary commit, median 1.9 ms',
+      summary: 'Two shards but one PostgreSQL server: still a local commit.',
+      subs: { w1: 'shards 102072 + 102074' },
+      steps: [
+        {
+          title: 'One worker, one connection',
+          note: 'The two shards are tables on the same worker, written over the same connection, so the worker commits them in one local transaction. Median 1.93 ms. pg_dist_transaction: 32 rows before and after 20 transactions.',
+          active: ['app', 'coord', 'w1'],
+          edges: ['app-coord', 'coord-w1'],
+        },
+      ],
+    },
+    {
+      title: 'Two workers',
+      path: 'sellers 8 → 1 → ✗ w1 and w2 → ✗ PREPARE TRANSACTION on both, then COMMIT PREPARED, median 6.0 ms',
+      summary: 'Two servers must agree, so Citus runs 2PC automatically.',
+      steps: [
+        {
+          title: 't1: one update on each worker',
+          active: ['app', 'coord', 'w1', 'w2'],
+          edges: ['app-coord', 'coord-w1', 'coord-w2'],
+          note: 'Seller 8 is on w1, seller 1 on w2. Each worker runs its part in its own local transaction.',
+        },
+        {
+          title: 't2: prepare, record, commit',
+          note: 'On COMMIT the coordinator sends PREPARE TRANSACTION to both workers, writes one row per worker into pg_dist_transaction (groupid 1 gid citus_0_3984_101533_0, groupid 2 gid citus_0_3984_101533_1), then COMMIT PREPARED to both. 20 transactions added 40 rows. Median 5.96 ms, 2.5 times the one-shard transaction.',
+          subs: { w1: 'prepared → committed', w2: 'prepared → committed', log: '2 rows per transaction' },
+          active: ['coord', 'w1', 'w2', 'log'],
+          edges: ['coord-w1', 'coord-w2', 'coord-log'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Comparison
+
+| Transfer between two sellers | MongoDB (median) | Citus (median, emulated) | Commit protocol |
+|---|---|---|---|
+| Two writes, no transaction | 5.1–7.2 ms | 2.5 ms | one commit per write |
+| Transaction, one shard | 3.1–4.5 ms | 2.3 ms | single participant |
+| Transaction, two shards on one server | n/a (a MongoDB shard is one replica set) | 1.9 ms | local commit |
+| Transaction, two shards / two workers | **22.1–23.3 ms** | **6.0 ms** | two-phase commit |
+
+The MongoDB "no transaction" row is slower than the one-shard transaction because each of the two writes waits for its own majority write concern; the transaction waits once, at commit.
+
+<Pitfall>
+2PC protects atomicity, not availability. If the coordinator dies between prepare and commit, the participants keep the prepared transaction and **its locks** until the decision is recovered: MongoDB's coordinator shard writes its decision to `config.transaction_coordinators` and resumes after failover; Citus's maintenance daemon reads `pg_dist_transaction` and finishes or rolls back prepared transactions on the workers every `citus.recover_2pc_interval` (1 min in the lab). Until then, rows touched by the in-doubt transaction cannot be written. Transactions S8 shows the same with MySQL XA.
+</Pitfall>
+
+## Real-world scenario: refunds between seller wallets
+
+A marketplace keeps a wallet per seller and moves money on every refund, chargeback and fee. Wallets are sharded by seller id. Most movements are platform → seller (the platform's fee account is one hot row), and a small share are seller → seller.
+
+| Design | Effect |
+|---|---|
+| Fee account as a normal row | Every fee transaction touches the platform's shard plus the seller's shard: almost every transaction is 2PC, and all of them conflict on one row |
+| ✓ Ledger rows sharded by seller, platform totals aggregated asynchronously | The common transaction (order + fee line for one seller) stays on the seller's shard |
+| ✓ Seller → seller transfers as two single-shard steps with an idempotent transfer id | No 2PC; a failed second step is retried from the transfer record (outbox pattern) |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Transactions Session 8, Concept 4](/blogs/databases/transactions/session-8-when-transactions-hurt/concept-4-distributed-transactions) | 2PC across systems, in-doubt XA branches holding locks, and the outbox alternative |
+| [Transactions Session 3](/blogs/databases/transactions/session-3-isolation-levels/concept-1-when-the-snapshot-starts) | MongoDB's snapshot isolation inside a transaction, the same on a sharded cluster |
+| [Session 7, Concept 2](/blogs/databases/partitioning-sharding/session-7-sharding-postgresql-mysql/concept-2-colocation-reference-tables) | Colocation: why tables sharded on the same column keep a seller's transaction on one worker |
+| Concept 5 | Choosing the shard key so that the usual transaction stays on one shard |
+
+## Key takeaways
+
+1. One participant means an ordinary commit; two or more means two-phase commit, in both MongoDB and Citus, automatically.
+2. Measured cost of crossing shards: MongoDB 3–4.5 ms → 22–23 ms; Citus 2.3 ms → 6.0 ms.
+3. Citus decides by **worker**, not by shard: two shards on one worker still commit locally.
+4. MongoDB write conflicts fail fast with `TransientTransactionError`; the client must retry the whole transaction.
+5. A prepared transaction keeps its locks until the coordinator's decision is applied, so coordinator failures turn into blocked rows.
+
+## Check questions
+
+1. Why did the MongoDB transaction between sellers 1 and 1001 not use two-phase commit?
+2. In the two-shard MongoDB case, which node coordinated the commit, and how can you tell?
+3. Citus: why did sellers 8 and 31, in different shards, commit without 2PC?
+4. What do the two rows in `pg_dist_transaction` let Citus do after a crash?
+5. Why were two separate MongoDB updates slower than a transaction with the same two updates on one shard?
+6. A transaction got `WriteConflict` with label `TransientTransactionError`. What should the application do?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-8-operations-across-shards/concept-1-cross-shard-transactions/answers">Worked answers to Q1–Q6</DeepDive>

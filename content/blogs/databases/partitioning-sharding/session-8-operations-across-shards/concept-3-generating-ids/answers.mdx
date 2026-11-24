@@ -1,0 +1,62 @@
+---
+title: "Answers: Generating ids without a central counter"
+description: "Worked answers to the Session 8 Concept 3 check questions."
+companion: "answers"
+tags: ["sharding", "ids", "uuid", "answers"]
+status: "draft"
+sources:
+  - "https://www.rfc-editor.org/rfc/rfc9562.html#name-monotonicity-and-counters"
+  - "https://docs.citusdata.com/en/stable/develop/reference_ddl.html#sequences"
+---
+
+<Tldr>
+The id's uniqueness comes from how it is built; its cost comes from where it lands in the index.
+</Tldr>
+
+## Q1. UUIDv4 almost twice the size
+
+**Question:** why did the UUIDv4 primary key end up almost twice the size of the bigint one?
+
+Two effects. The key is 16 bytes instead of 8, so each leaf holds fewer entries. And the keys are random, so each insert goes into some existing leaf; when that leaf is full it splits 50/50 and both halves are left half full until later inserts fill them. The measured result: 4,882 leaves at 70.75% density against 2,733 leaves at 90.06%, 38 MB against 21 MB. The UUIDv7 at one row per ms isolates the first effect: same 90% density, 30 MB, purely because of the wider key.
+
+> **Common mistake:** blaming only the 16-byte key. Ordered UUIDs at 30 MB show that most of the extra 17 MB came from the random order.
+
+## Q2. Bulk UUIDv7 larger than slow UUIDv7
+
+**Question:** why was the UUIDv7 index from the bulk insert larger than the one built at one row per millisecond?
+
+The bulk `INSERT … SELECT` produced 423 rows per millisecond. All 423 share the same 48-bit timestamp, and the rest of the UUID is random, so within that millisecond they arrive in random order. They all land among the newest pages, and those pages split 50/50 as in UUIDv4: 68.15% density, 40 MB. At one row per millisecond every new id is larger than the previous one and only the rightmost leaf is written. RFC 9562 lets a generator put a counter or extra clock precision after the timestamp to keep ids monotonic within a millisecond; PostgreSQL 18's `uuidv7()` does that.
+
+> **Common mistake:** assuming any UUIDv7 is monotonic. Check what your generator puts after the timestamp.
+
+## Q3. `id >> 48` on a Citus worker
+
+**Question:** what does `id >> 48` return for a Citus `bigserial` value inserted through a worker, and why does Citus do this?
+
+The worker's group id: 1 for `pt-citus-w1` (id 281474976710657 = 2^48 + 1) and 2 for `pt-citus-w2` (562949953421313 = 2^49 + 1). Rows inserted through a worker (Citus lets workers with metadata accept distributed queries) cannot call the coordinator's sequence for every row without a network round trip, so each node draws from its own slice of the bigint range. Through the coordinator, ids come from its sequence starting at 1 (group 0).
+
+> **Common mistake:** sorting by this id to get insertion order. Ids from different nodes interleave by node, not by time.
+
+## Q4. Snowflake less dense than the sequence
+
+**Question:** why is the snowflake index slightly less dense than the plain sequence?
+
+The lab's generator takes the low 12 bits of a global sequence. Every 4,096 ids that counter wraps to 0. If the wrap happens inside one millisecond (the bulk insert made about 400 ids per ms), the next id has the same timestamp but a smaller sequence part, so it is smaller than the previous id and goes into an earlier page, causing a split away from the right edge. The result was 82.73% density against 90.06%. A real snowflake generator resets the sequence each millisecond and waits for the next millisecond when it runs out, which keeps ids monotonic per node.
+
+> **Common mistake:** reusing a database sequence modulo 4096 in production. It also allows duplicates if one node makes more than 4,096 ids in one millisecond.
+
+## Q5. Good primary key, bad ranged shard key
+
+**Question:** why is a time-ordered id a good primary key on each shard but a bad ranged shard key?
+
+Inside one B-tree, appending at the right edge keeps pages full and the working set small (one hot leaf). Across shards with **ranged** sharding, the same property sends every insert to the shard that owns the highest range: one shard takes all writes while the others idle, until the balancer moves ranges after the fact. Hash the id (or shard by something else, like the seller) and keep the time-ordered id as the primary key inside each shard.
+
+> **Common mistake:** choosing `{ _id: 1 }` (ranged ObjectId) as a MongoDB shard key because ObjectIds are unique.
+
+## Q6. Snowflake ids in a browser
+
+**Question:** why should a 64-bit snowflake id be sent to a browser as a string?
+
+JavaScript numbers are 64-bit floats and represent integers exactly only up to 2^53 − 1 (9,007,199,254,740,991). The lab's snowflake ids were already about 3.8 × 10^17 (383602437992222721), so `JSON.parse` would round them and two orders could show the same id. Send them as strings (or use BigInt end to end).
+
+> **Common mistake:** finding the problem only in production, when the ids grow past 2^53 years after launch.

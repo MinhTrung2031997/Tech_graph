@@ -1,0 +1,246 @@
+---
+title: "Concept 3: Generating ids without a central counter"
+description: "On Citus, a bigserial column draws from the coordinator's sequence, and rows inserted through a worker get ids with the worker's group id in the top 16 bits (281474976710657 on worker group 1). Measured on 1M rows in PostgreSQL 17: bigint identity 1.1–1.5 s and a 21 MB primary key; snowflake bigint 1.4–1.9 s, 23 MB; random UUIDv4 2.9–3.9 s, 38 MB at 71% leaf density; a UUIDv7 layout 1.6 s and 30 MB at one row per millisecond, but 40 MB when 423 rows shared each millisecond. PostgreSQL 17 has no uuidv7(). MongoDB: ObjectId 2.1–2.5 s per million inserts, UUIDv4 5.9–6.0 s, _id index 10.2 vs 25.9 MB."
+type: "concept"
+tags: ["sharding", "ids", "uuid", "snowflake", "citus", "postgresql", "mongodb"]
+status: "draft"
+sources:
+  - "https://docs.citusdata.com/en/stable/develop/reference_ddl.html#sequences"
+  - "https://www.rfc-editor.org/rfc/rfc9562.html#name-uuid-version-7"
+  - "https://www.postgresql.org/docs/17/functions-uuid.html"
+  - "https://www.postgresql.org/docs/17/pgstattuple.html"
+  - "https://www.mongodb.com/docs/manual/reference/method/ObjectId/"
+---
+
+<Tldr>
+On one server, `bigserial` is the easy answer. Across shards there is no single counter that every writer can call cheaply, so the id either comes from **one place** (a coordinator sequence), carries **where it was made** (a node number inside the id), or is **random enough** never to collide (UUID). What it costs is decided by **where new ids land in the B-tree**:
+
+| 1,000,000 inserts, PostgreSQL 17 (3 runs) | Time | WAL | Primary key | Leaf density |
+|---|---|---|---|---|
+| bigint identity (one sequence) | 1.12–1.53 s | 143.1 MB | **21 MB** | 90.1% |
+| Snowflake-style bigint | 1.42–1.90 s | 144.2–144.4 MB | 23 MB | 82.7% |
+| UUIDv4 (`gen_random_uuid()`) | 2.90–3.90 s | 171.5–171.8 MB | **38 MB** | 70.8% |
+| UUIDv7 layout, 423 rows per ms | 2.55–2.89 s | 166.1–166.8 MB | 40 MB | 68.2% |
+| UUIDv7 layout, at most 1 row per ms | 1.57–1.67 s | 157.2 MB | 30 MB | 90.0% |
+
+- **Citus** `bigserial`: through the coordinator, ids 1, 2, 3; through worker group 1, **281474976710657** (1 shifted left by 48, plus 1); through worker group 2, 562949953421313. No collisions, no round trip to the coordinator.
+- **PostgreSQL 17 has no `uuidv7()`** (`ERROR: function uuidv7() does not exist`); the lab builds the layout with a SQL function.
+- **MongoDB** (1M documents): ObjectId **2.1–2.5 s**, int64 2.1–2.4 s, UUIDv4 **5.9–6.0 s**; `_id` index 10.2 / 11.4 / **25.9 MB**.
+</Tldr>
+
+## The setup
+
+- `idx-pg`, database `pt8` (PostgreSQL 17.11, native ARM): four tables with the same columns and a different primary key (`id_seq`, `id_snow`, `id_uuid4`, `id_uuid7`, plus `id_uuid7_1ms`), each loaded with `INSERT … SELECT` of 1,000,000 rows, measured with `EXPLAIN (ANALYZE, WAL)`, index density with `pgstatindex()` (extension `pgstattuple`).
+- `idx-mongo`, database `pt8`: 1,000,000 documents per collection in batches of 10,000, sizes read after the next WiredTiger checkpoint.
+- `pt-citus`, database `pt8`: a `bigserial` column on a distributed table.
+
+The id generators used in the lab:
+
+```sql
+-- UUIDv7 layout (RFC 9562): 48 bits of Unix milliseconds, version 7, then random bits
+CREATE FUNCTION uuid_v7() RETURNS uuid LANGUAGE sql VOLATILE AS $$
+  SELECT encode(set_bit(set_bit(
+           overlay(uuid_send(gen_random_uuid())
+                   placing substring(int8send((extract(epoch FROM clock_timestamp()) * 1000)::bigint) FROM 3)
+                   FROM 1 FOR 6),
+           52, 1), 53, 1), 'hex')::uuid
+$$;
+-- Snowflake-style: 41 bits of ms since 2024-01-01, 10 bits of node id, 12 bits of sequence
+CREATE SEQUENCE snow_seq;
+CREATE FUNCTION snowflake(node int) RETURNS bigint LANGUAGE sql VOLATILE AS $$
+  SELECT (((extract(epoch FROM clock_timestamp()) * 1000)::bigint - 1704067200000) << 22)
+         | ((node & 1023)::bigint << 12) | (nextval('snow_seq') & 4095)
+$$;
+```
+
+| Term | Meaning |
+|---|---|
+| Monotonic id | Each new id is larger than the previous one, so inserts go to the rightmost B-tree leaf |
+| Rightmost split | When the last leaf fills, PostgreSQL leaves it about 90% full and starts a new one |
+| 50/50 split | A full leaf in the middle splits into two half-full leaves; random keys cause these |
+| Leaf density | How full the index leaf pages are on average (`pgstatindex().avg_leaf_density`) |
+| UUIDv7 | 128-bit id starting with a millisecond timestamp, then random bits (RFC 9562) |
+| Snowflake id | 64-bit id: timestamp, node number, per-node sequence (Twitter's design) |
+| **✓ / ✗** | New keys append at the right edge / land anywhere in the index |
+
+## Where the ids come from on Citus
+
+<Flow
+  title="Citus: bigserial on a distributed table"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'INSERT … RETURNING id', x: 20, y: 20, w: 200 },
+    { id: 'coord', label: 'Coordinator', sub: 'id_test_id_seq', x: 300, y: 20, w: 200 },
+    { id: 'w1', label: 'pt-citus-w1', sub: 'group 1', x: 120, y: 200, w: 220 },
+    { id: 'w2', label: 'pt-citus-w2', sub: 'group 2', x: 460, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'app-coord', from: 'app', to: 'coord' },
+    { id: 'coord-w1', from: 'coord', to: 'w1' },
+    { id: 'coord-w2', from: 'coord', to: 'w2' },
+    { id: 'app-w1', from: 'app', to: 'w1' },
+  ]}
+  cases={[
+    {
+      title: 'Insert through the coordinator',
+      path: 'INSERT via pt-citus → ✓ nextval on the coordinator: 1, 2, 3 → rows routed to their shards',
+      summary: 'One counter, like a single server.',
+      steps: [
+        {
+          title: 'The coordinator numbers the rows',
+          note: 'INSERT INTO id_test (seller_id) VALUES (1), (2), (3) RETURNING id: ids 1, 2, 3, then each row goes to the shard of its seller.',
+          active: ['app', 'coord', 'w1', 'w2'],
+          edges: ['app-coord', 'coord-w1', 'coord-w2'],
+        },
+      ],
+    },
+    {
+      title: 'Insert through a worker',
+      path: 'INSERT via pt-citus-w1 → ✓ id = (group 1 << 48) + n: 281474976710657 → no call to the coordinator',
+      summary: 'Each node owns a slice of the bigint range.',
+      subs: { w1: 'ids from 2^48', w2: 'ids from 2^49' },
+      steps: [
+        {
+          title: 'Each worker has its own range',
+          note: 'On pt-citus-w1: ids 281474976710657 and 281474976710658 (id >> 48 = 1). On pt-citus-w2: 562949953421313 (id >> 48 = 2). Unique without coordination, but not in time order across nodes: a row made later on the coordinator gets a smaller id than one made earlier on w2.',
+          active: ['app', 'w1', 'w2'],
+          edges: ['app-w1'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Where new ids land in the index
+
+<Flow
+  title="PostgreSQL: one million inserts into a primary key"
+  height={300}
+  nodes={[
+    { id: 'gen', label: 'Id generator', sub: 'per row', x: 300, y: 20, w: 200 },
+    { id: 'left', label: 'Old leaves', sub: 'smallest keys', x: 20, y: 200, w: 200 },
+    { id: 'mid', label: 'Middle leaves', sub: 'any key', x: 300, y: 200, w: 200 },
+    { id: 'right', label: 'Rightmost leaf', sub: 'largest keys', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'gen-left', from: 'gen', to: 'left' },
+    { id: 'gen-mid', from: 'gen', to: 'mid' },
+    { id: 'gen-right', from: 'gen', to: 'right' },
+  ]}
+  cases={[
+    {
+      title: 'bigint sequence or snowflake',
+      path: 'each id > the previous → ✓ append to the rightmost leaf → ✓ 21–23 MB, 83–90% full',
+      summary: 'Only the last page is written; full pages are never touched again.',
+      steps: [
+        {
+          title: 'Append at the right edge',
+          note: 'bigint identity: 1.12–1.53 s, 143.1 MB WAL, 21 MB, avg_leaf_density 90.06. Snowflake: 1.42–1.90 s, 23 MB, 82.73: the 12-bit sequence wraps every 4,096 ids, and a wrap inside the same millisecond produces a smaller id that splits a recent page.',
+          subs: { right: 'all inserts here' },
+          active: ['gen', 'right'],
+          edges: ['gen-right'],
+        },
+      ],
+    },
+    {
+      title: 'UUIDv4',
+      path: 'random 122 bits → ✗ any leaf → ✗ 50/50 splits → ✗ 38 MB, 71% full, 2.9–3.9 s',
+      summary: 'Every insert touches a random page of the whole index.',
+      steps: [
+        {
+          title: 'Insert anywhere',
+          note: '2.90–3.90 s, 171.5–171.8 MB of WAL, 38 MB at 70.75% density, 4,882 leaf pages against 2,733. In this lab the index fits in shared_buffers; once it does not, each insert is also a random read.',
+          subs: { left: 'random inserts', mid: 'random inserts', right: 'random inserts' },
+          active: ['gen', 'left', 'mid', 'right'],
+          edges: ['gen-left', 'gen-mid', 'gen-right'],
+        },
+      ],
+    },
+    {
+      title: 'UUIDv7 layout',
+      path: 'timestamp prefix → ✓ right edge at ≤ 1 row/ms (30 MB, 90%) → ✗ random within the ms at 423 rows/ms (40 MB, 68%)',
+      summary: 'Time-ordered only between milliseconds, unless the generator adds a counter.',
+      steps: [
+        {
+          title: 'One row per millisecond',
+          note: 'Generated with uuid_v7_at(ms) for consecutive milliseconds: 1.57–1.67 s, 157.2 MB WAL, 30 MB at 90.03%. Same shape as the bigint, twice the key size (16 bytes against 8).',
+          subs: { right: 'all inserts here' },
+          active: ['gen', 'right'],
+          edges: ['gen-right'],
+        },
+        {
+          title: 'Many rows in one millisecond',
+          note: 'The bulk INSERT produced 423 rows per millisecond. Inside each millisecond the remaining 74 bits are random, so those 423 rows land in random order across the newest pages: 40 MB at 68.15%, worse than UUIDv4. RFC 9562 allows a counter or extra clock precision after the timestamp for exactly this; PostgreSQL 18\'s built-in uuidv7() uses sub-millisecond precision to stay monotonic. Not measured here: PostgreSQL 17 has no uuidv7().',
+          subs: { mid: 'random within the ms', right: 'newest pages' },
+          active: ['gen', 'mid', 'right'],
+          edges: ['gen-mid', 'gen-right'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+| 1,000,000 documents (2 runs) | Insert time | `_id` index | Collection |
+|---|---|---|---|
+| ObjectId (default: 4-byte seconds, 5 random bytes, 3-byte counter) | 2.09–2.50 s | 10.2 MB | 15.4 MB |
+| int64 from the application | 2.09–2.37 s | 11.4 MB | 15.7 MB |
+| UUIDv4 (`UUID()`) | 5.86–6.03 s | 25.9 MB | 32.3 MB |
+
+ObjectId is time-ordered by second with a counter inside, so it appends like a sequence and needs no coordination: each `mongos` client or driver makes its own. Sizes were read after a WiredTiger checkpoint; WiredTiger compresses keys, so the int64 and ObjectId indexes are about the same size although the keys are 8 and 12 bytes.
+
+## Choosing
+
+| Id | Unique across shards | Time-ordered | Key size | Coordination |
+|---|---|---|---|---|
+| One sequence on the coordinator | ✓ | ✓ | 8 bytes | every insert passes the coordinator |
+| Citus worker ranges (`group << 48`) | ✓ | ✗ across nodes | 8 bytes | none |
+| Sequence per shard with step N | ✓ if configured right | ✗ across shards | 8 bytes | none, but fragile |
+| Snowflake-style bigint | ✓ if node ids are unique | ✓ to the ms | 8 bytes | assign node ids once |
+| ObjectId | ✓ (random part per process) | ✓ to the second | 12 bytes | none |
+| UUIDv4 | ✓ (122 random bits) | ✗ | 16 bytes | none |
+| UUIDv7 | ✓ | ✓ to the ms (monotonic generators: fully) | 16 bytes | none |
+
+<Pitfall>
+A time-ordered id as a **hashed** shard key is fine, but as a **ranged** shard key it sends every new insert to the shard holding the highest range: the same right-edge effect, one level up. Time-ordered ids are good for the B-tree on each shard and bad for ranged sharding. [Session 5, Concept 2](/blogs/databases/partitioning-sharding/session-5-choosing-a-shard-key/concept-2-monotonic-keys) measures that hot shard.
+</Pitfall>
+
+## Real-world scenario: order ids for three marketplaces
+
+Orders are created by importers running in Vietnam and Thailand, sharded by seller, and the ids are shown to support staff and used in URLs.
+
+| Choice | Why |
+|---|---|
+| ✓ Snowflake-style bigint, node id per importer process | 8 bytes, time-ordered, no central counter, fits JavaScript's safe integers only if you keep it under 2^53, so send it as a string to browsers |
+| ✗ UUIDv4 | 16 bytes, random index inserts, 1.8 times the index size measured |
+| ✓ Monotonic UUIDv7 (PostgreSQL 18, or a library) | When a standard format matters more than size |
+| ✓ Keep the platform's `order_sn` as a separate column | Unique per `(seller_id, marketplace)` (Concept 2), not as the primary key |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Indexing Session 2, Concept 6](/blogs/databases/indexing/session-2-btree-internals/concept-6-page-splits) | Rightmost vs 50/50 page splits, the mechanism behind the size differences |
+| [Indexing Session 6, Concept 4](/blogs/databases/indexing/session-6-engine-differences/concept-4-uuid-v4-v7) | UUIDv4 vs UUIDv7 as a clustered key in InnoDB and in PostgreSQL, on one server |
+| Concept 2 | Ids that are unique by construction need no cross-shard check |
+| Concept 5 | Why the order id is still a poor shard key for a seller workload |
+
+## Key takeaways
+
+1. Across shards, ids must be unique without a shared counter: node ranges, snowflake ids, ObjectId or UUIDs.
+2. What matters for the index is order: right-edge appends kept the primary key at 21–30 MB; random keys made it 38–40 MB.
+3. A UUIDv7 is only time-ordered between milliseconds unless the generator adds a counter; at 423 rows per ms it behaved like UUIDv4.
+4. Citus `bigserial` puts the worker group in the top 16 bits for rows inserted through workers.
+5. PostgreSQL 17 has no `uuidv7()`; write a function or upgrade.
+
+## Check questions
+
+1. Why did the UUIDv4 primary key end up almost twice the size of the bigint one?
+2. Why was the UUIDv7 index from the bulk insert larger than the one built at one row per millisecond?
+3. What does `id >> 48` return for a Citus `bigserial` value inserted through a worker, and why does Citus do this?
+4. Why is the snowflake index slightly less dense than the plain sequence?
+5. Why is a time-ordered id a good primary key on each shard but a bad ranged shard key?
+6. Why should a 64-bit snowflake id be sent to a browser as a string?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-8-operations-across-shards/concept-3-generating-ids/answers">Worked answers to Q1–Q6</DeepDive>
