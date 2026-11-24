@@ -1,0 +1,329 @@
+---
+title: "Concept 5: Unique indexes as constraints"
+description: "A unique index is how the database enforces 'no duplicates': every insert first looks for the key. How NULLs are treated in each engine, why upserts need a unique index, what concurrent inserts do, and what the check costs, measured in PostgreSQL, MySQL and MongoDB."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "unique-index", "constraints", "upsert"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-unique.html"
+  - "https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT"
+  - "https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-UNIQUE-CONSTRAINTS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/create-index.html#create-index-unique"
+  - "https://dev.mysql.com/doc/refman/8.4/en/insert-on-duplicate.html"
+  - "https://www.mongodb.com/docs/manual/core/index-unique/"
+---
+
+<Tldr>
+A unique constraint is implemented **by** a unique index: before inserting a key, the engine descends the index to where the key would go (the "missing key" lookup of Session 2) and fails if it is already there. The rules differ on **NULL**: PostgreSQL and MySQL allow any number of NULLs (unless PostgreSQL 15+'s `NULLS NOT DISTINCT`), while MongoDB indexes a missing field as `null`, so a second document without the field is a duplicate. Unique indexes are also what make **upserts** safe under concurrency. With the index in memory, the check was free in PostgreSQL and MySQL in the lab (within noise) and cost MongoDB about 50% on a bulk load.
+</Tldr>
+
+## How an insert is checked
+
+| Step | What happens |
+|---|---|
+| 1. Descend | Find the leaf where the new key belongs |
+| 2. Look for equal keys | If a visible row with the same key exists: error (or, for an upsert, take the update path) |
+| 3. Uncommitted duplicate? | If another transaction inserted the same key and has not committed, wait for it: fail if it commits, continue if it aborts |
+| 4. Insert | Add the entry |
+
+| Engine | Primary key | NULLs in a unique index |
+|---|---|---|
+| PostgreSQL | Unique + NOT NULL | Distinct by default: many NULLs allowed. `UNIQUE NULLS NOT DISTINCT` (v15+): one NULL |
+| MySQL | Unique + NOT NULL; also the clustered index | Many NULLs allowed |
+| MongoDB | `_id`, always unique | A missing field is indexed as `null`: only one document may lack it (unless the index is partial or sparse) |
+
+Measured in the lab: PostgreSQL accepted two `NULL` emails and rejected the second `'a@x'`; with `NULLS NOT DISTINCT` it rejected the second `NULL`. MySQL accepted two `NULL`s. MongoDB rejected the second document without an `email` field.
+
+| Term | Meaning |
+|---|---|
+| Unique violation | PostgreSQL `23505`, MySQL `1062`, MongoDB `E11000` |
+| Upsert | Insert, or update if the key exists: `ON CONFLICT`, `ON DUPLICATE KEY UPDATE`, `upsert: true` |
+| **✓ Key absent / ✗ Key present** | Insert proceeds / violation or update path |
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: inserting into a unique index"
+  height={340}
+  nodes={[
+    { id: 'ins', label: 'INSERT', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'look', label: 'Descend to the key', sub: 'unique index', x: 310, y: 20, w: 220 },
+    { id: 'absent', label: '✓ Key absent', sub: 'insert the entry', x: 600, y: 20, w: 180 },
+    { id: 'present', label: '✗ Key present', sub: 'visible row', x: 310, y: 150, w: 220 },
+    { id: 'err', label: 'ERROR 23505', sub: 'duplicate key', x: 600, y: 150, w: 180 },
+    { id: 'upd', label: 'ON CONFLICT', sub: 'DO UPDATE', x: 20, y: 150, w: 220 },
+    { id: 'wait', label: 'Uncommitted duplicate', sub: 'wait for the other txn', x: 310, y: 270, w: 220 },
+  ]}
+  edges={[
+    { id: 'ins-look', from: 'ins', to: 'look' },
+    { id: 'look-absent', from: 'look', to: 'absent' },
+    { id: 'look-present', from: 'look', to: 'present' },
+    { id: 'present-err', from: 'present', to: 'err' },
+    { id: 'present-upd', from: 'present', to: 'upd' },
+    { id: 'present-wait', from: 'present', to: 'wait', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Duplicate value',
+      path: "INSERT 'a@x' → descend → ✗ present → ERROR: duplicate key",
+      summary: 'The index is the constraint.',
+      subs: { ins: "INSERT email 'a@x'" },
+      steps: [
+        {
+          title: 'Look for the key',
+          note: 'The email column has a UNIQUE constraint, implemented by the index u_email_key. The insert descends it to where a@x belongs.',
+          code: "CREATE TABLE u (id int PRIMARY KEY, email text UNIQUE);\nINSERT INTO u VALUES (3, 'a@x');\nINSERT INTO u VALUES (4, 'a@x');",
+          active: ['ins', 'look'],
+          edges: ['ins-look'],
+        },
+        {
+          title: '✗ Already there',
+          note: 'ERROR: duplicate key value violates unique constraint "u_email_key". DETAIL: Key (email)=(a@x) already exists.',
+          active: ['look', 'present', 'err'],
+          edges: ['look-present', 'present-err'],
+        },
+      ],
+    },
+    {
+      title: 'NULLs',
+      path: 'two NULL emails → NULLs are distinct → ✓ both inserted; NULLS NOT DISTINCT → ✗ second rejected',
+      summary: 'PostgreSQL 15+ lets you choose.',
+      subs: { ins: 'INSERT email NULL' },
+      steps: [
+        {
+          title: '✓ NULL ≠ NULL by default',
+          note: 'INSERT INTO u VALUES (1, NULL), (2, NULL): both succeed. In SQL, NULL is "unknown", so two NULLs are not considered equal.',
+          code: 'INSERT INTO u VALUES (1, NULL), (2, NULL);',
+          active: ['ins', 'look', 'absent'],
+          edges: ['ins-look', 'look-absent'],
+        },
+        {
+          title: '✗ With NULLS NOT DISTINCT',
+          note: 'CREATE TABLE u2 (… email text UNIQUE NULLS NOT DISTINCT): the second NULL fails with Key (email)=(null) already exists.',
+          code: 'CREATE TABLE u2 (id int PRIMARY KEY, email text UNIQUE NULLS NOT DISTINCT);',
+          active: ['look', 'present', 'err'],
+          edges: ['look-present', 'present-err'],
+        },
+      ],
+    },
+    {
+      title: 'Upsert',
+      path: 'INSERT … ON CONFLICT (k) → ✗ present → DO UPDATE → n = 2',
+      summary: 'Atomic insert-or-update, safe under concurrency, only with a unique index on k.',
+      subs: { ins: 'INSERT k=1 ON CONFLICT' },
+      steps: [
+        {
+          title: 'First call inserts',
+          note: 'k = 1 is absent: the row (1, 1) is inserted.',
+          code: 'INSERT INTO up VALUES (1, 1) ON CONFLICT (k) DO UPDATE SET n = up.n + 1;',
+          active: ['ins', 'look', 'absent'],
+          edges: ['ins-look', 'look-absent'],
+        },
+        {
+          title: 'Second call updates',
+          note: 'k = 1 is present: the DO UPDATE branch runs, RETURNING shows (1, 2). ON CONFLICT (k) requires a unique index or constraint on k: without one, PostgreSQL refuses the statement.',
+          active: ['look', 'present', 'upd'],
+          edges: ['look-present', 'present-upd'],
+        },
+        {
+          title: 'Concurrent duplicates wait',
+          note: 'If another transaction has just inserted k = 1 and not committed, this insert waits on it; then it updates (other committed) or inserts (other rolled back). That waiting is what makes upserts race-free.',
+          active: ['present', 'wait'],
+          edges: ['present-wait'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL
+
+| Term | Meaning |
+|---|---|
+| `ON DUPLICATE KEY UPDATE` | MySQL's upsert; fires on a conflict with **any** unique index, including the primary key |
+| Change buffer | Defers secondary-index changes for pages not in memory; cannot be used for unique indexes (the page must be read to check), and is off by default since 8.4 |
+| **✓ Key absent / ✗ Key present** | As before |
+
+<Flow
+  title="MySQL: unique checks and upserts"
+  height={300}
+  nodes={[
+    { id: 'ins', label: 'INSERT', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'look', label: 'Unique index lookup', sub: 'page must be read', x: 310, y: 20, w: 220 },
+    { id: 'absent', label: '✓ Key absent', sub: 'insert', x: 600, y: 20, w: 180 },
+    { id: 'present', label: '✗ Key present', sub: '', x: 310, y: 150, w: 220 },
+    { id: 'err', label: 'ERROR 1062', sub: 'Duplicate entry', x: 600, y: 150, w: 180 },
+    { id: 'upd', label: 'ON DUPLICATE KEY', sub: 'UPDATE', x: 20, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'ins-look', from: 'ins', to: 'look' },
+    { id: 'look-absent', from: 'look', to: 'absent' },
+    { id: 'look-present', from: 'look', to: 'present' },
+    { id: 'present-err', from: 'present', to: 'err' },
+    { id: 'present-upd', from: 'present', to: 'upd' },
+  ]}
+  cases={[
+    {
+      title: 'Duplicate and NULLs',
+      path: "two NULLs ✓ allowed; 'a@x' twice ✗ ERROR 1062",
+      summary: "Measured: INSERT (1,NULL),(2,NULL),(3,'a@x') succeeded; (4,'a@x') failed.",
+      subs: { ins: 'INSERT email …' },
+      steps: [
+        {
+          title: '✓ NULLs are not duplicates',
+          note: 'Like PostgreSQL\'s default, MySQL allows many NULLs in a unique index.',
+          code: "CREATE TABLE u (id INT PRIMARY KEY, email VARCHAR(50) NULL, UNIQUE KEY (email));\nINSERT INTO u VALUES (1, NULL), (2, NULL), (3, 'a@x');",
+          active: ['ins', 'look', 'absent'],
+          edges: ['ins-look', 'look-absent'],
+        },
+        {
+          title: '✗ Duplicate value',
+          note: "INSERT INTO u VALUES (4, 'a@x'): ERROR 1062 (23000): Duplicate entry 'a@x' for key 'u.email'.",
+          active: ['look', 'present', 'err'],
+          edges: ['look-present', 'present-err'],
+        },
+      ],
+    },
+    {
+      title: 'Upsert',
+      path: 'INSERT … ON DUPLICATE KEY UPDATE → ✗ present → update',
+      summary: 'Beware: any unique index can trigger it.',
+      subs: { ins: 'INSERT … ON DUPLICATE KEY' },
+      steps: [
+        {
+          title: 'The update path',
+          note: 'On a conflict with the primary key or any unique index, the UPDATE part runs instead. With several unique indexes, a conflict on an unexpected one updates a different row than intended: keep upsert tables to one unique key where possible.',
+          code: 'INSERT INTO counters (k, n) VALUES (1, 1) ON DUPLICATE KEY UPDATE n = n + 1;',
+          active: ['ins', 'look', 'present', 'upd'],
+          edges: ['ins-look', 'look-present', 'present-upd'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+| Term | Meaning |
+|---|---|
+| Missing field | Indexed as `null`; counts as a value for uniqueness |
+| `upsert: true` | Insert if no document matches the filter; safe against duplicates only with a unique index on the filter fields |
+| **✓ Key absent / ✗ Key present** | As before |
+
+<Flow
+  title="MongoDB: unique indexes and upserts"
+  height={300}
+  nodes={[
+    { id: 'ins', label: 'insertOne / upsert', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'look', label: 'Unique index lookup', sub: 'missing field = null', x: 310, y: 20, w: 220 },
+    { id: 'absent', label: '✓ Key absent', sub: 'insert', x: 600, y: 20, w: 180 },
+    { id: 'present', label: '✗ Key present', sub: '', x: 310, y: 150, w: 220 },
+    { id: 'err', label: 'E11000', sub: 'duplicate key', x: 600, y: 150, w: 180 },
+    { id: 'upd', label: 'upsert', sub: 'update instead', x: 20, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'ins-look', from: 'ins', to: 'look' },
+    { id: 'look-absent', from: 'look', to: 'absent' },
+    { id: 'look-present', from: 'look', to: 'present' },
+    { id: 'present-err', from: 'present', to: 'err' },
+    { id: 'present-upd', from: 'present', to: 'upd' },
+  ]}
+  cases={[
+    {
+      title: 'Documents without the field',
+      path: 'first doc without email → key null ✓; second → null again ✗ E11000',
+      summary: 'Measured: the second insert failed.',
+      subs: { ins: 'insertOne({ _id: 2 })' },
+      steps: [
+        {
+          title: '✓ First missing field',
+          note: 'The unique index on email gets the key null for a document with no email.',
+          code: 'db.u.createIndex({ email: 1 }, { unique: true })\ndb.u.insertOne({ _id: 1 })',
+          active: ['ins', 'look', 'absent'],
+          edges: ['ins-look', 'look-absent'],
+        },
+        {
+          title: '✗ Second missing field',
+          note: 'db.u.insertOne({ _id: 2 }) fails with a duplicate key error on null. Fix: a partial index (partialFilterExpression: { email: { $exists: true } }) or sparse: true, so documents without the field are not indexed.',
+          active: ['look', 'present', 'err'],
+          edges: ['look-present', 'present-err'],
+        },
+      ],
+    },
+    {
+      title: 'Upsert',
+      path: 'updateOne({ k: 1 }, $inc, upsert) twice → one document, n = 2',
+      summary: 'With a unique index on k, concurrent upserts cannot create two documents.',
+      subs: { ins: 'updateOne k=1 upsert' },
+      steps: [
+        {
+          title: 'Insert, then update',
+          note: 'The first call finds nothing and inserts { k: 1, n: 1 }; the second matches and increments: one document, n: 2.',
+          code: 'db.up.createIndex({ k: 1 }, { unique: true })\ndb.up.updateOne({ k: 1 }, { $inc: { n: 1 } }, { upsert: true })',
+          active: ['ins', 'look', 'present', 'upd'],
+          edges: ['ins-look', 'look-present', 'present-upd'],
+        },
+        {
+          title: 'Why the unique index matters',
+          note: 'Without it, two concurrent upserts can both find no document and both insert, leaving duplicates. With it, the second insert fails on the unique key, and MongoDB retries it as an update.',
+          active: ['present', 'err'],
+          edges: ['present-err'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## What the check costs
+
+Bulk-inserting 500,000 rows with random values into a table with one secondary index on that column, unique vs not (the index fits in memory):
+
+| Engine | Plain index | Unique index |
+|---|---|---|
+| PostgreSQL 17 | 609 ms | 564 ms (within noise) |
+| MySQL 8.4 | 1,256 ms | 1,263 ms (within noise) |
+| MongoDB 8.0 | 1,286 ms | 1,914 ms (+49%) |
+
+With the index cached, the lookup is cheap because the insert must descend to the same leaf anyway. The cost grows when the index does not fit in memory (each check may be a random read that a non-unique insert could have deferred) and under concurrency (waits on uncommitted duplicates; in InnoDB, extra gap locking for unique checks).
+
+<Pitfall>
+"Check then insert" in application code (`SELECT … WHERE email = ?`, then `INSERT` if none) is a race: two requests can both see nothing and both insert. Only a unique index makes it safe. Let the database reject the duplicate (or use an upsert) and handle the error.
+</Pitfall>
+
+## Real-world scenario: idempotent webhooks
+
+A payment provider retries webhooks, sometimes concurrently. Each payment must be recorded once.
+
+| Approach | Result |
+|---|---|
+| `SELECT` by `provider_event_id`, insert if missing | Occasional duplicate payments under concurrent retries |
+| Unique index on `provider_event_id` + `INSERT … ON CONFLICT DO NOTHING` (PostgreSQL) / `INSERT IGNORE` or `ON DUPLICATE KEY` (MySQL) / upsert with a unique index (MongoDB) | Exactly one row per event, whatever the timing |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 6: InnoDB clustered primary key | The primary key is the unique clustered index |
+| Session 8: write amplification | Unique checks add reads on large, uncached indexes |
+| Session 8: CREATE INDEX CONCURRENTLY | Building a unique index online can fail and leave an invalid index |
+
+## Key takeaways
+
+1. A unique constraint is enforced by a unique index: every insert descends it and fails on an existing visible key.
+2. Concurrent inserts of the same key wait for each other, which is what makes the constraint and upserts race-free.
+3. NULLs: PostgreSQL and MySQL allow many (PostgreSQL 15+ can forbid with `NULLS NOT DISTINCT`); MongoDB treats a missing field as `null`, allowing only one, unless the index is partial or sparse.
+4. Upserts (`ON CONFLICT`, `ON DUPLICATE KEY UPDATE`, `upsert: true`) need a unique index to be safe.
+5. With the index in memory the check is cheap (PostgreSQL, MySQL within noise; MongoDB +49% on bulk load); it costs more on large uncached indexes.
+6. Never enforce uniqueness with check-then-insert in application code.
+
+## Check questions
+
+1. What exactly does the database do with a unique index when you insert a row?
+2. A PostgreSQL table with `email text UNIQUE` accepts two rows with `NULL` email. Why, and how do you forbid it?
+3. Why does a MongoDB unique index on `email` reject a second document that has no `email` field, and how do you allow many such documents?
+4. Why does `INSERT … ON CONFLICT (k)` require a unique index on `k`?
+5. Two transactions insert the same new key at the same time. What happens in PostgreSQL?
+6. In the lab, the unique check cost almost nothing in PostgreSQL and MySQL. When would it become expensive?
+7. Why is "SELECT, then INSERT if not found" unsafe, and what should replace it?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-5-covering-partial-expression/concept-5-unique-indexes/answers">Worked answers to Q1–Q7</DeepDive>

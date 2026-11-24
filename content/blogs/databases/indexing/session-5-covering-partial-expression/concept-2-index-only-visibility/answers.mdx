@@ -1,0 +1,71 @@
+---
+title: "Answers: Index-only scans and the visibility map"
+description: "Worked answers to the Session 5 Concept 2 check questions."
+companion: "answers"
+tags: ["indexing", "index-only-scan", "visibility-map", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/storage-vm.html"
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html"
+---
+
+<Tldr>
+Index-only scans skip the heap only for pages the visibility map marks all-visible. VACUUM sets the bits, changes clear them; count `Heap Fetches` to know which you got.
+</Tldr>
+
+## Q1. Why an extra check
+
+**Question:** why can't PostgreSQL answer a covered query from the index alone, without any extra check?
+
+Index entries have no transaction information. The index may contain entries for row versions that were deleted, replaced, or written by transactions not yet committed (or not visible to this snapshot). Only the heap tuple's `xmin` and `xmax` say whether a version is visible, so the planner needs either a heap visit or a guarantee that the whole page is visible to everyone: the visibility map.
+
+> **Common mistake:** "the index only contains live rows". Dead and uncommitted versions stay indexed until VACUUM.
+
+## Q2. One bit
+
+**Question:** what does one bit of the visibility map say, and who sets and clears it?
+
+The all-visible bit for a heap page says: every tuple on this page is visible to every current and future transaction. **VACUUM** sets it when it leaves a page with no dead or recent tuples. **Any modification** of the page (insert, update, delete) clears it immediately.
+
+> **Common mistake:** "autovacuum keeps it always correct". It is always correct, but set only after VACUUM visits the page.
+
+## Q3. 1% of rows, 9,967 fetches
+
+**Question:** updating 10,000 rows (1%) made `Heap Fetches` go from 0 to 9,967. Why so many, for so few updated rows?
+
+The bit is per **page**, not per row. `id % 100 = 0` picked one row on almost every page (99 rows per page), so 98% of pages had their bit cleared. Every row on those pages, updated or not, now needs a heap check, so the query over 9,956 rows (plus dead entries left by the updates) fetched 9,967.
+
+> **Common mistake:** expecting heap fetches only for the rows that changed.
+
+## Q4. Slower than not covering
+
+**Question:** why was the "Index Only Scan" after those updates slower than a plain Bitmap Heap Scan without a covering index?
+
+Both read nearly every matching heap page, but the Index Only Scan visits them in **index order**: customer by customer, jumping across the table and revisiting pages. The Bitmap Heap Scan reads each needed page **once, in file order**. The index-only scan also hit dead index entries left by the updates and set hint bits as it went (3,158 pages dirtied). Result: 33.9 ms vs 4.25 ms.
+
+> **Common mistake:** assuming an index-only plan is never worse than a heap-visiting plan.
+
+## Q5. Index cleanup bypass
+
+**Question:** what is VACUUM's index cleanup bypass, and how did it leave 386 heap fetches in the Session 2 lab?
+
+Since PostgreSQL 14, when only a tiny fraction of pages (below about 2%) have dead items, VACUUM skips the expensive pass over every index to save time. Those dead line pointers stay referenced by index entries, so the pages holding them cannot be marked all-visible. In the lab, 501 non-HOT updates left dead items on 7 pages; VACUUM bypassed index cleanup ("index scan bypassed: 7 pages … 0.07%"), the 7 pages stayed not all-visible, and an index-only scan over that range fetched 386 rows from the heap. `VACUUM (INDEX_CLEANUP ON)` removed them and brought it to 0.
+
+> **Common mistake:** "VACUUM ran, so the visibility map is complete".
+
+## Q6. InnoDB's check
+
+**Question:** how does InnoDB decide whether a covering read can trust a secondary index entry?
+
+Each secondary index page stores `PAGE_MAX_TRX_ID`, the newest transaction that modified it. If that id is older than anything the reader's read view excludes, every entry on the page is visible and the covering read uses it directly. Otherwise InnoDB looks up the clustered record (and, if needed, older versions in the undo log) to decide. No map needs maintaining; pages simply become safe again as transactions age.
+
+> **Common mistake:** assuming InnoDB covering reads never touch the clustered index.
+
+## Q7. MongoDB without a map
+
+**Question:** why does MongoDB not need a visibility map for covered queries?
+
+WiredTiger is multi-versioned at the level of every key in every B-tree, indexes included: recent changes are kept as version chains, and each read sees the versions committed before its snapshot. So a covered query reads index entries that are already correct for its snapshot and never needs the document to decide visibility.
+
+> **Common mistake:** "MongoDB has no MVCC". WiredTiger provides snapshot reads; it just keeps versions per key rather than as heap tuples.

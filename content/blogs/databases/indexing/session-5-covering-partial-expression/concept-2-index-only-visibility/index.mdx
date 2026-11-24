@@ -1,0 +1,300 @@
+---
+title: "Concept 2: Index-only scans and the visibility map"
+description: "Why a PostgreSQL index-only scan can still read the table: the index has no visibility information, so it relies on the visibility map that VACUUM maintains. Measured: 1% of rows updated turned 0 heap fetches into 9,967. How InnoDB and MongoDB handle the same problem."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "index-only-scan", "visibility-map", "vacuum"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-index-only-scans.html"
+  - "https://www.postgresql.org/docs/current/storage-vm.html"
+  - "https://www.postgresql.org/docs/current/pgvisibility.html"
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html"
+---
+
+<Tldr>
+A PostgreSQL index entry says where a row version is, not whether your transaction may see it (Session 2, Concept 4). An **index-only scan** therefore checks the **visibility map**, one bit per heap page meaning "every row here is visible to everyone". Bit set: skip the heap. Bit cleared: fetch the row after all. VACUUM sets the bits; any change to a page clears them. In the lab, updating **1% of the rows** (one per page) cleared the bit on 98% of pages: the same covering query went from **0 heap fetches and 53 buffers to 9,967 heap fetches and 10,014 buffers**, slower than not covering at all, until VACUUM ran. InnoDB and MongoDB solve visibility differently and have no such map.
+</Tldr>
+
+## Why the index cannot answer alone
+
+| Fact | Consequence |
+|---|---|
+| Index entries have no `xmin`/`xmax` | The index cannot tell a live row from a deleted, updated or uncommitted one |
+| Visibility is decided on the heap tuple | Normally every index lookup visits the heap |
+| The visibility map marks pages where every tuple is visible to all transactions | For those pages, the heap visit can be skipped |
+
+| Term | Meaning |
+|---|---|
+| Visibility map (VM) | A small file per table: 2 bits per heap page, "all-visible" and "all-frozen" |
+| `Heap Fetches` | Rows an Index Only Scan still had to check in the heap |
+| VACUUM | Removes dead tuples and sets the all-visible bit on pages it leaves fully visible |
+| Index cleanup bypass | Since PostgreSQL 14, VACUUM may skip index vacuuming when very few pages have dead items; those pages then stay not all-visible |
+| **✓ All-visible / ✗ Not all-visible** | Skip the heap / fetch the row |
+
+<Flow
+  title="PostgreSQL: an Index Only Scan, page by page"
+  height={330}
+  nodes={[
+    { id: 'entry', label: 'Index entry', sub: 'key + ctid + INCLUDE', x: 20, y: 20, w: 240 },
+    { id: 'vm', label: 'Visibility map', sub: 'bit for the heap page', x: 330, y: 20, w: 220 },
+    { id: 'yes', label: '✓ All-visible', sub: 'answer from the index', x: 610, y: 20, w: 170 },
+    { id: 'no', label: '✗ Not all-visible', sub: 'Heap Fetch', x: 330, y: 150, w: 220 },
+    { id: 'heap', label: 'Heap page', sub: 'check xmin / xmax', x: 610, y: 150, w: 170 },
+    { id: 'vac', label: 'VACUUM', sub: 'sets the bits', x: 20, y: 150, w: 240 },
+  ]}
+  edges={[
+    { id: 'entry-vm', from: 'entry', to: 'vm' },
+    { id: 'vm-yes', from: 'vm', to: 'yes' },
+    { id: 'vm-no', from: 'vm', to: 'no' },
+    { id: 'no-heap', from: 'no', to: 'heap' },
+    { id: 'vac-vm', from: 'vac', to: 'vm', label: 'set' },
+  ]}
+  cases={[
+    {
+      title: 'Right after VACUUM',
+      path: 'every page ✓ all-visible → Heap Fetches 0 → 53 buffers',
+      summary: 'customers 1–1,000 through the INCLUDE index: 0.73 ms.',
+      subs: { vm: '10,205 of 10,205 set' },
+      steps: [
+        {
+          title: 'VACUUM marked every page',
+          note: 'No dead tuples, nothing changed since: VACUUM set the all-visible bit on all pages.',
+          code: 'VACUUM orders;\nSELECT count(*) FILTER (WHERE all_visible) FROM pg_visibility_map(\'orders\');',
+          active: ['vac', 'vm'],
+          edges: ['vac-vm'],
+        },
+        {
+          title: '✓ Skip the heap for every entry',
+          note: 'For each of the 9,956 entries, the VM bit of its heap page is set: the values in the entry are returned directly. Heap Fetches: 0; 53 buffers.',
+          code: 'EXPLAIN (ANALYZE, BUFFERS) SELECT customer_id, created_at, amount\nFROM orders WHERE customer_id BETWEEN 1 AND 1000;',
+          active: ['entry', 'vm', 'yes'],
+          edges: ['entry-vm', 'vm-yes'],
+        },
+      ],
+    },
+    {
+      title: 'After updating 1% of rows',
+      path: 'one update per page clears 98% of the bits → ✗ Heap Fetch for almost every entry → 10,014 buffers',
+      summary: 'Measured: Heap Fetches 9,967, 33.9 ms: worse than the non-covering Bitmap scan (4.25 ms).',
+      subs: { vm: '102 of 10,205 set' },
+      steps: [
+        {
+          title: 'Small update, wide damage',
+          note: 'UPDATE … WHERE id % 100 = 0 touches 10,000 rows, one on almost every heap page. Each modified page loses its all-visible bit: only 102 of 10,205 pages keep it.',
+          code: 'UPDATE orders SET status = status WHERE id % 100 = 0;',
+          active: ['vm'],
+        },
+        {
+          title: '✗ Fetch nearly every row',
+          note: 'The scan is still an "Index Only Scan", but for 9,967 of 9,956+ entries (including dead entries) the page is not all-visible, so the heap tuple is checked: 10,014 buffers, 33.9 ms. Index order means those heap visits are random, and they also set hint bits (dirtying 3,158 pages).',
+          active: ['entry', 'vm', 'no', 'heap'],
+          edges: ['entry-vm', 'vm-no', 'no-heap'],
+        },
+      ],
+    },
+    {
+      title: 'VACUUM again',
+      path: 'VACUUM removes 10,000 dead tuples, sets every bit → ✓ Heap Fetches 0',
+      summary: 'Measured: 53 buffers, 0.57 ms.',
+      subs: { vm: '10,205 of 10,205 set' },
+      steps: [
+        {
+          title: 'VACUUM cleans and marks',
+          note: 'VACUUM VERBOSE: "index scan needed: 10000 pages from table (97.99% of total) had 10000 dead item identifiers removed". Dead index entries are removed and every page becomes all-visible again.',
+          code: 'VACUUM (VERBOSE) orders;',
+          active: ['vac', 'vm'],
+          edges: ['vac-vm'],
+        },
+        {
+          title: '✓ Back to index-only',
+          note: 'Heap Fetches: 0, 0.57 ms.',
+          active: ['entry', 'vm', 'yes'],
+          edges: ['entry-vm', 'vm-yes'],
+        },
+      ],
+    },
+    {
+      title: 'VACUUM bypasses index cleanup',
+      path: 'few pages with dead items → VACUUM skips index cleanup → those pages ✗ stay not all-visible',
+      summary: 'Session 2 lab: 501 updated rows on 7 pages → Heap Fetches 386 after VACUUM; 0 after VACUUM (INDEX_CLEANUP ON).',
+      subs: { vm: '7 pages not set' },
+      steps: [
+        {
+          title: 'A small number of dead items',
+          note: '501 rows on 7 heap pages were updated (non-HOT). VACUUM saw dead items on only 0.07% of pages and skipped index vacuuming to save time ("index scan bypassed: 7 pages … have 502 dead item identifiers").',
+          code: 'VACUUM (VERBOSE) orders;',
+          active: ['vac', 'vm'],
+        },
+        {
+          title: '✗ Those pages stay not all-visible',
+          note: 'A page with dead line pointers that indexes still reference cannot be marked all-visible, so an index-only scan over that range fetched 386 rows from the heap.',
+          active: ['entry', 'vm', 'no', 'heap'],
+          edges: ['entry-vm', 'vm-no', 'no-heap'],
+        },
+        {
+          title: 'Force the cleanup when it matters',
+          note: 'VACUUM (INDEX_CLEANUP ON) orders removed the dead index entries and set the bits: Heap Fetches 0. Autovacuum later catches up on its own; force it only for an important index-only workload.',
+          active: ['vac', 'vm', 'yes'],
+          edges: ['vac-vm', 'vm-yes'],
+        },
+      ],
+    },
+  ]}
+/>
+
+### Keeping index-only scans index-only
+
+| Table pattern | Visibility map | What to do |
+|---|---|---|
+| Append-only (logs, events) | New pages need one VACUUM to be marked | PostgreSQL 13+ autovacuums after inserts too (`autovacuum_vacuum_insert_scale_factor`); nothing else needed |
+| Mostly static with rare updates | Mostly all-visible | Default autovacuum is fine |
+| Hot updates spread over the table | Bits constantly cleared | Lower `autovacuum_vacuum_scale_factor` for the table; check `Heap Fetches` in plans; consider whether index-only scans are realistic here |
+
+## MySQL InnoDB: page-level transaction ids
+
+InnoDB secondary indexes also lack per-row visibility, but InnoDB checks visibility per **index page**: each secondary page records the largest transaction id that modified it (`PAGE_MAX_TRX_ID`).
+
+| Term | Meaning |
+|---|---|
+| Read view | The set of transactions a statement may see |
+| `PAGE_MAX_TRX_ID` | Newest transaction that changed this secondary index page |
+| **✓ Page older than the read view** | Every entry on it is safe: answer from the index |
+| **✗ Page possibly newer** | Look up the clustered record (and undo log) to decide visibility |
+
+<Flow
+  title="InnoDB: a covering read and visibility"
+  height={300}
+  nodes={[
+    { id: 'entry', label: 'Secondary entry', sub: 'covering columns', x: 20, y: 20, w: 240 },
+    { id: 'page', label: 'PAGE_MAX_TRX_ID', sub: 'vs the read view', x: 330, y: 20, w: 220 },
+    { id: 'yes', label: '✓ Page is old', sub: 'use the entry', x: 610, y: 20, w: 170 },
+    { id: 'no', label: '✗ Possibly newer', sub: 'check the row', x: 330, y: 150, w: 220 },
+    { id: 'clu', label: 'Clustered record', sub: '+ undo log', x: 610, y: 150, w: 170 },
+  ]}
+  edges={[
+    { id: 'entry-page', from: 'entry', to: 'page' },
+    { id: 'page-yes', from: 'page', to: 'yes' },
+    { id: 'page-no', from: 'page', to: 'no' },
+    { id: 'no-clu', from: 'no', to: 'clu' },
+  ]}
+  cases={[
+    {
+      title: 'Quiet pages',
+      path: 'page last changed long ago ✓ → covering read stays in the index',
+      summary: 'The common case: the 1,133 page requests measured in Concept 1.',
+      steps: [
+        {
+          title: '✓ Safe page',
+          note: 'The page\'s max transaction id is older than every transaction the reader cannot see, so all entries are visible: Using index, no clustered lookups.',
+          code: 'SELECT customer_id, created_at, amount FROM orders WHERE customer_id BETWEEN 1 AND 1000;',
+          active: ['entry', 'page', 'yes'],
+          edges: ['entry-page', 'page-yes'],
+        },
+      ],
+    },
+    {
+      title: 'Recently modified pages',
+      path: 'page changed by a recent transaction ✗ → clustered lookup per entry on that page',
+      summary: 'Covering reads degrade on pages under concurrent writes.',
+      steps: [
+        {
+          title: '✗ Possibly invisible entries',
+          note: 'If a transaction the reader cannot see modified the page, any entry could be too new (or a delete-marked one could still be visible). InnoDB then looks up the clustered record, and if needed the undo log, for entries on that page.',
+          active: ['entry', 'page', 'no', 'clu'],
+          edges: ['entry-page', 'page-no', 'no-clu'],
+        },
+        {
+          title: 'No VACUUM needed',
+          note: 'The effect fades by itself once those transactions are older than every active read view; purge removes delete-marked entries in the background. There is no map to maintain, but there is also no guarantee.',
+          active: ['yes'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: no map needed
+
+WiredTiger keeps recent versions of index entries and documents in memory (update chains) and reads each at the query's snapshot. A covered query reads index entries as of its snapshot and never needs the document to decide visibility.
+
+| | PostgreSQL | InnoDB | MongoDB |
+|---|---|---|---|
+| Where visibility lives | Heap tuple (`xmin`/`xmax`) | Clustered record + undo log | WiredTiger versions of each key and document |
+| Index-only / covered read must | Check the visibility map, else fetch the row | Check the page's max trx id, else fetch the row | Read the index at its snapshot |
+| Maintenance that matters | VACUUM (sets VM bits) | Purge (removes delete-marked entries) | Checkpoints / eviction (not visibility-related) |
+
+<Flow
+  title="MongoDB: a covered query and visibility"
+  height={240}
+  nodes={[
+    { id: 'q', label: 'Covered query', sub: 'snapshot at start', x: 20, y: 20, w: 240 },
+    { id: 'ix', label: 'Index entries', sub: 'version as of snapshot', x: 330, y: 20, w: 220 },
+    { id: 'yes', label: '✓ Visible version', sub: 'no FETCH', x: 610, y: 20, w: 170 },
+  ]}
+  edges={[
+    { id: 'q-ix', from: 'q', to: 'ix' },
+    { id: 'ix-yes', from: 'ix', to: 'yes' },
+  ]}
+  cases={[
+    {
+      title: 'Covered read',
+      path: 'snapshot → index entries at that snapshot ✓ → result without documents',
+      summary: 'totalDocsExamined: 0, whatever the write activity.',
+      steps: [
+        {
+          title: 'Read the index at the snapshot',
+          note: 'Concurrent inserts or updates create new versions in memory; the query sees the versions committed before its snapshot. No per-page map, no document visit.',
+          code: 'db.orders.find({ customer_id: { $gte: 1, $lte: 1000 } }, { _id: 0, customer_id: 1, created_at: 1, amount: 1 })',
+          active: ['q', 'ix', 'yes'],
+          edges: ['q-ix', 'ix-yes'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+"Index Only Scan" in a PostgreSQL plan is a plan **type**, not a promise. Always look at `Heap Fetches`. An index-only plan on a table with fresh changes can do as many heap visits as a normal Index Scan, in index order, which is worse than a Bitmap Heap Scan.
+</Pitfall>
+
+## Real-world scenario: the dashboard that is fast at 9 am and slow at 11 am
+
+A covering index serves a dashboard query on `orders`. Overnight, autovacuum runs and the query takes 2 ms. During the morning, status updates touch rows all over the table, and by 11 am the query takes 80 ms; at 1 pm, after autovacuum, it is fast again.
+
+| Check | Finding |
+|---|---|
+| `EXPLAIN (ANALYZE, BUFFERS)` at 11 am | Index Only Scan, `Heap Fetches` ≈ rows returned |
+| `pg_visibility_map('orders')` | Most pages not all-visible |
+| `pg_stat_user_tables.last_autovacuum` | Hours ago; scale factor 0.2 = 20% of the table must change first |
+
+**Fix:** `ALTER TABLE orders SET (autovacuum_vacuum_scale_factor = 0.02);` so autovacuum runs after 2% changes, keeping the visibility map fresh during the day.
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Session 6: Postgres heap and MVCC | VACUUM's full job, beyond the visibility map |
+| Session 8: bloat | Dead entries also slow down normal index scans |
+| Session 8: index-design checklist | Covering indexes on hot-update tables need vacuum tuning |
+
+## Key takeaways
+
+1. PostgreSQL index entries carry no visibility information; an index-only scan checks the visibility map instead of the heap.
+2. VACUUM sets a page's all-visible bit; any change to the page clears it.
+3. Updating 1% of rows, spread out, cleared 98% of the bits: 0 → 9,967 heap fetches, 53 → 10,014 buffers.
+4. VACUUM may bypass index cleanup when few pages have dead items, leaving those pages not all-visible; `INDEX_CLEANUP ON` forces it.
+5. Check `Heap Fetches`, not just the plan name.
+6. InnoDB checks visibility per secondary page via its max transaction id; MongoDB reads index versions at the query snapshot; neither has a visibility map.
+
+## Check questions
+
+1. Why can't PostgreSQL answer a covered query from the index alone, without any extra check?
+2. What does one bit of the visibility map say, and who sets and clears it?
+3. Updating 10,000 rows (1%) made `Heap Fetches` go from 0 to 9,967. Why so many, for so few updated rows?
+4. Why was the "Index Only Scan" after those updates slower than a plain Bitmap Heap Scan without a covering index?
+5. What is VACUUM's index cleanup bypass, and how did it leave 386 heap fetches in the Session 2 lab?
+6. How does InnoDB decide whether a covering read can trust a secondary index entry?
+7. Why does MongoDB not need a visibility map for covered queries?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-5-covering-partial-expression/concept-2-index-only-visibility/answers">Worked answers to Q1–Q7</DeepDive>

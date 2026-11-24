@@ -2,13 +2,12 @@
   "title": "Session 5: Covering, partial & expression indexes",
   "collapsible": true,
   "defaultOpen": false,
-  "pages": [],
-  "planned": [
-    "Concept 1: Covering indexes and INCLUDE",
-    "Concept 2: Index-only scans and the visibility map",
-    "Concept 3: Partial indexes",
-    "Concept 4: Expression indexes",
-    "Concept 5: Unique indexes as constraints",
-    "Lab and session quiz"
+  "pages": [
+    "concept-1-covering-include/index",
+    "concept-2-index-only-visibility/index",
+    "concept-3-partial-indexes/index",
+    "concept-4-expression-indexes/index",
+    "concept-5-unique-indexes/index",
+    "lab/index"
   ]
 }

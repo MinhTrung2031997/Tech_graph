@@ -1,0 +1,279 @@
+---
+title: "Concept 1: Covering indexes and INCLUDE"
+description: "An index that contains every column a query needs answers it without touching the table. PostgreSQL's INCLUDE columns, InnoDB's covering secondary indexes and MongoDB's covered queries, measured: 53 vs 6,404 buffers, 1,133 vs 40,014 page requests, 0 vs 10,000 documents."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "covering-index", "include"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-index-only-scans.html"
+  - "https://www.postgresql.org/docs/current/sql-createindex.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/explain-output.html#explain-extra-information"
+  - "https://www.mongodb.com/docs/manual/core/query-optimization/#covered-query"
+---
+
+<Tldr>
+Session 2 showed that the expensive part of an index lookup is often the **second step**, fetching each row. A **covering index** removes it: it contains every column the query filters on **and** returns. For 9,956 rows of customers 1–1,000, PostgreSQL went from **6,404 buffers to 53** with `INCLUDE (amount)`, MySQL from **40,014 page requests to 1,133**, and MongoDB from **10,000 documents fetched to 0**. The price is a bigger index (39 MB vs 30 MB) and more work on every write.
+</Tldr>
+
+## What "covering" means
+
+| Query | Index | Covered? |
+|---|---|---|
+| `SELECT created_at, amount FROM orders WHERE customer_id = 7` | `(customer_id, created_at)` | ✗ `amount` is missing: a row fetch per match |
+| same | `(customer_id, created_at) INCLUDE (amount)` | ✓ |
+| same | `(customer_id, created_at, amount)` | ✓ (amount as a key column) |
+| `SELECT * …` | any normal index | ✗ |
+
+## Key columns vs INCLUDE columns (PostgreSQL)
+
+| | Key column | `INCLUDE` column |
+|---|---|---|
+| Stored in | Every level of the tree | Leaf entries only |
+| Sorted by it, searchable, usable for `ORDER BY` | ✓ | ✗ |
+| Counts toward uniqueness in a `UNIQUE` index | ✓ | ✗ (so `UNIQUE (email) INCLUDE (name)` still means unique emails) |
+| Use for | Columns you filter or sort on | Columns you only return |
+
+MySQL and MongoDB have no `INCLUDE`: extra columns are added as trailing key columns, which works the same for covering but makes internal pages wider.
+
+| Term | Meaning |
+|---|---|
+| Index-only scan | PostgreSQL plan that answers from the index; still checks the visibility map (Concept 2) |
+| `Using index` | MySQL's EXPLAIN marker for a covering index |
+| `PROJECTION_COVERED` | MongoDB's stage when no document is fetched |
+| **✓ Covered / ✗ Needs the row** | Whether the second step can be skipped |
+
+## PostgreSQL: INCLUDE
+
+<Flow
+  title="PostgreSQL: customers 1–1,000, with and without a covering index"
+  height={330}
+  nodes={[
+    { id: 'q', label: 'SELECT customer_id,', sub: 'created_at, amount', x: 20, y: 20, w: 240 },
+    { id: 'idx', label: 'Index', sub: '', x: 330, y: 20, w: 220 },
+    { id: 'cov', label: '✓ Covered', sub: 'Index Only Scan', x: 610, y: 20, w: 170 },
+    { id: 'no', label: '✗ Needs the row', sub: 'amount not in index', x: 330, y: 150, w: 220 },
+    { id: 'heap', label: 'Heap pages', sub: '', x: 610, y: 150, w: 170 },
+    { id: 'out', label: 'Rows', sub: '', x: 330, y: 270, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-idx', from: 'q', to: 'idx' },
+    { id: 'idx-cov', from: 'idx', to: 'cov' },
+    { id: 'idx-no', from: 'idx', to: 'no' },
+    { id: 'no-heap', from: 'no', to: 'heap' },
+    { id: 'heap-out', from: 'heap', to: 'out', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Not covering',
+      path: 'orders_customer_idx ✗ amount missing → 6,376 heap pages',
+      summary: 'Measured: Bitmap Heap Scan, 6,404 buffers, 4.25 ms.',
+      subs: { idx: 'orders_customer_idx', heap: '6,376 pages', out: '9,956 rows' },
+      steps: [
+        {
+          title: 'The index finds the rows',
+          note: 'customer_id BETWEEN 1 AND 1000: 14 index pages give 9,956 ctids.',
+          code: 'SET enable_indexonlyscan = off;  -- simulate an index without amount\nEXPLAIN (ANALYZE, BUFFERS) SELECT customer_id, created_at, amount\nFROM orders WHERE customer_id BETWEEN 1 AND 1000;',
+          active: ['q', 'idx'],
+          edges: ['q-idx'],
+        },
+        {
+          title: '✗ amount is only in the heap',
+          note: 'Each row must be fetched for amount: 6,376 heap pages, scattered across the table (Session 1, Concept 4).',
+          active: ['idx', 'no', 'heap'],
+          edges: ['idx-no', 'no-heap'],
+        },
+        {
+          title: 'Total: 6,404 buffers',
+          note: '14 index pages and 6,390 heap and bitmap buffers; 4.25 ms warm, far more on cold storage.',
+          active: ['heap', 'out'],
+          edges: ['heap-out'],
+        },
+      ],
+    },
+    {
+      title: 'Covering with INCLUDE',
+      path: 'orders_cust_created_incl ✓ all three columns in the leaf → Index Only Scan, Heap Fetches 0',
+      summary: 'Measured: 53 buffers, 0.73 ms.',
+      subs: { idx: '… INCLUDE (amount)', cov: '53 buffers', out: '9,956 rows' },
+      steps: [
+        {
+          title: 'Every needed column is in the index',
+          note: 'customer_id and created_at are key columns; amount is an INCLUDE column stored in the leaf entries.',
+          code: 'CREATE INDEX orders_cust_created_incl ON orders (customer_id, created_at) INCLUDE (amount);\nVACUUM orders;\nEXPLAIN (ANALYZE, BUFFERS) SELECT customer_id, created_at, amount\nFROM orders WHERE customer_id BETWEEN 1 AND 1000;',
+          active: ['q', 'idx'],
+          edges: ['q-idx'],
+        },
+        {
+          title: '✓ Index Only Scan',
+          note: 'Heap Fetches: 0 (the pages are all-visible, Concept 2). The walk covers ≈ 50 leaf pages.',
+          active: ['idx', 'cov'],
+          edges: ['idx-cov'],
+        },
+        {
+          title: '120× fewer buffers',
+          note: '53 buffers instead of 6,404; 0.73 ms instead of 4.25 ms. The same index also serves WHERE customer_id = 7 ORDER BY created_at DESC LIMIT 5 with 4 buffers and no heap access.',
+          active: ['cov', 'out'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: covering secondary indexes
+
+Every InnoDB secondary entry already contains the primary key, so `(customer_id, created_at, amount)` covers any query on those columns plus `id`.
+
+<Flow
+  title="InnoDB: covering vs non-covering secondary index"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'SELECT customer_id,', sub: 'created_at, amount', x: 20, y: 20, w: 240 },
+    { id: 'sec', label: 'Secondary range', sub: '', x: 330, y: 20, w: 220 },
+    { id: 'cov', label: '✓ Covered', sub: 'Using index', x: 610, y: 20, w: 170 },
+    { id: 'no', label: '✗ Needs the row', sub: 'PK lookup per entry', x: 330, y: 150, w: 220 },
+    { id: 'clu', label: 'Clustered index', sub: '', x: 610, y: 150, w: 170 },
+  ]}
+  edges={[
+    { id: 'q-sec', from: 'q', to: 'sec' },
+    { id: 'sec-cov', from: 'sec', to: 'cov' },
+    { id: 'sec-no', from: 'sec', to: 'no' },
+    { id: 'no-clu', from: 'no', to: 'clu' },
+  ]}
+  cases={[
+    {
+      title: '(customer_id) only',
+      path: '✗ each of 10,000 entries → clustered lookup → 40,014 page requests',
+      summary: 'Measured: 8.2 ms.',
+      subs: { sec: 'orders_customer_idx', clu: '40,014 page requests' },
+      steps: [
+        {
+          title: '✗ A lookup per row',
+          note: 'EXPLAIN: Using index condition (no "Using index"). 10,000 primary-key descents of ≈ 4 page requests each.',
+          code: 'SELECT customer_id, created_at, amount FROM orders FORCE INDEX (orders_customer_idx)\nWHERE customer_id BETWEEN 1 AND 1000;',
+          active: ['q', 'sec', 'no', 'clu'],
+          edges: ['q-sec', 'sec-no', 'no-clu'],
+        },
+      ],
+    },
+    {
+      title: '(customer_id, created_at, amount)',
+      path: '✓ Using index → 1,133 page requests',
+      summary: 'Measured: 0.88 ms, 35× fewer page requests.',
+      subs: { sec: 'orders_cust_created_amt', cov: '1,133 page requests' },
+      steps: [
+        {
+          title: '✓ Covered',
+          note: 'EXPLAIN: Using where; Using index. The range walk over ≈ 10,000 entries is all the work.',
+          code: 'CREATE INDEX orders_cust_created_amt ON orders (customer_id, created_at, amount);\nSELECT customer_id, created_at, amount FROM orders FORCE INDEX (orders_cust_created_amt)\nWHERE customer_id BETWEEN 1 AND 1000;',
+          active: ['q', 'sec', 'cov'],
+          edges: ['q-sec', 'sec-cov'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: covered queries
+
+A query is covered when every filtered and projected field is in the index **and** `_id` is excluded (unless `_id` is in the index).
+
+<Flow
+  title="MongoDB: covered vs fetched"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'find(customer 1–1,000)', sub: '', x: 20, y: 20, w: 240 },
+    { id: 'ix', label: 'IXSCAN', sub: '', x: 330, y: 20, w: 220 },
+    { id: 'cov', label: '✓ Covered', sub: 'PROJECTION_COVERED', x: 610, y: 20, w: 170 },
+    { id: 'no', label: '✗ Needs the document', sub: 'FETCH', x: 330, y: 150, w: 220 },
+    { id: 'docs', label: '10,000 documents', sub: '', x: 610, y: 150, w: 170 },
+  ]}
+  edges={[
+    { id: 'q-ix', from: 'q', to: 'ix' },
+    { id: 'ix-cov', from: 'ix', to: 'cov' },
+    { id: 'ix-no', from: 'ix', to: 'no' },
+    { id: 'no-docs', from: 'no', to: 'docs' },
+  ]}
+  cases={[
+    {
+      title: '_id not excluded',
+      path: 'index { customer_id, created_at, amount } but projection includes _id ✗ → FETCH 10,000 docs',
+      summary: 'Measured: 11 ms.',
+      subs: { ix: 'cust_cov', docs: '11 ms' },
+      steps: [
+        {
+          title: '✗ _id is returned by default',
+          note: 'The projection { customer_id: 1, created_at: 1, amount: 1 } still returns _id, which this index does not hold: PROJECTION_SIMPLE ← FETCH ← IXSCAN, 10,000 documents examined.',
+          code: 'db.orders.find({ customer_id: { $gte: 1, $lte: 1000 } }, { customer_id: 1, created_at: 1, amount: 1 })',
+          active: ['q', 'ix', 'no', 'docs'],
+          edges: ['q-ix', 'ix-no', 'no-docs'],
+        },
+      ],
+    },
+    {
+      title: '_id excluded',
+      path: '{ _id: 0, … } ✓ → PROJECTION_COVERED, 0 documents',
+      summary: 'Measured: 2 ms.',
+      subs: { ix: 'cust_cov', cov: '0 docs, 2 ms' },
+      steps: [
+        {
+          title: '✓ Covered',
+          note: 'totalKeysExamined 10,000, totalDocsExamined 0. The same projection on the customer_id_1 index (no created_at, amount) needs a FETCH again: 8 ms.',
+          code: 'db.orders.find({ customer_id: { $gte: 1, $lte: 1000 } }, { _id: 0, customer_id: 1, created_at: 1, amount: 1 })',
+          active: ['q', 'ix', 'cov'],
+          edges: ['q-ix', 'ix-cov'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## What covering costs
+
+| Cost | Lab |
+|---|---|
+| Size | PostgreSQL: 30 MB → 39 MB with `INCLUDE (amount)`; MongoDB `cust_cov` 26 MB vs `customer_id_1` 6.8 MB |
+| Writes | Every insert writes the extra bytes; every update of an included column updates the index (and in PostgreSQL makes the update non-HOT) |
+| Visibility (PostgreSQL only) | Index-only scans need all-visible pages (Concept 2) |
+
+<Pitfall>
+Covering is for **specific, frequent** queries. "Add every column to INCLUDE" turns the index into a second copy of the table that must be maintained on every write, and any update to an included column can no longer be a HOT update. Cover the queries on your hot path, not the table.
+</Pitfall>
+
+## Real-world scenario: the order-list API
+
+The mobile app's order list shows id, date, status and total for a user's 20 latest orders: `SELECT id, created_at, status, amount FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 20`.
+
+| Index | Work per call |
+|---|---|
+| `(user_id)` | All the user's rows + sort |
+| `(user_id, created_at)` | 20 entries + 20 row fetches |
+| PostgreSQL: `(user_id, created_at) INCLUDE (status, amount)`; MySQL: `(user_id, created_at, status, amount)`; MongoDB: `{ user_id: 1, created_at: -1, status: 1, amount: 1 }` + `_id` in the index or excluded | 20 index entries, no row fetch |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 2: index-only scans | Why PostgreSQL's covered query may still visit the heap |
+| Session 6: engine differences | InnoDB's free primary key in every entry |
+| Session 8: write amplification | Covering columns add write cost |
+
+## Key takeaways
+
+1. A covering index contains every column a query filters on and returns, so the row fetch is skipped.
+2. PostgreSQL's `INCLUDE` adds return-only columns to leaf entries without affecting order or uniqueness.
+3. MySQL and MongoDB cover with trailing key columns; InnoDB entries already include the primary key.
+4. MongoDB queries are covered only with `_id` excluded or indexed.
+5. Measured gains: 6,404 → 53 buffers, 40,014 → 1,133 page requests, 10,000 → 0 documents.
+6. Covering costs size, write work and (in PostgreSQL) HOT updates on included columns.
+
+## Check questions
+
+1. What makes a query "covered" by an index? Give one covered and one non-covered query for `(customer_id, created_at)`.
+2. What is the difference between a key column and an `INCLUDE` column in PostgreSQL?
+3. Why did the covering index reduce PostgreSQL's buffers from 6,404 to 53?
+4. Why does `(customer_id, created_at, amount)` cover `SELECT id, amount … WHERE customer_id = ?` in InnoDB?
+5. A MongoDB query on a perfectly matching index still shows `FETCH`. What is the most likely cause?
+6. Why does `UNIQUE (email) INCLUDE (name)` still enforce unique emails?
+7. What are the costs of adding many `INCLUDE` columns, and which update behaviour changes in PostgreSQL?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-5-covering-partial-expression/concept-1-covering-include/answers">Worked answers to Q1–Q7</DeepDive>
