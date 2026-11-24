@@ -1,0 +1,130 @@
+---
+title: "Lab and session quiz: When indexes hurt"
+description: "Measure write amplification with 0 to 8 indexes in all three engines, find unused and bloated indexes, rebuild one online, reproduce the locking problems of index builds (PostgreSQL ShareLock, CONCURRENTLY leftovers, MySQL metadata-lock queue), and finish with a design exercise."
+type: "how-to"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "write-amplification", "locking", "lab"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY"
+  - "https://dev.mysql.com/doc/refman/8.4/en/metadata-locking.html"
+  - "https://www.mongodb.com/docs/manual/reference/operator/aggregation/indexStats/"
+---
+
+<Tldr>
+Uses the containers from the [Session 1 lab](/blogs/databases/indexing/session-1-storage-basics/lab). Exercise 3 needs **three terminals** (or background sessions), because locking only shows up between concurrent sessions. Run the shell parts with `bash`: the array indexing below assumes bash, not zsh.
+</Tldr>
+
+## Exercise 1: write amplification (Concept 1)
+
+```bash
+#!/bin/bash
+# Insert 200k rows into a table with 0, 2, 5 or 8 secondary indexes; report time and WAL volume (PostgreSQL).
+P() { docker exec idx-pg psql -U postgres -At "$@"; }
+cols=(a b c d e f g h)
+for n in 0 2 5 8; do
+  P -q -c "DROP TABLE IF EXISTS wa" -c "CREATE TABLE wa (id bigint PRIMARY KEY, a int, b int, c int, d text, e timestamptz, f numeric, g int, h int)"
+  for ((i=0;i<n;i++)); do P -q -c "CREATE INDEX ON wa (${cols[$i]})"; done
+  L1=$(P -c "SELECT pg_current_wal_lsn()"); S=$(date +%s%N)
+  P -q -c "INSERT INTO wa SELECT g, (g*7)%100000, (g*13)%100000, (g*17)%1000, md5(g::text), now() - (g % 86400) * interval '1 second', g % 1000, (g*31)%50000, (g*37)%50000 FROM generate_series(1, 200000) g"
+  echo "$n indexes: $(( ($(date +%s%N)-S)/1000000 )) ms, WAL $(P -c "SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), '$L1'))")"
+done
+P -q -c "DROP TABLE wa"
+```
+
+| Secondary indexes | PostgreSQL | WAL | MySQL (same idea, `Innodb_os_log_written` for redo) | Redo | MongoDB |
+|---|---|---|---|---|---|
+| 0 | 305 ms | 39 MB | 630 ms | 45 MB | 574 ms |
+| 8 | 1,486 ms | 164 MB | 1,942 ms | 99 MB | 1,493 ms |
+
+## Exercise 2: unused and bloated indexes (Concept 2)
+
+```sql
+-- pg
+SELECT indexrelname, idx_scan, pg_size_pretty(pg_relation_size(indexrelid))
+FROM pg_stat_user_indexes WHERE relname = 'orders' ORDER BY idx_scan;
+SELECT stats_reset FROM pg_stat_database WHERE datname = current_database();
+
+SELECT leaf_pages, avg_leaf_density FROM pgstatindex('orders_status_created_idx');   -- e.g. 4461, 86.2
+REINDEX INDEX CONCURRENTLY orders_status_created_idx;                                -- ≈ 0.4 s
+SELECT leaf_pages, avg_leaf_density FROM pgstatindex('orders_status_created_idx');   -- 4270, 90.1
+```
+
+```sql
+-- my
+SHOW GLOBAL STATUS LIKE 'Uptime';     -- counters below start at the last restart
+SELECT object_name, index_name FROM sys.schema_unused_indexes WHERE object_schema = 'lab';
+ALTER TABLE orders ALTER INDEX orders_day INVISIBLE;   -- test before dropping
+ALTER TABLE orders ALTER INDEX orders_day VISIBLE;
+```
+
+```js
+// mg
+db.orders.aggregate([{ $indexStats: {} }, { $project: { name: 1, ops: '$accesses.ops', since: '$accesses.since' } }]);
+db.orders.hideIndex('ers'); db.orders.unhideIndex('ers');
+```
+
+## Exercise 3: locking during index builds (Concept 3)
+
+**PostgreSQL, plain CREATE INDEX.** Terminal 1:
+
+```sql
+BEGIN; CREATE INDEX lock_demo ON orders (amount); SELECT pg_sleep(30); ROLLBACK;
+```
+
+Terminal 2 (within 30 s): `INSERT INTO orders VALUES (2000001, 1, 'paid', 'web', 'SKU-1', 1, now());` hangs. Terminal 3:
+
+```sql
+SELECT pid, wait_event_type, wait_event, left(query, 50) FROM pg_stat_activity WHERE state <> 'idle';
+SELECT l.mode, l.granted, left(a.query, 40) FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+WHERE l.relation = 'orders'::regclass;
+-- ShareLock | t | BEGIN; CREATE INDEX …   ·   RowExclusiveLock | f | INSERT INTO orders …
+```
+
+**PostgreSQL, CONCURRENTLY.** Terminal 1: `BEGIN; SELECT count(*) FROM orders WHERE id = 1; SELECT pg_sleep(30); COMMIT;` Terminal 2: `CREATE INDEX CONCURRENTLY cic_demo ON orders (amount);` Terminal 3:
+
+```sql
+SELECT phase FROM pg_stat_progress_create_index;          -- waiting for old snapshots
+INSERT INTO orders VALUES (2000002, 1, 'paid', 'web', 'SKU-1', 1, now());   -- succeeds immediately
+```
+
+Failed unique build:
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY uq_demo ON orders (customer_id);   -- ERROR: … is duplicated
+SELECT indexrelid::regclass, indisvalid FROM pg_index WHERE NOT indisvalid;   -- uq_demo | f
+DROP INDEX CONCURRENTLY uq_demo; DROP INDEX CONCURRENTLY cic_demo;
+DELETE FROM orders WHERE id IN (2000001, 2000002);
+```
+
+**MySQL, metadata-lock queue.** Terminal 1: `START TRANSACTION; SELECT COUNT(*) FROM orders WHERE id = 1; SELECT SLEEP(30); COMMIT;` Terminal 2: `ALTER TABLE orders ADD INDEX mdl_demo (amount), ALGORITHM=INPLACE, LOCK=NONE;` Terminal 3: `SELECT COUNT(*) FROM orders WHERE id = 2;` hangs, then:
+
+```sql
+SELECT id, state, LEFT(info, 50) FROM information_schema.processlist WHERE db = 'lab' AND command <> 'Sleep';
+-- ALTER … Waiting for table metadata lock · SELECT … Waiting for table metadata lock
+-- afterwards: DROP INDEX mdl_demo ON orders;
+```
+
+## Exercise 4: design (Concept 4)
+
+For the query below, write the index for each engine, predict the plan, then build it and verify:
+
+```sql
+SELECT id, created_at, amount FROM orders
+WHERE customer_id = ? AND status = 'paid'
+ORDER BY created_at DESC LIMIT 10;
+```
+
+Expected: PostgreSQL Index Only Scan Backward (or Index Scan Backward plus a few heap pages), MySQL `ref` + Backward index scan + `Using index`, MongoDB `LIMIT ← PROJECTION_COVERED ← IXSCAN` with `_id` handled.
+
+## Session quiz
+
+1. In Exercise 1, WAL grew 4.2× with 8 indexes. Estimate the WAL for 16 similar indexes and explain what assumption you make.
+2. Why does a non-HOT update in PostgreSQL make write amplification worse than an insert with the same indexes?
+3. `idx_scan` is 0 for an index created 3 months ago, and `stats_reset` was yesterday. What do you conclude?
+4. After `REINDEX INDEX CONCURRENTLY`, the index shrank only from 35 MB to 34 MB. When would you expect a much bigger gain?
+5. In Exercise 3, why did the INSERT wait for the plain `CREATE INDEX` but not for `CREATE INDEX CONCURRENTLY`?
+6. Why did the plain SELECT in the MySQL demo wait, and what single setting limits the damage?
+7. Write the three indexes for Exercise 4 and explain the column order once.
+8. Name one situation from this course where the right answer was to **not** add an index.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-8-when-indexes-hurt/lab/answers">Answers to the session quiz</DeepDive>

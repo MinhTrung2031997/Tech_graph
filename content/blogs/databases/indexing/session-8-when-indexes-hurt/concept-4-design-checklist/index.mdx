@@ -1,0 +1,220 @@
+---
+title: "Concept 4: An index-design checklist"
+description: "The whole course as one procedure: find the queries that matter, read their plans, pick the index type by operator, order the columns (equality, sort, range), decide on covering, partial or expression variants, weigh the write cost, deploy online and verify. With a worked example in PostgreSQL, MySQL and MongoDB."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "checklist", "index-design"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/pgstatstatements.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/performance-schema-statement-digests.html"
+  - "https://www.mongodb.com/docs/manual/tutorial/manage-the-database-profiler/"
+  - "https://www.mongodb.com/docs/manual/tutorial/equality-sort-range-guideline/"
+---
+
+<Tldr>
+An index is a decision with a read side and a write side. The checklist: **(1)** start from the queries that cost the most in total, not from columns; **(2)** read their plans and measure pages or keys examined vs rows returned; **(3)** pick the index type from the operator (`=`/range/sort → B-tree, contains → GIN, overlaps → GiST, append-only time ranges → BRIN, substrings → trigram); **(4)** order columns **equality → sort → range**; **(5)** add covering columns, a partial predicate or an expression only when the query needs it; **(6)** check write cost and redundancy; **(7)** deploy online with a lock timeout; **(8)** verify the plan and keep auditing. Every step has appeared in this course; this page puts them in order.
+</Tldr>
+
+## The checklist
+
+| # | Step | Question to answer | Session |
+|---|---|---|---|
+| 1 | Find the queries | Which statements cost the most **in total** (calls × time)? | 3, 6 |
+| 2 | Read the plan | Full scan? Rows/keys examined ≫ returned? A Sort? Heap or document fetches? | 1, 3, 6 |
+| 3 | Is an index the answer? | Selective enough? Small table? Would a rewrite (sargable condition) fix it? | 3 |
+| 4 | Pick the type | Which operator: `=`, range, `ORDER BY`, contains, overlaps, `LIKE '%…%'`, time range on an append-only table? | 2, 7 |
+| 5 | Order the columns | Equality columns, then sort columns, then one range column | 4 |
+| 6 | Variants | Cover hot queries (`INCLUDE` / extra columns)? Partial for a fixed subset? Expression for a function? Unique for a rule? | 5 |
+| 7 | Count the cost | Write amplification, HOT updates lost, redundant with an existing index? | 6, 8 |
+| 8 | Deploy | `CONCURRENTLY` / online DDL, lock timeout, no long transactions | 8 |
+| 9 | Verify | Plan uses it; pages/keys examined dropped; write latency and WAL acceptable | all |
+| 10 | Audit | Unused, redundant, bloated indexes, periodically | 8 |
+
+| Term | Meaning |
+|---|---|
+| Total time | Calls × mean time: a 2 ms query run 10 million times a day costs more than a 10 s report run once |
+| **✓ Index justified / ✗ Not justified** | Reads saved outweigh writes added, or another fix is better |
+
+## Step 1 in each engine: find the queries
+
+<Flow
+  title="PostgreSQL: from slow query to verified index"
+  height={300}
+  nodes={[
+    { id: 'pss', label: 'pg_stat_statements', sub: 'total_exec_time', x: 20, y: 20, w: 240 },
+    { id: 'plan', label: 'EXPLAIN (ANALYZE, BUFFERS)', sub: '', x: 320, y: 20, w: 240 },
+    { id: 'idx', label: 'CREATE INDEX', sub: 'CONCURRENTLY', x: 620, y: 20, w: 160 },
+    { id: 'yes', label: '✓ Index justified', sub: 'buffers dropped', x: 620, y: 150, w: 160 },
+    { id: 'no', label: '✗ Not justified', sub: 'rewrite / leave', x: 320, y: 150, w: 240 },
+  ]}
+  edges={[
+    { id: 'pss-plan', from: 'pss', to: 'plan' },
+    { id: 'plan-idx', from: 'plan', to: 'idx' },
+    { id: 'idx-yes', from: 'idx', to: 'yes' },
+    { id: 'plan-no', from: 'plan', to: 'no' },
+  ]}
+  cases={[
+    {
+      title: 'Workflow',
+      path: 'top statements by total time → plan → index → ✓ verified with Buffers',
+      summary: 'pg_stat_statements must be loaded via shared_preload_libraries.',
+      steps: [
+        {
+          title: 'Rank by total time',
+          note: 'pg_stat_statements groups queries by shape. Sort by total_exec_time, not mean time.',
+          code: "-- postgresql.conf: shared_preload_libraries = 'pg_stat_statements'\nCREATE EXTENSION pg_stat_statements;\nSELECT calls, round(total_exec_time) AS total_ms, round(mean_exec_time, 2) AS mean_ms, query\nFROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 10;",
+          active: ['pss'],
+        },
+        {
+          title: 'Read the plan',
+          note: 'Look for Seq Scan with large Rows Removed by Filter, Sort nodes under a Limit, Heap Fetches on index-only scans, buffers far above rows returned.',
+          active: ['pss', 'plan'],
+          edges: ['pss-plan'],
+        },
+        {
+          title: '✓ or ✗',
+          note: 'If an index fits the operators and selectivity, build it CONCURRENTLY and compare Buffers before/after. If the plan was right (low selectivity) or the condition is not sargable, rewrite or leave it.',
+          active: ['plan', 'idx', 'yes', 'no'],
+          edges: ['plan-idx', 'idx-yes', 'plan-no'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Flow
+  title="MySQL: from slow query to verified index"
+  height={300}
+  nodes={[
+    { id: 'dig', label: 'statement digests', sub: 'performance_schema', x: 20, y: 20, w: 240 },
+    { id: 'plan', label: 'EXPLAIN ANALYZE', sub: '', x: 320, y: 20, w: 240 },
+    { id: 'idx', label: 'ALTER … ADD INDEX', sub: 'LOCK=NONE', x: 620, y: 20, w: 160 },
+    { id: 'yes', label: '✓ Index justified', sub: 'rows examined dropped', x: 620, y: 150, w: 160 },
+    { id: 'no', label: '✗ Not justified', sub: 'rewrite / leave', x: 320, y: 150, w: 240 },
+  ]}
+  edges={[
+    { id: 'dig-plan', from: 'dig', to: 'plan' },
+    { id: 'plan-idx', from: 'plan', to: 'idx' },
+    { id: 'idx-yes', from: 'idx', to: 'yes' },
+    { id: 'plan-no', from: 'plan', to: 'no' },
+  ]}
+  cases={[
+    {
+      title: 'Workflow',
+      path: 'digests by SUM_TIMER_WAIT and rows examined → plan → online ALTER → ✓ verified',
+      summary: 'sys.statements_with_full_table_scans is a quick shortlist.',
+      steps: [
+        {
+          title: 'Rank by total time and rows examined',
+          note: 'events_statements_summary_by_digest has SUM_TIMER_WAIT, SUM_ROWS_EXAMINED and SUM_ROWS_SENT per query shape; a large examined/sent ratio marks missing indexes.',
+          code: 'SELECT DIGEST_TEXT, COUNT_STAR, ROUND(SUM_TIMER_WAIT/1e12) AS total_s, SUM_ROWS_EXAMINED, SUM_ROWS_SENT\nFROM performance_schema.events_statements_summary_by_digest ORDER BY SUM_TIMER_WAIT DESC LIMIT 10;',
+          active: ['dig'],
+        },
+        {
+          title: 'Plan, index, verify',
+          note: 'EXPLAIN ANALYZE shows actual rows per step; add the index with online DDL and a low lock_wait_timeout; compare rows examined afterwards.',
+          active: ['dig', 'plan', 'idx', 'yes', 'no'],
+          edges: ['dig-plan', 'plan-idx', 'idx-yes', 'plan-no'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Flow
+  title="MongoDB: from slow query to verified index"
+  height={300}
+  nodes={[
+    { id: 'prof', label: 'Profiler / slow log', sub: 'planSummary, docsExamined', x: 20, y: 20, w: 240 },
+    { id: 'plan', label: 'explain("executionStats")', sub: '', x: 320, y: 20, w: 240 },
+    { id: 'idx', label: 'createIndex', sub: 'ESR order', x: 620, y: 20, w: 160 },
+    { id: 'yes', label: '✓ Index justified', sub: 'keys ≈ docs ≈ returned', x: 620, y: 150, w: 160 },
+    { id: 'no', label: '✗ Not justified', sub: 'reshape the query', x: 320, y: 150, w: 240 },
+  ]}
+  edges={[
+    { id: 'prof-plan', from: 'prof', to: 'plan' },
+    { id: 'plan-idx', from: 'plan', to: 'idx' },
+    { id: 'idx-yes', from: 'idx', to: 'yes' },
+    { id: 'plan-no', from: 'plan', to: 'no' },
+  ]}
+  cases={[
+    {
+      title: 'Workflow',
+      path: 'profiler: COLLSCAN or docsExamined ≫ nreturned → explain → ESR index → ✓ ratios ≈ 1',
+      summary: 'Session 6, Concept 5 for reading the output.',
+      steps: [
+        {
+          title: 'Find candidates',
+          note: 'With the profiler at level 1 (slowms), look for planSummary COLLSCAN, SORT stages, and docsExamined or keysExamined far above nreturned, grouped by queryHash.',
+          code: 'db.setProfilingLevel(1, { slowms: 100 })\ndb.system.profile.find({ planSummary: "COLLSCAN" }).sort({ millis: -1 }).limit(10)',
+          active: ['prof'],
+        },
+        {
+          title: 'Explain, index, verify',
+          note: 'explain("executionStats"), design the index with ESR, build it, compare keys/docs/returned and check $indexStats over time.',
+          active: ['prof', 'plan', 'idx', 'yes', 'no'],
+          edges: ['prof-plan', 'plan-idx', 'idx-yes', 'plan-no'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Worked example: a seller's order list
+
+Query: "a seller's orders with a given status, amount above X, newest first, 50 per page".
+
+| Step | Decision |
+|---|---|
+| Operators | `seller_id =`, `status =`, `amount >`, `ORDER BY created_at DESC LIMIT 50` |
+| Type | B-tree |
+| Order (ESR) | `seller_id`, `status` (equality) → `created_at` (sort) → `amount` (range) |
+| Covering? | The list shows id, created_at, status, amount: cover it if the endpoint is hot |
+| Partial? | If only `status = 'pending'` is ever listed, a partial index (PostgreSQL / MongoDB) is smaller |
+| Pagination | Keyset on `(created_at, id)`, not OFFSET (Session 2) |
+| Write cost | Replaces the old `(seller_id)` and `(status)` indexes → fewer indexes overall |
+| Deploy | Online, with a lock timeout |
+
+| Engine | Index |
+|---|---|
+| PostgreSQL | `CREATE INDEX CONCURRENTLY ON orders (seller_id, status, created_at DESC, amount) INCLUDE (id);` (the `id` is in every heap tuple but not in the index, so include it for index-only scans) |
+| MySQL | `ALTER TABLE orders ADD INDEX (seller_id, status, created_at, amount), ALGORITHM=INPLACE, LOCK=NONE;` (`id` is already in every entry) |
+| MongoDB | `db.orders.createIndex({ seller_id: 1, status: 1, created_at: -1, amount: 1 })`, projection with `_id: 0` or `_id` added to the index for covering |
+
+<Pitfall>
+The most common index mistakes in this course, in one list: indexing low-selectivity columns alone (Session 3); a function or type mismatch hiding the column (Session 3); range before equality or sort (Session 4); `SELECT *` defeating covering (Session 5); forgetting `_id: 0` (Session 5); random primary keys (Session 6); indexing every column of a write-heavy table (Session 8); plain `CREATE INDEX` on a busy table (Session 8).
+</Pitfall>
+
+## Real-world scenario: the quarterly index review
+
+A team reviews indexes every quarter with one query per engine and a short meeting.
+
+| Check | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| Top queries by total time | `pg_stat_statements` | Statement digests | Profiler / Atlas Query Insights |
+| Unused indexes (counting period known) | `pg_stat_user_indexes.idx_scan` | `sys.schema_unused_indexes` | `$indexStats` |
+| Redundant indexes | Prefix comparison | `sys.schema_redundant_indexes` | Prefix comparison |
+| Bloat | `pgstatindex` density | Table rebuild size estimates | `compact` candidates |
+| Write health | WAL rate, HOT ratio | Redo rate, history list length | Oplog window, replication lag |
+
+## Key takeaways
+
+1. Start from queries ranked by total cost, not from columns.
+2. Read the plan: pages or keys examined vs rows returned, sorts, fetches.
+3. Choose the index type by operator, then order columns equality → sort → range.
+4. Add covering, partial, expression or unique variants only for a concrete need.
+5. Count the write cost and remove redundant indexes when adding new ones.
+6. Deploy online with lock timeouts; verify with the same measurements you started from.
+7. Audit regularly: unused, redundant, bloated.
+
+## Check questions
+
+1. Why rank queries by total time rather than by mean time?
+2. A query is slow and has no index on its WHERE column. Give two reasons not to add one.
+3. Design an index in each engine for `WHERE tenant_id = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 20` that never touches the table, returning `id, created_at, total`.
+4. Which plan signals in each engine tell you an index is missing?
+5. You add an index and the query is no faster. List three things to check.
+6. What should a quarterly index review include?
+7. Pick three mistakes from this course you think are most common in production systems, and how to detect each.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-8-when-indexes-hurt/concept-4-design-checklist/answers">Worked answers to Q1–Q7</DeepDive>

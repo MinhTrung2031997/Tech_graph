@@ -1,0 +1,224 @@
+---
+title: "Concept 1: Write amplification"
+description: "Every index is written on every insert and on every update that touches it. Measured with 0, 2, 5 and 8 secondary indexes: PostgreSQL inserts 4.9× slower with 4.2× the WAL, MySQL 3.1× slower with 2.2× the redo, MongoDB 2.6× slower. How updates multiply it further, and how to keep it in check."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "write-amplification", "wal"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/wal-intro.html"
+  - "https://www.postgresql.org/docs/current/storage-hot.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-redo-log.html"
+  - "https://www.mongodb.com/docs/manual/core/data-model-operations/#indexes"
+---
+
+<Tldr>
+Every session so far showed what an index saves on reads. This one shows what it costs on writes. Inserting 200,000 rows into the same table with **0, 2, 5 and 8** secondary indexes took **305 → 526 → 1,013 → 1,486 ms** in PostgreSQL and generated **39 → 164 MB of WAL**; MySQL **630 → 1,942 ms** with **45 → 99 MB** of redo; MongoDB **574 → 1,493 ms**. Each index adds a B-tree insert (often into a random leaf), log records, dirty pages to flush and replicate. Updates add more: in PostgreSQL a non-HOT update writes to **every** index (Session 6). The rule: every index must pay for itself in reads.
+</Tldr>
+
+## Measured: inserts vs number of indexes
+
+Table with 8 extra columns, 200,000 rows inserted in one statement, indexes on 0, 2, 5 or 8 of the columns (plus the primary key):
+
+| Secondary indexes | PostgreSQL time | WAL | Index size | MySQL time | Redo | MongoDB time |
+|---|---|---|---|---|---|---|
+| 0 | 305 ms | 39 MB | 4.4 MB | 630 ms | 45 MB | 574 ms |
+| 2 | 526 ms | 67 MB | 14 MB | 920 ms | 57 MB | 729 ms |
+| 5 | 1,013 ms | 121 MB | 35 MB | 1,487 ms | 84 MB | 1,139 ms |
+| 8 | 1,486 ms (4.9×) | 164 MB (4.2×) | 47 MB | 1,942 ms (3.1×) | 99 MB (2.2×) | 1,493 ms (2.6×) |
+
+| Term | Meaning |
+|---|---|
+| Write amplification | Bytes and operations the database writes per logical change; each index multiplies it |
+| WAL / redo | The log every change is written to first (PostgreSQL WAL, InnoDB redo, WiredTiger journal); also what replicas replay |
+| Full-page write | PostgreSQL logs a whole 8 KB page the first time it changes after a checkpoint; random index inserts touch many pages, so many full-page writes |
+| **✓ Index pays for itself / ✗ Pure cost** | Reads it speeds up outweigh the writes it adds, or not |
+
+## Where the cost comes from
+
+<Flow
+  title="PostgreSQL: one INSERT with N indexes"
+  height={330}
+  nodes={[
+    { id: 'ins', label: 'INSERT one row', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'heap', label: 'Heap page', sub: 'append', x: 310, y: 20, w: 200 },
+    { id: 'idx', label: 'Each index', sub: 'descend + insert', x: 580, y: 20, w: 200 },
+    { id: 'wal', label: 'WAL', sub: 'record per page change', x: 310, y: 150, w: 200 },
+    { id: 'fpw', label: 'Full-page writes', sub: 'first touch after checkpoint', x: 580, y: 150, w: 200 },
+    { id: 'rep', label: 'Replicas + backups', sub: 'replay the WAL', x: 310, y: 270, w: 200 },
+  ]}
+  edges={[
+    { id: 'ins-heap', from: 'ins', to: 'heap' },
+    { id: 'heap-idx', from: 'heap', to: 'idx', label: 'ctid' },
+    { id: 'heap-wal', from: 'heap', to: 'wal' },
+    { id: 'idx-fpw', from: 'idx', to: 'fpw' },
+    { id: 'wal-rep', from: 'wal', to: 'rep' },
+  ]}
+  cases={[
+    {
+      title: '0 secondary indexes',
+      path: 'heap append + primary-key insert → 39 MB WAL for 200,000 rows',
+      summary: 'Measured: 305 ms.',
+      subs: { idx: 'primary key only' },
+      steps: [
+        {
+          title: 'Heap and primary key',
+          note: 'Each row is appended to the heap and inserted into the primary-key index; both changes are logged. Sequential ids keep the index inserts at the right edge.',
+          code: 'INSERT INTO wa SELECT g, … FROM generate_series(1, 200000) g;',
+          active: ['ins', 'heap', 'idx', 'wal'],
+          edges: ['ins-heap', 'heap-idx', 'heap-wal'],
+        },
+      ],
+    },
+    {
+      title: '8 secondary indexes',
+      path: '+8 B-tree inserts per row, mostly into random leaves → 164 MB WAL, 4.9× the time',
+      summary: 'Measured: 1,486 ms; indexes 47 MB.',
+      subs: { idx: '9 indexes' },
+      steps: [
+        {
+          title: 'Nine index inserts per row',
+          note: 'The row gets its ctid in the heap, then each of the 9 indexes is descended and gets an entry. Columns like a, b, g, h hold scattered values, so their entries land in random leaves.',
+          code: 'CREATE INDEX ON wa (a); … CREATE INDEX ON wa (h);\nINSERT INTO wa SELECT g, … FROM generate_series(1, 200000) g;',
+          active: ['ins', 'heap', 'idx'],
+          edges: ['ins-heap', 'heap-idx'],
+        },
+        {
+          title: 'More pages dirtied, more WAL',
+          note: 'Random leaf inserts dirty many different pages, each needing a full-page image in the WAL on its first change after a checkpoint, plus page splits. WAL grew from 39 MB to 164 MB.',
+          active: ['idx', 'fpw', 'wal'],
+          edges: ['idx-fpw'],
+        },
+        {
+          title: 'Everyone downstream pays',
+          note: 'Replicas replay all 164 MB, backups archive it, and checkpoints flush all those dirty pages. Write amplification is a cluster-wide cost, not only a slower INSERT.',
+          active: ['wal', 'rep'],
+          edges: ['wal-rep'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Flow
+  title="InnoDB: one INSERT with N secondary indexes"
+  height={280}
+  nodes={[
+    { id: 'ins', label: 'INSERT one row', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'clu', label: 'Clustered index', sub: 'the row', x: 310, y: 20, w: 200 },
+    { id: 'sec', label: 'Each secondary', sub: '(columns, PK) entry', x: 580, y: 20, w: 200 },
+    { id: 'redo', label: 'Redo log', sub: '', x: 310, y: 150, w: 200 },
+  ]}
+  edges={[
+    { id: 'ins-clu', from: 'ins', to: 'clu' },
+    { id: 'clu-sec', from: 'clu', to: 'sec' },
+    { id: 'clu-redo', from: 'clu', to: 'redo' },
+    { id: 'sec-redo', from: 'sec', to: 'redo', quiet: true },
+  ]}
+  cases={[
+    {
+      title: '0 → 8 secondary indexes',
+      path: 'clustered insert + 8 secondary inserts → redo 45 → 99 MB, 630 → 1,942 ms',
+      summary: 'Measured on the same 200,000 rows.',
+      steps: [
+        {
+          title: 'The row, then each secondary entry',
+          note: 'The row goes into the clustered index; each secondary index gets (indexed columns, primary key). The change buffer, which could defer secondary inserts into uncached pages, is off by default since 8.4.',
+          code: 'CREATE TABLE wa (…, INDEX (a), …, INDEX (h));\nINSERT INTO wa …;',
+          active: ['ins', 'clu', 'sec'],
+          edges: ['ins-clu', 'clu-sec'],
+        },
+        {
+          title: 'Logged and flushed',
+          note: 'Redo grew from 45 to 99 MB, time 3.1×. InnoDB logs page changes more compactly than PostgreSQL\'s full-page images, so the redo grows less, but the work per index is similar.',
+          active: ['clu', 'sec', 'redo'],
+          edges: ['clu-redo', 'sec-redo'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Flow
+  title="MongoDB: one insert with N secondary indexes"
+  height={280}
+  nodes={[
+    { id: 'ins', label: 'insertMany', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'coll', label: 'Collection', sub: 'document by RecordId', x: 310, y: 20, w: 200 },
+    { id: 'idx', label: 'Each index', sub: 'key → RecordId', x: 580, y: 20, w: 200 },
+    { id: 'jr', label: 'Journal + oplog', sub: '', x: 310, y: 150, w: 200 },
+  ]}
+  edges={[
+    { id: 'ins-coll', from: 'ins', to: 'coll' },
+    { id: 'coll-idx', from: 'coll', to: 'idx' },
+    { id: 'coll-jr', from: 'coll', to: 'jr' },
+  ]}
+  cases={[
+    {
+      title: '0 → 8 secondary indexes',
+      path: 'document + 8 index keys per insert → 574 → 1,493 ms',
+      summary: 'Measured: 2.6× slower.',
+      steps: [
+        {
+          title: 'One key per index per document',
+          note: 'Each document is written once to the collection, then one key into each index (more for multikey arrays). The oplog records the document; secondaries rebuild index entries themselves, so they repeat the index work.',
+          code: 'db.wa.createIndex({ a: 1 }); …\ndb.wa.insertMany(docs)',
+          active: ['ins', 'coll', 'idx', 'jr'],
+          edges: ['ins-coll', 'coll-idx', 'coll-jr'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Updates multiply it further
+
+| Engine | Update of a column with no index | Update of an indexed column |
+|---|---|---|
+| PostgreSQL | 0 index writes if HOT; **every** index if not (Session 6) | **Every** index |
+| InnoDB | 0 | That index: delete-mark + insert |
+| MongoDB | 0 | That index: remove + insert |
+
+So in PostgreSQL the cost of an index is paid by updates of **other** columns too, whenever the update cannot be HOT.
+
+<Pitfall>
+Benchmarks of read queries never show write amplification. Before adding an index to a write-heavy table, measure insert and update throughput, WAL or redo volume, and replication lag with and without it, under realistic concurrency.
+</Pitfall>
+
+## Real-world scenario: the ingestion table with nine indexes
+
+An events table ingests 20,000 rows/s. Over two years it collected nine indexes, one per dashboard filter. Ingestion lags, replicas fall behind, and the WAL archive fills disks.
+
+| Step | Effect |
+|---|---|
+| List index usage (Concept 2) | 4 indexes never used since the last stats reset weeks ago |
+| Drop them | Insert time and WAL roughly halved (lab: 8 → 5 indexes ≈ −32% time) |
+| Replace 3 single-column indexes with 1 composite | Same queries served, fewer writes |
+| Move rare reports to a replica or warehouse | Their indexes live only there |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 2: bloat and unused indexes | Find indexes that cost writes and save nothing |
+| Concept 4: checklist | "Who pays for this index?" |
+
+## Key takeaways
+
+1. Every index adds a B-tree insert per row on every insert, plus log records and dirty pages.
+2. Lab, 200,000 inserts with 0 → 8 secondary indexes: PostgreSQL 4.9× slower and 4.2× WAL; MySQL 3.1× and 2.2× redo; MongoDB 2.6×.
+3. Random-key indexes cost more than sequential ones (more pages touched, more full-page writes, more splits).
+4. Replicas, backups and checkpoints all pay for the extra log volume.
+5. In PostgreSQL, non-HOT updates write to every index, even for unrelated columns.
+6. An index must save more on reads than it costs on writes.
+
+## Check questions
+
+1. Why did eight secondary indexes multiply PostgreSQL's WAL by 4.2 for the same rows?
+2. Why do indexes on scattered values cost more on insert than an index on an increasing column?
+3. Why did MySQL's redo grow less (2.2×) than PostgreSQL's WAL (4.2×)?
+4. Who besides the inserting session pays for write amplification?
+5. Why can a PostgreSQL index on `updated_at` slow down updates of every other column?
+6. How would you decide whether to keep an index on a write-heavy table?
+7. Replacing three single-column indexes with one composite index: what does it save on writes, and what must you check first?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-8-when-indexes-hurt/concept-1-write-amplification/answers">Worked answers to Q1–Q7</DeepDive>
