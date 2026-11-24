@@ -1,0 +1,343 @@
+---
+title: "Concept 3: GROUP BY and DISTINCT through an index"
+description: "How an index turns grouping into a streaming walk (PostgreSQL GroupAggregate, MySQL covering index scans) and DISTINCT into a handful of descents (MySQL loose index scan, MongoDB DISTINCT_SCAN, a recursive CTE in PostgreSQL). SELECT DISTINCT status: 10,110 buffers vs 20 in PostgreSQL, 191 ms vs 0.7 ms in MySQL, 5 keys in MongoDB."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "group-by", "distinct", "loose-index-scan"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-RECURSIVE"
+  - "https://wiki.postgresql.org/wiki/Loose_indexscan"
+  - "https://dev.mysql.com/doc/refman/8.4/en/group-by-optimization.html"
+  - "https://www.mongodb.com/docs/manual/reference/method/db.collection.distinct/"
+---
+
+<Tldr>
+Grouping needs rows with the same key **next to each other**. Without an index the engine hashes (or sorts) every row; with an index on the group key the rows already arrive grouped, so groups can be emitted as the scan goes and a `LIMIT` stops it early: the first 10 customers' order counts took **104 index entries (5 buffers)** instead of a full scan with a 2.5 MB spill to disk. `DISTINCT` on a column with few values is better still: jump from one value to the next instead of reading the entries in between. MySQL does it automatically (**"Using index for group-by"**, 0.7 ms vs 191 ms), MongoDB too (**DISTINCT_SCAN**, 5 keys), PostgreSQL 17 does not, but a **recursive CTE** emulates it: 20 buffers instead of 10,110. Catch in MongoDB: `$group` with a `$sum` count ignored the index and scanned 1M documents.
+</Tldr>
+
+## Three ways to group
+
+| Strategy | How | Needs | Can stop early? |
+|---|---|---|---|
+| Hash aggregate | Build a hash table keyed by the group, one pass over all rows | Memory (spills to disk when too large) | No |
+| Sort + group | Sort all rows by the key, then aggregate runs | A sort over all rows | No |
+| Streaming over an index | Read the index in key order; emit each group when the key changes | An index whose leading columns are the group key | **Yes**, with `ORDER BY key LIMIT n` |
+| Skip / loose scan | Read the first entry of a key, then **seek** to the next key | Few distinct values, an index on the key | Reads one entry per group |
+
+| Term | Meaning |
+|---|---|
+| GroupAggregate | PostgreSQL node aggregating sorted input group by group |
+| HashAggregate | PostgreSQL node aggregating unsorted input in a hash table; `Batches > 1` = spilled to disk |
+| Loose index scan | Jump from group to group in the index (MySQL "Using index for group-by", MongoDB DISTINCT_SCAN) |
+| **✓ Index walk / ✗ Every row** | Cost follows the groups you need, or the whole table |
+
+## PostgreSQL: streaming groups and an emulated skip scan
+
+<Flow
+  title="PostgreSQL: grouping with and without an index"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Group orders', sub: 'by customer or status', x: 20, y: 130, w: 240 },
+    { id: 'hash', label: 'HashAggregate', sub: 'Parallel Seq Scan', x: 330, y: 20, w: 200 },
+    { id: 'hashr', label: '✗ 10,116 buffers', sub: '+ 2.5 MB spill', x: 600, y: 20, w: 180 },
+    { id: 'grp', label: 'GroupAggregate', sub: 'Index Only Scan', x: 330, y: 130, w: 200 },
+    { id: 'grpr', label: '✓ 5 buffers', sub: '104 entries', x: 600, y: 130, w: 180 },
+    { id: 'rec', label: 'Recursive CTE', sub: 'one descent per value', x: 330, y: 240, w: 200 },
+    { id: 'recr', label: '✓ 20 buffers', sub: '6 descents', x: 600, y: 240, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-hash', from: 'q', to: 'hash' },
+    { id: 'hash-r', from: 'hash', to: 'hashr' },
+    { id: 'q-grp', from: 'q', to: 'grp' },
+    { id: 'grp-r', from: 'grp', to: 'grpr' },
+    { id: 'q-rec', from: 'q', to: 'rec' },
+    { id: 'rec-r', from: 'rec', to: 'recr' },
+  ]}
+  cases={[
+    {
+      title: 'No usable index',
+      path: 'Parallel Seq Scan 1M rows → Partial HashAggregate (5 batches) → sort → ✗ 10,116 buffers, temp files',
+      summary: 'First 10 customers by id, with index scans disabled: ≈ 125 ms, hash spilled to disk.',
+      steps: [
+        {
+          title: 'Hash every row',
+          note: 'Without the customer index (index scans disabled for the demo), PostgreSQL hashes all 1M rows into ≈ 100,000 groups. The hash table hit its memory limit (work_mem 4 MB × hash_mem_multiplier 2 = 8 MB): Batches 5, up to 1,640 kB spilled per process.',
+          code: 'SELECT customer_id, count(*) FROM orders\nGROUP BY customer_id ORDER BY customer_id LIMIT 10;',
+          active: ['q', 'hash'],
+          edges: ['q-hash'],
+        },
+        {
+          title: '✗ The LIMIT cannot help',
+          note: 'A hash aggregate cannot emit any group until it has seen every row. Then the 100,000 groups are sorted (external merge, ≈ 2.5 MB on disk) to return 10. Buffers: 10,116 shared, plus temp read/written.',
+          active: ['hash', 'hashr'],
+          edges: ['hash-r'],
+        },
+      ],
+    },
+    {
+      title: 'Index on the group key',
+      path: 'Index Only Scan on orders_customer_idx in key order → GroupAggregate emits each customer → ✓ stop after 10 groups',
+      summary: 'Limit ← GroupAggregate ← Index Only Scan: 104 entries, 5 buffers, 0.08 ms.',
+      steps: [
+        {
+          title: 'Rows arrive grouped',
+          note: 'The index delivers entries sorted by customer_id, so GroupAggregate just counts until the key changes, then emits the group. No hash table, no sort.',
+          code: 'EXPLAIN (ANALYZE, BUFFERS) SELECT customer_id, count(*) FROM orders\nGROUP BY customer_id ORDER BY customer_id LIMIT 10;',
+          active: ['q', 'grp'],
+          edges: ['q-grp'],
+        },
+        {
+          title: '✓ Streaming lets LIMIT stop the scan',
+          note: '104 index entries (the orders of the first 10 customers), 5 buffers, 0.08 ms. Without the LIMIT the same plan reads all 1M entries (1,135 buffers, ≈ 90 ms) but still needs no memory for a hash table.',
+          active: ['grp', 'grpr'],
+          edges: ['grp-r'],
+        },
+      ],
+    },
+    {
+      title: 'DISTINCT on 5 values',
+      path: 'SELECT DISTINCT status: ✗ Seq Scan + HashAggregate · recursive CTE: ✓ descend to the next status, 6 times',
+      summary: 'PostgreSQL 17 reads all 1M rows for DISTINCT status (10,110 buffers, ≈ 30 ms warm, 104 ms cold); the CTE needs 20 buffers, 0.46 ms.',
+      steps: [
+        {
+          title: 'DISTINCT reads everything',
+          note: 'SELECT DISTINCT status FROM orders: Parallel Seq Scan + HashAggregate over 1,000,000 rows to find 5 values, 10,110 buffers, ≈ 30 ms warm and 104 ms cold. PostgreSQL has no automatic loose index scan for DISTINCT.',
+          code: 'SELECT DISTINCT status FROM orders;',
+          active: ['q', 'hash', 'hashr'],
+          edges: ['q-hash', 'hash-r'],
+          subs: { hash: 'DISTINCT: Seq Scan', hashr: '1M rows for 5 values' },
+        },
+        {
+          title: 'Ask for the next value',
+          note: 'Each recursive step asks for the smallest status greater than the previous one. With ORDER BY status LIMIT 1, that is one descent of the (status, created_at) index.',
+          code: "WITH RECURSIVE s AS (\n  (SELECT status FROM orders ORDER BY status LIMIT 1)\n  UNION ALL\n  SELECT (SELECT o.status FROM orders o WHERE o.status > s.status\n          ORDER BY o.status LIMIT 1)\n  FROM s WHERE s.status IS NOT NULL)\nSELECT status FROM s WHERE status IS NOT NULL;",
+          active: ['q', 'rec'],
+          edges: ['q-rec'],
+        },
+        {
+          title: '✓ Six descents',
+          note: 'Recursive Union: 1 + 5 Index Only Scans with LIMIT 1 (the last finds nothing and ends the recursion), ≈ 3 pages each: 20 buffers, 0.46 ms.',
+          active: ['rec', 'recr'],
+          edges: ['rec-r'],
+        },
+      ],
+    },
+  ]}
+/>
+
+PostgreSQL 18's skip scan (Session 4) is for a missing **leading column in a WHERE** clause; it does not turn `DISTINCT` into jumps. The recursive CTE remains the tool when you need distinct values of a low-cardinality column often.
+
+## MySQL: the loose index scan is built in
+
+<Flow
+  title="MySQL: DISTINCT and GROUP BY on InnoDB"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Group orders', sub: 'by status or customer', x: 20, y: 130, w: 240 },
+    { id: 'tmp', label: 'Table scan + temp', sub: 'IGNORE INDEX', x: 330, y: 20, w: 200 },
+    { id: 'tmpr', label: '✗ 1M rows, 191 ms', sub: 'dedup temp table', x: 600, y: 20, w: 180 },
+    { id: 'skip', label: 'Skip scan', sub: 'Using index for group-by', x: 330, y: 130, w: 200 },
+    { id: 'skipr', label: '✓ 5 rows, 0.7 ms', sub: '7 index reads', x: 600, y: 130, w: 180 },
+    { id: 'tight', label: 'Covering scan', sub: 'GROUP BY + LIMIT', x: 330, y: 240, w: 200 },
+    { id: 'tightr', label: '✓ 101 entries', sub: '0.07 ms', x: 600, y: 240, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-tmp', from: 'q', to: 'tmp' },
+    { id: 'tmp-r', from: 'tmp', to: 'tmpr' },
+    { id: 'q-skip', from: 'q', to: 'skip' },
+    { id: 'skip-r', from: 'skip', to: 'skipr' },
+    { id: 'q-tight', from: 'q', to: 'tight' },
+    { id: 'tight-r', from: 'tight', to: 'tightr' },
+  ]}
+  cases={[
+    {
+      title: 'Without the index',
+      path: 'Table scan 1M rows → temporary table with deduplication → ✗ 191 ms for 5 values',
+      summary: 'IGNORE INDEX (orders_status_created_idx) shows what the loose scan saves.',
+      steps: [
+        {
+          title: 'Deduplicate every row',
+          note: 'Each row is inserted into an in-memory temporary table with a unique key on status; duplicates are dropped. 1,000,000 inserts attempted for 5 survivors.',
+          code: 'EXPLAIN ANALYZE SELECT DISTINCT status\nFROM orders IGNORE INDEX (orders_status_created_idx);',
+          active: ['q', 'tmp'],
+          edges: ['q-tmp'],
+        },
+        {
+          title: '✗ 191 ms',
+          note: 'Table scan on orders: 1e+6 rows in 131 ms, then the temporary table: 191 ms in total.',
+          active: ['tmp', 'tmpr'],
+          edges: ['tmp-r'],
+        },
+      ],
+    },
+    {
+      title: 'Loose index scan',
+      path: 'read first entry of a status → seek past it → next status … → ✓ 5 groups, 7 index reads',
+      summary: 'EXPLAIN: type range, rows 5, Extra "Using index for group-by". Tree: "Covering index skip scan for deduplication".',
+      steps: [
+        {
+          title: 'Jump between values',
+          note: 'MySQL reads the first entry, then seeks to the first entry with a greater status. Handler counters after the query: Handler_read_first 1, Handler_read_key 7, Handler_read_next 0.',
+          code: 'SELECT DISTINCT status FROM orders;\nSELECT status, MAX(created_at) FROM orders GROUP BY status;',
+          active: ['q', 'skip'],
+          edges: ['q-skip'],
+        },
+        {
+          title: '✓ MIN/MAX per group too',
+          note: 'DISTINCT: 0.7 ms. status, MAX(created_at) GROUP BY status: "Covering index skip scan for grouping", 5 rows, 0.14 ms: for each status it reads only the last entry of its stretch in (status, created_at).',
+          active: ['skip', 'skipr'],
+          edges: ['skip-r'],
+        },
+      ],
+    },
+    {
+      title: 'Tight index scan',
+      path: 'GROUP BY customer_id ORDER BY customer_id LIMIT 10 → covering scan in key order → ✓ 101 entries',
+      summary: 'Group aggregate over "Covering index scan on orders using orders_customer_idx": 101 rows read.',
+      steps: [
+        {
+          title: 'Streaming like PostgreSQL',
+          note: 'With many distinct values, MySQL reads the index in order (a tight scan) and aggregates group by group: no temporary table, no filesort.',
+          code: 'SELECT customer_id, COUNT(*) FROM orders\nGROUP BY customer_id ORDER BY customer_id LIMIT 10;',
+          active: ['q', 'tight'],
+          edges: ['q-tight'],
+        },
+        {
+          title: '✓ Stops after 10 groups',
+          note: '101 index entries, 0.07 ms. SUM(amount) instead of COUNT(*) used the same index but not covering (amount is not in it): 101 primary-key lookups, 0.27 ms.',
+          active: ['tight', 'tightr'],
+          edges: ['tight-r'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: DISTINCT_SCAN, and when $group ignores the index
+
+<Flow
+  title="MongoDB: distinct() and $group"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Group orders', sub: 'by status', x: 20, y: 130, w: 240 },
+    { id: 'ds', label: 'distinct / $group', sub: 'no accumulator', x: 330, y: 20, w: 200 },
+    { id: 'dsr', label: '✓ DISTINCT_SCAN', sub: '5 keys, 0 docs', x: 600, y: 20, w: 180 },
+    { id: 'cnt', label: '$group $sum', sub: 'count per status', x: 330, y: 130, w: 200 },
+    { id: 'cntr', label: '✗ COLLSCAN', sub: '1M docs, ≈ 150 ms', x: 600, y: 130, w: 180 },
+    { id: 'srt', label: '$sort, then $group', sub: 'index order first', x: 330, y: 240, w: 200 },
+    { id: 'srtr', label: '✓ Covered IXSCAN', sub: '1M keys, 0 docs', x: 600, y: 240, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-ds', from: 'q', to: 'ds' },
+    { id: 'ds-r', from: 'ds', to: 'dsr' },
+    { id: 'q-cnt', from: 'q', to: 'cnt' },
+    { id: 'cnt-r', from: 'cnt', to: 'cntr' },
+    { id: 'q-srt', from: 'q', to: 'srt' },
+    { id: 'srt-r', from: 'srt', to: 'srtr' },
+  ]}
+  cases={[
+    {
+      title: 'Distinct values',
+      path: 'distinct("status") → DISTINCT_SCAN on es → ✓ 5 keys, 0 documents',
+      summary: 'MongoDB\'s loose index scan: one key per distinct value, covered by the index.',
+      steps: [
+        {
+          title: 'Jump from value to value',
+          note: 'PROJECTION_COVERED ← DISTINCT_SCAN on es { status, created_at }. The same plan serves a $group on "$status" with no accumulator, and $sort + $group with $first (stage $groupByDistinctScan).',
+          code: 'db.orders.distinct("status")\ndb.orders.aggregate([{ $group: { _id: "$status" } }])',
+          active: ['q', 'ds'],
+          edges: ['q-ds'],
+        },
+        {
+          title: '✓ 5 keys',
+          note: 'totalKeysExamined 5, totalDocsExamined 0, 0–1 ms.',
+          active: ['ds', 'dsr'],
+          edges: ['ds-r'],
+        },
+      ],
+    },
+    {
+      title: 'Count per status',
+      path: '$group { _id: "$status", n: { $sum: 1 } } → ✗ GROUP ← COLLSCAN, 1M documents',
+      summary: 'A count per group needs every entry; with no filter or sort, MongoDB chose COLLSCAN.',
+      steps: [
+        {
+          title: 'No hint from the pipeline',
+          note: 'The $group needs every row of every status, and nothing in the pipeline asks for index order, so the planner picks a collection scan.',
+          code: 'db.orders.aggregate([{ $group: { _id: "$status", n: { $sum: 1 } } }])',
+          active: ['q', 'cnt'],
+          edges: ['q-cnt'],
+        },
+        {
+          title: '✗ 1M documents',
+          note: 'GROUP ← COLLSCAN: 1,000,000 documents, ≈ 150 ms. Five countDocuments({ status }) calls (COUNT_SCAN each) took 62 ms together.',
+          active: ['cnt', 'cntr'],
+          edges: ['cnt-r'],
+        },
+      ],
+    },
+    {
+      title: '$sort first',
+      path: '$sort { status: 1 } + $group → GROUP ← PROJECTION_COVERED ← IXSCAN → ✓ 0 documents',
+      summary: 'Asking for index order turns the scan into a covered index scan: 1M keys, no documents.',
+      steps: [
+        {
+          title: 'Give the planner a reason',
+          note: 'A leading $sort on status can use the es index, and since $group only needs status the scan is covered. hint: "es" gives the same plan.',
+          code: 'db.orders.aggregate([\n  { $sort: { status: 1 } },\n  { $group: { _id: "$status", n: { $sum: 1 } } } ])',
+          active: ['q', 'srt'],
+          edges: ['q-srt'],
+        },
+        {
+          title: '✓ Keys instead of documents',
+          note: '1,000,000 keys, 0 documents, ≈ 112–144 ms: similar time here because the documents are small and cached, but far less I/O when the collection does not fit in memory.',
+          active: ['srt', 'srtr'],
+          edges: ['srt-r'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+An index on the group key only helps if the plan **uses its order**. A hash aggregate (PostgreSQL), a temporary table (MySQL) or a COLLSCAN (MongoDB) over all rows means the index was not used for grouping. Look for GroupAggregate over an index scan, "Using index for group-by", or DISTINCT_SCAN / covered IXSCAN.
+</Pitfall>
+
+## Real-world scenario: filter dropdowns
+
+A product listing shows filter dropdowns: every status, every channel, every country that has orders. Each dropdown runs `SELECT DISTINCT col FROM orders`, on every page load.
+
+| Engine | Fix |
+|---|---|
+| MySQL | An index on each filter column: loose index scan, a few index reads each |
+| MongoDB | An index on each column: `distinct()` uses DISTINCT_SCAN |
+| PostgreSQL | An index plus the recursive CTE, or keep the values in a small lookup table (statuses rarely change) |
+| All | Cache the lists; they change far less often than they are read |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 4: MIN/MAX and top-N | The loose scan with MAX per group is "latest per group" for few groups |
+| Concept 5: pipelines | Where in a pipeline the grouping happens decides whether the index can help |
+| Session 11: case study | Dashboards are mostly GROUP BY queries |
+
+## Key takeaways
+
+1. An index on the group key delivers rows already grouped: no hash table, no sort, and `LIMIT` can stop the scan (104 entries instead of 1M).
+2. Hash aggregation reads everything and can spill to disk (5 batches in the lab).
+3. MySQL ("Using index for group-by") and MongoDB (DISTINCT_SCAN) jump between distinct values automatically: 5 values in 5–7 index reads.
+4. PostgreSQL 17 reads every row for `DISTINCT`; a recursive CTE emulates the jump (20 vs 10,110 buffers).
+5. MongoDB's `$group` with an accumulator scanned the collection; a leading `$sort` made it a covered index scan.
+
+## Check questions
+
+1. Why can `GROUP BY customer_id ORDER BY customer_id LIMIT 10` stop early with an index but not with a hash aggregate?
+2. What does `Batches: 5` on a HashAggregate tell you, and what are two ways to avoid it?
+3. How does the recursive CTE find the 5 statuses with 20 buffers?
+4. Which MySQL `EXPLAIN` text shows a loose index scan, and why did `SELECT status, MAX(created_at) … GROUP BY status` qualify?
+5. When does a loose index scan stop being a good idea?
+6. Why did MongoDB scan 1M documents for a count per status, and how did a `$sort` change the plan?
+7. Why was `SUM(amount)` per customer not covered by `orders_customer_idx` in MySQL, and what index would cover it?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-10-pagination-aggregation/concept-3-group-by-distinct/answers">Worked answers to Q1–Q7</DeepDive>

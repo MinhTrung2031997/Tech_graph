@@ -9,6 +9,7 @@
     "session-6-engine-differences",
     "session-7-specialist-indexes",
     "session-8-when-indexes-hurt",
-    "session-9-indexes-for-joins"
+    "session-9-indexes-for-joins",
+    "session-10-pagination-aggregation"
   ]
 }

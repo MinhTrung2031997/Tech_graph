@@ -1,0 +1,347 @@
+---
+title: "Concept 2: Counting rows and the total-pages problem"
+description: "What COUNT(*) really reads in each engine (the smallest index in PostgreSQL and InnoDB, a collection scan for MongoDB's countDocuments with an empty filter), how filtered counts use covering index scans, when an estimate is good enough, and how LIMIT n+1 replaces the count for a Next button. Measured on 1M orders."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "count", "pagination", "estimates"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-index-only-scans.html"
+  - "https://wiki.postgresql.org/wiki/Count_estimate"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-restrictions-limitations.html"
+  - "https://www.mongodb.com/docs/manual/reference/method/db.collection.countDocuments/"
+  - "https://www.mongodb.com/docs/manual/reference/method/db.collection.estimatedDocumentCount/"
+---
+
+<Tldr>
+Keyset pagination (Concept 1) makes every page cheap, but a "Page 3 of 50,000" label needs a **count**, and an exact count reads every matching entry. None of the three engines keeps an exact row count, because MVCC means the answer depends on who is asking. PostgreSQL counted 1M orders with an **index-only scan of its smallest index** (`orders_sku_idx` from Session 9, 7 MB: 871 buffers instead of the 10,102-page table); InnoDB counted inside the storage engine, and `EXPLAIN` named its smallest secondary index; MongoDB's `countDocuments({})` did a **COLLSCAN** of 1M documents (111 ms) while `estimatedDocumentCount()` answered from metadata in 1 ms. Filtered counts are covering index scans: 50,000 shipped orders took 196 buffers, 350,000 paid orders 1,348. For a Next button, fetch **LIMIT n+1** and skip the count; for a total, show an **estimate**.
+</Tldr>
+
+## Why an exact count is never free
+
+| Engine | Why it cannot keep a counter | What an exact `COUNT(*)` reads |
+|---|---|---|
+| PostgreSQL | Each transaction sees a different set of row versions | Every matching index entry (plus heap pages not all-visible) |
+| InnoDB | Same: consistent reads see different versions | Every entry of the smallest index that can answer |
+| MongoDB | Count with a filter must honour the snapshot | Every matching index key, or every document for `{}` |
+
+| Term | Meaning |
+|---|---|
+| Exact count | Reads every qualifying entry; cost grows with the result |
+| Estimate | From statistics or metadata: `reltuples`, `EXPLAIN` rows, `table_rows`, collection metadata |
+| Index-only / covering count | Counts index entries without visiting rows (Session 5) |
+| `LIMIT n+1` | Fetch one extra row: if it exists, there is a next page |
+| **✓ Cheap / ✗ Reads everything** | Cost independent of the table size, or proportional to it |
+
+## PostgreSQL: the smallest index, the visibility map, the estimate
+
+<Flow
+  title="PostgreSQL: three ways to answer 'how many?'"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'How many orders?', sub: 'whole table or filtered', x: 20, y: 130, w: 240 },
+    { id: 'all', label: 'count(*)', sub: 'smallest index', x: 330, y: 20, w: 200 },
+    { id: 'allr', label: '✗ 871 buffers', sub: 'all 1M entries', x: 600, y: 20, w: 180 },
+    { id: 'flt', label: "status = 'shipped'", sub: 'Index Only Scan', x: 330, y: 130, w: 200 },
+    { id: 'fltr', label: '✓ 196 buffers', sub: '50,000 entries', x: 600, y: 130, w: 180 },
+    { id: 'est', label: 'Estimate', sub: 'reltuples / EXPLAIN', x: 330, y: 240, w: 200 },
+    { id: 'estr', label: '✓ 0 rows read', sub: '51,833 vs 50,000', x: 600, y: 240, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-all', from: 'q', to: 'all' },
+    { id: 'all-r', from: 'all', to: 'allr' },
+    { id: 'q-flt', from: 'q', to: 'flt' },
+    { id: 'flt-r', from: 'flt', to: 'fltr' },
+    { id: 'q-est', from: 'q', to: 'est' },
+    { id: 'est-r', from: 'est', to: 'estr' },
+  ]}
+  cases={[
+    {
+      title: 'Whole table',
+      path: 'count(*) → Index Only Scan on orders_sku_idx (7 MB) → Heap Fetches 0 → ✗ still 1M entries',
+      summary: 'The planner picks the smallest index, not the table: 871 buffers instead of 10,102 heap pages.',
+      steps: [
+        {
+          title: 'Any index will do',
+          note: 'count(*) needs no columns, so any B-tree over all rows can answer. The planner chose orders_sku_idx (Session 9): 7 MB, because 5,000 distinct SKUs deduplicate into long posting lists (Session 2). orders_customer_idx is 9 MB, the others 23–46 MB, the heap 79 MB.',
+          code: 'EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM orders;',
+          active: ['q', 'all'],
+          edges: ['q-all'],
+        },
+        {
+          title: '✗ Proportional to the table',
+          note: 'Parallel Index Only Scan, rows=1,000,000, Heap Fetches: 0, Buffers 871, ≈ 36 ms. Heap Fetches stays 0 only while the visibility map says the pages are all-visible (Session 5, Concept 2); after heavy updates, each not-all-visible page costs a heap visit.',
+          active: ['all', 'allr'],
+          edges: ['all-r'],
+        },
+      ],
+    },
+    {
+      title: 'Filtered count',
+      path: "Index Cond status = 'shipped' on (status, created_at) → count entries → ✓ 196 buffers",
+      summary: 'Cost follows the number of matches: shipped 196 buffers (3 ms), paid 1,348 buffers (68 ms).',
+      steps: [
+        {
+          title: 'A covering index scan',
+          note: 'The (status, created_at) index holds every column the query needs (only status), so it counts entries in the shipped stretch without touching the heap.',
+          code: "SELECT count(*) FROM orders WHERE status = 'shipped';",
+          active: ['q', 'flt'],
+          edges: ['q-flt'],
+        },
+        {
+          title: '✓ Cheap for rare values',
+          note: 'Index Only Scan, 50,000 rows, Heap Fetches 0, 196 buffers. For status = paid (350,000 rows): 1,348 buffers. A count is as expensive as reading its matches.',
+          active: ['flt', 'fltr'],
+          edges: ['flt-r'],
+        },
+      ],
+    },
+    {
+      title: 'Estimate',
+      path: 'pg_class.reltuples or EXPLAIN rows → ✓ no rows read, within a few percent after ANALYZE',
+      summary: 'shipped: estimated 51,833 (actual 50,000). Paid since June: 204,273 (actual 205,206).',
+      steps: [
+        {
+          title: 'Ask the planner',
+          note: 'reltuples is the row count measured by the last VACUUM or ANALYZE (1,000,000). EXPLAIN gives the planner\'s estimate for any WHERE clause from the column statistics (Session 3).',
+          code: "SELECT reltuples::bigint FROM pg_class WHERE relname = 'orders';\nEXPLAIN SELECT 1 FROM orders WHERE status = 'shipped';   -- rows=51833",
+          active: ['q', 'est'],
+          edges: ['q-est'],
+        },
+        {
+          title: '✓ Good enough for a label',
+          note: 'After inserting 50,000 rows without ANALYZE, reltuples still said 1,000,000, but EXPLAIN SELECT * estimated 1,046,228 (it scales reltuples by the current number of pages). Estimates drift between ANALYZE runs; "about 1.05M orders" is honest.',
+          active: ['est', 'estr'],
+          edges: ['est-r'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: "Count rows in orders"
+
+<Flow
+  title="MySQL: COUNT(*) on InnoDB"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'How many orders?', sub: 'whole table or filtered', x: 20, y: 130, w: 240 },
+    { id: 'all', label: 'COUNT(*)', sub: 'Count rows in orders', x: 330, y: 20, w: 200 },
+    { id: 'allr', label: '✗ 1M index entries', sub: '≈ 60–118 ms', x: 600, y: 20, w: 180 },
+    { id: 'flt', label: "status = 'shipped'", sub: 'covering lookup', x: 330, y: 130, w: 200 },
+    { id: 'fltr', label: '✓ 50,000 entries', sub: '≈ 15 ms', x: 600, y: 130, w: 180 },
+    { id: 'est', label: 'Estimate', sub: 'table_rows / EXPLAIN', x: 330, y: 240, w: 200 },
+    { id: 'estr', label: '✗ 94,980 vs 50,000', sub: 'index statistics', x: 600, y: 240, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-all', from: 'q', to: 'all' },
+    { id: 'all-r', from: 'all', to: 'allr' },
+    { id: 'q-flt', from: 'q', to: 'flt' },
+    { id: 'flt-r', from: 'flt', to: 'fltr' },
+    { id: 'q-est', from: 'q', to: 'est' },
+    { id: 'est-r', from: 'est', to: 'estr' },
+  ]}
+  cases={[
+    {
+      title: 'Whole table',
+      path: 'COUNT(*) → smallest secondary index (orders_customer_idx, 20 MB vs 68 MB clustered) → ✗ every entry',
+      summary: 'EXPLAIN: type index, key orders_customer_idx, Using index. Tree: "Count rows in orders".',
+      steps: [
+        {
+          title: 'InnoDB counts in the storage engine',
+          note: 'An unfiltered COUNT(*) is handed to InnoDB as one operation (the tree shows only "Count rows in orders"). EXPLAIN names the smallest secondary index, 20 MB instead of the 68 MB clustered index; InnoDB can also read the clustered index with parallel threads (innodb_parallel_read_threads = 4 here). Either way, every entry is read.',
+          code: 'EXPLAIN SELECT COUNT(*) FROM orders;\nEXPLAIN ANALYZE SELECT COUNT(*) FROM orders;',
+          active: ['q', 'all'],
+          edges: ['q-all'],
+        },
+        {
+          title: '✗ Still a full read',
+          note: '118 ms on the first run, 60 ms warm. MyISAM kept an exact row count in its header; InnoDB never does, because of MVCC.',
+          active: ['all', 'allr'],
+          edges: ['all-r'],
+        },
+      ],
+    },
+    {
+      title: 'Filtered count',
+      path: "ref lookup status = 'shipped' on (status, created_at) → ✓ covering, 50,000 entries",
+      summary: 'Covering index lookup: 14.7 ms for shipped, 86 ms for the 350,000 paid orders.',
+      steps: [
+        {
+          title: 'Covering lookup',
+          note: 'Aggregate: count(0) ← Covering index lookup on orders using orders_status_created_idx (status=\'shipped\'): actual rows 50,000.',
+          code: "EXPLAIN ANALYZE SELECT COUNT(*) FROM orders WHERE status = 'shipped';",
+          active: ['q', 'flt'],
+          edges: ['q-flt'],
+        },
+        {
+          title: '✓ Proportional to the matches',
+          note: '14.7 ms for 50,000 entries; status = paid read 350,000 entries in 86 ms.',
+          active: ['flt', 'fltr'],
+          edges: ['flt-r'],
+        },
+      ],
+    },
+    {
+      title: 'Estimate',
+      path: 'information_schema.tables.table_rows, EXPLAIN rows → ✗ rougher than PostgreSQL',
+      summary: 'table_rows 996,111 (actual 1,000,000); EXPLAIN rows for shipped 94,980 (actual 50,000), from an index dive.',
+      steps: [
+        {
+          title: 'Where the estimate comes from',
+          note: 'table_rows comes from the persistent statistics (sampled pages). EXPLAIN rows for status = shipped came from an index dive (optimizer trace: index_dives_for_eq_ranges true, rows 94,980): InnoDB descends to both ends of the range and extrapolates the entries between them from the pages it touched. For a 50,000-entry range spread over many leaf pages, the extrapolation was 90% high.',
+          code: "SELECT table_rows FROM information_schema.tables\nWHERE table_schema = DATABASE() AND table_name = 'orders';",
+          active: ['q', 'est'],
+          edges: ['q-est'],
+        },
+        {
+          title: '✗ Fine for the table, rough per value',
+          note: 'Use table_rows for "about 1M orders". Per-value estimates from index dives are good enough to choose a plan, not to show users as a count.',
+          active: ['est', 'estr'],
+          edges: ['est-r'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: countDocuments, estimatedDocumentCount, COUNT_SCAN
+
+<Flow
+  title="MongoDB: three ways to count"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'How many orders?', sub: 'whole or filtered', x: 20, y: 130, w: 240 },
+    { id: 'all', label: 'countDocuments({})', sub: '$match + $group', x: 330, y: 20, w: 200 },
+    { id: 'allr', label: '✗ COLLSCAN 1M docs', sub: '≈ 111 ms', x: 600, y: 20, w: 180 },
+    { id: 'flt', label: 'countDocuments(f)', sub: 'status: shipped', x: 330, y: 130, w: 200 },
+    { id: 'fltr', label: '✓ COUNT_SCAN', sub: '50,000 keys, 0 docs', x: 600, y: 130, w: 180 },
+    { id: 'est', label: 'estimatedDocCount', sub: 'collection metadata', x: 330, y: 240, w: 200 },
+    { id: 'estr', label: '✓ 1 ms', sub: 'no filter allowed', x: 600, y: 240, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-all', from: 'q', to: 'all' },
+    { id: 'all-r', from: 'all', to: 'allr' },
+    { id: 'q-flt', from: 'q', to: 'flt' },
+    { id: 'flt-r', from: 'flt', to: 'fltr' },
+    { id: 'q-est', from: 'q', to: 'est' },
+    { id: 'est-r', from: 'est', to: 'estr' },
+  ]}
+  cases={[
+    {
+      title: 'countDocuments({})',
+      path: 'aggregation $match {} + $group $sum → ✗ COLLSCAN of 1M documents',
+      summary: 'An empty filter is the most expensive count: it reads every document, not an index.',
+      steps: [
+        {
+          title: 'An aggregation in disguise',
+          note: 'countDocuments(filter) runs [{ $match: filter }, { $group: { _id: 1, n: { $sum: 1 } } }]. With an empty filter, the plan is GROUP ← COLLSCAN.',
+          code: 'db.orders.countDocuments({})',
+          active: ['q', 'all'],
+          edges: ['q-all'],
+        },
+        {
+          title: '✗ 1M documents',
+          note: '111 ms for 1,000,000 documents. Unlike PostgreSQL and InnoDB, it did not pick the smallest index.',
+          active: ['all', 'allr'],
+          edges: ['all-r'],
+        },
+      ],
+    },
+    {
+      title: 'Filtered count',
+      path: 'status: shipped → COUNT_SCAN on es { status, created_at } → ✓ 50,000 keys, 0 documents',
+      summary: 'COUNT_SCAN counts index keys in the bounds without building documents.',
+      steps: [
+        {
+          title: 'Index bounds, keys only',
+          note: 'COUNT ← COUNT_SCAN over the es index. The same idea as an index-only count in SQL.',
+          code: 'db.orders.countDocuments({ status: "shipped" })',
+          active: ['q', 'flt'],
+          edges: ['q-flt'],
+        },
+        {
+          title: '✓ Keys, not documents',
+          note: 'shipped: 50,000 keys, 0 documents, 10 ms. paid: 350,001 keys, 0 documents, 35 ms.',
+          active: ['flt', 'fltr'],
+          edges: ['flt-r'],
+        },
+      ],
+    },
+    {
+      title: 'Metadata count',
+      path: 'estimatedDocumentCount() → collection metadata → ✓ 1 ms, whole collection only',
+      summary: 'RECORD_STORE_FAST_COUNT: the storage engine\'s running count, no filter possible.',
+      steps: [
+        {
+          title: 'No scan at all',
+          note: 'db.orders.count() with no filter (explain: RECORD_STORE_FAST_COUNT) and estimatedDocumentCount() read the count kept in collection metadata.',
+          code: 'db.orders.estimatedDocumentCount()   // 1000000, 1 ms',
+          active: ['q', 'est'],
+          edges: ['q-est'],
+        },
+        {
+          title: '✓ Fast, but not transactional',
+          note: 'It can be off after an unclean shutdown or during orphaned-document migrations on sharded clusters, and it ignores any filter. Good for "about 1M orders".',
+          active: ['est', 'estr'],
+          edges: ['est-r'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## LIMIT n+1: a Next button without a count
+
+Most lists only need to know whether **another page exists**:
+
+```sql
+-- Ask for 21 rows to display 20: the 21st only answers "is there a next page?"
+SELECT id, created_at, amount FROM orders
+WHERE (created_at, id) < (:last_created_at, :last_id)
+ORDER BY created_at DESC, id DESC
+LIMIT 21;
+```
+
+The extra row costs one more index entry on a page the scan is already reading. Show "Next" if 21 rows came back, and display the first 20. For totals, show an estimate ("about 350,000 paid orders") or compute the exact number in the background and cache it.
+
+<Pitfall>
+Pagination APIs often return `total` on every page "for convenience". With keyset pages costing 4 buffers and a filtered count costing 1,348, the count becomes 99% of the endpoint's work, and it is repeated on every click. Make the total optional, estimated or cached.
+</Pitfall>
+
+## Real-world scenario: the seller dashboard
+
+A seller dashboard shows "12,345 orders · page 1 of 618" for the seller's orders in the last 90 days, refreshed on every page change. For large sellers each page takes seconds.
+
+| Change | Effect |
+|---|---|
+| Drop "page X of Y"; keyset + `LIMIT n+1` for Next/Previous | Page cost constant |
+| Show the total from a cached nightly count, or `EXPLAIN` rows ("about 12,000") | No count per click |
+| Exact count only on demand (export, reconciliation), using an index on `(seller_id, created_at)` | Count reads the seller's stretch only, covering |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 3: GROUP BY | A count per group is many counts in one scan |
+| Concept 5: pipelines | `countDocuments` is an aggregation; pipeline rules apply |
+| Session 11: diagnosis | Count queries often top "total time" in pg_stat_statements |
+
+## Key takeaways
+
+1. No engine keeps an exact row count usable under MVCC; an exact count reads every match.
+2. PostgreSQL counted through its smallest index and InnoDB counted every entry inside the storage engine; MongoDB's `countDocuments({})` scanned every document.
+3. A filtered count is a covering index scan: cost follows the number of matches (196 vs 1,348 buffers).
+4. Estimates are free: `reltuples`, `EXPLAIN` rows, `table_rows`, `estimatedDocumentCount()`.
+5. For Next/Previous, fetch `LIMIT n+1` instead of counting.
+
+## Check questions
+
+1. Why can't PostgreSQL or InnoDB answer `COUNT(*)` from a stored counter?
+2. Why did PostgreSQL count the table through `orders_sku_idx` and not through the primary key?
+3. What makes a PostgreSQL index-only count slower after many updates, and how do you fix it?
+4. Why was `countDocuments({})` slower than `countDocuments({ status: "paid" })` in MongoDB?
+5. Why was MySQL's `EXPLAIN` estimate for shipped orders 94,980 when the real count was 50,000?
+6. How does `LIMIT 21` tell you whether a next page exists?
+7. A list endpoint returns `total` on every page. What would you change, and what would you tell the product owner?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-10-pagination-aggregation/concept-2-counting/answers">Worked answers to Q1–Q7</DeepDive>

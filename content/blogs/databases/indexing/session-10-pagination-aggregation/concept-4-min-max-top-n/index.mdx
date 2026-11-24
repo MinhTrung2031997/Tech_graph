@@ -1,0 +1,339 @@
+---
+title: "Concept 4: MIN, MAX and the latest row per group"
+description: "Why MIN and MAX on an indexed column read one entry (PostgreSQL InitPlan + Limit, MySQL 'Select tables optimized away', MongoDB sort + limit), and how to get the latest order per customer: a LATERAL join with one index descent per customer vs ROW_NUMBER() over every order. 513 customers: 2,428 vs 10,920 buffers; all 100,000: 168 ms vs 567 ms in PostgreSQL."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "min-max", "lateral", "window-functions", "top-n"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-LATERAL"
+  - "https://dev.mysql.com/doc/refman/8.4/en/lateral-derived-tables.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/min-max-optimization.html"
+  - "https://www.mongodb.com/docs/manual/reference/operator/aggregation/group/#optimization-to-return-the-first-document-of-each-group"
+---
+
+<Tldr>
+The largest value of an indexed column is the **last entry** of the index: `max(created_at)` read 5 buffers in PostgreSQL (rewritten as `ORDER BY … DESC LIMIT 1`), was answered **before execution** in MySQL, and examined 1 key in MongoDB with `sort + limit(1)`. But MongoDB's `$group: { $max }` scanned 1M documents. The same idea, repeated per group, solves "latest order per customer": a **LATERAL** subquery does one descent of `(customer_id, created_at)` per customer. For the 513 gold customers in Singapore it read 2,428 buffers (1.7 ms warm) where `ROW_NUMBER()` joined and sorted their 5,151 orders found through a full scan of `orders` (10,920 buffers, ≈ 41–53 ms). For all 100,000 customers the window still read **every** order (≈ 1M heap fetches, 567 ms) against 168 ms for LATERAL. MongoDB does it in one plan: `$sort` + `$group` with `$first` became a **DISTINCT_SCAN** of 1,023 keys and 0 documents.
+</Tldr>
+
+## One entry, not a scan
+
+| Query | What the index gives | Cost |
+|---|---|---|
+| `max(created_at)` | The last entry of an index on `created_at` | One descent |
+| `max(created_at) WHERE status = 'paid'` | The last entry of the `paid` stretch in `(status, created_at)` | One descent |
+| `max(amount) WHERE status = 'paid'` | No index has `amount` after `status`: walk `(amount, id)` from the top until a paid row | Few rows if paid is common, many if rare |
+| Latest order **per customer** | The last entry of each customer's stretch in `(customer_id, created_at)` | One descent **per customer** |
+
+| Term | Meaning |
+|---|---|
+| InitPlan + Limit | PostgreSQL rewrites `min()`/`max()` into `ORDER BY col LIMIT 1` subplans |
+| "Select tables optimized away" | MySQL resolved MIN/MAX from the index during optimization |
+| LATERAL | A subquery that runs once per outer row and can reference it (`WHERE customer_id = c.id`) |
+| Top-N per group | The first N rows of each group in some order (latest order, 3 cheapest items) |
+| **✓ Descent per group / ✗ Every row** | Cost follows the number of groups, or the number of rows |
+
+## PostgreSQL: InitPlan for MIN/MAX, LATERAL for per-group
+
+<Flow
+  title="PostgreSQL: latest order per customer"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Latest order', sub: 'per gold SG customer', x: 20, y: 130, w: 240 },
+    { id: 'max', label: 'max(created_at)', sub: 'InitPlan + Limit 1', x: 330, y: 20, w: 200 },
+    { id: 'maxr', label: '✓ 5 buffers', sub: 'one descent', x: 600, y: 20, w: 180 },
+    { id: 'win', label: 'ROW_NUMBER()', sub: 'Hash Join + Sort', x: 330, y: 130, w: 200 },
+    { id: 'winr', label: '✗ 10,920 buffers', sub: 'all orders scanned', x: 600, y: 130, w: 180 },
+    { id: 'lat', label: 'LATERAL … LIMIT 1', sub: 'descent per customer', x: 330, y: 240, w: 200 },
+    { id: 'latr', label: '✓ 513 descents', sub: '2,428 buffers', x: 600, y: 240, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-max', from: 'q', to: 'max' },
+    { id: 'max-r', from: 'max', to: 'maxr' },
+    { id: 'q-win', from: 'q', to: 'win' },
+    { id: 'win-r', from: 'win', to: 'winr' },
+    { id: 'q-lat', from: 'q', to: 'lat' },
+    { id: 'lat-r', from: 'lat', to: 'latr' },
+  ]}
+  cases={[
+    {
+      title: 'MIN / MAX',
+      path: 'max(created_at) → InitPlan: Limit ← Index Only Scan Backward → ✓ 1 entry, 5 buffers',
+      summary: 'Also with an equality filter in front: max(created_at) WHERE status = paid used (status, created_at), 5 buffers.',
+      subs: { q: 'newest order overall' },
+      steps: [
+        {
+          title: 'Rewritten as LIMIT 1',
+          note: 'The planner turns max(created_at) into (SELECT created_at FROM orders ORDER BY created_at DESC LIMIT 1) when an index can deliver that order. min() and max() together become two InitPlans, one per end of the index (9 buffers).',
+          code: 'EXPLAIN (ANALYZE, BUFFERS) SELECT max(created_at) FROM orders;',
+          active: ['q', 'max'],
+          edges: ['q-max'],
+        },
+        {
+          title: '✓ One descent',
+          note: 'Result ← InitPlan 1 ← Limit ← Index Only Scan Backward using orders_created_id: 5 buffers, 0.08 ms. With WHERE status = paid: Index Cond on (status, created_at), 5 buffers.',
+          active: ['max', 'maxr'],
+          edges: ['max-r'],
+        },
+      ],
+    },
+    {
+      title: 'ROW_NUMBER()',
+      path: 'Hash Join (513 customers × Parallel Seq Scan of orders) → Sort 5,151 rows → WindowAgg rn = 1 → ✗ 10,920 buffers',
+      summary: '513 gold customers in SG (512 with orders): ≈ 41–53 ms. The plan reads every order to find their 5,151.',
+      steps: [
+        {
+          title: 'Number every order of every customer',
+          note: 'The window needs all orders of the 513 customers, sorted by (customer_id, created_at DESC). The planner found the customers through the (country, tier) index from Session 9, hash-joined them with a full scan of orders (the per-customer index lookups were estimated as more expensive), sorted the 5,151 matches and kept rn = 1 (Run Condition).',
+          code: "SELECT * FROM (\n  SELECT o.customer_id, o.id, o.created_at, o.amount,\n         row_number() OVER (PARTITION BY o.customer_id ORDER BY o.created_at DESC) rn\n  FROM orders o JOIN customers c ON c.id = o.customer_id\n  WHERE c.tier = 'gold' AND c.country = 'SG') x\nWHERE rn = 1;",
+          active: ['q', 'win'],
+          edges: ['q-win'],
+        },
+        {
+          title: '✗ Work for rows you discard',
+          note: '10,920 buffers (10,102 of them the whole orders table), ≈ 41–53 ms, to return 512 rows. 90% of the sorted orders are thrown away by rn = 1.',
+          active: ['win', 'winr'],
+          edges: ['win-r'],
+        },
+      ],
+    },
+    {
+      title: 'LATERAL',
+      path: 'for each of 513 customers: descend (customer_id, created_at) backwards → LIMIT 1 → ✓ 2,051 buffers for orders',
+      summary: 'Nested Loop ← Limit ← Index Scan Backward using orders_cust_created, loops=513: 1.7 ms warm, 76 ms on a cold cache.',
+      steps: [
+        {
+          title: 'A small query per customer',
+          note: 'CROSS JOIN LATERAL runs the subquery for each customer row. ORDER BY created_at DESC LIMIT 1 with WHERE customer_id = c.id is exactly "the last entry of this customer\'s stretch" in (customer_id, created_at).',
+          code: "SELECT c.id, o.id, o.created_at, o.amount\nFROM customers c\nCROSS JOIN LATERAL (\n  SELECT id, created_at, amount FROM orders\n  WHERE customer_id = c.id\n  ORDER BY created_at DESC LIMIT 1) o\nWHERE c.tier = 'gold' AND c.country = 'SG';",
+          active: ['q', 'lat'],
+          edges: ['q-lat'],
+        },
+        {
+          title: '✓ Cost follows the number of customers',
+          note: '513 loops × (≈ 3 index pages + 1 heap page) ≈ 2,051 buffers for orders, plus 377 for the 513 customers (Bitmap scan of customers_country_tier): 2,428 buffers, 1.7 ms warm. For all 100,000 customers: 400,000 buffers, 168 ms, against 567 ms for ROW_NUMBER() and 545 ms for DISTINCT ON, which both read all 1M orders.',
+          active: ['lat', 'latr'],
+          edges: ['lat-r'],
+        },
+      ],
+    },
+  ]}
+/>
+
+**DISTINCT ON and matching index direction.** `SELECT DISTINCT ON (customer_id) … ORDER BY customer_id, created_at DESC` is PostgreSQL's short form of the window query, and it also reads every order. With an index on `(customer_id, created_at)` the plan needed an Incremental Sort, because the query mixes ASC and DESC; an index on `(customer_id, created_at DESC)` removed the sort (545 → 377 ms) but not the 1M heap fetches. Only LATERAL reads one row per customer.
+
+## MySQL: optimized away, and LATERAL since 8.0.14
+
+<Flow
+  title="MySQL: latest order per customer"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Latest order', sub: 'per gold SG customer', x: 20, y: 130, w: 240 },
+    { id: 'max', label: 'MAX(created_at)', sub: 'during optimization', x: 330, y: 20, w: 200 },
+    { id: 'maxr', label: '✓ 0 rows at runtime', sub: 'optimized away', x: 600, y: 20, w: 180 },
+    { id: 'win', label: 'ROW_NUMBER()', sub: 'materialize + sort', x: 330, y: 130, w: 200 },
+    { id: 'winr', label: '✗ 5,130 rows sorted', sub: '13 ms warm', x: 600, y: 130, w: 180 },
+    { id: 'lat', label: 'JOIN LATERAL', sub: 'per customer', x: 330, y: 240, w: 200 },
+    { id: 'latr', label: '✓ 8–12 ms', sub: '10 rows per customer', x: 600, y: 240, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-max', from: 'q', to: 'max' },
+    { id: 'max-r', from: 'max', to: 'maxr' },
+    { id: 'q-win', from: 'q', to: 'win' },
+    { id: 'win-r', from: 'win', to: 'winr' },
+    { id: 'q-lat', from: 'q', to: 'lat' },
+    { id: 'lat-r', from: 'lat', to: 'latr' },
+  ]}
+  cases={[
+    {
+      title: 'MIN / MAX',
+      path: 'MAX(created_at) → read the index end while optimizing → ✓ "Select tables optimized away"',
+      summary: 'Also with WHERE status = paid (index (status, created_at)): "Rows fetched before execution".',
+      subs: { q: 'newest order overall' },
+      steps: [
+        {
+          title: 'Answered by the optimizer',
+          note: 'When MIN/MAX can be read from one end of an index (after equality conditions on the leading columns), MySQL reads that entry during optimization and replaces the aggregate with a constant.',
+          code: "EXPLAIN SELECT MAX(created_at) FROM orders WHERE status = 'paid';",
+          active: ['q', 'max'],
+          edges: ['q-max'],
+        },
+        {
+          title: '✓ Nothing left to execute',
+          note: 'EXPLAIN Extra: Select tables optimized away. EXPLAIN ANALYZE: "Rows fetched before execution", 0.0006 ms.',
+          active: ['max', 'maxr'],
+          edges: ['max-r'],
+        },
+      ],
+    },
+    {
+      title: 'ROW_NUMBER()',
+      path: 'customers by (country, tier) → orders by customer (ref) → sort 5,130 → window → materialize → ✗ rn = 1 keeps 513',
+      summary: 'MySQL looked up each customer\'s orders through the index, but still sorted and numbered all 5,130.',
+      steps: [
+        {
+          title: 'Every order of every customer',
+          note: 'Nested loop: covering index lookup on customers_country_tier (513 rows), index lookup on orders_cust_created (10 rows each). The 5,130 rows are sorted by (customer_id, created_at DESC), numbered, materialized, then filtered on rn = 1.',
+          code: "SELECT * FROM (\n  SELECT o.customer_id, o.id, o.created_at, o.amount,\n         ROW_NUMBER() OVER (PARTITION BY o.customer_id ORDER BY o.created_at DESC) rn\n  FROM orders o JOIN customers c ON c.id = o.customer_id\n  WHERE c.tier = 'gold' AND c.country = 'SG') x\nWHERE rn = 1;",
+          active: ['q', 'win'],
+          edges: ['q-win'],
+        },
+        {
+          title: '✗ 5,130 rows for 513 results',
+          note: '119 ms on the first run, 13.5 ms warm. For all 100,000 customers: the window materialized all 1M rows, 752 ms.',
+          active: ['win', 'winr'],
+          edges: ['win-r'],
+        },
+      ],
+    },
+    {
+      title: 'LATERAL',
+      path: 'for each customer: index lookup → sort its ≈ 10 orders → LIMIT 1 → ✓ 8–12 ms',
+      summary: 'MySQL 8.0.14+ supports LATERAL. It used orders_cust_created, but read all ≈ 10 entries per customer and sorted them.',
+      steps: [
+        {
+          title: 'Re-materialized per customer',
+          note: '"Materialize (invalidate on row from c)": the derived table is recomputed for each customer. The lookup on orders_cust_created (customer_id = c.id) read all ≈ 10 entries of the customer and a top-1 sort kept the newest, rather than reading only the last entry backwards.',
+          code: "SELECT c.id, o.id, o.created_at, o.amount\nFROM customers c\nJOIN LATERAL (\n  SELECT id, created_at, amount FROM orders\n  WHERE customer_id = c.id\n  ORDER BY created_at DESC LIMIT 1) o ON TRUE\nWHERE c.tier = 'gold' AND c.country = 'SG';",
+          active: ['q', 'lat'],
+          edges: ['q-lat'],
+        },
+        {
+          title: '✓ Bounded per customer',
+          note: '7.6–11.9 ms for 513 customers; for all 100,000 customers 184 ms against 752 ms for the window. With customers that have thousands of orders, check that the plan reads the index backwards instead of sorting each customer\'s orders.',
+          active: ['lat', 'latr'],
+          edges: ['lat-r'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: sort + limit, and $first after $sort
+
+<Flow
+  title="MongoDB: latest order per customer"
+  height={300}
+  nodes={[
+    { id: 'q', label: 'Latest order', sub: 'per gold SG customer', x: 20, y: 130, w: 240 },
+    { id: 'max', label: 'sort + limit(1)', sub: 'vs $group $max', x: 330, y: 20, w: 200 },
+    { id: 'maxr', label: '✓ 1 key', sub: '$max: 1M docs ✗', x: 600, y: 20, w: 180 },
+    { id: 'grp', label: '$sort + $group', sub: '$first per customer', x: 330, y: 130, w: 200 },
+    { id: 'grpr', label: '✓ DISTINCT_SCAN', sub: '1,023 keys, 0 docs', x: 600, y: 130, w: 180 },
+    { id: 'root', label: '$first: $$ROOT', sub: 'whole document', x: 330, y: 240, w: 200 },
+    { id: 'rootr', label: '✓ FETCH 513 docs', sub: 'one per customer', x: 600, y: 240, w: 180 },
+  ]}
+  edges={[
+    { id: 'q-max', from: 'q', to: 'max' },
+    { id: 'max-r', from: 'max', to: 'maxr' },
+    { id: 'q-grp', from: 'q', to: 'grp' },
+    { id: 'grp-r', from: 'grp', to: 'grpr' },
+    { id: 'q-root', from: 'q', to: 'root' },
+    { id: 'root-r', from: 'root', to: 'rootr' },
+  ]}
+  cases={[
+    {
+      title: 'MIN / MAX',
+      path: 'find().sort({ created_at: -1 }).limit(1) → ✓ 1 key · $group { $max } → ✗ COLLSCAN 1M',
+      summary: 'MongoDB does not rewrite $max into an index lookup: ask for the order explicitly.',
+      subs: { q: 'newest order overall' },
+      steps: [
+        {
+          title: 'The aggregate form scans',
+          note: '$group: { _id: null, m: { $max: "$created_at" } } ran as GROUP ← COLLSCAN: 1,000,000 documents, 162 ms.',
+          code: 'db.orders.aggregate([{ $group: { _id: null, m: { $max: "$created_at" } } }])',
+          active: ['q', 'max'],
+          edges: ['q-max'],
+        },
+        {
+          title: '✓ The sort form reads one key',
+          note: 'With an index on created_at, sort descending + limit 1 + a projection of only created_at examined 1 key and 0 documents.',
+          code: 'db.orders.find({}, { created_at: 1, _id: 0 }).sort({ created_at: -1 }).limit(1)',
+          active: ['max', 'maxr'],
+          edges: ['max-r'],
+        },
+      ],
+    },
+    {
+      title: '$sort + $group $first',
+      path: '$match customer_id $in 513 ids → $sort { customer_id, created_at: -1 } → $group $first → ✓ DISTINCT_SCAN',
+      summary: 'Index { customer_id: 1, created_at: -1 }: 1,023 keys, 0 documents.',
+      steps: [
+        {
+          title: 'MongoDB\'s built-in "first per group"',
+          note: 'When $group takes $first of fields after a $sort that matches an index, MongoDB replaces both stages with a DISTINCT_SCAN: jump to each customer\'s first key ($groupByDistinctScan).',
+          code: 'db.orders.aggregate([\n  { $match: { customer_id: { $in: ids } } },\n  { $sort: { customer_id: 1, created_at: -1 } },\n  { $group: { _id: "$customer_id", last: { $first: "$created_at" } } } ])',
+          active: ['q', 'grp'],
+          edges: ['q-grp'],
+        },
+        {
+          title: '✓ Covered: keys only',
+          note: 'PROJECTION_COVERED ← DISTINCT_SCAN on cust_created: 1,023 keys (about two per customer: its first entry, and the probe that moves on to the next customer), 0 documents. For all 100,000 customers: 100,000 keys, 147 ms.',
+          active: ['grp', 'grpr'],
+          edges: ['grp-r'],
+        },
+      ],
+    },
+    {
+      title: 'Whole document',
+      path: '$first: "$$ROOT" → DISTINCT_SCAN + FETCH → ✓ 513 documents, one per customer',
+      summary: 'Returning the full order costs one document per customer, not all 5,130.',
+      steps: [
+        {
+          title: 'Fetch only the winners',
+          note: 'Asking for $$ROOT (the whole document) keeps the DISTINCT_SCAN and adds a FETCH of each customer\'s first entry.',
+          code: '{ $group: { _id: "$customer_id", last: { $first: "$$ROOT" } } }',
+          active: ['q', 'root'],
+          edges: ['q-root'],
+        },
+        {
+          title: '✓ 513 documents',
+          note: 'FETCH ← DISTINCT_SCAN: 1,023 keys, 513 documents, 8 ms.',
+          active: ['root', 'rootr'],
+          edges: ['root-r'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+`ROW_NUMBER() … WHERE rn = 1` is the textbook answer to "latest row per group", and it reads every row of every group. It is the right plan when you need **all** groups and they are small; when you need a few groups, or groups are large, use one descent per group (LATERAL, or MongoDB's `$sort` + `$group` `$first`).
+</Pitfall>
+
+## Real-world scenario: the customer list with "last order"
+
+A CRM screen lists 50 customers with their last order date and amount. The query used a window function over orders joined to the page of customers; as order history grew to 50M rows, the page slowed down every month.
+
+| Change | Effect |
+|---|---|
+| Index `(customer_id, created_at)` | Each customer's latest order is the end of its stretch |
+| LATERAL subquery with `LIMIT 1` (or `$sort` + `$group` `$first`) | 50 descents per page, whatever the history size |
+| Optionally store `last_order_at` on customers | A write on every order, but reads become free (trade-off from Session 8) |
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 5: pipelines | Window functions and `$group` block filters from reaching the index |
+| Session 9: joins | LATERAL is a nested loop with an index on the inner side |
+| Session 11: case study | "Latest X per Y" appears in almost every dashboard |
+
+## Key takeaways
+
+1. MIN/MAX on an indexed column reads one end of the index: PostgreSQL InitPlan + Limit (5 buffers), MySQL "Select tables optimized away".
+2. MongoDB's `$group: { $max }` scanned 1M documents; `sort` + `limit(1)` read 1 key.
+3. Window functions and `DISTINCT ON` read every row of every group, even with a matching index (1M heap fetches).
+4. LATERAL + `ORDER BY … LIMIT 1` does one index descent per group: 168 ms vs 567 ms for all customers in PostgreSQL.
+5. MongoDB turns `$sort` + `$group` `$first` into a DISTINCT_SCAN: one key per group, documents only if you ask for them.
+
+## Check questions
+
+1. Why is `max(created_at) WHERE status = 'paid'` one descent with `(status, created_at)`, while `max(amount) WHERE status = 'paid'` is not?
+2. Why did the window-function query read all 1M orders even with an index on `(customer_id, created_at DESC)`?
+3. Explain the cost of the LATERAL query for the 513 customers in buffers.
+4. When would `ROW_NUMBER()` be the better plan than LATERAL?
+5. Why did MySQL's LATERAL sort each customer's orders, and when would that matter?
+6. Which MongoDB pipeline returns the latest order per customer without reading their other orders, and what does `explain` show?
+7. Write the "3 most recent orders per customer" version of the LATERAL query. Which index serves it?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-10-pagination-aggregation/concept-4-min-max-top-n/answers">Worked answers to Q1–Q7</DeepDive>
