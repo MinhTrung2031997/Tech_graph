@@ -1,0 +1,65 @@
+---
+title: "Answers: How durable each kind of data must be"
+description: "Worked answers to the Session 8 Concept 3 check questions."
+companion: "answers"
+tags: ["replication", "durability", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/warm-standby.html#SYNCHRONOUS-REPLICATION"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-semisync-monitoring.html"
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+---
+
+<Tldr>
+Pay one round trip for data you cannot lose, never depend on a single replica for commits, and know how your engine behaves when the quorum is gone.
+</Tldr>
+
+## Q1. What synchronous commit buys and costs
+
+**Question:** what does a synchronous commit buy, in Session 5's numbers, and what does it cost, in Session 2's?
+
+It buys a zero loss window at failover. With asynchronous replication Session 5 lost 8,207 and 15,883 acknowledged PostgreSQL commits, 1,615 of 2,818 MySQL transactions and rolled back 19,333 MongoDB w:1 writes; with synchronous commit / w:'majority' nothing acknowledged was lost. It costs a network round trip per commit: with the replica 20 ms away, 26.2 ms (PostgreSQL `on`), 25.0 ms (MySQL semi-sync), 26.7 ms (MongoDB majority), against 1.05 ms, 2.5 ms and 0.19 ms without waiting.
+
+> **Common mistake:** measuring synchronous commit on replicas in the same rack (sub-millisecond) and being surprised by cross-zone latency in production.
+
+## Q2. One synchronous standby
+
+**Question:** why is a single synchronous standby risky, and what configuration fixes it in each engine?
+
+Because the primary cannot acknowledge any commit without it: when that standby stopped answering, every PostgreSQL commit waited indefinitely. The fix is a quorum with a spare: PostgreSQL `synchronous_standby_names = 'ANY 1 (s1, s2)'` with two standbys; MySQL semi-sync with two replicas and `rpl_semi_sync_source_wait_for_replica_count = 1`; MongoDB a 3-member set (or more) with w:'majority'. Session 2 measured the fallback: with the near replica down, commits used the far one (53–55 ms) instead of hanging.
+
+> **Common mistake:** `FIRST 1 (s2, s1)`: PostgreSQL waits for the first listed, even if it is the far one (55.7 ms in Session 2).
+
+## Q3. Semi-sync's silent fallback
+
+**Question:** MySQL semi-sync fell back to async after 10 s. Why is that dangerous, and how do you detect it?
+
+The application keeps getting successful commits and believes they are on two servers, but after the fallback they are only on the source: a failover now loses data, exactly what semi-sync was supposed to prevent, and nobody was told. Detect it with the status variable `Rpl_semi_sync_source_status` (OFF means async) and `Rpl_semi_sync_source_no_tx` (commits acknowledged without a replica); alert on both. Some teams set `rpl_semi_sync_source_timeout` very high to prefer waiting over losing durability, which brings back the single-standby availability problem unless there are spare replicas.
+
+> **Common mistake:** checking only that semi-sync is "enabled" in the configuration.
+
+## Q4. Three data classes
+
+**Question:** assign a durability setting to orders, carrier tracking events and clickstream, and justify each.
+
+- Orders: quorum (any one of two replicas / w:'majority'). Losing an acknowledged order is a customer-facing and financial incident.
+- Carrier tracking events: asynchronous (`synchronous_commit = local` for those transactions, or w:1). They arrive many times per order and can be re-fetched from carrier APIs; a few seconds of loss is repaired by the next update.
+- Clickstream: asynchronous, preferably in a separate store or pipeline; volume is high, single events have little value, and synchronous waits would multiply load.
+
+> **Common mistake:** one durability level for the whole database, chosen either by the most valuable table (slow everywhere) or by the noisiest (unsafe for orders).
+
+## Q5. Two levels on one PostgreSQL server
+
+**Question:** how can one PostgreSQL server give orders and tracking events different durability?
+
+`synchronous_commit` is a per-session and per-transaction setting. Keep `synchronous_standby_names` configured and the default at `on` (or `remote_apply` where needed), and in the code path that writes tracking events run `SET LOCAL synchronous_commit = local` inside the transaction. Those commits return after the local WAL flush; order transactions still wait for a standby. (From the documentation; Session 2 measured the per-level commit times.)
+
+> **Common mistake:** setting it with `ALTER SYSTEM` or in a pooled session without `LOCAL`, which leaks the weaker setting to the next transaction on that connection.
+
+## Q6. The two numbers
+
+**Question:** which two numbers should a design review state per data class, and which component decides each?
+
+RPO (how much acknowledged data a failover may lose), decided by the commit/write-concern setting: asynchronous allows seconds of loss, a quorum allows none. RTO (how long writes may be unavailable), decided by the failover mechanism: MongoDB's built-in election (milliseconds for a clean stepdown, about 11 s for a crash), or external tooling for PostgreSQL and MySQL (detection time plus `pg_promote()` / promotion in well under a second, plus fencing and client reconnection).
+
+> **Common mistake:** stating "RPO 0" while running asynchronous replication with automatic failover.

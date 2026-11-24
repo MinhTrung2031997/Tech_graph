@@ -1,0 +1,211 @@
+---
+title: "Concept 4: Monitoring and runbooks for replicas"
+description: "Every incident in this course had an early signal that a dashboard of 'lag in seconds' would have missed: replay_lag frozen at 0.23 s with 15 MB unreplayed, Seconds_Behind_Source at 0 with transactions missing, a slot holding 206 MB for a consumer nobody ran, a subscription stopped by one ALTER TABLE, semi-sync silently off, a binlog purged under a reader. This page turns them into a monitoring checklist per engine, with the query for each signal, and three runbooks: replica lag, WAL or log retention, and failover."
+type: "concept"
+tags: ["replication", "monitoring", "operations", "runbook", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW"
+  - "https://www.postgresql.org/docs/17/view-pg-replication-slots.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-administration-status.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/performance-schema-replication-tables.html"
+  - "https://www.mongodb.com/docs/manual/reference/method/rs.printSecondaryReplicationInfo/"
+---
+
+<Tldr>
+Monitor **positions, not reported seconds**: LSN differences, GTID sets still missing, optime differences. Then monitor what keeps history alive or lets it vanish: **slots** (retained WAL, inactive slots), **binlog and oplog windows** in hours against your slowest reader, and **apply errors** (a stopped subscription, a replica SQL thread error). Then the durability guards: number of **synchronous standbys** streaming, **semi-sync status**, w:'majority' **write-concern errors**. And the routing signals from Concept 2: **fallback rate** of own-writes reads. Each signal below comes with the query and the incident from this course that it would have caught. Three runbooks close the course: lag, retention, failover.
+</Tldr>
+
+## Why seconds are not enough
+
+| Signal that looked fine | What was actually happening | Session |
+|---|---|---|
+| PostgreSQL `replay_lag` 0.23 s | 15 MB of WAL not replayed; the value only updates when replay progresses | [3, Concept 1](/blogs/databases/replication/session-3-replica-lag/concept-1-measuring-lag) |
+| `now() - pg_last_xact_replay_timestamp()` 42.7 s | Nothing behind; the primary was idle | 3 |
+| MySQL `Seconds_Behind_Source` 0, IO thread Yes | Network cut, 5 transactions missing for 40–50 s | 3 |
+| MySQL `Seconds_Behind_Source` 3 s, then 37 s | 105,686 transactions behind under sustained load | this session, Concept 2 |
+| Slot `active = f`, nothing alarming | 206 MB WAL retained, growing with every write | [7, Concept 2](/blogs/databases/replication/session-7-logical-replication-cdc/concept-2-logical-decoding-and-slots) |
+| Subscription exists, `pg_stat_subscription` shows a worker | Apply failing every 5 s on a missing column | [7, Concept 1](/blogs/databases/replication/session-7-logical-replication-cdc/concept-1-publications-and-subscriptions) |
+| Commits succeed | MySQL semi-sync had fallen back to async after 10 s | [2, Concept 2](/blogs/databases/replication/session-2-sync-vs-async/concept-2-mysql-semi-sync) |
+
+## The checklist
+
+### PostgreSQL
+
+| Signal | Query | Alert when |
+|---|---|---|
+| Standby position lag | `SELECT application_name, pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) FROM pg_stat_replication;` | bytes grow for several minutes, or above what replays in your RTO |
+| Standby missing | `SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming';` | below the expected count; for `ANY 1 (s1, s2)`, below 2 |
+| Sync state | `sync_state` column (`sync`, `quorum`, `potential`, `async`) | no `sync`/`quorum` standby while synchronous commit is configured |
+| Slot retention | `SELECT slot_name, active, wal_status, pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) FROM pg_replication_slots;` | inactive slot, retained bytes above a few GB, `wal_status` not `reserved` |
+| Subscription health (subscriber) | `SELECT subname, apply_error_count, sync_error_count FROM pg_stat_subscription_stats;` | counter increases |
+| Hot-standby cancellations (standby) | `SELECT datname, confl_snapshot, confl_lock FROM pg_stat_database_conflicts;` | increases on replicas serving users (Session 6) |
+
+### MySQL
+
+| Signal | Query | Alert when |
+|---|---|---|
+| Transactions missing on a replica | `SELECT GTID_SUBTRACT(<source gtid_executed>, <replica gtid_executed>);` (or a heartbeat table) | non-empty for longer than your bound |
+| Threads running | `SHOW REPLICA STATUS` → `Replica_IO_Running`, `Replica_SQL_Running`, `Last_IO_Errno`, `Last_SQL_Errno` | not Yes, or any error (1236, 13114, 1062) |
+| Applier detail | `performance_schema.replication_applier_status_by_worker` | `LAST_ERROR_NUMBER` ≠ 0 |
+| Semi-sync | `SHOW STATUS LIKE 'Rpl_semi_sync_source_status'`, `Rpl_semi_sync_source_no_tx` | status OFF, or no_tx increasing |
+| Binlog window | oldest file in `SHOW BINARY LOGS` vs slowest reader's position | slowest reader within hours of the oldest file |
+| Errant GTIDs | replica `gtid_executed` minus source `gtid_executed` | non-empty (blocks failover, Session 5) |
+| Replicas writable | `SELECT @@super_read_only` on replicas | 0 |
+
+### MongoDB
+
+| Signal | Query | Alert when |
+|---|---|---|
+| Secondary lag | `rs.printSecondaryReplicationInfo()` or optime differences from `rs.status()` | above the bounded-staleness limit you route with |
+| Member health | `rs.status().members[].stateStr`, `health` | fewer than a majority healthy, or any member not PRIMARY/SECONDARY |
+| Oplog window | `rs.printReplicationInfo()` "log length start to end" | below the longest expected CDC or secondary outage |
+| Majority writes failing | driver errors `WriteConcernFailed` (64), server `serverStatus().metrics.getLastError.wtimeouts` | any increase |
+| Change-stream consumers | consumer's lag = now − cluster time of the last processed event | approaching the oplog window |
+
+### Application
+
+| Signal | Where | Alert when |
+|---|---|---|
+| Own-writes fallback rate | router metric (Concept 2) | rising: replicas lagging, primary about to take more load |
+| Stale-read complaints | support tags | any pattern after deploys |
+| CDC consumer lag | connector metrics (Debezium `MilliSecondsBehindSource`, offsets) | approaching retention (binlog age, oplog window, slot limit) |
+
+## Runbooks
+
+<Flow
+  title="Runbook: a replica is behind"
+  height={360}
+  nodes={[
+    { id: 'alert', label: 'Lag alert', sub: 'position lag growing', x: 20, y: 20, w: 200 },
+    { id: 'recv', label: 'Receiving?', sub: 'IO thread / walreceiver', x: 300, y: 20, w: 200 },
+    { id: 'apply', label: 'Applying?', sub: 'SQL thread / replay', x: 580, y: 20, w: 200 },
+    { id: 'net', label: 'Network or source', sub: 'reconnect, slot, 1236', x: 20, y: 290, w: 200 },
+    { id: 'blocked', label: 'Applier blocked', sub: 'lock, long query, error', x: 300, y: 290, w: 200 },
+    { id: 'rate', label: 'Too slow', sub: 'writes outpace apply', x: 580, y: 290, w: 200 },
+  ]}
+  edges={[
+    { id: 'alert-recv', from: 'alert', to: 'recv' },
+    { id: 'recv-apply', from: 'recv', to: 'apply' },
+    { id: 'recv-net', from: 'recv', to: 'net' },
+    { id: 'apply-blocked', from: 'apply', to: 'blocked' },
+    { id: 'apply-rate', from: 'apply', to: 'rate' },
+  ]}
+  cases={[
+    {
+      title: 'Not receiving',
+      path: 'alert → receive position not moving ✗ → network, source, or purged log',
+      summary: 'Nothing new arrives; fix the link or rebuild.',
+      steps: [
+        {
+          title: 'Is the log arriving?',
+          note: 'PostgreSQL: pg_stat_wal_receiver.status and latest_end_lsn on the standby; MySQL: Replica_IO_Running and Retrieved_Gtid_Set; MongoDB: the secondary\'s syncSourceHost and lastHeartbeat.',
+          active: ['alert', 'recv'],
+          edges: ['alert-recv'],
+          subs: { recv: '✗ position frozen' },
+        },
+        {
+          title: 'Causes',
+          note: 'Network cut (Session 3: MySQL reconnect waited for a 60 s retry); source purged the log (error 1236 / 13114: rebuild the replica); a PostgreSQL standby without a slot that fell behind wal_keep_size needs a re-clone (from the documentation).',
+          active: ['recv', 'net'],
+          edges: ['recv-net'],
+          subs: { net: 'fix link or re-clone' },
+        },
+      ],
+    },
+    {
+      title: 'Receiving but not applying',
+      path: 'alert → received ✓ → applied position frozen ✗ → lock, long query, or apply error',
+      summary: 'Find what the applier is waiting for.',
+      steps: [
+        {
+          title: 'Is replay moving?',
+          note: 'Compare received and applied positions: PostgreSQL receive_lsn vs replay_lsn; MySQL Retrieved_Gtid_Set vs Executed_Gtid_Set; a frozen applied position with growing received means the applier is stuck.',
+          active: ['recv', 'apply'],
+          edges: ['recv-apply'],
+          subs: { apply: '✗ frozen' },
+        },
+        {
+          title: 'Causes',
+          note: 'A lock held on the replica (Session 3: one locked row held 6 transactions); a long query and max_standby_streaming_delay (Session 6); an apply error (Session 7: missing column; Session 1: duplicate key 1062 on a writable replica). Kill the blocker or fix the error.',
+          active: ['apply', 'blocked'],
+          edges: ['apply-blocked'],
+          subs: { blocked: 'kill blocker / fix error' },
+        },
+      ],
+    },
+    {
+      title: 'Applying, but slower than the writes',
+      path: 'alert → received ✓ → applied ✓ but gap grows → capacity',
+      summary: 'Remove it from read pools, then add apply capacity or reduce writes.',
+      steps: [
+        {
+          title: 'Gap grows steadily',
+          note: 'This session\'s MySQL replica applied about 1,165 transactions/s against 1,636 written: the gap grew by roughly 470/s and took about 90 s to close after the load stopped. Take it out of bounded-staleness pools, raise replica_parallel_workers or its I/O capacity, or spread the write burst (batch jobs at night).',
+          active: ['apply', 'rate'],
+          edges: ['apply-rate'],
+          subs: { rate: 'out of pool, add capacity' },
+        },
+      ],
+    },
+  ]}
+/>
+
+**Runbook: log retention.** A PostgreSQL slot retains WAL, or a MySQL / MongoDB reader approaches the end of the binlog / oplog.
+
+1. Identify the reader: slot name and `active`; connector name and stored position; replica host.
+2. If the reader is gone for good: drop the slot (PostgreSQL) — never delete WAL files by hand.
+3. If it is coming back: compare its expected catch-up time with free WAL space (PostgreSQL) or with the remaining binlog/oplog window (MySQL, MongoDB). If it will not make it, plan the resnapshot now.
+4. Afterwards: `max_slot_wal_keep_size` set, alert on inactive slots, binlog/oplog window sized for the slowest reader.
+
+**Runbook: failover.** From Session 5.
+
+1. Confirm the primary is really down from more than one place (avoid failing over on a network partition seen from one side).
+2. Fence the old primary first: stop it, block its port, or revoke its storage, so two writable primaries cannot exist (Session 5, Concept 5).
+3. Promote the most up-to-date candidate: highest replayed LSN / most complete GTID set; MongoDB elects by itself.
+4. Repoint applications and replicas; drop own-writes session tokens (Concept 2); check logical slots exist on the new primary (Session 7: failover slots, `synchronized_standby_slots` reset).
+5. Record what was lost: async commits after the last replicated position, MongoDB rollback files, MySQL errant GTIDs on the old source.
+6. Rebuild the old primary as a replica (`pg_rewind` or re-clone; for MySQL, remove errant transactions or re-clone).
+
+<Pitfall>
+Alerting on lag in seconds only. Every misleading value in the first table above came from a seconds metric. Alert on positions (bytes of WAL, GTIDs missing, optime difference), and add a **heartbeat** (a row updated every second on the primary, read on each replica) if you need lag in time that is right even when the primary is idle.
+</Pitfall>
+
+## Real-world scenario: the Monday after a long weekend
+
+Over a three-day holiday, the analytics team's Debezium connector stopped on Friday night when their Kafka cluster ran out of disk. On Monday at 09:00 the OMS primary's WAL volume is at 92 %, a reporting replica is 2 hours behind after a weekend bulk import, and the semi-sync status on the MySQL catalog database is OFF since Saturday.
+
+| Signal | Would have fired | Action |
+|---|---|---|
+| Inactive slot, retained bytes | Saturday morning | Drop or fix the connector before the disk fills; `max_slot_wal_keep_size` as a backstop |
+| Reporting replica position lag | Sunday during the import | It is class 4 (analytics): fine if routing kept users off it |
+| `Rpl_semi_sync_source_status = OFF` | Saturday | Find the replica that stopped acknowledging; until fixed, the catalog's RPO is not 0 |
+| Own-writes fallback rate | Never: users were on healthy replicas | — |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 3, Concept 1](/blogs/databases/replication/session-3-replica-lag/concept-1-measuring-lag) | Why each lag metric can lie |
+| [Session 5, Concept 5](/blogs/databases/replication/session-5-failover/concept-5-split-brain-and-fencing) | Fencing before promotion |
+| [Session 7, Concept 2](/blogs/databases/replication/session-7-logical-replication-cdc/concept-2-logical-decoding-and-slots) | Slot retention and invalidation |
+| [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) | Build the clusters and try every query on this page |
+
+## Key takeaways
+
+1. Alert on positions (bytes, GTIDs, optimes), not on reported seconds.
+2. Watch what keeps history: slots in PostgreSQL; binlog and oplog windows against the slowest reader in MySQL and MongoDB.
+3. Watch durability guards: streaming synchronous standbys, semi-sync status, majority write errors.
+4. Lag has three causes with different fixes: not receiving, not applying, applying too slowly.
+5. Failover: confirm, fence, promote, repoint, record losses, rebuild.
+
+## Check questions
+
+1. Give one example from this course where a lag value in seconds was wrong, and the position-based check that would have been right.
+2. Which PostgreSQL query finds a slot that is about to fill the WAL volume, and what two settings limit the damage?
+3. Which MySQL status tells you semi-sync is no longer protecting commits?
+4. A replica's received position moves but its applied position does not. List three causes from this course.
+5. Why must the old primary be fenced before promotion, and what does Session 5 show happens otherwise?
+6. Which application-side metric warns that replicas lag before users complain, and why?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-8-designing-for-replicas/concept-4-monitoring-and-runbooks/answers">Worked answers to Q1–Q6</DeepDive>

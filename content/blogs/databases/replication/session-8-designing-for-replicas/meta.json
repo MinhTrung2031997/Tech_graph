@@ -1,0 +1,12 @@
+{
+  "title": "Session 8: Designing for replicas",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-which-reads-go-where/index",
+    "concept-2-routing-and-session-tokens/index",
+    "concept-3-durability-per-data/index",
+    "concept-4-monitoring-and-runbooks/index",
+    "lab/index"
+  ]
+}

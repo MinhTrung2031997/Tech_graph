@@ -1,0 +1,65 @@
+---
+title: "Answers: Which reads can go to a replica"
+description: "Worked answers to the Session 8 Concept 1 check questions."
+companion: "answers"
+tags: ["replication", "consistency", "architecture", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/read-preference-staleness/"
+  - "https://www.postgresql.org/docs/17/hot-standby.html"
+---
+
+<Tldr>
+Route reads by what they are used for. The database cannot tell a stock check from a product page; the application can.
+</Tldr>
+
+## Q1. Stale with millisecond lag
+
+**Question:** why were almost all reads stale right after the write, although the replicas were only milliseconds behind?
+
+The client sent the read within a fraction of a millisecond of receiving the commit acknowledgement (reads took 0.06–0.28 ms). The replica needs the change shipped and applied, which took 1–3 ms in the labs (the position waits had a median of 1.7–2.3 ms). A read that arrives before the apply sees the old row, so with an immediate read nearly every attempt loses that race: 499/500, 300/300 and 295/300. "Lag" is never zero; it only has to be shorter than the time between a write and the read that depends on it, and for the user who just wrote, that time is close to zero.
+
+> **Common mistake:** reading "replica lag: 0 s" on a dashboard and assuming reads are fresh. Dashboards round to seconds; users click in milliseconds.
+
+## Q2. Classify four reads
+
+**Question:** classify these reads: stock check at checkout, buyer's order list, product page, monthly finance export.
+
+- Stock check at checkout: class 1, primary, inside the write transaction (it decides whether to sell).
+- Buyer's order list: class 2 right after an order (the buyer must see the new order); class 3 otherwise. Implement with a session position that expires after, say, 30 s.
+- Product page: class 3, bounded staleness (seconds); usually cached in front of the replica anyway.
+- Monthly finance export: class 4, analytics replica or warehouse; never the primary or the replicas that serve users.
+
+> **Common mistake:** putting the order list on the primary "to be safe" for every request. It moves most read load back to the primary; the position token gives the same guarantee only when needed.
+
+## Q3. All SELECTs to replicas
+
+**Question:** why is "route all SELECTs to replicas" dangerous for an e-commerce app?
+
+Because some SELECTs are decisions: stock availability, voucher usage counts, payment status, the version of a row about to be updated. On a replica they are old, so the app decides on old data: sells stock that is gone, lets a voucher be used twice, refunds twice. Also, `SELECT … FOR UPDATE` and the reads inside a write transaction must run on the primary. Under load the error grows: the MySQL replica in this session's lab fell about 105,700 transactions behind in 90 s.
+
+> **Common mistake:** a read/write-splitting proxy configured with a regex on `^SELECT`.
+
+## Q4. Dashboard vs product page
+
+**Question:** what does a seller dashboard need from the router that a product page does not?
+
+Monotonic, bounded freshness across refreshes. A product page viewed once tolerates seconds of staleness from any replica. A dashboard is refreshed repeatedly and compared with the previous view; if the router alternates between a replica 1 s behind and one 40 s behind, numbers jump backwards. It needs a lag bound that excludes slow replicas, and ideally session stickiness to one replica (or a causal session in MongoDB) so successive reads never go back in time.
+
+> **Common mistake:** round-robin across replicas with very different lag.
+
+## Q5. Rolled-back writes
+
+**Question:** Session 5 showed w:1 writes rolled back after a failover. Which read class can show such a write, and does it matter?
+
+Any read with `readConcern: 'local'` on the old primary, including class 1 primary reads and own-writes reads served by the primary: they can see a w:1 write that a later failover rolls back (19,333 writes in Session 5). It matters for class 1: a decision based on a write that later disappears (e.g. "payment recorded") is wrong. For decisions, write with w:'majority' (the default in MongoDB 8.0) and read with majority read concern where it matters; then the write and the read survive a failover.
+
+> **Common mistake:** lowering the write concern to w:1 for speed on collections whose reads drive money movements.
+
+## Q6. CDC instead of a replica
+
+**Question:** when should a downstream system get a CDC feed instead of reading a replica?
+
+When it needs **every change**, in order, rather than the current state at some moment: syncing stock to marketplaces, updating a search index, feeding a warehouse incrementally, sending notifications. Polling a replica for changes misses intermediate states, needs a reliable "updated since" column, and adds query load; a change feed (PostgreSQL slot, MySQL binlog, MongoDB change stream) delivers each committed change once or at least once, and can resume (Session 7).
+
+> **Common mistake:** `SELECT … WHERE updated_at > :last_poll` on a replica: it misses rows whose transactions committed late with an earlier `updated_at`.

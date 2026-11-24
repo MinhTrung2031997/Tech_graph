@@ -1,0 +1,172 @@
+---
+title: "Concept 3: How durable each kind of data must be"
+description: "Earlier sessions measured both sides of the trade. Waiting for one replica 20 ms away cost 23–26 ms per commit in every engine; not waiting lost 8,207 to 15,883 acknowledged PostgreSQL commits, 1,615 MySQL transactions and 19,333 MongoDB w:1 writes in failovers. A single synchronous standby that stops answering stops all commits in PostgreSQL, while MySQL silently falls back to async after 10 s. The capstone answer is per data class: quorum commits for orders, payments and stock movements; asynchronous for data you can rebuild; and an 'any one of two' quorum so one replica failure costs latency, not availability."
+type: "concept"
+tags: ["replication", "durability", "synchronous-replication", "failover", "architecture"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/runtime-config-replication.html#GUC-SYNCHRONOUS-STANDBY-NAMES"
+  - "https://www.postgresql.org/docs/17/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html"
+  - "https://www.mongodb.com/docs/manual/reference/write-concern/"
+---
+
+<Tldr>
+"Is the write safe?" has three answers: on the primary's disk, on one other server, on a majority. Each step costs a network round trip and buys a smaller loss window at failover. Measured earlier in this course: waiting for a replica **20 ms away** cost **23–26 ms per commit** in PostgreSQL, MySQL and MongoDB ([Session 2](/blogs/databases/replication/session-2-sync-vs-async/concept-4-quorums)); not waiting lost **8,207 and 15,883** acknowledged PostgreSQL commits, **1,615** MySQL transactions and **19,333** MongoDB w:1 writes when the primary failed ([Session 5](/blogs/databases/replication/session-5-failover/concept-3-promoting-postgresql)). The traps are in failure handling: one unreachable synchronous standby **stopped every PostgreSQL commit** (statement_timeout did not help), MySQL semi-sync **silently became asynchronous after 10 s**, MongoDB w:'majority' failed after its `wtimeout` and the primary stepped down. Decide per data class, and use a quorum of **any one of two** replicas so one replica failure costs latency, not availability.
+</Tldr>
+
+## The evidence
+
+| Setting | Commit cost (replica 20 ms away) | Loss at failover | When a replica is unreachable | Session |
+|---|---|---|---|---|
+| PostgreSQL async (`synchronous_commit = local`) | 1.05 ms | 8,207 / 15,883 commits (standby cut off 2 s before the crash) | Nothing changes | [2](/blogs/databases/replication/session-2-sync-vs-async/concept-1-postgresql-synchronous-commit), [5](/blogs/databases/replication/session-5-failover/concept-3-promoting-postgresql) |
+| PostgreSQL sync, one standby (`on`) | 26.2 ms | 0 | **Every commit waits indefinitely**; cancel after 122 s: committed locally anyway | 2, 5 |
+| PostgreSQL `ANY 1 (s1, s2)` | 23–26 ms; 53–55 ms if the near standby is down | 0 while one standby answers | Uses the other standby | [2](/blogs/databases/replication/session-2-sync-vs-async/concept-4-quorums) |
+| MySQL async | 2.5 ms | 1,615 of 2,818 transactions; errant GTIDs | Nothing changes | [5](/blogs/databases/replication/session-5-failover/concept-4-promoting-mysql) |
+| MySQL semi-sync (AFTER_SYNC) | 25.0 ms | 0 while semi-sync is active | First commit waits 10 s, then **silently async** | [2](/blogs/databases/replication/session-2-sync-vs-async/concept-2-mysql-semi-sync) |
+| MongoDB w:1 | 0.19 ms | 19,333 writes rolled back | Writes succeed; primary steps down when it loses the majority | [2](/blogs/databases/replication/session-2-sync-vs-async/concept-3-mongodb-write-concern), [5](/blogs/databases/replication/session-5-failover/concept-2-lost-writes-and-rollback) |
+| MongoDB w:'majority' (default) | 26.7 ms | 0 (all 1,000 kept) | WriteConcernFailed after `wtimeout` (2,017 ms), write stays on the primary | 2, 5 |
+
+| Term | Meaning |
+|---|---|
+| RPO | Recovery point objective: how much acknowledged data a failover may lose |
+| RTO | Recovery time objective: how long writes may be unavailable |
+| Quorum commit | Commit waits for k of n replicas (`ANY 1 (s1, s2)`, w:'majority') |
+| Data class | Group of tables/collections with the same loss tolerance |
+| **✓ / ✗** | Commit acknowledged / waits or fails |
+
+<Flow
+  title="An order commit with an 'any one of two' quorum"
+  height={330}
+  nodes={[
+    { id: 'app', label: 'Checkout service', sub: 'INSERT order', x: 20, y: 20, w: 200 },
+    { id: 'primary', label: 'Primary', sub: 'ANY 1 (near, far)', x: 300, y: 20, w: 200 },
+    { id: 'near', label: 'Replica near', sub: '20 ms away', x: 580, y: 20, w: 200 },
+    { id: 'far', label: 'Replica far', sub: '50 ms away', x: 580, y: 250, w: 200 },
+    { id: 'ack', label: 'Commit ack', sub: 'to the buyer', x: 300, y: 250, w: 200 },
+  ]}
+  edges={[
+    { id: 'app-primary', from: 'app', to: 'primary' },
+    { id: 'primary-near', from: 'primary', to: 'near' },
+    { id: 'primary-far', from: 'primary', to: 'far' },
+    { id: 'primary-ack', from: 'primary', to: 'ack' },
+  ]}
+  cases={[
+    {
+      title: 'Both replicas healthy',
+      path: 'commit → near confirms first ✓ (23–26 ms) → ack ✓',
+      summary: 'Cost of zero data loss: one round trip to the nearest replica.',
+      steps: [
+        {
+          title: 'Ship and wait for one',
+          note: 'The primary sends the commit to both replicas and acknowledges when the first one confirms. Measured in all three engines: 23 to 26 ms with the near replica 20 ms away.',
+          active: ['app', 'primary', 'near', 'far'],
+          edges: ['app-primary', 'primary-near', 'primary-far'],
+          subs: { near: '✓ first to confirm' },
+        },
+        {
+          title: 'Acknowledge',
+          note: 'The order now exists on two servers. A failover to the replica that confirmed loses nothing.',
+          active: ['primary', 'ack'],
+          edges: ['primary-ack'],
+          subs: { ack: '✓ RPO 0' },
+        },
+      ],
+    },
+    {
+      title: 'Near replica down',
+      path: 'near ✗ → far confirms ✓ (53–55 ms) → ack ✓',
+      summary: 'One replica failure costs latency, not availability.',
+      steps: [
+        {
+          title: 'Fall back to the far replica',
+          note: 'Session 2 measured 53 to 55 ms per commit in all three engines: no hang, no silent switch to asynchronous.',
+          active: ['primary', 'near', 'far', 'ack'],
+          edges: ['primary-near', 'primary-far', 'primary-ack'],
+          subs: { near: '✗ down', far: '✓ confirms' },
+        },
+      ],
+    },
+    {
+      title: 'Only one synchronous standby, and it is down (PostgreSQL)',
+      path: 'standby ✗ → every commit waits on SyncRep ✗ → checkout stops',
+      summary: 'Zero data loss turned into zero availability.',
+      steps: [
+        {
+          title: 'Commits hang',
+          note: 'With synchronous_standby_names naming a single standby that was paused, commits waited indefinitely; statement_timeout did not end the wait. Cancelling after 122 s printed a WARNING that the transaction had already committed locally. MySQL in the same situation waited 10 s once, then went asynchronous without telling the application.',
+          active: ['app', 'primary', 'near'],
+          edges: ['app-primary', 'primary-near'],
+          subs: { near: '✗ paused', primary: '✗ waiting on SyncRep' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Durability per data class
+
+| Data | Loss tolerance | Recommended | Why |
+|---|---|---|---|
+| Orders, payments, refunds, wallet balances | None | Quorum: `ANY 1 (s1, s2)` / semi-sync with 2 replicas / w:'majority' | A lost order or payment is customer-visible and financial |
+| Stock movements (reservations, deductions) | None, or reconcilable from orders | Quorum, same transaction as the order | Lost decrements oversell |
+| Seller listings, prices | Small; sellers re-save | w:'majority' (MongoDB default) / async acceptable in SQL | Cheap to re-enter, but visible |
+| Sessions, carts | Minutes | Async, or a cache | Recreated by the user |
+| Clickstream, logs, metrics | Minutes to hours | Async, often a separate store | Volume matters more than every row |
+| Derived data (search index, aggregates) | Fully rebuildable | Async or CDC | Rebuild from the source of truth (Session 7) |
+
+PostgreSQL lets one server mix classes: `synchronous_commit` can be set per transaction (`SET LOCAL synchronous_commit = local` for a clickstream insert; from the documentation). MongoDB takes `writeConcern` per operation. MySQL semi-sync is a server-wide setting, so mixing classes means separate servers or accepting the stronger setting for all.
+
+<Pitfall>
+"Synchronous with one standby" is the configuration that most often turns a replica problem into an outage: the standby's disk fills, the network blips, and every commit on the primary stops. If you need zero loss, give the primary **two** candidates and wait for **any one** (`synchronous_standby_names = 'ANY 1 (s1, s2)'`, semi-sync with `rpl_semi_sync_source_wait_for_replica_count = 1` and two replicas, or a 3-member MongoDB set with w:'majority'). And know your engine's failure mode: PostgreSQL waits forever, MySQL falls back to async silently (alert on `Rpl_semi_sync_source_status = OFF`), MongoDB fails the write after `wtimeout`.
+</Pitfall>
+
+## Failover is the other half
+
+| Engine | Measured failover behaviour | Session |
+|---|---|---|
+| MongoDB | Clean stepdown in milliseconds; crashed primary noticed after `electionTimeoutMillis`, one write waited 11.4 s; retryable writes hid the failover from the app | [5, Concept 1](/blogs/databases/replication/session-5-failover/concept-1-mongodb-elections) |
+| PostgreSQL | No built-in failover; `pg_promote()` 0.14–0.26 s; old primary needs `pg_rewind` or re-clone | [5, Concept 3](/blogs/databases/replication/session-5-failover/concept-3-promoting-postgresql) |
+| MySQL | Promotion 0.06–0.08 s; old source's leftovers become errant GTIDs (error 1062 on rejoin) | [5, Concept 4](/blogs/databases/replication/session-5-failover/concept-4-promoting-mysql) |
+| All | Two writable primaries after a promotion without fencing | [5, Concept 5](/blogs/databases/replication/session-5-failover/concept-5-split-brain-and-fencing) |
+
+The durability setting decides **what** survives a failover; the failover tooling (Patroni, Orchestrator / MySQL InnoDB Cluster, the MongoDB replica set itself) decides **how long** writes are unavailable and whether the old primary is fenced. A design review needs both numbers per data class: RPO from the commit setting, RTO from the failover mechanism.
+
+## Real-world scenario: one cluster, two durability needs
+
+An OMS database holds orders (no loss allowed) and an `order_events` table that receives 20 tracking updates per order from carriers (rebuildable from carrier APIs). Running everything with one synchronous standby made each tracking insert wait 26 ms and, during a standby maintenance window, stopped checkout.
+
+| Change | Effect |
+|---|---|
+| Two standbys, `synchronous_standby_names = 'ANY 1 (s1, s2)'` | Standby maintenance no longer stops commits |
+| `SET LOCAL synchronous_commit = local` in the tracking-update transactions | Tracking inserts back to about 1 ms; orders still wait for a standby |
+| Alert when fewer than 2 standbys are streaming | Know when the quorum has no spare |
+| Failover runbook states RPO 0 for orders, up to a few seconds for tracking | Explicit, agreed loss tolerance |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 2, Concept 4](/blogs/databases/replication/session-2-sync-vs-async/concept-4-quorums) | The quorum measurements behind "any one of two" |
+| [Session 5, Concept 2](/blogs/databases/replication/session-5-failover/concept-2-lost-writes-and-rollback) | What w:1 loses in a MongoDB failover |
+| [Transactions Session 1, Concept 3](/blogs/databases/transactions/session-1-transaction-guarantees/concept-3-durability) | Local durability: WAL, redo and journal flushing |
+| Concept 4 | Monitoring the quorum and the failover |
+
+## Key takeaways
+
+1. Waiting for one replica costs about one network round trip (23–26 ms at 20 ms away) and removes the failover loss window.
+2. Not waiting lost thousands of acknowledged writes in each engine's failover test.
+3. One synchronous standby is a single point of failure for commits; use any one of two.
+4. Engines fail differently when the quorum is missing: wait forever, silently go async, or error after a timeout.
+5. Set durability per data class; PostgreSQL and MongoDB can do it per transaction or operation.
+
+## Check questions
+
+1. What does a synchronous commit buy, in Session 5's numbers, and what does it cost, in Session 2's?
+2. Why is a single synchronous standby risky, and what configuration fixes it in each engine?
+3. MySQL semi-sync fell back to async after 10 s. Why is that dangerous, and how do you detect it?
+4. Assign a durability setting to orders, carrier tracking events and clickstream, and justify each.
+5. How can one PostgreSQL server give orders and tracking events different durability?
+6. Which two numbers should a design review state per data class, and which component decides each?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-8-designing-for-replicas/concept-3-durability-per-data/answers">Worked answers to Q1–Q6</DeepDive>
