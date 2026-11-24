@@ -1,0 +1,67 @@
+---
+title: "Answers: Measuring lag, and which number to trust"
+description: "Worked answers to the Session 3 Concept 1 check questions."
+companion: "answers"
+tags: ["replication", "lag", "monitoring", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW"
+  - "https://dev.mysql.com/doc/refman/8.4/en/show-replica-status.html"
+  - "https://www.mongodb.com/docs/manual/reference/method/rs.status/"
+---
+
+<Tldr>
+A lag number in seconds is a message about the past. Compare positions, and treat a missing number as an outage.
+</Tldr>
+
+## Q1. replay_lag at 0.23 s with 15 MB waiting
+
+**Question:** why did `replay_lag` show 0.23 s while 15 MB of WAL was waiting to be replayed?
+
+The primary computes `replay_lag` when a standby reply arrives: it looks up when the WAL position the standby reports as replayed was written. The standby sends a reply when new WAL arrives and otherwise every `wal_receiver_status_interval` (10 s here). The burst of three UPDATEs produced one last reply 0.23 s after the write; after that no new WAL arrived, so no new reply, so the value stayed. The byte distance, `pg_wal_lsn_diff(sent_lsn, replay_lsn)`, needs no reply about timing and showed 15 MB.
+
+> **Common mistake:** reading `replay_lag` as "how far behind the standby is right now". It is "how far behind it was at its last reply".
+
+## Q2. A frozen standby in pg_stat_replication
+
+**Question:** a standby is frozen. What does `pg_stat_replication` show in the first 60 s, and after?
+
+For the first 50–60 s: `state = streaming` with `write_lag`, `flush_lag` and `replay_lag` NULL, exactly like an idle standby that is caught up. The byte distance grows (1.2 → 7.5 MB in the lab). At `wal_sender_timeout` (60 s) the primary logs "terminating walsender process due to replication timeout" and the row disappears. The physical slot stays, `active = false`, and keeps WAL (9.9 MB after 70 s) until the standby returns or the slot is dropped.
+
+> **Common mistake:** treating NULL lag as healthy. NULL means "no recent measurement", for good or bad reasons.
+
+## Q3. The naive reading on a caught-up standby
+
+**Question:** why can `now() − pg_last_xact_replay_timestamp()` be large on a standby that is fully caught up?
+
+`pg_last_xact_replay_timestamp()` is the commit time of the last transaction the standby replayed. If the primary commits nothing, there is nothing new to replay and the value does not move, so `now()` minus it grows by one second per second: 12.6 s and 42.7 s in the lab with 0 bytes behind. It only measures lag while the primary is committing steadily.
+
+> **Common mistake:** "fixing" it by alerting only above a large threshold. A busy-hour real lag of 20 s then goes unnoticed while quiet nights still page. Use bytes, or write your own heartbeat row every second.
+
+## Q4. SBS 0 after a network cut
+
+**Question:** after a network cut, why did MySQL report `Seconds_Behind_Source = 0` and `Replica_IO_Running = Yes`?
+
+Disconnecting the network did not close the TCP connection; it just stopped delivering packets. The I/O thread was blocked in a read, waiting for the next event, which is its normal idle state, so it reported Yes. `Seconds_Behind_Source` compares the applier with the newest event in the relay log; the applier had applied everything that had arrived, so it reported 0. Only after the connection timed out did the I/O thread go to Connecting and SBS to NULL. `GTID_SUBTRACT` of the two servers' `gtid_executed` showed 1 to 5 missing transactions throughout.
+
+> **Common mistake:** believing SBS = 0 means "no lag". It means "no lag relative to what this replica has received".
+
+## Q5. A healthy secondary shown 2–3 s behind
+
+**Question:** why did `rs.status()` show a healthy secondary 2–3 s behind right after a write?
+
+`rs.status()` on the primary reports what the primary last heard about each member: heartbeats every 2 s and position updates. Right after a write, the primary's own optime is new and its record of the secondary is from the previous message, and `optimeDate` has one-second resolution. A direct read on the secondary found the write after 1.04 ms (median). One second later `rs.status()` showed 0.
+
+> **Common mistake:** alerting on a single `rs.status()` sample above 1–2 s. Sample over a window, or use a threshold well above the heartbeat interval.
+
+## Q6. Two alerts per engine
+
+**Question:** write the two checks you would alert on for each engine.
+
+| Engine | Position check | Presence check |
+|---|---|---|
+| PostgreSQL | `pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)` above N MB per standby, and retained WAL in `pg_replication_slots` | expected standbys missing from `pg_stat_replication`, or a slot with `active = false` |
+| MySQL | missing GTIDs from a probe reading both servers (or a heartbeat table) | `Replica_IO_Running` or `Replica_SQL_Running` ≠ Yes, or SBS NULL |
+| MongoDB | optime difference over a 30–60 s window | member state not SECONDARY / not reachable in `rs.status()` |
+
+> **Common mistake:** one alert on time lag only. Each engine has a failure mode where time lag reads 0 or NULL while the replica is not replicating.

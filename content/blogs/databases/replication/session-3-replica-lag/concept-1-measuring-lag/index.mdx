@@ -1,0 +1,383 @@
+---
+title: "Concept 1: Measuring lag, and which number to trust"
+description: "Every engine reports lag, and every report can mislead. PostgreSQL's replay_lag froze at 0.23 s while 15 MB of WAL waited unreplayed, and showed NULL for 50 s while the standby was frozen; now() − pg_last_xact_replay_timestamp() said 42.7 s with nothing behind. MySQL's Seconds_Behind_Source stayed 0 with the I/O thread 'Yes' for 40–50 s while 5 transactions were missing after a network cut. MongoDB's rs.status() showed a healthy secondary 2–3 s behind right after a write. Bytes and transaction ids do not lie: LSN difference, GTID_SUBTRACT, optimes."
+type: "concept"
+tags: ["replication", "lag", "monitoring", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW"
+  - "https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-RECOVERY-INFO-TABLE"
+  - "https://dev.mysql.com/doc/refman/8.4/en/show-replica-status.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/performance-schema-replication-applier-status-by-worker-table.html"
+  - "https://www.mongodb.com/docs/manual/reference/method/rs.printSecondaryReplicationInfo/"
+---
+
+<Tldr>
+Lag has two units: **how much** has not been applied (bytes, transactions, oplog entries) and **how old** the replica's data is (seconds). The seconds are easier to read and easier to get wrong. In the lab, **PostgreSQL**'s `replay_lag` is refreshed only when the standby sends a reply: it showed 0.23 s while 15 MB of WAL sat unreplayed, and **NULL** for 50 s while the standby was frozen (the row still said `streaming`). `now() − pg_last_xact_replay_timestamp()` read 42.7 s on a standby that was 0 bytes behind. **MySQL**'s `Seconds_Behind_Source` stayed **0** with `Replica_IO_Running: Yes` for 40–50 s after the replica lost the network, while 5 transactions were missing. **MongoDB**'s `rs.status()` showed a healthy secondary 2–3 s behind right after a write (the primary's view comes from heartbeats), and 0 a second later. Trust the counters that compare **positions**: LSN difference, `GTID_SUBTRACT`, optimes, and alert on both units.
+</Tldr>
+
+## Two units of lag
+
+| Term | Meaning |
+|---|---|
+| Position lag | How much log the replica has not applied: WAL bytes (LSN difference), GTIDs not executed, oplog entries |
+| Time lag | How old the newest data on the replica is, in seconds |
+| write / flush / replay | PostgreSQL's three steps on the standby: WAL written to the OS, flushed to disk, applied to data |
+| Heartbeat view | What one node believes about another, refreshed by periodic messages (MongoDB heartbeats every 2 s, PostgreSQL standby replies on new WAL or every `wal_receiver_status_interval` = 10 s) |
+| **✓ / ✗** | The reading matches reality / misleads |
+
+Time lag is what users feel ("my edit is not there"). Position lag is what you can measure without clocks. Every time-lag number below is computed from some message, and is only as fresh as the last message.
+
+## PostgreSQL
+
+Lab: primary `rpb-pg1`, standby `rpb-pg2` (streaming, slot `standby1`), table `orders` with 100,000 rows. Three readings were compared on the primary and the standby:
+
+```sql
+-- On the primary: what the standby last reported, and the byte distance
+SELECT write_lag, flush_lag, replay_lag,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS bytes_behind
+FROM pg_stat_replication;
+-- On the standby: the "naive" lag many dashboards use
+SELECT now() - pg_last_xact_replay_timestamp();
+```
+
+<Flow
+  title="PostgreSQL: three lag readings in three situations"
+  height={380}
+  nodes={[
+    { id: 'pri', label: 'Primary rpb-pg1', sub: 'generates WAL', x: 20, y: 20, w: 220 },
+    { id: 'stb', label: 'Standby rpb-pg2', sub: 'receives + replays', x: 560, y: 20, w: 220 },
+    { id: 'lag', label: 'replay_lag', sub: 'from standby replies', x: 20, y: 170, w: 220 },
+    { id: 'bytes', label: 'Bytes behind', sub: 'current LSN − replay_lsn', x: 290, y: 170, w: 220 },
+    { id: 'naive', label: 'now() − last replay', sub: 'on the standby', x: 560, y: 170, w: 220 },
+    { id: 'lagv', label: 'replay_lag says', sub: 'reading', x: 20, y: 300, w: 220 },
+    { id: 'bytesv', label: 'Bytes say', sub: 'reading', x: 290, y: 300, w: 220 },
+    { id: 'naivev', label: 'Naive lag says', sub: 'reading', x: 560, y: 300, w: 220 },
+  ]}
+  edges={[
+    { id: 'pri-stb', from: 'pri', to: 'stb', label: 'WAL' },
+    { id: 'stb-lag', from: 'stb', to: 'lag', label: 'reply' },
+    { id: 'pri-bytes', from: 'pri', to: 'bytes' },
+    { id: 'stb-naive', from: 'stb', to: 'naive' },
+    { id: 'lag-v', from: 'lag', to: 'lagv' },
+    { id: 'bytes-v', from: 'bytes', to: 'bytesv' },
+    { id: 'naive-v', from: 'naive', to: 'naivev' },
+  ]}
+  cases={[
+    {
+      title: 'Idle primary, standby caught up',
+      path: 'replay_lag ✓ 0.0018 s, then NULL → bytes ✓ 0 → naive ✗ 12.6 s, then 42.7 s',
+      summary: 'Nothing is behind, yet the naive reading keeps growing.',
+      steps: [
+        {
+          title: 't0: one UPDATE, then nothing',
+          note: 'Right after a single-row UPDATE: write_lag 0.0004 s, flush_lag 0.0016 s, replay_lag 0.0018 s, sync_state async. The standby replays in about 2 ms.',
+          code: "UPDATE orders SET status = 'returned' WHERE id = 1;",
+          active: ['pri', 'stb', 'lag', 'lagv'],
+          edges: ['pri-stb', 'stb-lag', 'lag-v'],
+          subs: { lagv: '✓ 0.0018 s' },
+        },
+        {
+          title: 't+12 s: the naive reading',
+          note: 'bytes_behind = 0. On the standby, now() − pg_last_xact_replay_timestamp() = 12.6 s: it is the age of the last replayed COMMIT, not lag. With no new commits on the primary it can only grow.',
+          active: ['pri', 'bytes', 'bytesv', 'stb', 'naive', 'naivev'],
+          edges: ['pri-bytes', 'bytes-v', 'stb-naive', 'naive-v'],
+          subs: { bytesv: '✓ 0 bytes', naivev: '✗ 12.6 s' },
+        },
+        {
+          title: 't+60 s: NULL and 42.7 s',
+          note: 'After about a minute idle, replay_lag is NULL (no recent WAL to time). The naive reading was 42.7 s (an autovacuum commit had reset it in between). The standby was 0 bytes behind the whole time.',
+          active: ['lag', 'lagv', 'naive', 'naivev', 'bytes', 'bytesv'],
+          edges: ['lag-v', 'naive-v', 'bytes-v'],
+          subs: { lagv: 'NULL (idle)', naivev: '✗ 42.7 s', bytesv: '✓ 0 bytes' },
+        },
+      ],
+    },
+    {
+      title: 'Replay paused, writes in one burst',
+      path: 'replay_lag ✗ frozen at 0.23 s → bytes ✓ 15 MB not replayed → naive ✗ 21.9 s',
+      summary: 'replay_lag only changes when the standby sends a reply.',
+      steps: [
+        {
+          title: 'Pause replay, write, wait 5 s',
+          note: 'pg_wal_replay_pause() on the standby, then 3 UPDATEs of 20,000 rows. The standby kept receiving WAL (receive LSN advanced) but applied none of it.',
+          code: "SELECT pg_wal_replay_pause();          -- on the standby\nUPDATE orders SET amount = amount + 0.01 WHERE id <= 20000;  -- x3 on the primary",
+          active: ['pri', 'stb'],
+          edges: ['pri-stb'],
+          subs: { stb: 'receiving, not replaying' },
+        },
+        {
+          title: 'Three readings 5 s later',
+          note: 'replay_lag 0.23 s: the last reply arrived right after the burst, and the next one is due only on new WAL or after wal_receiver_status_interval (10 s). Bytes not replayed: 15 MB. Naive: 21.9 s. Only the bytes describe the situation.',
+          active: ['lag', 'lagv', 'bytes', 'bytesv', 'naive', 'naivev'],
+          edges: ['stb-lag', 'lag-v', 'pri-bytes', 'bytes-v', 'stb-naive', 'naive-v'],
+          subs: { lagv: '✗ 0.23 s', bytesv: '✓ 15 MB behind', naivev: '✗ 21.9 s' },
+        },
+        {
+          title: 'Writes every 5 s keep replay_lag honest',
+          note: 'With replay still paused and one small write every 5 s, every write triggers a reply and replay_lag grows with the pause: 5.15 s, 10.4 s, 15.6 s, 20.7 s. Resume: it fell to 0.001 s within a second.',
+          active: ['pri', 'stb', 'lag', 'lagv'],
+          edges: ['pri-stb', 'stb-lag', 'lag-v'],
+          subs: { lagv: '✓ 5 → 20.7 s' },
+        },
+      ],
+    },
+    {
+      title: 'Standby frozen (docker pause)',
+      path: 'row ✗ "streaming", lags NULL for 50 s → bytes ✓ 1.2 → 7.5 MB → after 60 s the row disappears, slot keeps 9.9 MB',
+      summary: 'A dead standby looks like an idle one until wal_sender_timeout.',
+      steps: [
+        {
+          title: 'One write every 10 s, standby frozen',
+          note: 'docker pause rpb-pg2 stops the whole standby process. For 50 s pg_stat_replication still showed state = streaming with write_lag and replay_lag NULL, which is also what a caught-up idle standby shows.',
+          active: ['pri', 'stb', 'lag', 'lagv'],
+          edges: ['pri-stb', 'lag-v'],
+          subs: { stb: '✗ frozen', lagv: '✗ NULL, "streaming"' },
+        },
+        {
+          title: 'The bytes and the slot',
+          note: 'Bytes behind grew 1210 kB, 2445 kB, 3687 kB … 7473 kB. After wal_sender_timeout (60 s) the log said "terminating walsender process due to replication timeout" and the row vanished. pg_replication_slots still showed the slot, active = false, holding 9.9 MB of WAL. After docker unpause the standby caught up within about 0.1 s.',
+          active: ['pri', 'bytes', 'bytesv'],
+          edges: ['pri-bytes', 'bytes-v'],
+          subs: { bytesv: '✓ 1.2 → 7.5 MB' },
+        },
+      ],
+    },
+  ]}
+/>
+
+| Reading | Idle, caught up | Replay paused, burst | Standby frozen |
+|---|---|---|---|
+| `replay_lag` | 0.0018 s, NULL after a minute | ✗ 0.23 s (stale reply) | ✗ NULL |
+| `pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)` | ✓ 0 | ✓ 15 MB | ✓ 1.2 → 7.5 MB, then no row |
+| `now() − pg_last_xact_replay_timestamp()` | ✗ 12.6 s → 42.7 s | ✗ 21.9 s | not reachable |
+| `pg_replication_slots` retained WAL | 0 | — | ✓ 9.9 MB, `active = false` |
+
+## MySQL InnoDB
+
+Lab: source `rpb-my1`, replica `rpb-my2` (GTID auto-position, 4 parallel workers, `replica_preserve_commit_order = 1`), database `shop`.
+
+```sql
+-- The precise per-transaction lag (MySQL 8.0+), on the replica
+SELECT LAST_APPLIED_TRANSACTION,
+       TIMESTAMPDIFF(MICROSECOND, LAST_APPLIED_TRANSACTION_ORIGINAL_COMMIT_TIMESTAMP,
+                     LAST_APPLIED_TRANSACTION_END_APPLY_TIMESTAMP) / 1000 AS lag_ms
+FROM performance_schema.replication_applier_status_by_worker
+ORDER BY LAST_APPLIED_TRANSACTION_END_APPLY_TIMESTAMP DESC LIMIT 1;
+-- What the replica is missing: run on the replica with the source's gtid_executed pasted in
+SELECT GTID_SUBTRACT('<source @@global.gtid_executed>', @@global.gtid_executed);
+```
+
+<Flow
+  title="MySQL: Seconds_Behind_Source vs GTIDs"
+  height={380}
+  nodes={[
+    { id: 'src', label: 'Source rpb-my1', sub: 'binlog, GTID …:1-28', x: 20, y: 20, w: 220 },
+    { id: 'io', label: 'I/O thread', sub: 'pulls binlog → relay log', x: 290, y: 20, w: 220 },
+    { id: 'sql', label: 'Applier workers', sub: 'apply relay log', x: 560, y: 20, w: 220 },
+    { id: 'sbs', label: 'Seconds_Behind_Source', sub: 'applier vs relay log', x: 290, y: 170, w: 220 },
+    { id: 'gtid', label: 'GTID_SUBTRACT', sub: 'source set − replica set', x: 20, y: 170, w: 220 },
+    { id: 'ps', label: 'performance_schema', sub: 'commit vs apply time', x: 560, y: 170, w: 220 },
+    { id: 'sbsv', label: 'SBS says', sub: 'reading', x: 290, y: 300, w: 220 },
+    { id: 'gtidv', label: 'GTIDs say', sub: 'reading', x: 20, y: 300, w: 220 },
+    { id: 'psv', label: 'Timestamps say', sub: 'reading', x: 560, y: 300, w: 220 },
+  ]}
+  edges={[
+    { id: 'src-io', from: 'src', to: 'io' },
+    { id: 'io-sql', from: 'io', to: 'sql' },
+    { id: 'sql-sbs', from: 'sql', to: 'sbs' },
+    { id: 'src-gtid', from: 'src', to: 'gtid' },
+    { id: 'sql-ps', from: 'sql', to: 'ps' },
+    { id: 'sbs-v', from: 'sbs', to: 'sbsv' },
+    { id: 'gtid-v', from: 'gtid', to: 'gtidv' },
+    { id: 'ps-v', from: 'ps', to: 'psv' },
+  ]}
+  cases={[
+    {
+      title: 'A transaction left open 10 s on the source',
+      path: 'SBS ✓ 0–1 s → performance_schema ✓ 21 ms after commit',
+      summary: 'MySQL 8.4 times lag from the original commit, so a long open transaction does not inflate it.',
+      steps: [
+        {
+          title: 'Two tiny updates 10 s apart in one transaction',
+          note: 'BEGIN; UPDATE id 1; SELECT SLEEP(10); UPDATE id 2; COMMIT. The binlog gets the transaction at COMMIT. Sampled every 0.4 s, Seconds_Behind_Source read 0, then 1 once at the commit, then 0.',
+          code: "BEGIN; UPDATE shop.orders SET status='returned' WHERE id=1;\nSELECT SLEEP(10);\nUPDATE shop.orders SET status='returned' WHERE id=2; COMMIT;",
+          active: ['src', 'io', 'sql', 'sbs', 'sbsv'],
+          edges: ['src-io', 'io-sql', 'sql-sbs', 'sbs-v'],
+          subs: { sbsv: '✓ 0–1 s' },
+        },
+        {
+          title: 'The exact number',
+          note: 'performance_schema: original commit 15:35:45.8277, apply start .8325, apply end .8491: applied 21 ms after the source committed. A 300,000-row transaction (source 514 ms) took 0.87 s to apply and SBS showed 1.',
+          active: ['sql', 'ps', 'psv'],
+          edges: ['sql-ps', 'ps-v'],
+          subs: { psv: '✓ 21 ms' },
+        },
+      ],
+    },
+    {
+      title: 'Replica cut off the network',
+      path: 'I/O thread ✗ "Yes", SBS ✗ 0 for 40–50 s → GTID_SUBTRACT ✓ 1 … 5 missing → SBS NULL, "Connecting"',
+      summary: 'SBS compares the applier with the relay log; it cannot see what never arrived.',
+      steps: [
+        {
+          title: 'docker network disconnect, one write every 10 s',
+          note: 'The TCP connection does not break: it goes silent. The I/O thread waits for data that never comes, so it reports Yes, and the applier has applied everything in the relay log, so SBS = 0.',
+          code: 'docker network disconnect rpb-net rpb-my2',
+          active: ['src', 'io', 'sql', 'sbs', 'sbsv'],
+          edges: ['src-io', 'sql-sbs', 'sbs-v'],
+          subs: { io: '✗ waiting, says Yes', sbsv: '✗ 0 s' },
+        },
+        {
+          title: 'What GTIDs show',
+          note: 'Missing on the replica: …:21 at t=0, …:21-22 at 10 s, …:21-25 at 40 s, still with SBS 0. From 50 s: Replica_IO_Running = Connecting, SBS = NULL. After reconnecting, the replica caught up 28 s later: the I/O thread retries only every Connect_Retry = 60 s.',
+          active: ['src', 'gtid', 'gtidv'],
+          edges: ['src-gtid', 'gtid-v'],
+          subs: { gtidv: '✓ 1 → 5 missing' },
+        },
+      ],
+    },
+  ]}
+/>
+
+| t after the cut | Missing GTIDs | `Replica_IO_Running` | `Seconds_Behind_Source` |
+|---|---|---|---|
+| 0 s | …:21 | Yes | 0 |
+| 20 s | …:21-23 | Yes | 0 |
+| 40 s | …:21-25 | Yes | 0 |
+| 50 s | …:21-26 | Connecting | NULL |
+| 70 s | …:21-28 | Connecting | NULL |
+
+The well-known "SBS jumps to the transaction's duration" effect did not appear on 8.4: the 10-second open transaction showed 0–1 s. The network case is the one that still bites.
+
+## MongoDB
+
+Lab: replica set `rpbrs`, primary `rpb-mongo1`, secondaries `rpb-mongo2` and `rpb-mongo3`, collection `shop.orders` with 100,000 documents.
+
+```js
+rs.printSecondaryReplicationInfo()          // "N secs (0 hrs) behind the primary"
+rs.status().members.map(m => [m.name, m.optimeDate])   // last applied op per member
+```
+
+<Flow
+  title="MongoDB: the primary's view of its secondaries"
+  height={380}
+  nodes={[
+    { id: 'pri', label: 'Primary rpb-mongo1', sub: 'oplog', x: 20, y: 20, w: 220 },
+    { id: 'm2', label: 'Secondary rpb-mongo2', sub: 'applies oplog', x: 290, y: 20, w: 220 },
+    { id: 'm3', label: 'Secondary rpb-mongo3', sub: 'applies oplog', x: 560, y: 20, w: 220 },
+    { id: 'hb', label: 'rs.status() optimes', sub: 'heartbeat view, 1 s units', x: 20, y: 170, w: 220 },
+    { id: 'read', label: 'Direct read on m2', sub: 'is the new value there?', x: 290, y: 170, w: 220 },
+    { id: 'noop', label: 'Periodic no-op', sub: 'oplog entry every 10 s', x: 560, y: 170, w: 220 },
+    { id: 'hbv', label: 'rs.status says', sub: 'reading', x: 20, y: 300, w: 220 },
+    { id: 'readv', label: 'The read says', sub: 'reading', x: 290, y: 300, w: 220 },
+    { id: 'noopv', label: 'Idle lag', sub: 'reading', x: 560, y: 300, w: 220 },
+  ]}
+  edges={[
+    { id: 'pri-m2', from: 'pri', to: 'm2' },
+    { id: 'pri-hb', from: 'pri', to: 'hb' },
+    { id: 'm2-read', from: 'm2', to: 'read' },
+    { id: 'm3-noop', from: 'm3', to: 'noop' },
+    { id: 'hb-v', from: 'hb', to: 'hbv' },
+    { id: 'read-v', from: 'read', to: 'readv' },
+    { id: 'noop-v', from: 'noop', to: 'noopv' },
+  ]}
+  cases={[
+    {
+      title: 'Healthy set, right after a write',
+      path: 'rs.status ✗ m2 2–3 s behind → direct read ✓ visible after 1.04 ms (median)',
+      summary: 'The primary learns positions from heartbeats; the secondary had the write long before.',
+      steps: [
+        {
+          title: 'Read rs.status() immediately',
+          note: 'Immediately after a w:1 update, the primary reported rpb-mongo2 2 s behind; 0.3 s later 3 s; 1 s later 0. rpb-mongo2\'s own rs.status() even showed −2 s (its view of the primary was older than its own data). optimeDate has 1-second resolution.',
+          active: ['pri', 'm2', 'hb', 'hbv'],
+          edges: ['pri-m2', 'pri-hb', 'hb-v'],
+          subs: { hbv: '✗ 2–3 s, then 0' },
+        },
+        {
+          title: 'Measure the real thing',
+          note: 'Write on the primary (w:1), then poll rpb-mongo2 over a direct connection: visible after 1.04 ms (median of 20). The first read was already fresh 13 times out of 20.',
+          code: "prim.orders.updateOne({ _id: 7 }, { $set: { note: v } }, { writeConcern: { w: 1 } });\nwhile (sec.orders.findOne({ _id: 7 }).note !== v) {}",
+          active: ['m2', 'read', 'readv'],
+          edges: ['m2-read', 'read-v'],
+          subs: { readv: '✓ 1.04 ms' },
+        },
+      ],
+    },
+    {
+      title: 'One secondary frozen (fsyncLock)',
+      path: 'rs.status ✓ m3 8 → 13 → 19 → 24 → 30 s → no-op keeps the number moving even without writes',
+      summary: 'Over seconds, the heartbeat view is accurate; the oplog never goes quiet.',
+      steps: [
+        {
+          title: 'db.fsyncLock() on rpb-mongo3',
+          note: 'fsyncLock blocks writes on that node, including applying the oplog. One write every 5 s on the primary: rpb-mongo3 lag 8, 13, 19, 24, 30 s; printSecondaryReplicationInfo said "30 secs (0.01 hrs) behind the primary". After fsyncUnlock it was 0 within a second.',
+          code: 'db.fsyncLock()     // on rpb-mongo3\ndb.fsyncUnlock()   // later',
+          active: ['pri', 'm2', 'm3', 'hb', 'hbv'],
+          edges: ['pri-m2', 'pri-hb', 'hb-v'],
+          subs: { m3: '✗ frozen', hbv: '✓ 8 → 30 s' },
+        },
+        {
+          title: 'Why idle lag is not a problem here',
+          note: 'The primary writes { msg: "periodic noop" } to the oplog every 10 s (seen at 15:42:47 and 15:42:57). Optimes keep advancing on an idle set, so a frozen member shows growing lag even without application writes, unlike PostgreSQL\'s naive reading.',
+          active: ['m3', 'noop', 'noopv'],
+          edges: ['m3-noop', 'noop-v'],
+          subs: { noopv: '✓ advances every 10 s' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## Comparison
+
+| | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| Position lag (trust this) | `pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)` | `GTID_SUBTRACT(source set, replica set)` | optime difference |
+| Built-in time lag | `replay_lag`: refreshed only on standby replies, NULL when idle or frozen | `Seconds_Behind_Source`: 0 when the I/O thread silently stalls | `rs.status()`: heartbeat view, 1 s units |
+| Exact per-transaction delay | not built in | `replication_applier_status_by_worker` timestamps | measure a write-then-read |
+| Dead replica looks like | "streaming", NULL lags, then the row disappears after 60 s | "Yes", 0 s, then "Connecting", NULL | lag grows every 10 s (no-op) |
+
+<Pitfall>
+An alert on "lag above 30 s" built on `replay_lag` or `Seconds_Behind_Source` stays green for a dead replica: NULL is not above 30, and neither is 0. Alert on the position (bytes, missing GTIDs) **and** on the replica being absent or not running, and treat NULL as a failure, not as zero. For PostgreSQL also alert on `pg_replication_slots` retained WAL: a slot whose standby is gone keeps WAL on the primary's disk until it fills.
+</Pitfall>
+
+## Real-world scenario: the dashboard that said 0
+
+A marketplace runs product pages from a MySQL replica. The monitoring graph is `Seconds_Behind_Source`. A switch reboots and the replica's connection to the source goes silent. For a minute the graph shows 0, sellers' price changes stop appearing on product pages, and support tickets start. Then the graph shows a gap (NULL), which the alert rule ignores. The replica reconnects 60 s later on its own retry interval.
+
+| Fix | Effect |
+|---|---|
+| Alert on missing GTIDs from a probe that reads both servers | Catches the silent stall within one probe interval |
+| Alert when `Replica_IO_Running` ≠ Yes or SBS is NULL | Catches the reconnect phase |
+| Lower `replica_net_timeout` / heartbeat period | The I/O thread notices a dead connection sooner (from the documentation; not measured) |
+| A heartbeat table written every second on the source, read on the replica | Time lag from your own clock, independent of engine counters |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 1 lab](/blogs/databases/replication/session-1-how-replication-works/lab) | Builds the clusters used here |
+| Concept 2 | What makes these numbers grow |
+| Concept 3 | What a user sees when they are above zero |
+| Session 4 | MongoDB's `maxStalenessSeconds` uses the same kind of estimate to choose a secondary |
+
+## Key takeaways
+
+1. Lag has two units: position (bytes, GTIDs, optimes) and time (seconds). Time readings are computed from messages and are only as fresh as the last message.
+2. PostgreSQL's `replay_lag` is NULL both for an idle standby and a frozen one; `now() − pg_last_xact_replay_timestamp()` grows on an idle primary.
+3. MySQL's `Seconds_Behind_Source` stayed 0 for 40–50 s with 5 transactions missing after a network cut; GTIDs showed the truth.
+4. MongoDB's `rs.status()` is the primary's heartbeat view: off by 2–3 s right after a write, accurate over longer periods because of the 10 s no-op.
+5. Alert on position lag and on the replica's presence, and treat NULL as an outage.
+
+## Check questions
+
+1. Why did `replay_lag` show 0.23 s while 15 MB of WAL was waiting to be replayed?
+2. A standby is frozen. What does `pg_stat_replication` show in the first 60 s, and after?
+3. Why can `now() − pg_last_xact_replay_timestamp()` be large on a standby that is fully caught up?
+4. After a network cut, why did MySQL report `Seconds_Behind_Source = 0` and `Replica_IO_Running = Yes`?
+5. Why did `rs.status()` show a healthy secondary 2–3 s behind right after a write?
+6. Write the two checks you would alert on for each engine.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-3-replica-lag/concept-1-measuring-lag/answers">Worked answers to Q1–Q6</DeepDive>

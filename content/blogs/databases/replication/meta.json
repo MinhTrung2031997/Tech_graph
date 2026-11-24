@@ -2,6 +2,7 @@
   "title": "Replication and consistency",
   "pages": [
     "session-1-how-replication-works",
-    "session-2-sync-vs-async"
+    "session-2-sync-vs-async",
+    "session-3-replica-lag"
   ]
 }

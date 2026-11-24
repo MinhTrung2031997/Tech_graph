@@ -1,0 +1,252 @@
+---
+title: "Concept 3: Stale reads"
+description: "A read on a replica returns the replica's past. On a healthy MongoDB set, a read on a secondary right after a w:1 write returned the old value 7 times out of 20, although the write arrived within about 1 ms. With replicas delayed 5 s (PostgreSQL recovery_min_apply_delay, MySQL SOURCE_DELAY) every read right after the write was stale, and the new value appeared after about 5 s; a MongoDB member delayed 10 s showed it after 10.02–10.22 s while w:'majority' writes were acknowledged in 3–12 ms."
+type: "concept"
+tags: ["replication", "lag", "consistency", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/hot-standby.html"
+  - "https://www.postgresql.org/docs/17/runtime-config-replication.html#GUC-RECOVERY-MIN-APPLY-DELAY"
+  - "https://dev.mysql.com/doc/refman/8.4/en/replication-delayed.html"
+  - "https://www.mongodb.com/docs/manual/core/read-preference/"
+---
+
+<Tldr>
+Asynchronous replication means a replica answers from its own past: a committed write is visible on the primary at once and on a replica only after it has been received **and applied**. Even a tiny lag is visible to a user who writes and then reads: on a healthy MongoDB set, a read on a secondary immediately after a `w: 1` update returned the **old value 7 times out of 20**, although the median time until the secondary had it was 1.04 ms. With a lag of seconds, every such read is stale: replicas delayed by 5 s returned the old status on all reads right after the write in **PostgreSQL** (new value visible after about 5.0 s) and **MySQL**, and a MongoDB member delayed 10 s showed the new value after **10.02–10.22 s** while `w: "majority"` writes were acknowledged in 3–12 ms. Stale reads do not throw errors; they look like lost updates.
+</Tldr>
+
+## What "stale" means
+
+| Term | Meaning |
+|---|---|
+| Stale read | A read that returns a value older than one already committed and acknowledged |
+| Read-your-writes | A client sees its own acknowledged writes in later reads (Concept 4) |
+| Monotonic reads | A client never sees data go backwards between two reads (broken when consecutive reads hit replicas with different lag) |
+| Delayed replica | A replica configured to apply changes only after N seconds (used here to make lag reproducible) |
+| **✓ / ✗** | The read returns the new value / the old value |
+
+The experiment is the same in every engine: flip the status of one order on the primary, read it from a replica immediately, then poll the replica until the new value appears.
+
+## PostgreSQL
+
+<Flow
+  title="PostgreSQL: write on the primary, read on the standby"
+  height={330}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'writes, then reads', x: 20, y: 20, w: 200 },
+    { id: 'pri', label: 'Primary rpb-pg1', sub: 'status of order 3', x: 300, y: 20, w: 200 },
+    { id: 'stb', label: 'Standby rpb-pg2', sub: 'status of order 3', x: 560, y: 20, w: 220 },
+    { id: 'fresh', label: '✓ New value', sub: 'read after apply', x: 430, y: 200, w: 160 },
+    { id: 'stale', label: '✗ Old value', sub: 'read before apply', x: 620, y: 200, w: 160 },
+  ]}
+  edges={[
+    { id: 'app-pri', from: 'app', to: 'pri', label: 'UPDATE' },
+    { id: 'pri-stb', from: 'pri', to: 'stb', label: 'WAL' },
+    { id: 'stb-fresh', from: 'stb', to: 'fresh' },
+    { id: 'stb-stale', from: 'stb', to: 'stale' },
+  ]}
+  cases={[
+    {
+      title: 'Healthy standby',
+      path: 'UPDATE on the primary → read on the standby about 50 ms later ✓ new value (9 of 9)',
+      summary: 'With millisecond lag, a read that arrives tens of milliseconds later is usually fresh.',
+      steps: [
+        {
+          title: 'Write, then read through a new connection',
+          note: 'Nine single-row UPDATEs, each followed by a SELECT on the standby through a separate docker exec (about 50 ms later): 9 of 9 returned the new value. A 25 MB UPDATE was replayed 43–92 ms after its commit (Concept 2): a read inside that window would have been stale.',
+          code: "UPDATE orders SET amount = amount + 0.01 WHERE id = 5 RETURNING amount;   -- primary\nSELECT amount FROM orders WHERE id = 5;                                      -- standby",
+          active: ['app', 'pri', 'stb', 'fresh'],
+          edges: ['app-pri', 'pri-stb', 'stb-fresh'],
+          subs: { stb: 'replayed in ms' },
+        },
+      ],
+    },
+    {
+      title: 'Standby 5 s behind',
+      path: 'UPDATE ✓ returns → read on the standby ✗ old status → new status visible after about 5.0 s',
+      summary: 'Every read inside the lag window returns the past.',
+      steps: [
+        {
+          title: 'Make the lag reproducible',
+          note: 'recovery_min_apply_delay = 5s on the standby (ALTER SYSTEM + pg_reload_conf()): WAL is received at once but applied 5 s after the commit time.',
+          code: "ALTER SYSTEM SET recovery_min_apply_delay = '5s';   -- standby\nSELECT pg_reload_conf();",
+          active: ['pri', 'stb'],
+          edges: ['pri-stb'],
+          subs: { stb: 'applies 5 s late' },
+        },
+        {
+          title: 'Write, read, poll',
+          note: 'Order 3: primary returned "returned"; the standby, read right after, said "delivered". Polling until it changed: 4,992 ms and 5,017 ms (including about 50 ms for the command). The write was committed and acknowledged; nothing failed.',
+          code: "UPDATE orders SET status = 'returned' WHERE id = 3;   -- primary\nSELECT status FROM orders WHERE id = 3;               -- standby: delivered",
+          active: ['app', 'pri', 'stb', 'stale'],
+          edges: ['app-pri', 'pri-stb', 'stb-stale'],
+          subs: { stale: 'delivered' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL InnoDB
+
+<Flow
+  title="MySQL: write on the source, read on the replica"
+  height={330}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'writes, then reads', x: 20, y: 20, w: 200 },
+    { id: 'src', label: 'Source rpb-my1', sub: 'status of order 11', x: 300, y: 20, w: 200 },
+    { id: 'rep', label: 'Replica rpb-my2', sub: 'status of order 11', x: 560, y: 20, w: 220 },
+    { id: 'fresh', label: '✓ New value', sub: 'read after apply', x: 430, y: 200, w: 160 },
+    { id: 'stale', label: '✗ Old value', sub: 'read before apply', x: 620, y: 200, w: 160 },
+  ]}
+  edges={[
+    { id: 'app-src', from: 'app', to: 'src', label: 'UPDATE' },
+    { id: 'src-rep', from: 'src', to: 'rep', label: 'binlog' },
+    { id: 'rep-fresh', from: 'rep', to: 'fresh' },
+    { id: 'rep-stale', from: 'rep', to: 'stale' },
+  ]}
+  cases={[
+    {
+      title: 'Replica with SOURCE_DELAY = 5',
+      path: 'UPDATE ✓ → read on the replica ✗ old status (3 of 3) → new status after about 5.6 s',
+      summary: 'A delayed replica is a stale replica on demand.',
+      steps: [
+        {
+          title: 'Configure the delay',
+          note: 'SQL_Delay: 5 in SHOW REPLICA STATUS. The I/O thread still receives immediately; the applier waits until 5 s after the source commit.',
+          code: 'STOP REPLICA SQL_THREAD;\nCHANGE REPLICATION SOURCE TO SOURCE_DELAY = 5;\nSTART REPLICA SQL_THREAD;',
+          active: ['src', 'rep'],
+          edges: ['src-rep'],
+          subs: { rep: 'applies 5 s late' },
+        },
+        {
+          title: 'Write, read',
+          note: 'Three flips of order 11 (delivered ↔ returned). Each time the replica, read right after, returned the previous status. Seconds_Behind_Source showed 0 on the first read and 6 on the next two.',
+          code: "UPDATE shop.orders SET status = IF(status='delivered','returned','delivered') WHERE id = 11;",
+          active: ['app', 'src', 'rep', 'stale'],
+          edges: ['app-src', 'src-rep', 'rep-stale'],
+          subs: { stale: 'previous status' },
+        },
+        {
+          title: 'When it appears',
+          note: 'Waiting on the replica with WAIT_FOR_EXECUTED_GTID_SET (Concept 4) returned after 5.56–5.63 s, and the replica then showed the new status.',
+          active: ['rep', 'fresh'],
+          edges: ['rep-fresh'],
+          subs: { fresh: 'after 5.6 s' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB
+
+<Flow
+  title="MongoDB: write on the primary, read on a secondary"
+  height={330}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'writes, then reads', x: 20, y: 20, w: 200 },
+    { id: 'pri', label: 'Primary rpb-mongo1', sub: 'order 7 / 8', x: 300, y: 20, w: 200 },
+    { id: 'sec', label: 'Secondary', sub: 'rpb-mongo2 or 3', x: 560, y: 20, w: 220 },
+    { id: 'fresh', label: '✓ New value', sub: 'read after apply', x: 430, y: 200, w: 160 },
+    { id: 'stale', label: '✗ Old value', sub: 'read before apply', x: 620, y: 200, w: 160 },
+  ]}
+  edges={[
+    { id: 'app-pri', from: 'app', to: 'pri', label: 'update' },
+    { id: 'pri-sec', from: 'pri', to: 'sec', label: 'oplog' },
+    { id: 'sec-fresh', from: 'sec', to: 'fresh' },
+    { id: 'sec-stale', from: 'sec', to: 'stale' },
+  ]}
+  cases={[
+    {
+      title: 'Healthy secondary, read at once',
+      path: 'w:1 update → immediate read on rpb-mongo2 ✗ old value 7 of 20 → ✓ new value after 1.04 ms (median)',
+      summary: 'A millisecond of lag is enough when the read follows the write immediately.',
+      steps: [
+        {
+          title: 'Write, then read in a tight loop',
+          note: 'One mongosh process: updateOne on the primary with w:1, then findOne on rpb-mongo2 (direct connection) in a loop until the new value appears. First read already fresh: 13 of 20. Median time until visible: 1.04 ms.',
+          code: "prim.orders.updateOne({ _id: 7 }, { $set: { note: v } }, { writeConcern: { w: 1 } });\nsec.orders.findOne({ _id: 7 }).note === v   // false 7 times out of 20",
+          active: ['app', 'pri', 'sec', 'stale', 'fresh'],
+          edges: ['app-pri', 'pri-sec', 'sec-stale', 'sec-fresh'],
+          subs: { stale: '7 of 20', fresh: 'after 1.04 ms' },
+        },
+        {
+          title: 'With w:"majority" and w:3',
+          note: 'w:"majority" (ack median 5.67 ms): first read on rpb-mongo2 fresh 20 of 20 in this run, because rpb-mongo2 happened to be in the acknowledging majority. w:3 (ack 2.25 ms): 20 of 20, guaranteed, since every member had applied the write before the ack.',
+          active: ['pri', 'sec', 'fresh'],
+          edges: ['pri-sec', 'sec-fresh'],
+          subs: { fresh: '20 of 20' },
+        },
+      ],
+    },
+    {
+      title: 'Secondary delayed 10 s',
+      path: 'w:"majority" ✓ 3–12 ms → read on rpb-mongo3 ✗ old value 3 of 3 → ✓ after 10.02–10.22 s',
+      summary: '"Majority acknowledged" says nothing about the member you read.',
+      steps: [
+        {
+          title: 'Write with majority, read the delayed member',
+          note: 'rpb-mongo3 with secondaryDelaySecs = 10. The majority (primary + rpb-mongo2) acknowledged in 3, 6 and 12 ms. The first read on rpb-mongo3 was stale every time; the new value appeared after 10,219, 10,030 and 10,023 ms.',
+          code: "prim.orders.updateOne({ _id: 8 }, { $set: { note: v } }, { writeConcern: { w: 'majority' } });\nd3.orders.findOne({ _id: 8 }).note   // old value for ~10 s",
+          active: ['app', 'pri', 'sec', 'stale', 'fresh'],
+          edges: ['app-pri', 'pri-sec', 'sec-stale', 'sec-fresh'],
+          subs: { sec: 'rpb-mongo3, 10 s late', stale: '3 of 3', fresh: 'after 10.0–10.2 s' },
+        },
+      ],
+    },
+  ]}
+/>
+
+MongoDB drivers never send reads to a delayed member: in MongoDB 8.0 the primary's `hello` response listed only `rpb-mongo1` and `rpb-mongo2` while `rpb-mongo3` had a delay, so the lab read it over a direct connection. A secondary that is merely slow is a normal read target; Session 4 shows how often a driver picked a 2-minute-old secondary.
+
+## Comparison
+
+| | PostgreSQL | MySQL | MongoDB |
+|---|---|---|---|
+| Healthy replica, read about 50 ms after the write | ✓ 9 of 9 | ✓ (GTID wait 0 ms) | — |
+| Healthy replica, read immediately | — | — | ✗ 7 of 20 stale, visible after 1.04 ms |
+| Replica 5–10 s behind, read immediately | ✗ every time | ✗ every time | ✗ every time |
+| New value visible after | about 5.0 s (delay 5 s) | 5.56–5.63 s (delay 5 s) | 10.02–10.22 s (delay 10 s) |
+| Error on a stale read | none | none | none |
+
+<Pitfall>
+Stale reads are silent and look like the application lost the write. A seller edits a price, the page reloads from a replica 200 ms behind and shows the old price, the seller edits it again, and support receives "your system doesn't save my changes". Before routing a read to a replica, decide whether that read may be stale: catalogue browsing usually may; the page shown right after a write, payment status, and anything used to decide a write (stock, balance) may not.
+</Pitfall>
+
+## Real-world scenario: "My orders" is empty after checkout
+
+A marketplace serves "My orders" from MongoDB secondaries with `readPreference: secondaryPreferred` to offload the primary. On a normal day the secondaries are milliseconds behind and nobody notices. During a flash sale, one secondary falls 8 seconds behind. Buyers who pay and are redirected to "My orders" see an empty list about half the time (one secondary of two), and many pay a second time.
+
+| Fix | Effect |
+|---|---|
+| Read the order page from the primary for the session's next N seconds after a write | Read-your-writes for the buyer; replicas still serve browsing |
+| Pass the write's position and wait for it on the replica (Concept 4) | Fresh read from a replica, bounded wait |
+| Causally consistent session (Session 4) | MongoDB waits on the secondary automatically |
+| `maxStalenessSeconds` (Session 4) | Excludes the 8 s-old secondary from reads, at 90 s minimum granularity |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| Concept 2 | Why a replica can be seconds behind |
+| Concept 4 | How to get read-your-writes while still using replicas |
+| [Transactions Session 2, Concept 4](/blogs/databases/transactions/session-2-anomalies/concept-4-lost-updates) | A stale read used to decide a write becomes a lost update |
+
+## Key takeaways
+
+1. A replica returns data as of its last applied change; a read inside the lag window returns the old value with no error.
+2. Even 1 ms of lag matters when the read follows the write at once: 7 of 20 reads were stale on a healthy MongoDB set.
+3. With seconds of lag, every read right after a write is stale (PostgreSQL and MySQL delayed 5 s, MongoDB delayed 10 s).
+4. `w: "majority"` acknowledgement does not make every secondary fresh; only `w` equal to the member count does.
+5. Decide per read whether it may be stale; pages shown right after a write and inputs to later writes usually may not.
+
+## Check questions
+
+1. Why did a read on a healthy MongoDB secondary return the old value 7 times out of 20?
+2. Why were PostgreSQL standby reads fresh 9 of 9 times without a delay, and would that hold in production?
+3. A write was acknowledged with `w: "majority"` in 3 ms. Why was the read on `rpb-mongo3` stale for 10 s?
+4. Give two kinds of reads in a marketplace that may be served stale and two that may not.
+5. What is a monotonic-read violation, and how can two replicas cause one?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/replication/session-3-replica-lag/concept-3-stale-reads/answers">Worked answers to Q1–Q5</DeepDive>
