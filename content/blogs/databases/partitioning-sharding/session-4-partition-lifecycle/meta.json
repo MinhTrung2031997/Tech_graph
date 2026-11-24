@@ -1,0 +1,12 @@
+{
+  "title": "Session 4: Partition lifecycle",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "concept-1-drop-vs-delete/index",
+    "concept-2-detach-without-blocking/index",
+    "concept-3-future-and-default-partitions/index",
+    "concept-4-converting-a-table/index",
+    "lab/index"
+  ]
+}

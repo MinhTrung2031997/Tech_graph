@@ -1,0 +1,75 @@
+---
+title: "Answers: Creating partitions ahead, and the DEFAULT trap"
+description: "Worked answers to the Session 4 Concept 3 check questions."
+companion: "answers"
+tags: ["partitioning", "ddl", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/sql-altertable.html#SQL-ALTERTABLE-ATTACH-PARTITION"
+  - "https://dev.mysql.com/doc/refman/8.4/en/alter-table-partition-operations.html"
+---
+
+<Tldr>
+Create partitions early, with ATTACH, and keep catch-all partitions empty.
+</Tldr>
+
+## Q1. PARTITION OF vs LIKE + ATTACH
+
+**Question:** why is `CREATE TABLE … PARTITION OF` riskier than `CREATE TABLE … (LIKE …)` + `ATTACH PARTITION` on a busy table?
+
+`CREATE TABLE … PARTITION OF` takes ACCESS EXCLUSIVE on the parent. Behind any open transaction that touched the table, it waits, and every later query on the table queues behind it (11.1 s and 10.1 s in the lab). `ATTACH PARTITION` takes SHARE UPDATE EXCLUSIVE on the parent, which conflicts only with other DDL and VACUUM; it ran in 0.09 s with the same reader open, and nobody waited. Both end in the same catalog state.
+
+> **Common mistake:** assuming an empty new partition is a harmless DDL. The data is empty; the lock is not.
+
+## Q2. What ATTACH did for 10–16 ms
+
+**Question:** ATTACH of January 2024 took 10–16 ms without a CHECK constraint and 1 ms with one. What did it do in the first case?
+
+It scanned all 212,039 rows of `orders_p_2024_01` to verify each `created_at` is within `['2024-01-01', '2024-02-01')` (debug message: `verifying table "orders_p_2024_01"`), holding ACCESS EXCLUSIVE on that table. With a CHECK constraint that implies the bound, the planner's proof replaces the scan: `partition constraint … is implied by existing constraints`. The data was cached; on a cold 100 GB partition the scan is minutes of I/O.
+
+> **Common mistake:** writing a CHECK that is almost the bound, e.g. without `created_at IS NOT NULL` on a nullable column, or with `<=` instead of `<`. The proof fails and the scan runs anyway. (`created_at` is NOT NULL here.)
+
+## Q3. Why the January rows cannot just be moved
+
+**Question:** with rows for January 2026 in DEFAULT, creating the January partition failed. Why can PostgreSQL not just move them?
+
+Moving rows between partitions is a data change: an INSERT into the new partition and a DELETE from DEFAULT, with WAL, locks and possibly millions of rows. DDL that silently did that inside `CREATE TABLE` would take an unpredictable time under ACCESS EXCLUSIVE. PostgreSQL refuses ("updated partition constraint for default partition "orders_p_default" would be violated by some row") and leaves it to you: detach DEFAULT, create the partition, move the rows, attach DEFAULT again. That took about 0.46 s for 212,039 rows, with the parent locked for the whole transaction.
+
+> **Common mistake:** finding this out on the first of the month, when the move is largest and traffic is highest.
+
+## Q4. A lock on DEFAULT for a July partition
+
+**Question:** why did attaching a July 2026 partition need a lock on DEFAULT, when DEFAULT had no July rows?
+
+DEFAULT's implicit constraint is "not in any other partition". Adding July narrows it, so PostgreSQL must prove that DEFAULT has no July rows: it scans DEFAULT (26–30 ms for 1M rows) under ACCESS EXCLUSIVE on DEFAULT, which waited for, and then blocked, DEFAULT's readers (11.2 s and 10.2 s). PostgreSQL cannot know DEFAULT has no July rows without looking, unless a CHECK constraint on DEFAULT says so; then the scan is skipped (1.5 ms).
+
+> **Common mistake:** thinking an empty-looking DEFAULT is free. Even with zero rows the lock is taken; the scan is just short.
+
+## Q5. Splitting MAXVALUE
+
+**Question:** in MySQL, why does splitting a `MAXVALUE` partition get slower the more rows it holds, and what does it block?
+
+`REORGANIZE PARTITION pmax INTO (p2026_02, pmax)` builds the two new partitions and copies every row of `pmax` into one of them: 1.56 s with 1M rows, 0.04–0.05 s when empty. It runs with `LOCK=SHARED` at best (`LOCK=NONE` gives ERROR 1845), so reads continue and **writes to every partition** wait for the metadata lock: an insert for December 2025 waited 1.43 s. Keep `pmax` as an empty safety net and split it before rows reach it.
+
+> **Common mistake:** relying on `MAXVALUE` as a permanent home for new data. Every month you then reorganize a growing partition.
+
+## Q6. The PostgreSQL job
+
+**Question:** design the "create future partitions" job for PostgreSQL: how far ahead, which statements, which lock settings, which alert.
+
+```sql
+-- Daily. Ensure partitions exist for the current month + 3 months ahead.
+SET lock_timeout = '2s';   -- retry tomorrow rather than queue behind a long reader
+CREATE TABLE IF NOT EXISTS orders_p_2026_04 (LIKE orders_p INCLUDING ALL);
+ALTER TABLE orders_p ATTACH PARTITION orders_p_2026_04
+  FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');   -- skip if already attached
+```
+
+- **Ahead:** 3 months, so two missed runs are harmless. Partitions are cheap when empty.
+- **Statements:** `LIKE … INCLUDING ALL` + `ATTACH` (SHARE UPDATE EXCLUSIVE), never `PARTITION OF` on a busy table. `INCLUDING ALL` copies the parent's indexes, and ATTACH adopts them as the partition's indexes (instant for an empty table).
+- **Locks:** a short `lock_timeout` in case another DDL or VACUUM holds a conflicting lock.
+- **No DEFAULT partition**, or one with an alert on its first row.
+- **Alert:** fewer than 2 future partitions (`SELECT count(*) FROM pg_inherits … WHERE bound > now()`), and job failure.
+- pg_partman's `premake` and `run_maintenance()` do the same if you can install the extension.
+
+> **Common mistake:** running this job once a month on the 25th. One failure leaves a week to notice; daily with 3 months ahead leaves 60 days.

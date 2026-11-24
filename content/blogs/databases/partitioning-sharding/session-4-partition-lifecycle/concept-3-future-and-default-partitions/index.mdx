@@ -1,0 +1,357 @@
+---
+title: "Concept 3: Creating partitions ahead, and the DEFAULT trap"
+description: "An insert with no matching partition fails in PostgreSQL and MySQL (ERROR 1526), so next month's partition must exist before the month starts. CREATE TABLE … PARTITION OF takes ACCESS EXCLUSIVE on the parent (a reader made it and the next read wait 10 s); CREATE TABLE + ATTACH PARTITION takes SHARE UPDATE EXCLUSIVE and ran in 0.09 s. A DEFAULT partition holding 1M rows made a new month fail outright when matching rows were in it, and otherwise scanned DEFAULT under ACCESS EXCLUSIVE (26–30 ms) unless a CHECK constraint ruled the range out (1.5 ms). MySQL's MAXVALUE catch-all costs a REORGANIZE that copied 1M rows in 1.56 s while writes waited."
+type: "concept"
+tags: ["partitioning", "ddl", "locking", "postgresql", "mysql", "mongodb"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE-MAINTENANCE"
+  - "https://www.postgresql.org/docs/17/sql-altertable.html#SQL-ALTERTABLE-ATTACH-PARTITION"
+  - "https://www.postgresql.org/docs/17/sql-createtable.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-management-range-list.html"
+  - "https://github.com/pgpartman/pg_partman"
+---
+
+<Tldr>
+A range-partitioned table only accepts rows for ranges that exist: an order dated 2026-01-05 failed with **"no partition of relation "orders_p" found for row"** in PostgreSQL and **ERROR 1526** in MySQL. So future partitions are created ahead of time, and **how** you create them matters:
+
+- **PostgreSQL** `CREATE TABLE … PARTITION OF` takes **ACCESS EXCLUSIVE** on the parent: behind one 12-second reader, it waited 11.1 s and a new read waited 10.1 s. `CREATE TABLE … (LIKE …)` + `ATTACH PARTITION` takes **SHARE UPDATE EXCLUSIVE**: 0.09 s, nobody blocked.
+- **ATTACH** checks every row of the incoming table (10–16 ms for 212,039 rows) unless a matching CHECK constraint proves the range (about 1 ms).
+- A **DEFAULT partition** catches rows with no partition, then gets in the way. With 1M rows in it: a new partition for a month that had rows in DEFAULT **failed** ("updated partition constraint for default partition … would be violated"); any other new partition **scanned DEFAULT** (26–30 ms) under ACCESS EXCLUSIVE on it, unless a CHECK on DEFAULT ruled the range out (**1.5 ms**).
+- **MySQL** has no DEFAULT; a `MAXVALUE` partition plays that role, and splitting it with `REORGANIZE PARTITION` **copied** its rows: 1.56 s for 1M rows, writes to the table waiting 1.43 s, against 0.04 s when it was empty.
+- **MongoDB**: a month collection created by the first insert has only the `_id` index; find on `created_at` was a **COLLSCAN**.
+</Tldr>
+
+## The setup
+
+`orders_p` has monthly partitions for 2024-01 … 2025-12. It is now January 2026, and new orders must go somewhere.
+
+| Term | Meaning |
+|---|---|
+| Future partition | A partition created before any row for its range exists |
+| `ATTACH PARTITION` | Turn an existing table into a partition; verifies that every row fits the bound |
+| DEFAULT partition | PostgreSQL catch-all for rows that match no other partition |
+| `MAXVALUE` partition | MySQL's open-ended last range, the closest thing to DEFAULT |
+| Implied by constraints | PostgreSQL skips the verification scan when a CHECK constraint already proves it |
+| **✓ / ✗** | Proceeds without blocking or scanning / blocks, scans or fails |
+
+## PostgreSQL: creating next month
+
+<Flow
+  title="PostgreSQL: add January 2026 while December is being read"
+  height={330}
+  nodes={[
+    { id: 'job', label: 'Maintenance job', sub: 'add 2026-01', x: 20, y: 20, w: 200 },
+    { id: 'parent', label: 'orders_p', sub: 'parent table lock', x: 300, y: 20, w: 200 },
+    { id: 'reader', label: 'Readers', sub: 'T1 open 12 s, then T3', x: 580, y: 20, w: 200 },
+    { id: 'create', label: 'PARTITION OF', sub: 'ACCESS EXCLUSIVE', x: 160, y: 200, w: 200 },
+    { id: 'attach', label: 'LIKE + ATTACH', sub: 'SHARE UPDATE EXCL.', x: 440, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'job-parent', from: 'job', to: 'parent' },
+    { id: 'reader-parent', from: 'reader', to: 'parent' },
+    { id: 'parent-create', from: 'parent', to: 'create' },
+    { id: 'parent-attach', from: 'parent', to: 'attach' },
+  ]}
+  cases={[
+    {
+      title: 'CREATE TABLE … PARTITION OF',
+      path: 'AccessExclusiveLock on orders_p ✗ waits for T1 → T3 ✗ queued (10.1 s)',
+      summary: 'Adding an empty partition blocks the table like a DROP does.',
+      steps: [
+        {
+          title: 'Create next month directly',
+          note: 'pg_locks: T2 AccessExclusiveLock on orders_p, granted = f, blocked by T1. T3\'s AccessShareLock queued behind T2. T2 finished after 11.1 s, T3 after 10.1 s.',
+          code: "CREATE TABLE orders_p_2026_08 PARTITION OF orders_p\n  FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');",
+          active: ['job', 'parent', 'reader', 'create'],
+          edges: ['job-parent', 'reader-parent', 'parent-create'],
+          subs: { create: '✗ waits, blocks T3' },
+        },
+      ],
+    },
+    {
+      title: 'CREATE TABLE + ATTACH PARTITION',
+      path: 'CREATE TABLE (LIKE orders_p) ✓ → ATTACH: ShareUpdateExclusiveLock on orders_p ✓ 0.09 s → T3 ✓ 0.09 s',
+      summary: 'Same result, a lock that does not conflict with reads or writes.',
+      steps: [
+        {
+          title: 'Create a standalone table',
+          note: 'CREATE TABLE … (LIKE orders_p INCLUDING ALL) takes only an ACCESS SHARE lock on orders_p, like a SELECT. Load it if you have data for it; empty is fine.',
+          code: 'CREATE TABLE orders_p_2026_08 (LIKE orders_p INCLUDING ALL);',
+          active: ['job', 'attach'],
+          edges: [],
+        },
+        {
+          title: 'Attach it',
+          note: 'Since PostgreSQL 12, ATTACH PARTITION takes SHARE UPDATE EXCLUSIVE on the parent. With T1 still open: T2 done in 0.092 s, T3 in 0.090 s. pg_locks showed no waiters.',
+          code: "ALTER TABLE orders_p ATTACH PARTITION orders_p_2026_08\n  FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');",
+          active: ['job', 'parent', 'reader', 'attach'],
+          edges: ['job-parent', 'reader-parent', 'parent-attach'],
+          subs: { attach: '✓ 0.09 s' },
+        },
+      ],
+    },
+  ]}
+/>
+
+The verification scan of ATTACH, on the January 2024 table (212,039 rows) re-attached:
+
+| ATTACH of `orders_p_2024_01` | Time | `client_min_messages = debug1` says |
+|---|---|---|
+| No CHECK constraint, 3 runs | 15.8, 11.0, 10.1 ms | `verifying table "orders_p_2024_01"` |
+| With `CHECK (created_at >= '2024-01-01' AND created_at < '2024-02-01')` | 1.1 ms | `partition constraint … is implied by existing constraints` |
+
+The scan runs under ACCESS EXCLUSIVE on the table being attached (not on the parent), so it only matters for tables that are big or in use. Concept 4 measures it on 5M rows.
+
+## PostgreSQL: the DEFAULT partition
+
+<Flow
+  title="PostgreSQL: DEFAULT with 1,000,000 rows (2026-01-01 … 2026-05-27)"
+  height={360}
+  nodes={[
+    { id: 'job', label: 'Maintenance job', sub: 'add a month', x: 20, y: 20, w: 200 },
+    { id: 'parent', label: 'orders_p', sub: 'SHARE UPDATE EXCL.', x: 300, y: 20, w: 200 },
+    { id: 'def', label: 'orders_p_default', sub: '1,000,000 rows', x: 580, y: 20, w: 200 },
+    { id: 'fail', label: '✗ ERROR', sub: 'rows already in DEFAULT', x: 20, y: 280, w: 200 },
+    { id: 'scan', label: '✗ Scan DEFAULT', sub: 'ACCESS EXCLUSIVE on it', x: 300, y: 280, w: 200 },
+    { id: 'skip', label: '✓ Scan skipped', sub: 'CHECK rules it out', x: 580, y: 280, w: 200 },
+  ]}
+  edges={[
+    { id: 'job-parent', from: 'job', to: 'parent' },
+    { id: 'parent-def', from: 'parent', to: 'def' },
+    { id: 'def-fail', from: 'def', to: 'fail' },
+    { id: 'def-scan', from: 'def', to: 'scan' },
+    { id: 'def-skip', from: 'def', to: 'skip' },
+  ]}
+  cases={[
+    {
+      title: 'New month already has rows in DEFAULT',
+      path: 'CREATE … 2026-01 → DEFAULT checked → ✗ 212,039 January rows in DEFAULT → ERROR',
+      summary: 'Once DEFAULT holds a month, that month cannot get a partition by DDL alone.',
+      steps: [
+        {
+          title: 'Rows went to DEFAULT',
+          note: 'Nobody created 2026 partitions, so 1,000,000 new orders (2026-01-01 … 2026-05-27) were routed to orders_p_default. Inserts succeeded; the problem is invisible until the next DDL.',
+          code: 'CREATE TABLE orders_p_default PARTITION OF orders_p DEFAULT;',
+          active: ['parent', 'def'],
+          edges: ['parent-def'],
+        },
+        {
+          title: 'Create January 2026',
+          note: 'ERROR: updated partition constraint for default partition "orders_p_default" would be violated by some row. Fix used in the lab, in one transaction: DETACH DEFAULT (0.9 ms), CREATE the January partition (1.5 ms), INSERT … SELECT its 212,039 rows from DEFAULT (270 ms), DELETE them from DEFAULT (57 ms), ATTACH DEFAULT again (126 ms: it re-checks DEFAULT against every partition). About 0.46 s with ACCESS EXCLUSIVE on orders_p the whole time.',
+          code: "CREATE TABLE orders_p_2026_01 PARTITION OF orders_p\n  FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');   -- ERROR",
+          active: ['job', 'parent', 'def', 'fail'],
+          edges: ['job-parent', 'parent-def', 'def-fail'],
+        },
+      ],
+    },
+    {
+      title: 'New month has no rows in DEFAULT',
+      path: 'ATTACH 2026-07 → ✗ verifying table "orders_p_default" (26–30 ms) under ACCESS EXCLUSIVE on DEFAULT',
+      summary: 'Every new partition makes PostgreSQL prove DEFAULT has none of its rows.',
+      steps: [
+        {
+          title: 'Scan DEFAULT',
+          note: 'CREATE … PARTITION OF for July 2026: 29.6 and 30.4 ms. ATTACH of an empty July table: 30.1 ms, with "verifying table "orders_p_default"" in the debug output. The scan grows with DEFAULT.',
+          code: "ALTER TABLE orders_p ATTACH PARTITION orders_p_2026_07\n  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');",
+          active: ['job', 'parent', 'def', 'scan'],
+          edges: ['job-parent', 'parent-def', 'def-scan'],
+        },
+        {
+          title: 'And it blocks DEFAULT\'s readers',
+          note: 'With T1 reading rows in DEFAULT (created_at >= 2026-02-01, open 12 s): T2\'s ATTACH got ShareUpdateExclusiveLock on orders_p but waited for AccessExclusiveLock on orders_p_default (11.2 s), and T3\'s read of DEFAULT queued behind it (10.2 s).',
+          active: ['parent', 'def', 'scan'],
+          edges: ['parent-def', 'def-scan'],
+          subs: { def: '✗ AccessExclusive pending' },
+        },
+      ],
+    },
+    {
+      title: 'CHECK constraint on DEFAULT',
+      path: 'CHECK (created_at < 2026-07-01) on DEFAULT → ATTACH 2026-07 → ✓ implied by existing constraints (1.5 ms)',
+      summary: 'Tell PostgreSQL what DEFAULT cannot contain.',
+      steps: [
+        {
+          title: 'Rule the range out',
+          note: 'Adding the constraint scanned DEFAULT once (26.3 ms). The next ATTACH logged "updated partition constraint for default partition "orders_p_default" is implied by existing constraints" and took 1.5 ms.',
+          code: "ALTER TABLE orders_p_default\n  ADD CONSTRAINT orders_p_default_upto_2026_06 CHECK (created_at < '2026-07-01');",
+          active: ['job', 'parent', 'def', 'skip'],
+          edges: ['job-parent', 'parent-def', 'def-skip'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: no DEFAULT, a MAXVALUE partition instead
+
+<Flow
+  title="InnoDB: adding months to orders_p"
+  height={330}
+  nodes={[
+    { id: 'job', label: 'Maintenance job', sub: 'add 2026-xx', x: 20, y: 20, w: 200 },
+    { id: 'last', label: 'Last partition', sub: 'p2025_12', x: 300, y: 20, w: 200 },
+    { id: 'writer', label: 'Writers', sub: 'insert Dec 2025', x: 580, y: 20, w: 200 },
+    { id: 'add', label: '✓ ADD PARTITION', sub: 'no MAXVALUE: 0.11 s', x: 20, y: 200, w: 200 },
+    { id: 'reorg', label: '✗ REORGANIZE pmax', sub: 'copies its rows', x: 300, y: 200, w: 200 },
+    { id: 'wait', label: '✗ Writers wait', sub: 'metadata lock', x: 580, y: 200, w: 200 },
+  ]}
+  edges={[
+    { id: 'job-last', from: 'job', to: 'last' },
+    { id: 'last-add', from: 'last', to: 'add' },
+    { id: 'last-reorg', from: 'last', to: 'reorg' },
+    { id: 'writer-wait', from: 'writer', to: 'wait' },
+  ]}
+  cases={[
+    {
+      title: 'No catch-all partition',
+      path: 'insert 2026-01-05 → ✗ ERROR 1526 → ADD PARTITION ✓ 0.11 s',
+      summary: 'Fast to extend, but a forgotten month means failed inserts.',
+      steps: [
+        {
+          title: 'Insert past the last range',
+          note: 'ERROR 1526 (HY000): Table has no partition for value from column_list. The order is lost unless the application retries.',
+          code: "INSERT INTO orders_p VALUES (5000001, 1, 'shopee', 'delivered', 10, '2026-01-05 10:00:00');",
+          active: ['job', 'last'],
+          edges: ['job-last'],
+        },
+        {
+          title: 'Add the month',
+          note: 'ADD PARTITION of an empty range after the last one: 0.11 s. Like DROP PARTITION it needs the exclusive metadata lock (Concept 2), so set lock_wait_timeout.',
+          code: "ALTER TABLE orders_p ADD PARTITION (PARTITION p2026_01 VALUES LESS THAN ('2026-02-01'));",
+          active: ['last', 'add'],
+          edges: ['last-add'],
+        },
+      ],
+    },
+    {
+      title: 'MAXVALUE partition with rows in it',
+      path: 'ADD PARTITION after pmax ✗ ERROR 1493 → REORGANIZE pmax ✗ copies 1M rows (1.56 s) → writers ✗ wait 1.43 s',
+      summary: 'The catch-all never fails an insert, and every split rewrites it.',
+      steps: [
+        {
+          title: 'ADD is no longer possible',
+          note: 'After PARTITION pmax VALUES LESS THAN (MAXVALUE): ADD PARTITION p2026_02 failed with ERROR 1493 (HY000): VALUES LESS THAN value must be strictly increasing for each partition. The only way is to split pmax.',
+          active: ['job', 'last', 'reorg'],
+          edges: ['job-last', 'last-reorg'],
+        },
+        {
+          title: 'Split pmax',
+          note: 'pmax held 1,000,000 rows (2026-02 … 2026-06). REORGANIZE pmax INTO (p2026_02, pmax): 1.56 s, then 1.09, 0.84, 0.67 s as pmax shrank; 0.04–0.05 s once it was empty. LOCK=NONE is refused: ERROR 1845, "Try LOCK=SHARED".',
+          code: "ALTER TABLE orders_p REORGANIZE PARTITION pmax INTO (\n  PARTITION p2026_02 VALUES LESS THAN ('2026-03-01'),\n  PARTITION pmax VALUES LESS THAN (MAXVALUE));",
+          active: ['last', 'reorg'],
+          edges: ['last-reorg'],
+        },
+        {
+          title: 'Writes to any month wait',
+          note: 'During a 1.84 s REORGANIZE (pmax with 1M rows): an INSERT dated 2025-12-31 waited 1.43 s ("Waiting for table metadata lock"); a read of December 2025 took 0.15 s. LOCK=SHARED: reads go on, writes to every partition stop.',
+          active: ['writer', 'wait', 'reorg'],
+          edges: ['writer-wait'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: the application creates the month
+
+<Flow
+  title="MongoDB: next month's collection"
+  height={260}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'writes to orders_YYYY_MM', x: 20, y: 20, w: 220 },
+    { id: 'implicit', label: '✗ Implicit create', sub: 'first insert, _id only', x: 300, y: 20, w: 200 },
+    { id: 'scan', label: 'COLLSCAN', sub: 'find by created_at', x: 580, y: 20, w: 200 },
+    { id: 'ahead', label: '✓ Created ahead', sub: 'createIndex: 26 ms', x: 300, y: 160, w: 200 },
+  ]}
+  edges={[
+    { id: 'app-implicit', from: 'app', to: 'implicit' },
+    { id: 'implicit-scan', from: 'implicit', to: 'scan' },
+    { id: 'app-ahead', from: 'app', to: 'ahead' },
+  ]}
+  cases={[
+    {
+      title: 'Created by the first insert',
+      path: 'insertOne into orders_2026_01 → ✗ collection with _id_ only → find on created_at ✗ COLLSCAN',
+      summary: 'Nothing fails, which is why nobody notices.',
+      steps: [
+        {
+          title: 'Insert creates the collection',
+          note: 'getIndexes(): ["_id_"]. explain() of find({ created_at: … }): winningPlan.stage COLLSCAN.',
+          code: "db.orders_2026_01.insertOne({ _id: 5000001, created_at: ISODate('2026-01-05T10:00:00Z') /* … */ })",
+          active: ['app', 'implicit', 'scan'],
+          edges: ['app-implicit', 'implicit-scan'],
+        },
+      ],
+    },
+    {
+      title: 'Created ahead with its indexes',
+      path: 'createCollection + createIndex before the month starts → ✓ 26 ms',
+      summary: 'The job a partition manager would do, done by your scheduler.',
+      steps: [
+        {
+          title: 'Create next month in advance',
+          note: 'createCollection("orders_2026_02") + createIndex({ created_at: 1 }) on the empty collection: 26 ms.',
+          code: "db.createCollection('orders_2026_02');\ndb.orders_2026_02.createIndex({ created_at: 1 });",
+          active: ['app', 'ahead'],
+          edges: ['app-ahead'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Comparison
+
+| | PostgreSQL | MySQL | MongoDB (collection per month) |
+|---|---|---|---|
+| Row with no partition | ERROR, row rejected | ERROR 1526 | collection created implicitly, no indexes |
+| Catch-all | DEFAULT partition | `MAXVALUE` partition | — |
+| Adding a month, no catch-all | `ATTACH`: SHARE UPDATE EXCLUSIVE, 0.09 s | `ADD PARTITION`: 0.11 s, metadata lock | `createCollection` + indexes: 26 ms |
+| Adding a month, catch-all with rows | DEFAULT scanned (26–30 ms per 1M rows), or ERROR if the month is in it | `REORGANIZE` copies pmax (1.56 s per 1M rows), writes wait | — |
+| Tooling | pg_partman `premake` (not installed here) | event scheduler or cron | your scheduler |
+
+PostgreSQL 17 has no `SPLIT PARTITION` or `MERGE PARTITIONS`: both are syntax errors on 17.11 (`syntax error at or near "SPLIT"`). The extension **pg_partman** (described from its documentation, not run here) creates future partitions ahead (`premake`, default 4) from a scheduled `run_maintenance()` and can drop or detach old ones by a retention setting.
+
+<Pitfall>
+A DEFAULT partition turns a missed maintenance run from a loud failure (inserts error out today) into a silent one (inserts succeed, and next month's DDL fails or scans and locks DEFAULT). If you keep one, monitor that it stays empty (`SELECT count(*) FROM orders_p_default` should be 0) and alert on the first row. Better: create partitions several months ahead and have no DEFAULT.
+</Pitfall>
+
+## Real-world scenario: the campaign month
+
+The partition job creates next month's partition on the 25th. In November it failed silently (a permission change). On 1 December, during a mega-sale, every insert into `orders` started failing with "no partition of relation "orders" found for row": checkout was down until someone created the partition by hand, which waited 40 s for the ACCESS EXCLUSIVE lock behind a dashboard query.
+
+| Fix | Effect |
+|---|---|
+| Create partitions 3 months ahead, not 1 | Two missed runs are still safe |
+| Use `CREATE TABLE … (LIKE …)` + `ATTACH PARTITION` | No ACCESS EXCLUSIVE on the parent |
+| Alert when fewer than 2 future partitions exist | A failed job is noticed weeks before it matters |
+| No DEFAULT partition | Missing partitions fail loudly instead of corrupting the scheme |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 2, Concept 1](/blogs/databases/partitioning-sharding/session-2-partitioning-postgresql/concept-1-declarative-partitioning) | Range, list and hash partitions and how rows are routed |
+| Concept 2 | The same lock queue for DROP and DETACH |
+| Concept 4 | ATTACH with a CHECK constraint is how an existing big table becomes a partition |
+
+## Key takeaways
+
+1. Range partitions must exist before their rows arrive; a missing one rejects inserts in PostgreSQL and MySQL.
+2. In PostgreSQL, `CREATE TABLE … PARTITION OF` locks the parent ACCESS EXCLUSIVE; `CREATE TABLE` + `ATTACH PARTITION` takes SHARE UPDATE EXCLUSIVE.
+3. ATTACH verifies every row unless a CHECK constraint already proves the bound.
+4. A DEFAULT partition makes each new partition scan and lock DEFAULT, and fails it if DEFAULT holds rows of the new range.
+5. MySQL's MAXVALUE partition has to be split with `REORGANIZE`, which copies its rows and blocks writes; keep it empty.
+6. In MongoDB, create next month's collection and its indexes ahead of time, or the first insert creates it without them.
+
+## Check questions
+
+1. Why is `CREATE TABLE … PARTITION OF` riskier than `CREATE TABLE … (LIKE …)` + `ATTACH PARTITION` on a busy table?
+2. ATTACH of January 2024 took 10–16 ms without a CHECK constraint and 1 ms with one. What did it do in the first case?
+3. With rows for January 2026 in DEFAULT, creating the January partition failed. Why can PostgreSQL not just move them?
+4. Why did attaching a July 2026 partition need a lock on DEFAULT, when DEFAULT had no July rows?
+5. In MySQL, why does splitting a `MAXVALUE` partition get slower the more rows it holds, and what does it block?
+6. Design the "create future partitions" job for PostgreSQL: how far ahead, which statements, which lock settings, which alert.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-4-partition-lifecycle/concept-3-future-and-default-partitions/answers">Worked answers to Q1–Q6</DeepDive>

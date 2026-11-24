@@ -1,0 +1,94 @@
+---
+title: "Answers: Partition lifecycle session quiz"
+description: "Worked answers to the Session 4 quiz, with the lab's measured values."
+companion: "answers"
+tags: ["partitioning", "retention", "locking", "lab", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/ddl-partitioning.html"
+  - "https://www.postgresql.org/docs/17/sql-altertable.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/metadata-locking.html"
+---
+
+<Tldr>
+Partitions make removing and adding data a catalog operation. The remaining risk is the lock each operation takes on the parent table.
+</Tldr>
+
+## Q1. Costs of the DELETE beyond its WAL
+
+**Question:** removing one month cost 11.4 MB of WAL by DELETE and about 44 KB by DROP in PostgreSQL. Name two more costs of the DELETE that the DROP does not have.
+
+Any two of:
+- **VACUUM:** 0.69 s and another 10.9 MB of WAL to remove the 212,039 dead tuples and their entries in both indexes (each index read in full, 13,712 pages).
+- **Slower reads until VACUUM:** a count over the deleted range did 212,039 heap fetches to find nothing.
+- **No space returned:** the file stayed 365 MB; the space is only reusable inside the table.
+- **Full-page images on cold pages:** the first run wrote 27.6 MB, not 11.4 MB.
+- **Replication:** replicas replay every WAL record of the DELETE and of the VACUUM.
+
+> **Common mistake:** comparing only the statement times (91 ms vs 8 ms) and concluding the difference does not matter.
+
+## Q2. The file did not shrink
+
+**Question:** why did the table file stay the same size after the DELETE and its VACUUM?
+
+PostgreSQL never moves rows to compact a table during plain VACUUM; it can only cut off empty pages at the **end** of the file. The deleted month was the oldest data, inserted first, so it sat at the start of the heap (`pages: 0 removed`). MySQL and MongoDB behave the same way: InnoDB's file stayed 423,624,704 bytes, WiredTiger's `storageSize` 146.4 MB. The space is reused by later inserts. Dropping a partition removes its files.
+
+> **Common mistake:** expecting a retention DELETE to lower disk usage alerts.
+
+## Q3. A DROP that blocks a read of another month
+
+**Question:** why did `DROP TABLE orders_p_2024_01` make a read of December 2025 wait 10 seconds?
+
+Dropping a partition takes ACCESS EXCLUSIVE on the parent `orders_p`. T1 held an ACCESS SHARE lock on `orders_p` (every query on a partitioned table locks the parent), so the DROP waited for T1 to commit. T3's ACCESS SHARE request was compatible with T1 but conflicted with the DROP's pending request ahead of it, so it queued: 10.2 s for a query that otherwise takes milliseconds.
+
+> **Common mistake:** "the DROP only takes 5 ms". The 5 ms start after the wait, and the wait blocks everyone.
+
+## Q4. What CONCURRENTLY changes
+
+**Question:** what does `DETACH PARTITION … CONCURRENTLY` change about that, and what are its two restrictions?
+
+It takes SHARE UPDATE EXCLUSIVE on the parent, which does not conflict with reads or writes, marks the partition pending detach, then waits for transactions that might still see the partition. T3 ran in 0.10 s while the detach waited 11.1 s for T1. Restrictions: it **cannot run inside a transaction block**, and only **one partition per parent** can be pending detach; if the command is interrupted, the partition stays pending (invisible to new queries) until `DETACH PARTITION … FINALIZE`. (Also: it cannot be used while the table has a DEFAULT partition, per the documentation; not tested here.)
+
+> **Common mistake:** running it from a migration tool that wraps every step in a transaction.
+
+## Q5. Keeping MySQL's DROP PARTITION from freezing the table
+
+**Question:** in MySQL, how do you stop `DROP PARTITION` from freezing the table behind a long reader?
+
+There is no concurrent variant, and `LOCK=NONE` does not avoid the exclusive metadata lock that every DDL needs to start. Set a short `lock_wait_timeout` in the job's session (`SET SESSION lock_wait_timeout = 2`): the DROP fails with ERROR 1205 after 2 s (2.09 s in the lab), the queued readers continue (T3 finished after 1.08 s), and the job retries later. Also keep long transactions off the table (they hold their metadata lock until commit).
+
+> **Common mistake:** relying on the default `lock_wait_timeout`, which is 31,536,000 seconds.
+
+## Q6. LIKE + ATTACH for next month
+
+**Question:** why is `CREATE TABLE … (LIKE …)` + `ATTACH PARTITION` preferred over `CREATE TABLE … PARTITION OF` for next month's partition?
+
+`PARTITION OF` takes ACCESS EXCLUSIVE on the parent: with a 12-second reader open it waited 11.1 s and a new reader waited 10.1 s behind it. `ATTACH PARTITION` takes SHARE UPDATE EXCLUSIVE on the parent: 0.09 s, nobody waited. The result is identical. Add a matching CHECK constraint (or attach an empty table) so ATTACH does not need to scan.
+
+> **Common mistake:** assuming DDL on an empty object is instant. The lock on the parent is what matters.
+
+## Q7. The DEFAULT partition
+
+**Question:** give two ways a DEFAULT partition causes trouble when you add a partition later, and how a CHECK constraint helps.
+
+1. **Failure:** if DEFAULT already holds rows of the new range, the new partition is refused ("updated partition constraint for default partition "orders_p_default" would be violated by some row"); the rows must be moved by hand (0.46 s for 212,039 rows, with the parent locked).
+2. **Scan and lock:** otherwise PostgreSQL scans DEFAULT to prove it has no rows of the new range (26–30 ms for 1M rows) under ACCESS EXCLUSIVE on DEFAULT, which waited for and then blocked DEFAULT's readers (11.2 s / 10.2 s).
+
+A CHECK constraint on DEFAULT that excludes the new range (`CHECK (created_at < '2026-07-01')`) lets PostgreSQL skip the scan: 1.5 ms, "implied by existing constraints". It does not help with case 1.
+
+> **Common mistake:** adding DEFAULT "for safety". It hides missing partitions until the next DDL.
+
+## Q8. Partitioning a 5M-row table without copying it
+
+**Question:** outline the steps to partition an existing 5M-row PostgreSQL table without copying it, with the lock each step takes.
+
+| Step | Lab time | Lock on the old table |
+|---|---|---|
+| `CREATE UNIQUE INDEX CONCURRENTLY … (id, created_at)` | 0.88 s | SHARE UPDATE EXCLUSIVE (writes continue) |
+| `ADD CONSTRAINT … CHECK (created_at < '2026-01-01') NOT VALID` | 3.3 ms | ACCESS EXCLUSIVE, brief |
+| `VALIDATE CONSTRAINT` | 0.14 s | SHARE UPDATE EXCLUSIVE (writes continue) |
+| In one transaction: swap the primary key to the new index (`USING INDEX`), rename the table, create the partitioned parent, `ATTACH PARTITION … FROM (MINVALUE) TO ('2026-01-01')` (no scan: implied by the CHECK), add the parent's primary key and indexes (adopted, not built), create next months | ≈ 33 ms | ACCESS EXCLUSIVE |
+
+Then new months get their own partitions, and the legacy partition is dropped as a whole once all its rows are past retention. Without the CHECK, ATTACH would scan the 5M rows under ACCESS EXCLUSIVE (140–276 ms here); without the prebuilt index, the switch would build one under ACCESS EXCLUSIVE.
+
+> **Common mistake:** forgetting that the new primary key `(id, created_at)` no longer enforces `id` alone as unique.

@@ -1,0 +1,62 @@
+---
+title: "Answers: Partitioning a table that already exists"
+description: "Worked answers to the Session 4 Concept 4 check questions."
+companion: "answers"
+tags: ["partitioning", "migration", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/17/sql-altertable.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/partitioning-limitations-partitioning-keys-unique-keys.html"
+---
+
+<Tldr>
+Do the slow work under weak locks first; keep the strong lock for a switch that only changes the catalog.
+</Tldr>
+
+## Q1. The real problem of the copy
+
+**Question:** why is "writes during the copy" the real problem of the copy migration, not the 6.1 s?
+
+`INSERT … SELECT` copies a snapshot. Every order created, updated or cancelled in `orders_c` while it runs is missing or stale in the new table. At production size the copy takes hours, so you need a mechanism to replay those changes (triggers that write to both tables, or change data capture) and a final moment where writes pause while the last changes are applied and the tables are renamed. That machinery, and verifying the two tables match, is most of the project. The copy also writes the whole table again to the WAL (1.22 GB here), which replicas must replay.
+
+> **Common mistake:** testing the copy on a quiet staging database and planning a maintenance window from its duration alone.
+
+## Q2. Why a new unique index first
+
+**Question:** why does the attach-in-place approach need a new unique index before the switch?
+
+A partitioned table's primary key must include the partition key, so the new parent's key is `(id, created_at)`. When the parent gets that key, every partition must have a matching unique index; if one exists, PostgreSQL adopts it, otherwise it builds one, under ACCESS EXCLUSIVE, inside the switch. Building it beforehand with `CREATE UNIQUE INDEX CONCURRENTLY` (880 ms, writes allowed) means the switch only adopts it: the parent's `ADD PRIMARY KEY` took 0.4 ms.
+
+> **Common mistake:** adding the parent key in the switch without the prebuilt index. The switch then includes a full index build with writes blocked.
+
+## Q3. Validate first
+
+**Question:** why validate the CHECK constraint before the switch instead of letting ATTACH check the rows?
+
+Both read every row. `VALIDATE CONSTRAINT` does it under SHARE UPDATE EXCLUSIVE, so the application keeps writing (141.7 ms here). ATTACH does it under ACCESS EXCLUSIVE on the table being attached, so nothing can read or write it during the scan (139–276 ms here, minutes or hours on a big table). With the validated constraint, ATTACH recognizes the bound as implied and skips the scan (0.64 ms).
+
+> **Common mistake:** adding the CHECK without `NOT VALID`. Plain `ADD CONSTRAINT … CHECK` validates immediately while holding ACCESS EXCLUSIVE, which is the same problem moved one step earlier.
+
+## Q4. Multiple primary keys
+
+**Question:** the first switch failed with "multiple primary keys for table "orders_legacy" are not allowed". What was wrong, and what does the fix give up?
+
+The old table kept `PRIMARY KEY (id)`. Adding `PRIMARY KEY (id, created_at)` on the parent tried to give the partition a second primary key. The fix swaps it inside the switch: `DROP CONSTRAINT orders_c_pkey, ADD CONSTRAINT orders_c_pkey PRIMARY KEY USING INDEX orders_c_id_created_at` (3.2 ms). What it gives up: the database no longer guarantees that `id` alone is unique. Two rows with the same `id` and different `created_at` would both be accepted. If something references orders by `id` only, keep uniqueness another way (an identity column that is never reused, or a separate table keyed by `id`; see Session 3, Concept 3).
+
+> **Common mistake:** keeping the old `UNIQUE (id)` index on the legacy partition and assuming it protects the whole table. It only covers rows in that partition.
+
+## Q5. MySQL's two rebuilds
+
+**Question:** why did MySQL refuse `PARTITION BY` on the original table, and why is the conversion two rebuilds?
+
+MySQL requires every unique key, including the primary key, to contain all columns of the partitioning function, because each partition enforces uniqueness only on its own rows (ERROR 1503). Changing the primary key of an InnoDB table rebuilds the clustered index, which is the table itself (6.31 s). Partitioning then splits that table into one tablespace per partition, which InnoDB can only do with ALGORITHM=COPY: every row is copied again (9.36–10.30 s), and with LOCK=SHARED at best, writes wait for the whole copy. The two steps can be combined into one ALTER, but it is still a full copy with writes blocked.
+
+> **Common mistake:** planning a MySQL conversion as an INPLACE operation. Only the partition-management operations on an already partitioned table (ADD, DROP, TRUNCATE) are cheap.
+
+## Q6. How the legacy partition goes away
+
+**Question:** after the switch, how does the legacy partition eventually go away without moving rows?
+
+All of its rows are older than 2026-01-01, and every newer row goes to a monthly partition. With a 13-month retention, once 2027-02-01 has passed, nothing in `orders_legacy` is still needed: `DETACH PARTITION orders_legacy CONCURRENTLY` and `DROP TABLE` remove five million rows as cheaply as any month (Concept 1). Until then, retention for the oldest months cannot be done by DROP; if that wait is too long, copy only the months you must keep into new standalone monthly tables, then in one transaction detach the legacy partition and attach the monthly tables in its place (their ranges overlap the legacy bound, so both cannot be attached at once), and drop the legacy table.
+
+> **Common mistake:** splitting the legacy partition into months right after the switch. That is the full copy you just avoided.
