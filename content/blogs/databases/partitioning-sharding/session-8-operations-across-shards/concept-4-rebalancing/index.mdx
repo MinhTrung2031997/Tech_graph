@@ -1,0 +1,216 @@
+---
+title: "Concept 4: Rebalancing: moving data between shards"
+description: "MongoDB moved a range of 252,264 orders (30.0 MB) from sh2 to sh1 in 2.03 s while inserts into that range kept running (median 3.1 ms, max 218 ms); the critical section took 12 ms, and the old copies stayed on sh2 as orphans for about 15 minutes. Citus could not do its default online shard move on this lab (wal_level is replica: 'logical decoding requires wal_level >= logical'); block_writes moved one shard group in 1.2–1.8 s, stalled writes to that shard for up to 1.73 s, and left other shards and reads unaffected."
+type: "concept"
+tags: ["sharding", "rebalancing", "chunk-migration", "mongodb", "citus", "postgresql"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-balancer-administration/"
+  - "https://www.mongodb.com/docs/manual/reference/command/moveRange/"
+  - "https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.orphanCleanupDelaySecs"
+  - "https://docs.citusdata.com/en/stable/develop/api_udf.html#citus-move-shard-placement"
+  - "https://docs.citusdata.com/en/stable/admin_guide/cluster_management.html#adding-a-worker"
+---
+
+<Tldr>
+Shards drift out of balance: one seller grows, a new shard is added, a server is retired. Rebalancing **copies** data to another shard, **catches up** with writes made during the copy, then **switches** the routing. Measured on the lab clusters:
+
+- **MongoDB** `moveRange` of sellers 1–1249 (**252,264 documents, 30.0 MB**) from sh2 to sh1: **2.03 s**, of which the clone took 1.77 s and the critical section (writes to the range paused) **12 ms**. A client inserting into that range the whole time saw median **3.1 ms**, p99 15 ms, max **218 ms**. The old copies stayed on sh2 as **orphans** until range deletion ran 15 minutes later (`orphanCleanupDelaySecs` 900).
+- **Citus** `citus_move_shard_placement` in its default mode failed here: `logical decoding requires "wal_level" >= "logical"` (the lab workers run `wal_level = replica`, and changing it needs a restart). With `shard_transfer_mode := 'block_writes'` one shard group (29,618 orders plus the colocated balances shard) moved in **1.16–1.83 s**. Writes to that shard stalled up to **1.73 s**; writes to another shard (max 0.22 s) and reads of the moving shard (max 0.16 s) carried on.
+
+Adding a shard or a worker was **not** done in the lab (other builders shared the clusters); it is described from the documentation below.
+</Tldr>
+
+## The setup
+
+- **MongoDB** `pt8.orders_by_seller`, sharded on `{ seller_id: 1 }`, balancing disabled for the collection so the moves are manual. Before: sellers 2501–5000 on sh1, everything below 2501 on sh2.
+- **Citus** `pt8.orders_dist`, the 1M orders distributed by `seller_id` (32 shards, 16 per worker), colocated with `seller_balances` (same column type, same shard count, so Citus puts them in colocation group 3).
+- Write load: a client inserting orders for one seller in the moving range (MongoDB seller 100; Citus seller 8 with pgbench, logging every transaction's latency).
+
+| Term | Meaning |
+|---|---|
+| Range / chunk | A contiguous span of shard key values owned by one shard (MongoDB) |
+| Shard group | All colocated shards for the same hash range (Citus); they always move together |
+| Clone | Copying the documents or rows to the recipient while the donor keeps serving |
+| Catch-up | Applying the writes that happened during the clone |
+| Critical section | The short pause in which the last writes are applied and the routing table changes |
+| Orphan | A copy left on the donor after the move, deleted later |
+| **✓ / ✗** | Traffic carries on / traffic waits |
+
+## MongoDB
+
+<Flow
+  title="MongoDB: moveRange of sellers 1–1249 from sh2 to sh1"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'Writer', sub: 'inserts for seller 100', x: 20, y: 20, w: 200 },
+    { id: 'mongos', label: 'mongos', sub: 'routing table', x: 300, y: 20, w: 200 },
+    { id: 'cfg', label: 'Config servers', sub: 'config.chunks', x: 580, y: 20, w: 200 },
+    { id: 'sh2', label: 'sh2 (donor)', sub: 'owns sellers 1–1249', x: 120, y: 200, w: 220 },
+    { id: 'sh1', label: 'sh1 (recipient)', sub: 'sellers 2501–5000', x: 460, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'app-mongos', from: 'app', to: 'mongos' },
+    { id: 'mongos-sh2', from: 'mongos', to: 'sh2' },
+    { id: 'mongos-sh1', from: 'mongos', to: 'sh1' },
+    { id: 'sh2-sh1', from: 'sh2', to: 'sh1', label: 'clone' },
+    { id: 'sh2-cfg', from: 'sh2', to: 'cfg' },
+  ]}
+  cases={[
+    {
+      title: 'Move the range',
+      path: 'moveRange → ✓ clone 252,264 docs (1.77 s) while writes continue → ✗ critical section 12 ms → ✓ commit to config → ✗ orphans on sh2 for 15 min',
+      summary: '2.03 s in all; writers barely noticed.',
+      steps: [
+        {
+          title: 't1: clone while serving',
+          note: 'sh1 pulls the documents in the range from sh2 (moveChunk.to step 4: 1,731 ms; donor step 4: 1,772 ms). Writes for seller 100 still go to sh2; sh2 records them for catch-up.',
+          code: "db.adminCommand({ moveRange: 'pt8.orders_by_seller',\n  min: { seller_id: 1 }, max: { seller_id: 1250 }, toShard: 'sh1' })",
+          subs: { sh2: 'serving + recording writes', sh1: 'receiving 30.0 MB' },
+          active: ['app', 'mongos', 'sh2', 'sh1'],
+          edges: ['app-mongos', 'mongos-sh2', 'sh2-sh1'],
+        },
+        {
+          title: 't2: critical section and commit',
+          note: 'sh2 blocks writes to the range, ships the last changes, and commits the new owner to config.chunks (donor step 5: 12 ms, step 6: 61 ms). moveChunk.commit: cloned 252,264, clonedBytes 30,006,926. Total 2,030 ms.',
+          subs: { sh2: 'writes to range paused', cfg: '[1, 1250) → sh1' },
+          active: ['sh2', 'sh1', 'cfg'],
+          edges: ['sh2-sh1', 'sh2-cfg'],
+        },
+        {
+          title: 't3: writers follow the new routing',
+          note: 'The next insert to mongos gets a stale-version error from sh2, refreshes, and goes to sh1. The writer: 7,537 inserts in 30 s, median 3.06 ms, p99 14.95 ms, max 218.3 ms.',
+          subs: { sh1: 'owns sellers 1–1249' },
+          active: ['app', 'mongos', 'sh1'],
+          edges: ['app-mongos', 'mongos-sh1'],
+        },
+        {
+          title: 't4: orphans wait 15 minutes',
+          note: 'sh2 still physically holds the 252,264 old copies: config.rangeDeletions shows the range whenToClean "delayed". The earlier move of sellers 2501+ (499,276 orphans) was still there 11 minutes after the move and gone 16 minutes after: orphanCleanupDelaySecs is 900. Queries through mongos filter orphans out; queries straight to the shard do not.',
+          subs: { sh2: 'orphans, deleted later' },
+          active: ['sh2'],
+          edges: [],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Citus
+
+<Flow
+  title="Citus: move the shard group of seller 8 from w1 to w2"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'Writers / readers', sub: 'pgbench, logged', x: 20, y: 20, w: 200 },
+    { id: 'coord', label: 'Coordinator', sub: 'pg_dist_placement', x: 300, y: 20, w: 200 },
+    { id: 'w1', label: 'pt-citus-w1', sub: 'shard 102136 (4 MB)', x: 120, y: 200, w: 220 },
+    { id: 'w2', label: 'pt-citus-w2', sub: '16 shards', x: 460, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'app-coord', from: 'app', to: 'coord' },
+    { id: 'coord-w1', from: 'coord', to: 'w1' },
+    { id: 'coord-w2', from: 'coord', to: 'w2' },
+    { id: 'w1-w2', from: 'w1', to: 'w2', label: 'copy' },
+  ]}
+  cases={[
+    {
+      title: 'Default mode',
+      path: "citus_move_shard_placement(102136, …) → ✗ 'auto' needs logical replication → ✗ error after 0.59 s, nothing moved",
+      summary: 'The online mode depends on a server setting this lab does not have.',
+      steps: [
+        {
+          title: 'Logical replication is unavailable',
+          note: 'WARNING: logical decoding requires "wal_level" >= "logical" / ERROR: … CONTEXT: while executing command on pt-citus-w1:5432. The default shard_transfer_mode (auto) copies the shard, then streams changes with logical replication so writes never stop. That needs wal_level = logical on the workers, a restart-time setting.',
+          active: ['app', 'coord', 'w1'],
+          edges: ['app-coord', 'coord-w1'],
+        },
+      ],
+    },
+    {
+      title: 'block_writes',
+      path: 'block writes to the shard group → ✗ copy 29,618 orders + colocated balances → ✓ switch placement → 1.16–1.83 s',
+      summary: 'Only the moving shard group waits.',
+      steps: [
+        {
+          title: 't1: writes to that shard wait, the copy runs',
+          note: 'Two runs: w1 → w2 in 1,827 ms, back in 1,160 ms. The pgbench writer for seller 8 logged a worst transaction of 1,734,372 µs and 980,492 µs: its inserts queued behind the move. seller_balances shard 102072 moved with orders_dist shard 102136: they are one shard group.',
+          code: "SELECT citus_move_shard_placement(102136, 'pt-citus-w1', 5432, 'pt-citus-w2', 5432,\n                                  shard_transfer_mode := 'block_writes');",
+          subs: { w1: 'writes to 102136 blocked' },
+          active: ['app', 'coord', 'w1', 'w2'],
+          edges: ['app-coord', 'coord-w1', 'w1-w2'],
+        },
+        {
+          title: 't2: everything else carries on',
+          note: 'During the second move, a writer for seller 1 (another shard, on w2) had a worst latency of 217 ms, and a reader counting seller 8\'s orders 156 ms. After the switch, citus_shards shows both shards of the group on the new worker.',
+          subs: { w2: 'now holds 102136 + 102072' },
+          active: ['app', 'coord', 'w2'],
+          edges: ['app-coord', 'coord-w2'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Comparison
+
+| | MongoDB `moveRange` | Citus `block_writes` | Citus `force_logical` / `auto` |
+|---|---|---|---|
+| Unit moved | one range of one collection | one shard group (all colocated tables) | same |
+| Lab size | 252,264 docs, 30.0 MB | 29,618 orders + 1 balances shard | not run (wal_level replica) |
+| Duration | 2.03 s | 1.16–1.83 s | — |
+| Writes to the moving data | continue; critical section 12 ms; max 218 ms | blocked for the copy: max 1.73 s | documented: continue, short block at the switch |
+| Old copy | orphans deleted after 15 min | old placement dropped by Citus's background cleanup | same |
+| Who starts it | balancer (automatic) or `moveRange` | `citus_rebalance_start()` or by hand | same |
+
+## Adding a shard (from the documentation, not run)
+
+| Step | MongoDB | Citus |
+|---|---|---|
+| 1. Add the node | Start a new shard replica set, then `sh.addShard("sh3/host:port")` | `SELECT citus_add_node('new-worker', 5432);` |
+| 2. Move data | The balancer moves ranges until each shard is within the migration threshold | `SELECT citus_rebalance_start();` moves shard groups in the background; `citus_rebalance_status()` reports progress |
+| 3. New tables | New collections are placed on the database's primary shard until sharded | New shards for new distributed tables include the new worker immediately |
+| Planning | `sh.balancerCollectionStatus(ns)` | `get_rebalance_table_shards_plan()`: in the lab it returned 0 moves (32 shards per worker, already even) |
+
+<Pitfall>
+Rebalancing fixes **how many ranges** each shard has, not **how much traffic** each gets. One giant seller in one range, or a ranged shard key that is always increasing, keeps one shard hot however many times you rebalance. Fix the key ([Session 5, Concept 4](/blogs/databases/partitioning-sharding/session-5-choosing-a-shard-key/concept-4-hot-keys)), not the placement. And plan moves for the quiet hours: even the 12 ms critical section becomes long when the range is large or the recipient is slow, and every moved byte is written again on the recipient and its replicas.
+</Pitfall>
+
+## Real-world scenario: 11.11 sale preparation
+
+Before the 11.11 campaign a brand-heavy marketplace adds a third shard for the expected traffic.
+
+| Plan | Why |
+|---|---|
+| ✓ Add the shard two weeks before, let the balancer finish | Migrations compete with the sale's writes; finish them in quiet days |
+| ✓ Set a balancer window (02:00–06:00) for the migration period | Migrations only run off-peak |
+| ✓ On Citus: `wal_level = logical` set at provisioning | Online shard moves need it, and it needs a restart; do not discover this during the incident |
+| ✗ Rebalance during the sale "because shard 1 is hot" | If the hot spot is one mega-seller, moving it moves the problem |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 1, Concept 3](/blogs/databases/partitioning-sharding/session-1-why-split-data/concept-3-partitioning-sharding-replication) | Why sharding needs data movement at all, and what replication does instead |
+| [Session 4, Concept 2](/blogs/databases/partitioning-sharding/session-4-partition-lifecycle/concept-2-detach-without-blocking) | The same trade-off inside one server: a quick catalog switch vs a lock that blocks traffic |
+| [Session 6, Concept 2](/blogs/databases/partitioning-sharding/session-6-mongodb-sharded-cluster/concept-2-chunks-and-balancer) | How the balancer decides which ranges to move |
+| Concept 2 | Orphans still take part in a shard's local unique checks |
+
+## Key takeaways
+
+1. Moving data between shards is copy, catch up, switch; the switch is the only moment writes must pause.
+2. MongoDB moved 30 MB in 2.03 s with a 12 ms critical section; writes into the range peaked at 218 ms.
+3. Citus moves whole shard groups. Its online mode needs `wal_level = logical`; without it, `block_writes` stalls writes to that group for the copy.
+4. MongoDB leaves orphans for 15 minutes by default; anything that reads shards directly sees them.
+5. Rebalancing evens out data, not hot keys.
+
+## Check questions
+
+1. Why did inserts into the moving MongoDB range keep working during the 1.77 s clone?
+2. What were the 12 ms of the donor's step 5?
+3. Why did the Citus move also move a `seller_balances` shard?
+4. What would `shard_transfer_mode := 'force_logical'` have changed, and why could the lab not use it?
+5. A report reads the shard's `mongod` directly instead of going through `mongos`. What does it see right after a migration?
+6. Shard sh1 is at 80% CPU and holds a single seller with 40% of all orders. Will adding a shard and rebalancing help?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-8-operations-across-shards/concept-4-rebalancing/answers">Worked answers to Q1–Q6</DeepDive>

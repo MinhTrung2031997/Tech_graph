@@ -1,0 +1,71 @@
+---
+title: "Answers: Uniqueness across shards"
+description: "Worked answers to the Session 8 Concept 2 check questions."
+companion: "answers"
+tags: ["sharding", "unique-constraints", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-shard-key/#unique-indexes"
+  - "https://docs.citusdata.com/en/stable/develop/reference_ddl.html"
+---
+
+<Tldr>
+A shard can only check what it stores. Unique keys that contain the shard key are checked on one shard; anything else needs a separate claim or ids that cannot collide.
+</Tldr>
+
+## Q1. Why `order_no` cannot be unique
+
+**Question:** why can't a shard enforce a unique index on `order_no` when the collection is sharded by `seller_id`?
+
+Two orders with the same `order_no` but different sellers are routed by seller, so they can land on different shards. Each shard's index sees only its own documents and would accept its copy. Enforcing it would need a check on every shard inside every insert, with a lock that spans shards; MongoDB refuses the index instead (CannotCreateIndex 67), and Citus refuses the equivalent constraint.
+
+> **Common mistake:** creating the unique index before sharding and assuming it survives. `shardCollection` also refuses to shard a collection whose unique indexes do not start with the shard key.
+
+## Q2. Two orders with `_id: 1`
+
+**Question:** how did MongoDB end up with two orders with `_id: 1`, and how would you find such duplicates?
+
+Order 1 (seller 1673) lives on sh2. The new document had `seller_id: 4000`, which routes to sh1, and sh1's own `_id` index had no 1, so it accepted it. `_id` always has a unique index, but per shard. To find duplicates, group across the cluster:
+
+```js
+db.orders_by_seller.aggregate([
+  { $group: { _id: '$_id', n: { $sum: 1 } } },
+  { $match: { n: { $gt: 1 } } }
+], { allowDiskUse: true })
+```
+
+It reads every document on every shard, so run it off-peak. The lab removed the duplicate afterwards with `deleteOne({ _id: 1, seller_id: 4000 })`: the shard key in the filter targets one shard.
+
+> **Common mistake:** relying on client-generated `_id` values being unique "because MongoDB checks `_id`". It does, on one shard only.
+
+## Q3. `(seller_id, id)` allowed, `(id)` refused
+
+**Question:** why is `(seller_id, id)` allowed as a Citus primary key when `(id)` is not?
+
+Rows are placed by the hash of `seller_id`. Two rows with the same `(seller_id, id)` have the same `seller_id`, so they hash to the same shard, and that shard's local unique index sees both. Two rows with the same `id` alone can have different sellers and end up on different shards, where no single index sees both.
+
+> **Common mistake:** reading the composite key as "id is unique". It only says "id is unique per seller".
+
+## Q4. Only half the transactions were two-phase
+
+**Question:** in the claim-collection test, why was only about half of the transactions two-phase?
+
+The claim goes to the shard that owns `hash(order id)`, the order to the shard that owns its seller. With two shards, and hashed placement independent of the seller, the two writes land on the same shard about half the time: measured 149/151, 158/142, 144/156 single-shard/two-phase commits per 300 orders. With N shards the share of two-phase commits grows to about 1 − 1/N.
+
+> **Common mistake:** benchmarking the claim pattern on one shard, or on two, and expecting the same cost on ten.
+
+## Q5. The duplicate that was rejected
+
+**Question:** why was the first duplicate insert (`_id: 5`) rejected?
+
+Order 5 belongs to seller 3945. That range had just been moved from sh2 to sh1, and the old copies were still on sh2 as orphans: `config.rangeDeletions` showed the range `whenToClean: "delayed"` (range deletion waits `orphanCleanupDelaySecs`, 900 s by default). The new document for seller 100 routed to sh2, whose `_id` index still contained the orphan 5. The rejection was an accident of timing, not a guarantee.
+
+> **Common mistake:** concluding from one rejected test insert that duplicates are prevented.
+
+## Q6. A key for marketplace order numbers
+
+**Question:** for marketplace order numbers, why is `(seller_id, marketplace, order_sn)` a better unique key than `order_sn` alone?
+
+It contains the shard key, so it can be a real unique index, and two deliveries of the same order (webhook and poller) go to the same shard, where the second insert or upsert fails or merges. `order_sn` alone cannot be unique on a sharded collection. The triple is also more correct: platform order numbers are only guaranteed unique per platform, not across Shopee, Lazada and TikTok.
+
+> **Common mistake:** adding `marketplace` but not the seller: still no shard key, still refused.

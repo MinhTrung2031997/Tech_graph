@@ -1,0 +1,192 @@
+---
+title: "Concept 5: Capstone: sharding marketplace orders"
+description: "The same 1M orders sharded three ways on the lab cluster. By seller: the seller dashboard hit 1 shard (7 docs, 0.61 ms), an order lookup by id hit both. By hashed order id: lookups hit 1 shard (0.46 ms), the seller dashboard both (1.05 ms), and placing a seller's wallet transaction becomes two-phase half the time. By marketplace: only three key values, Shopee alone 50.1% of orders on one shard. On Citus by seller: dashboard 1 task in 0.2 ms, lookup by id 32 tasks in 20–24 ms (1.7–1.8 ms with a per-shard index). Decision: shard by seller, keep ids time-ordered and unique by construction, route id lookups through a seller-carrying key."
+type: "concept"
+tags: ["sharding", "shard-key", "case-study", "ecommerce", "mongodb", "citus"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-choose-a-shard-key/"
+  - "https://www.mongodb.com/docs/manual/core/sharded-cluster-query-router/"
+  - "https://docs.citusdata.com/en/stable/sharding/data_modeling.html"
+---
+
+<Tldr>
+An enabler runs order management for brands on Shopee, Lazada and TikTok Shop. The data is `orders` (seller, marketplace, status, amount, time) plus seller wallets. Three candidate shard keys, measured on 1M orders on the two-shard MongoDB cluster and on Citus:
+
+| Workload | By `seller_id` | By hashed order id | By `marketplace` |
+|---|---|---|---|
+| Seller dashboard: one seller, one month | ✓ **1 shard**, 0.61 ms | ✗ 2 shards, 1.05 ms | ✗ 2 shards, 0.81 ms |
+| Order lookup by id | ✗ 2 shards, 0.80 ms | ✓ **1 shard**, 0.46 ms | ✗ 2 shards, 0.53 ms |
+| Marketplace GMV for a month | ✗ 2 shards, 7.48 ms | ✗ 2 shards, 5.30 ms | ✓ **1 shard**, 4.15 ms |
+| Platform-wide day report | ✗ 2 shards, 4.75 ms | ✗ 2 shards, 5.20 ms | ✗ 2 shards, 5.01 ms |
+| Order + seller wallet in one transaction | ✓ one shard | ✗ two-phase about half the time (Concept 2) | ✗ two-phase whenever the seller sells on two platforms |
+| Can grow past 3 shards | ✓ 5,000 values | ✓ | ✗ **3 values**, Shopee = 50.1% |
+
+On 1M documents in memory, every query takes milliseconds; the difference that grows with scale is **how many shards each query touches**. On Citus the same gap is plainer: seller dashboard **1 task, 0.2 ms**; lookup by id **32 tasks, 20–24 ms**, 1.7–1.8 ms with a per-shard index on id. The recommendation: **shard by seller**, give ids that are unique by construction, and carry the seller in every id-based lookup.
+</Tldr>
+
+## The setup
+
+Database `pt8`, the 1M-row `orders` (2024–2025, 5,000 sellers, Shopee 50% / TikTok 30% / Lazada 20%), copied into three MongoDB collections with indexes `{ seller_id, created_at }`, `{ marketplace, created_at }` and `{ created_at }`:
+
+| Collection | Shard key | Placement (balancing off) | Documents per shard |
+|---|---|---|---|
+| `orders_by_seller` | `{ seller_id: 1 }` | sellers 1–1249 and 2501–5000 on sh1, 1250–2500 on sh2 (moved by hand in Concept 4) | sh1 748,979 / sh2 251,021 |
+| `orders_by_id` | `{ _id: 'hashed' }` | pre-split, one range per shard | sh1 499,595 / sh2 500,405 |
+| `orders_by_mkt` | `{ marketplace: 1 }` | shopee on sh1; lazada and tiktok on sh2 | sh1 501,221 / sh2 498,779 |
+
+Citus: `orders_dist`, distributed by `seller_id`, 32 shards. Latencies are the median of 15 runs through `mongos`, or pgbench averages on Citus (emulated, compare within Citus only).
+
+| Term | Meaning |
+|---|---|
+| Targeted query | mongos or the Citus coordinator can tell from the filter which single shard holds the answer |
+| Scatter-gather / fan-out | The query is sent to every shard and the results merged |
+| Task count | Citus EXPLAIN: how many shard queries one SQL statement became |
+| Access pattern | A query or transaction the application runs often, with its filter |
+| **✓ / ✗** | One shard / all shards |
+
+## Routing per shard key
+
+<Flow
+  title="MongoDB: which shards answer each query"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'OMS / dashboards', sub: 'four access patterns', x: 20, y: 20, w: 200 },
+    { id: 'mongos', label: 'mongos', sub: 'reads the shard key', x: 300, y: 20, w: 200 },
+    { id: 'sh2', label: 'sh2', sub: 'second half', x: 120, y: 200, w: 220 },
+    { id: 'sh1', label: 'sh1', sub: 'first half', x: 460, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'app-mongos', from: 'app', to: 'mongos' },
+    { id: 'mongos-sh2', from: 'mongos', to: 'sh2' },
+    { id: 'mongos-sh1', from: 'mongos', to: 'sh1' },
+  ]}
+  cases={[
+    {
+      title: 'Sharded by seller_id',
+      path: 'seller dashboard → ✓ sh1 only (7 docs, 0.61 ms) · order by id → ✗ sh1 + sh2 (0.80 ms)',
+      summary: 'Best for the workload sellers see; id lookups fan out.',
+      subs: { sh2: 'sellers 1250–2500', sh1: 'sellers 1–1249, 2501+' },
+      steps: [
+        {
+          title: 'Seller 1234, June 2025',
+          note: "find({ seller_id: 1234, created_at: June 2025 }): explain shows one shard, sh1, 7 docs examined, 7 returned. Median 0.61 ms.",
+          active: ['app', 'mongos', 'sh1'],
+          edges: ['app-mongos', 'mongos-sh1'],
+        },
+        {
+          title: 'Order 777777',
+          note: 'find({ _id: 777777 }) has no seller, so both shards are asked: sh1 examined 1 and returned 1; sh2 examined 1 (an orphan from the Concept 4 move) and returned 0. Median 0.80 ms.',
+          active: ['app', 'mongos', 'sh1', 'sh2'],
+          edges: ['app-mongos', 'mongos-sh1', 'mongos-sh2'],
+        },
+      ],
+    },
+    {
+      title: 'Sharded by hashed order id',
+      path: 'order by id → ✓ one shard (0.46 ms) · seller dashboard → ✗ sh1 + sh2 (1.05 ms)',
+      summary: 'Perfectly even, but every seller is spread over every shard.',
+      subs: { sh2: 'half of every seller', sh1: 'half of every seller' },
+      steps: [
+        {
+          title: 'Order 777777',
+          note: 'The hash of 777777 falls in sh1\'s range: one shard, 0.46 ms.',
+          active: ['app', 'mongos', 'sh1'],
+          edges: ['app-mongos', 'mongos-sh1'],
+        },
+        {
+          title: 'Seller 1234, June 2025',
+          note: 'The seller\'s 7 orders are hashed across both shards: sh1 examined 2, sh2 examined 5. Median 1.05 ms. With 10 shards, every seller query would go to all 10.',
+          active: ['app', 'mongos', 'sh1', 'sh2'],
+          edges: ['app-mongos', 'mongos-sh1', 'mongos-sh2'],
+        },
+      ],
+    },
+    {
+      title: 'Sharded by marketplace',
+      path: 'Lazada GMV → ✓ sh2 only (4.15 ms) · seller dashboard → ✗ both · at most 3 shards ever',
+      summary: 'Matches the platform reports, not the sellers, and cannot grow.',
+      subs: { sh2: 'lazada + tiktok', sh1: 'shopee (50.1%)' },
+      steps: [
+        {
+          title: 'Lazada GMV, June 2025',
+          note: 'One shard, sh2: 4.15 ms, against 5.30–7.48 ms when the same aggregate fans out.',
+          active: ['app', 'mongos', 'sh2'],
+          edges: ['app-mongos', 'mongos-sh2'],
+        },
+        {
+          title: 'Why it does not scale',
+          note: 'Three shard key values means at most three ranges: a fourth shard would get nothing, and Shopee\'s 501,221 orders can never be split. Every seller selling on two platforms has orders on two shards.',
+          active: ['mongos', 'sh1', 'sh2'],
+          edges: ['mongos-sh1', 'mongos-sh2'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Citus: the same choice in SQL
+
+| Query on `orders_dist` (by `seller_id`) | EXPLAIN | Latency (pgbench, 3 runs) |
+|---|---|---|
+| `WHERE seller_id = 1234 AND created_at` in June 2025 | Task Count: 1 (router, pt-citus-w1) | 0.195–0.208 ms |
+| `WHERE id = 777777` | Task Count: 32, `Filter: (id = 777777)` on each shard | 20.5–24.1 ms |
+| same, after `CREATE INDEX ON orders_dist (id)` | Task Count: 32, index scan on each shard | 1.72–1.83 ms |
+| Day report `GROUP BY marketplace` | Task Count: 32, partial aggregate per shard, merged on the coordinator | fan-out by design |
+
+An index on `id` turned 32 sequential scans into 32 index probes, but it is still 32 queries for one row: about 9 times the router query.
+
+## The decision
+
+| Requirement | Decision | Evidence |
+|---|---|---|
+| Seller dashboards and seller APIs are most of the traffic | **Shard key: `seller_id`** (compound with `created_at` or the order id if one seller can outgrow a shard) | 1 shard vs all shards above |
+| Order + wallet + fee lines in one transaction | Keep them under the same seller → single-shard commits | Concept 1: 3.1–4.5 ms vs 22–23 ms |
+| Order ids unique cluster-wide | Snowflake-style bigint or ObjectId; unique `(seller_id, marketplace, order_sn)` for imports | Concepts 2 and 3 |
+| Support looks orders up by id | Put the seller in the external id (or keep a small `order_id → seller_id` lookup sharded by id) | lookup by id fans out otherwise |
+| Platform-wide reports (GMV per marketplace per day) | Run them on a replica or a warehouse fed by change streams / CDC, not on the OLTP shards | they fan out under every key |
+| A mega-seller (brand flagship store) | Compound key so its orders span ranges; watch for jumbo ranges | Concept 4, Q6 |
+| Adding shards before peak (11.11, 12.12) | Add weeks before, balancer window, Citus `wal_level = logical` | Concept 4 |
+
+<Pitfall>
+The lab data is uniform: the largest seller has 259 of the 1M orders. Real marketplace data is not: a handful of brand stores can hold a large share of orders, and their campaigns hit at the same minute. Before choosing `seller_id`, measure the real distribution (top sellers' share of orders and of writes per minute during a campaign), and use a compound key if any single seller could need more than one shard.
+</Pitfall>
+
+## Real-world scenario: support lookups by order id
+
+Customer support pastes an order id from a complaint and needs the order in under 100 ms. Orders are sharded by seller.
+
+| Option | Cost |
+|---|---|
+| ✗ Query by id alone | Fans out to every shard: 32 tasks on Citus, every shard on MongoDB |
+| ✓ External id contains the seller (e.g. `S1234-…`) | The router extracts the seller and targets one shard |
+| ✓ Lookup collection `order_id → seller_id`, sharded by order id | One targeted read to find the seller, one targeted read for the order; must be written with the order (Concept 2's claim pattern does both jobs) |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 1, Concept 4](/blogs/databases/partitioning-sharding/session-1-why-split-data/concept-4-when-not-to-split) | Whether to shard at all: a good index on one server goes a long way |
+| [Session 4, Concept 1](/blogs/databases/partitioning-sharding/session-4-partition-lifecycle/concept-1-drop-vs-delete) | Retention inside each shard still uses partitions by time |
+| [Session 5, Concept 3](/blogs/databases/partitioning-sharding/session-5-choosing-a-shard-key/concept-3-targeted-vs-scatter-gather) | Targeted vs scatter-gather queries, measured per shard key |
+| [Session 7, Concept 3](/blogs/databases/partitioning-sharding/session-7-sharding-postgresql-mysql/concept-3-multi-shard-queries) | Router vs multi-shard plans on Citus |
+| Concepts 1–4 | The transaction, uniqueness, id and rebalancing costs behind each row of the decision table |
+
+## Key takeaways
+
+1. List the access patterns first; the shard key is the filter of the most frequent ones.
+2. A query targets one shard only if its filter contains the shard key; everything else fans out to all shards.
+3. By seller fits marketplace order management: dashboards and transactions stay on one shard; id lookups need the seller carried along.
+4. Low-cardinality keys like `marketplace` cap the number of useful shards at the number of values.
+5. Platform-wide reports fan out under every key; serve them from replicas or a warehouse.
+
+## Check questions
+
+1. Why did the order lookup on `orders_by_seller` examine a document on sh2 and return nothing from it?
+2. With hashed order ids, what happens to the seller dashboard when the cluster grows from 2 to 10 shards?
+3. Why can `orders_by_mkt` never use a fourth shard?
+4. On Citus, why is a lookup by `id` still about 9 times slower than the router query after adding an index on `id`?
+5. Which workload is fan-out under every one of the three keys, and where should it run instead?
+6. Name two measurements you would take on production data before committing to `seller_id`.
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-8-operations-across-shards/concept-5-ecommerce-case-study/answers">Worked answers to Q1–Q6</DeepDive>

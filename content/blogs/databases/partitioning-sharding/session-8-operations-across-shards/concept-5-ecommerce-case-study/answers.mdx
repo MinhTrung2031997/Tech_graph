@@ -1,0 +1,66 @@
+---
+title: "Answers: Capstone: sharding marketplace orders"
+description: "Worked answers to the Session 8 Concept 5 check questions."
+companion: "answers"
+tags: ["sharding", "shard-key", "case-study", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-choose-a-shard-key/"
+  - "https://docs.citusdata.com/en/stable/sharding/data_modeling.html"
+---
+
+<Tldr>
+Pick the key from the access patterns, then check what fans out, what goes two-phase and what cannot grow.
+</Tldr>
+
+## Q1. A document examined but not returned
+
+**Question:** why did the order lookup on `orders_by_seller` examine a document on sh2 and return nothing from it?
+
+`find({ _id: 777777 })` has no `seller_id`, so mongos sent it to both shards. Order 777777 belongs to a seller in sh1's range, but sh2 still held an **orphan** copy left over from the move of sellers 2501+ in Concept 4 (range deletion had not run yet). The `_id` index on sh2 found it (`totalDocsExamined: 1`), and the shard's ownership filter dropped it (`nReturned: 0`). Through mongos the answer is correct; the work was still done.
+
+> **Common mistake:** reading `totalDocsExamined` across shards as the number of matching documents.
+
+## Q2. Hashed ids with 10 shards
+
+**Question:** with hashed order ids, what happens to the seller dashboard when the cluster grows from 2 to 10 shards?
+
+A seller's orders are spread by hash over all shards, so the query goes to all 10, each returning a small part, and mongos merges them. Latency becomes the slowest of 10 shards plus merging, and every seller query uses capacity on every shard: adding shards adds capacity for id lookups but not for seller queries. The lab already showed it at 2 shards: 2 shards and 1.05 ms against 1 shard and 0.61 ms.
+
+> **Common mistake:** choosing a hashed key because the data spreads perfectly. Even data is not the goal; targeted queries are.
+
+## Q3. No fourth shard by marketplace
+
+**Question:** why can `orders_by_mkt` never use a fourth shard?
+
+A shard key range cannot split a single value: all `shopee` orders have the same key and must stay in one range on one shard. With three values there are at most three non-empty ranges, so at most three shards hold data, and the Shopee shard always holds about half of everything (501,221 of 1M).
+
+> **Common mistake:** adding `created_at` later. Changing a shard key means `refineCollectionShardKey` (only adding suffix fields) or resharding the whole collection.
+
+## Q4. Citus id lookup still slower
+
+**Question:** on Citus, why is a lookup by `id` still about 9 times slower than the router query after adding an index on `id`?
+
+The coordinator cannot know which shard holds `id = 777777`, because rows are placed by `seller_id`. It sends 32 queries (Task Count: 32), each an index probe on one shard, over connections to both workers, and waits for all of them: 1.72–1.83 ms. The router query sends one query to one shard: 0.195–0.208 ms. The index removed the scans (20.5–24.1 ms before), not the fan-out.
+
+> **Common mistake:** expecting an index to make a non-shard-key query targeted.
+
+## Q5. Fan-out under every key
+
+**Question:** which workload is fan-out under every one of the three keys, and where should it run instead?
+
+The platform-wide day report: all orders of one day, grouped by marketplace. Its filter is only a date, which is in none of the three shard keys, so it went to both shards in all three layouts (4.75–5.20 ms here, and every shard's capacity at scale). Such reports belong on a secondary, an analytics replica, or a warehouse fed by change streams or CDC, where they cannot slow the seller-facing traffic.
+
+> **Common mistake:** adding the date to the shard key for the report: a ranged date key makes every insert go to the newest range (one hot shard).
+
+## Q6. Measurements before choosing `seller_id`
+
+**Question:** name two measurements you would take on production data before committing to `seller_id`.
+
+Any two of:
+- **Share of orders per seller**: the top seller's and top 10 sellers' share of rows. If one seller could exceed what one shard can hold, use a compound key.
+- **Share of writes per seller per minute during a campaign** (11.11, flash sales): a seller with 5% of rows can have 40% of the writes in the first minute.
+- **Share of queries that carry the seller**: from slow-query logs or `$queryStats` / `pg_stat_statements`. If most queries by volume do not filter by seller, they will fan out.
+- **Share of transactions that touch more than one seller**: each one becomes a two-phase commit.
+
+> **Common mistake:** choosing the key from the schema alone, without counting how the data and the queries are actually distributed.

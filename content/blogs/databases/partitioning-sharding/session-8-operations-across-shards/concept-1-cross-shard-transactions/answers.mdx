@@ -1,0 +1,62 @@
+---
+title: "Answers: Transactions across shards"
+description: "Worked answers to the Session 8 Concept 1 check questions."
+companion: "answers"
+tags: ["sharding", "transactions", "two-phase-commit", "answers"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/transactions-sharded-clusters/"
+  - "https://www.citusdata.com/blog/2017/11/22/how-citus-executes-distributed-transactions/"
+---
+
+<Tldr>
+The commit protocol follows the number of participants: one shard (or one Citus worker) commits locally, more than one needs two-phase commit.
+</Tldr>
+
+## Q1. No 2PC for sellers 1 and 1001
+
+**Question:** why did the MongoDB transaction between sellers 1 and 1001 not use two-phase commit?
+
+Both `_id` values are in the range below 2501, which lives on sh2. mongos tracks which shards a transaction has written to; with a single participant it sends `commitTransaction` straight to that shard. `commitTypes.singleShard` grew by exactly the number of such transactions (50 for 50).
+
+> **Common mistake:** assuming every transaction on a sharded cluster is distributed. Only the ones whose writes land on more than one shard are.
+
+## Q2. Who coordinated the two-shard commit
+
+**Question:** in the two-shard MongoDB case, which node coordinated the commit, and how can you tell?
+
+The first shard the transaction wrote to: seller 1 was updated first, on sh2, so sh2 was the coordinator. On the shards, `serverStatus().transactions` shows it: over 50 cross-shard transactions, sh1 went +50 `totalPrepared` / +50 `totalCommitted`, while sh2 went +50 `totalPrepared` and +100 `totalCommitted` (it also committed the 50 one-shard transactions of the same run). mongos counted them under `commitTypes.twoPhaseCommit`.
+
+> **Common mistake:** thinking mongos or the config server coordinates. mongos only hands the commit to a shard; the coordinator's state lives on that shard (`config.transaction_coordinators`).
+
+## Q3. Two shards without 2PC on Citus
+
+**Question:** Citus: why did sellers 8 and 31, in different shards, commit without 2PC?
+
+Shards 102072 and 102074 are both tables on `pt-citus-w1`. Inside a transaction, Citus reuses one connection per worker for the shards it has already touched, so both updates ran in one local transaction on w1 and committed with a plain `COMMIT`. `pg_dist_transaction` stayed at 32 rows. 2PC starts when writes reach a second **worker** (sellers 8 and 1: +2 rows per transaction).
+
+> **Common mistake:** counting shards to predict the cost. Citus pays for distinct workers written to; MongoDB pays for distinct shards (each shard is a separate replica set).
+
+## Q4. What the pg_dist_transaction rows are for
+
+**Question:** what do the two rows in `pg_dist_transaction` let Citus do after a crash?
+
+Each row says "worker group N has a prepared transaction with this gid, and the coordinator decided to commit it". They are written in the coordinator's own transaction, so they exist only if the commit decision committed. After a crash, the maintenance daemon (or `recover_prepared_transactions()`) lists the prepared transactions on each worker: a gid with a row is committed (`COMMIT PREPARED`), a Citus gid without a row is rolled back. Then the rows are removed, which is why the table empties about once a minute.
+
+> **Common mistake:** deleting stray prepared transactions on a worker by hand. Without the coordinator's record you do not know whether the other worker already committed its half.
+
+## Q5. Two plain updates slower than a transaction
+
+**Question:** why were two separate MongoDB updates slower than a transaction with the same two updates on one shard?
+
+Without a transaction, each `updateOne` is acknowledged on its own with the default write concern `w: "majority"`, which waits for the write to be journaled: two waits. In the transaction, the updates are applied in memory and the single commit waits once. Median 5.1–7.2 ms for two plain updates against 3.1–4.5 ms for the transaction.
+
+> **Common mistake:** avoiding transactions "for speed" on one shard. A short single-shard transaction is not the expensive case; the cross-shard one is.
+
+## Q6. WriteConflict with TransientTransactionError
+
+**Question:** a transaction got `WriteConflict` with label `TransientTransactionError`. What should the application do?
+
+Abort the transaction and run the **whole** transaction again (re-reading what it read), usually with a short backoff. The label means the outcome is known: nothing was committed, so a retry is safe. The driver's `withTransaction` / `session.withTransaction` callback API does this automatically for `TransientTransactionError` and retries the commit for `UnknownTransactionCommitResult`. MongoDB does not queue the second writer behind the first, so under contention on hot documents (one fee account, one popular SKU) retries can pile up.
+
+> **Common mistake:** retrying only the failed statement. The transaction has been aborted; earlier statements in it are gone too.

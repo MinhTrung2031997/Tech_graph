@@ -1,0 +1,210 @@
+---
+title: "Concept 2: Uniqueness across shards"
+description: "Each shard enforces its unique indexes on its own data only. MongoDB refuses a unique index that does not start with the shard key (CannotCreateIndex 67), and with orders sharded by seller_id it accepted a second document with _id 1 on the other shard: find returned two. Citus refuses PRIMARY KEY (id) on a table distributed by seller_id. A claim collection sharded by the unique value restores uniqueness, inside a transaction that was two-phase about half the time: median 7.7–12.2 ms per order against 1.4–5.5 ms for a plain insert."
+type: "concept"
+tags: ["sharding", "unique-constraints", "mongodb", "citus", "postgresql"]
+status: "draft"
+sources:
+  - "https://www.mongodb.com/docs/manual/core/sharding-shard-key/#unique-indexes"
+  - "https://www.mongodb.com/docs/manual/core/index-unique/#unique-index-and-sharded-collections"
+  - "https://docs.citusdata.com/en/stable/develop/reference_ddl.html#coordinator-node-only-tables-and-constraints"
+---
+
+<Tldr>
+A unique index is a B-tree **per shard**. A shard can check a new key against its own index, but it cannot see the other shards' indexes, so a value can be unique on every shard and still appear twice in the cluster. Both engines therefore only allow unique keys that **include the shard key**: then equal values always land on the same shard.
+
+- **MongoDB**, orders sharded by `seller_id`: `createIndex({ order_no: 1 }, { unique: true })` failed with **CannotCreateIndex (67)** (`cannot create index with 'unique' … over { order_no: 1 } with shard key pattern { seller_id: 1 }`). `_id` is the exception that is **not** checked across shards: a second document with `_id: 1` for seller 4000 was accepted on sh1, and `find({ _id: 1 })` returned **two** documents.
+- **Citus**, orders distributed by `seller_id`: `PRIMARY KEY (id)` failed ("Distributed relations cannot have UNIQUE, EXCLUDE, or PRIMARY KEY constraints that do not include the partition column"); a unique index on `id` alone failed too.
+- **Workaround measured on MongoDB**: a claim collection sharded by the order id, written in the same transaction as the order. Duplicates were refused (E11000), at a cost: median **7.7–12.2 ms** per order instead of **1.4–5.5 ms**, and **47–52%** of the transactions needed two-phase commit.
+</Tldr>
+
+## The setup
+
+In database `pt8`:
+
+- **MongoDB** `orders_by_seller`: the 1M orders sharded on `{ seller_id: 1 }`, ranges set by hand: sellers 1–1249 and 2501–5000 on **sh1**, sellers 1250–2500 on **sh2** (balancing off for the collection).
+- **Citus** `orders_d` / `orders_dist`: the orders distributed by `seller_id`.
+
+| Term | Meaning |
+|---|---|
+| Local unique index | Each shard checks the key against its own index only |
+| Shard key prefix | The unique key starts with (MongoDB) or contains (Citus) the shard key, so equal keys hash or range to the same shard |
+| Claim collection / table | A separate collection sharded **by the value that must be unique**; inserting the value there "claims" it cluster-wide |
+| Orphan document | A copy left on the old shard after a migration, until range deletion removes it (Concept 4) |
+| **✓ / ✗** | Uniqueness enforced / not enforced across shards |
+
+## MongoDB
+
+<Flow
+  title="MongoDB: unique values on a collection sharded by seller_id"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'insert order', x: 20, y: 20, w: 200 },
+    { id: 'mongos', label: 'mongos', sub: 'routes by seller_id', x: 300, y: 20, w: 200 },
+    { id: 'sh2', label: 'sh2', sub: 'sellers 1250–2500', x: 120, y: 200, w: 220 },
+    { id: 'sh1', label: 'sh1', sub: 'sellers 1–1249, 2501+', x: 460, y: 200, w: 220 },
+    { id: 'claims', label: 'order_claims', sub: 'sharded by hashed _id', x: 580, y: 20, w: 200 },
+  ]}
+  edges={[
+    { id: 'app-mongos', from: 'app', to: 'mongos' },
+    { id: 'mongos-sh2', from: 'mongos', to: 'sh2' },
+    { id: 'mongos-sh1', from: 'mongos', to: 'sh1' },
+    { id: 'mongos-claims', from: 'mongos', to: 'claims' },
+  ]}
+  cases={[
+    {
+      title: 'Unique index without the shard key',
+      path: 'createIndex order_no unique → ✗ refused: CannotCreateIndex (67)',
+      summary: 'MongoDB will not pretend to enforce what one shard cannot check.',
+      steps: [
+        {
+          title: 'The index is refused',
+          note: '"Index build failed … cannot create index with \'unique\' or \'prepareUnique\' option over { order_no: 1 } with shard key pattern { seller_id: 1 } and collation {}". The same index prefixed by the shard key, { seller_id: 1, order_no: 1 }, was created: unique per seller.',
+          code: "db.orders_by_seller.createIndex({ order_no: 1 }, { unique: true })\n// CannotCreateIndex (67)\ndb.orders_by_seller.createIndex({ seller_id: 1, order_no: 1 }, { unique: true })  // ok",
+          active: ['app', 'mongos'],
+          edges: ['app-mongos'],
+        },
+      ],
+    },
+    {
+      title: 'Duplicate _id on two shards',
+      path: 'order _id 1 exists for seller 1673 (sh2) → insert _id 1 for seller 4000 → ✗ accepted on sh1 → ✗ find returns 2 documents',
+      summary: 'The _id index is unique per shard, never across shards.',
+      steps: [
+        {
+          title: 't1: the insert goes to sh1',
+          note: 'mongos routes by seller_id: 4000 is in sh1\'s range. sh1\'s _id index has no 1, so the insert is acknowledged.',
+          code: "db.orders_by_seller.insertOne({ _id: 1, seller_id: 4000, … })   // acknowledged: true",
+          subs: { sh1: '_id 1 for seller 4000' },
+          active: ['app', 'mongos', 'sh1'],
+          edges: ['app-mongos', 'mongos-sh1'],
+        },
+        {
+          title: 't2: two orders with _id 1',
+          note: 'find({ _id: 1 }) has no shard key, so mongos asks both shards and merges: [{ _id: 1, seller_id: 4000 }, { _id: 1, seller_id: 1673 }]; countDocuments returns 2. The documentation puts it plainly: when _id is not the shard key, the application must guarantee its uniqueness.',
+          subs: { sh2: '_id 1 for seller 1673', sh1: '_id 1 for seller 4000' },
+          active: ['mongos', 'sh2', 'sh1'],
+          edges: ['mongos-sh2', 'mongos-sh1'],
+        },
+      ],
+    },
+    {
+      title: 'Claim the id first',
+      path: 'transaction: insert order_claims _id → insert order → ✓ duplicate refused (E11000) → ✗ 2PC in about half the orders',
+      summary: 'Uniqueness by a second collection sharded on the unique value.',
+      steps: [
+        {
+          title: 't1: claim and order in one transaction',
+          note: 'order_claims is sharded on { _id: "hashed" }: equal ids always hash to the same shard, so its _id index is unique cluster-wide. The claim lands on the shard of hash(id), the order on the shard of its seller.',
+          code: "s.withTransaction(() => {\n  s.getDatabase('pt8').order_claims.insertOne({ _id: id });\n  s.getDatabase('pt8').orders_by_seller.insertOne(order);\n});",
+          active: ['app', 'mongos', 'claims', 'sh1', 'sh2'],
+          edges: ['app-mongos', 'mongos-claims', 'mongos-sh1', 'mongos-sh2'],
+        },
+        {
+          title: 't2: cost and result',
+          note: '3 runs of 300 orders: median 12.21, 7.66, 9.08 ms (plain insertOne: 2.81, 5.47, 1.44 ms). commitTypes: 149/151, 158/142, 144/156 single-shard/two-phase. Claiming an existing id: E11000 duplicate key error collection: pt8.order_claims index: _id_ dup key: { _id: 2000302 }; the order insert in the same transaction was rolled back with it.',
+          subs: { claims: 'E11000 on a second claim' },
+          active: ['mongos', 'claims'],
+          edges: ['mongos-claims'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Citus
+
+<Flow
+  title="Citus: unique keys on a table distributed by seller_id"
+  height={300}
+  nodes={[
+    { id: 'app', label: 'Application', sub: 'DDL', x: 20, y: 20, w: 200 },
+    { id: 'coord', label: 'Coordinator', sub: 'checks the constraint', x: 300, y: 20, w: 200 },
+    { id: 'w1', label: 'pt-citus-w1', sub: '16 shards', x: 120, y: 200, w: 220 },
+    { id: 'w2', label: 'pt-citus-w2', sub: '16 shards', x: 460, y: 200, w: 220 },
+  ]}
+  edges={[
+    { id: 'app-coord', from: 'app', to: 'coord' },
+    { id: 'coord-w1', from: 'coord', to: 'w1' },
+    { id: 'coord-w2', from: 'coord', to: 'w2' },
+  ]}
+  cases={[
+    {
+      title: 'PRIMARY KEY (id)',
+      path: 'ALTER TABLE orders_d ADD PRIMARY KEY (id) → ✗ refused by the coordinator',
+      summary: 'Refused before any shard is touched.',
+      steps: [
+        {
+          title: 'Refused, before and after distribution',
+          note: 'create_distributed_table on a table that already had PRIMARY KEY (id), and ADD PRIMARY KEY (id) on the distributed table, both failed: "ERROR: cannot create constraint on "orders_d" DETAIL: Distributed relations cannot have UNIQUE, EXCLUDE, or PRIMARY KEY constraints that do not include the partition column (with an equality operator if EXCLUDE)." CREATE UNIQUE INDEX ON orders_d (id): "creating unique indexes on non-partition columns is currently unsupported".',
+          active: ['app', 'coord'],
+          edges: ['app-coord'],
+        },
+      ],
+    },
+    {
+      title: 'PRIMARY KEY (seller_id, id)',
+      path: 'ADD PRIMARY KEY (seller_id, id) → ✓ created on all 32 shards → ✗ id alone still not unique across sellers',
+      summary: 'Allowed, because equal (seller_id, id) pairs share a shard.',
+      steps: [
+        {
+          title: 'One local index per shard',
+          note: 'Accepted and propagated to every shard. It guarantees "no seller has the same order id twice"; it does not stop seller 1 and seller 2 from both having order 42. If id comes from one generator (Concept 3), that is enough in practice.',
+          active: ['app', 'coord', 'w1', 'w2'],
+          edges: ['app-coord', 'coord-w1', 'coord-w2'],
+        },
+      ],
+    },
+  ]}
+/>
+
+## Ways to keep a value unique
+
+| Approach | How | Cost |
+|---|---|---|
+| ✓ Make the value the shard key | Shard by order id | Every query by seller becomes a fan-out (Concept 5) |
+| ✓ Unique within the shard key | (seller_id, order_no) unique | Enough when the value is only meaningful per seller, like a seller's own SKU code |
+| ✓ Unique by construction | Ids from one sequence, ObjectId, UUID, snowflake (Concept 3) | No check at all; collisions are prevented, not detected |
+| ✓ Claim collection / table | Insert the value into a collection sharded by it, in the same transaction | Measured: 7.7–12.2 ms vs 1.4–5.5 ms per order, about half the transactions two-phase |
+| ✗ Check with a query first | find, then insert | Two concurrent inserts both find nothing; no lock spans shards |
+
+<Pitfall>
+Orphans take part in the local check. The first attempt to duplicate an order (`_id: 5`, seller 3945, moved from sh2 to sh1 minutes earlier) was **rejected** with E11000 on sh2, because the old copy was still physically on sh2 waiting for range deletion. A few minutes later the same insert would have been accepted. Neither outcome is a uniqueness guarantee.
+</Pitfall>
+
+## Real-world scenario: marketplace order numbers
+
+Orders arrive from Shopee, Lazada and TikTok Shop with the platform's order number (`order_sn`), and the importer must never create the same order twice, even when a webhook and a polling job deliver it at the same moment. Orders are sharded by seller.
+
+| Design | Result |
+|---|---|
+| ✗ Unique index on `order_sn` | Refused on a sharded collection (MongoDB) or a distributed table (Citus) |
+| ✓ Unique on `(seller_id, marketplace, order_sn)` | Allowed: a platform order belongs to exactly one shop, so the seller is known before insert and both deliveries land on the same shard |
+| ✓ Upsert keyed on that triple | Two concurrent deliveries end as one order, with no cross-shard transaction |
+
+## Why this matters
+
+| Link | Connection |
+|---|---|
+| [Session 3, Concept 3](/blogs/databases/partitioning-sharding/session-3-indexes-and-constraints/concept-3-unique-keys) | The same rule one level down: a partitioned table's unique keys must include the partition key |
+| [Transactions Session 7](/blogs/databases/transactions/session-7-application-patterns/concept-5-idempotency-advisory-locks) | Idempotency keys rely on a unique constraint; on a sharded table the key must contain the shard key |
+| Concept 3 | Generating ids that need no uniqueness check |
+
+## Key takeaways
+
+1. Unique indexes are checked per shard. Both engines refuse unique keys that do not contain the shard key.
+2. MongoDB's `_id` is the exception: always unique per shard, never checked across shards unless `_id` is the shard key.
+3. Prefer keys that contain the shard key, or ids that are unique by construction.
+4. A claim collection works but turns every insert into a transaction, about half of them two-phase.
+5. Check-then-insert never guarantees uniqueness across shards.
+
+## Check questions
+
+1. Why can't a shard enforce a unique index on `order_no` when the collection is sharded by `seller_id`?
+2. How did MongoDB end up with two orders with `_id: 1`, and how would you find such duplicates?
+3. Why is `(seller_id, id)` allowed as a Citus primary key when `(id)` is not?
+4. In the claim-collection test, why was only about half of the transactions two-phase?
+5. Why was the first duplicate insert (`_id: 5`) rejected?
+6. For marketplace order numbers, why is `(seller_id, marketplace, order_sn)` a better unique key than `order_sn` alone?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/partitioning-sharding/session-8-operations-across-shards/concept-2-uniqueness-across-shards/answers">Worked answers to Q1–Q6</DeepDive>
