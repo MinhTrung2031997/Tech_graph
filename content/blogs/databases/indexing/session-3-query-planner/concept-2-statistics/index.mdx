@@ -1,0 +1,465 @@
+---
+title: "Concept 2: Statistics and ANALYZE"
+description: "Where a planner's row estimates come from: PostgreSQL's sampled column statistics (most common values, histograms, n_distinct), InnoDB's persistent index statistics, index dives and histograms, and MongoDB's plan cache instead of statistics. What goes wrong when they are stale."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "query-planner", "statistics"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/planner-stats.html"
+  - "https://www.postgresql.org/docs/current/view-pg-stats.html"
+  - "https://www.postgresql.org/docs/current/row-estimation-examples.html"
+  - "https://www.postgresql.org/docs/current/routine-vacuuming.html#VACUUM-FOR-STATISTICS"
+  - "https://dev.mysql.com/doc/refman/8.4/en/innodb-persistent-stats.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/optimizer-statistics.html"
+  - "https://www.mongodb.com/docs/manual/core/query-plans/"
+---
+
+<Tldr>
+A planner cannot count rows before choosing a plan, so it keeps a **summary** of each column. **PostgreSQL**'s `ANALYZE` samples 30,000 rows and stores the most common values with their frequencies, a 100-bucket histogram, the number of distinct values and the physical correlation. **InnoDB** stores per-index distinct-value counts sampled from 20 pages, dives into the index for ranges, and uses optional histograms for unindexed columns. **MongoDB** keeps no statistics: it races plans and caches the winner. When the data changes faster than the summary, estimates go wrong: in the lab, 300,000 new rows were estimated as **1**.
+</Tldr>
+
+## What each engine keeps
+
+| | PostgreSQL | MySQL InnoDB | MongoDB |
+|---|---|---|---|
+| Stored where | `pg_statistic` (readable view: `pg_stats`), `pg_class.reltuples / relpages` | `mysql.innodb_table_stats`, `mysql.innodb_index_stats`, `information_schema.column_statistics` | Nothing persistent; the plan cache in memory |
+| Per column | Null fraction, width, distinct count, most common values + frequencies, histogram, correlation | Histogram only if created with `ANALYZE TABLE … UPDATE HISTOGRAM` | — |
+| Per index | Size; uses column statistics | Distinct values per key prefix (`n_diff_pfx01` …), leaf pages | — |
+| Refreshed by | `ANALYZE`, autovacuum (after 50 + 10% of rows change) | `ANALYZE TABLE`, automatically after 10% of rows change | Plans re-raced when the cache entry is evicted or performs badly |
+| Sample | 300 × `default_statistics_target` (100) = 30,000 rows | 20 pages per index (`innodb_stats_persistent_sample_pages`) | — |
+
+## PostgreSQL: pg_stats on the lab
+
+```sql
+SELECT attname, n_distinct, most_common_vals, most_common_freqs, correlation
+FROM pg_stats WHERE tablename = 'orders' AND attname IN ('status', 'customer_id', 'created_at');
+```
+
+| Column | `n_distinct` | Most common values (frequency) | Histogram | `correlation` |
+|---|---|---|---|---|
+| `status` | 5 | delivered 0.352, paid 0.349, pending 0.199, shipped 0.051, cancelled 0.049 | none (every value is in the MCV list) | 0.29 |
+| `customer_id` | 91,474 (real: 100,000) | none: no value is common enough | 101 bounds: 4, 1188, 2198, 3319 … | −0.01 |
+| `created_at` | −1 (= every row distinct) | none | 101 bounds | 1.0 |
+
+| Term | Meaning |
+|---|---|
+| MCV list | Most common values and their frequencies, up to `default_statistics_target` entries |
+| Histogram | Bounds splitting the remaining values into 100 buckets with equal numbers of rows |
+| `n_distinct` | Distinct values; a negative number is a fraction of the rows (−1 = all distinct) |
+| **✓ In the MCV list** | The value's frequency is read directly |
+| **✗ Not in the MCV list** | Assume the value is as frequent as an average non-MCV value |
+
+<Flow
+  title="PostgreSQL: estimating rows from pg_stats"
+  height={340}
+  nodes={[
+    { id: 'q', label: 'Condition', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'stats', label: 'pg_stats', sub: 'from the last ANALYZE', x: 310, y: 20, w: 200 },
+    { id: 'est', label: 'Estimated rows', sub: 'reltuples × selectivity', x: 580, y: 270, w: 200 },
+    { id: 'mcv', label: '✓ In the MCV list', sub: 'use its frequency', x: 20, y: 150, w: 220 },
+    { id: 'nomcv', label: '✗ Not in the MCV list', sub: 'average frequency', x: 290, y: 150, w: 220 },
+    { id: 'hist', label: 'Histogram', sub: 'fraction of buckets', x: 580, y: 150, w: 200 },
+    { id: 'nd', label: 'n_distinct', sub: '', x: 290, y: 270, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-stats', from: 'q', to: 'stats' },
+    { id: 'stats-mcv', from: 'stats', to: 'mcv' },
+    { id: 'stats-nomcv', from: 'stats', to: 'nomcv' },
+    { id: 'stats-hist', from: 'stats', to: 'hist' },
+    { id: 'nomcv-nd', from: 'nomcv', to: 'nd' },
+    { id: 'mcv-est', from: 'mcv', to: 'est', quiet: true },
+    { id: 'hist-est', from: 'hist', to: 'est' },
+    { id: 'nd-est', from: 'nd', to: 'est', quiet: true },
+  ]}
+  cases={[
+    {
+      title: "Common value: status = 'shipped'",
+      path: '✓ shipped is in the MCV list, frequency 0.051 → 51,000 rows',
+      summary: 'Measured: estimate 51,000, actual 50,000.',
+      subs: { q: "status = 'shipped'" },
+      steps: [
+        {
+          title: 'Look up the column statistics',
+          note: 'ANALYZE sampled 30,000 rows and stored status\'s five values with their frequencies.',
+          code: "EXPLAIN SELECT * FROM orders WHERE status = 'shipped';",
+          active: ['q', 'stats'],
+          edges: ['q-stats'],
+        },
+        {
+          title: '✓ In the MCV list',
+          note: 'shipped appears with frequency 0.051: 5.1% of the sampled rows.',
+          active: ['stats', 'mcv'],
+          edges: ['stats-mcv'],
+          subs: { mcv: 'shipped: 0.051' },
+        },
+        {
+          title: 'Estimate: 51,000',
+          note: 'reltuples (1,000,000) × 0.051 = 51,000. The sample said 5.1%; the truth is 5.0%.',
+          active: ['mcv', 'est'],
+          edges: ['mcv-est'],
+          subs: { est: '51,000 rows' },
+        },
+      ],
+    },
+    {
+      title: 'Rare value: customer_id = 7',
+      path: '✗ no MCV list → 1 / n_distinct = 1 / 91,474 → 11 rows',
+      summary: 'Measured: estimate 11, actual 7.',
+      subs: { q: 'customer_id = 7' },
+      steps: [
+        {
+          title: '✗ Not a common value',
+          note: 'Each customer has about 10 orders; in a 30,000-row sample almost every customer appears once or not at all, so there is no MCV list.',
+          code: 'EXPLAIN SELECT * FROM orders WHERE customer_id = 7;',
+          active: ['q', 'stats', 'nomcv'],
+          edges: ['q-stats', 'stats-nomcv'],
+        },
+        {
+          title: 'Use n_distinct',
+          note: 'Selectivity = (1 − sum of MCV frequencies) / (n_distinct − number of MCVs) = 1 / 91,474. The distinct count is itself an estimate from the sample (the truth is 100,000).',
+          active: ['nomcv', 'nd'],
+          edges: ['nomcv-nd'],
+          subs: { nd: '91,474' },
+        },
+        {
+          title: 'Estimate: 11',
+          note: '1,000,000 / 91,474 ≈ 11 rows; actual 7. Every customer gets the same estimate, including a big customer with 10,000 orders: that is when to raise the statistics target.',
+          active: ['nd', 'est'],
+          edges: ['nd-est'],
+          subs: { est: '11 rows' },
+        },
+      ],
+    },
+    {
+      title: 'Range: customer_id BETWEEN 1 AND 1000',
+      path: 'histogram: 1,000 lies 84% into the first of 100 buckets (4–1,188) → ≈ 0.84% → 8,314 rows',
+      summary: 'Measured: estimate 8,314, actual 9,956.',
+      subs: { q: 'customer_id BETWEEN 1 AND 1000' },
+      steps: [
+        {
+          title: 'Ranges use the histogram',
+          note: 'The 101 histogram bounds split customer_id into 100 buckets of ≈ 1% of the rows each. The first bucket runs from 4 to 1,188.',
+          code: 'EXPLAIN SELECT * FROM orders WHERE customer_id BETWEEN 1 AND 1000;',
+          active: ['q', 'stats', 'hist'],
+          edges: ['q-stats', 'stats-hist'],
+          subs: { hist: 'bucket 1: 4 – 1,188' },
+        },
+        {
+          title: 'Interpolate inside the bucket',
+          note: '1,000 is (1,000 − 4) / (1,188 − 4) ≈ 84% of the way through bucket 1, so the range covers ≈ 0.84 of 1% of the rows, assuming values are spread evenly inside a bucket.',
+          active: ['hist', 'est'],
+          edges: ['hist-est'],
+          subs: { est: '8,314 rows' },
+        },
+      ],
+    },
+    {
+      title: 'Stale statistics',
+      path: '300,000 refunded rows inserted, no ANALYZE → ✗ refunded not in the MCV list → estimate 1',
+      summary: 'Measured on a copy with autovacuum off: estimated 1 row, actual 300,000.',
+      subs: { q: "status = 'refunded'", stats: 'before the insert' },
+      steps: [
+        {
+          title: 'Statistics from before the insert',
+          note: 'The table copy was analyzed, then 300,000 rows with status = refunded were inserted. Autovacuum was off, so nothing re-analyzed it.',
+          code: "INSERT INTO orders_stale SELECT …, 'refunded', … FROM orders WHERE id <= 300000;\nEXPLAIN ANALYZE SELECT … FROM orders_stale WHERE status = 'refunded';",
+          active: ['q', 'stats'],
+          edges: ['q-stats'],
+        },
+        {
+          title: '✗ refunded is unknown',
+          note: 'The MCV list has only the five old values, and all five MCVs together cover 100% of the sampled rows: there is no frequency left for anything else.',
+          active: ['stats', 'nomcv', 'nd'],
+          edges: ['stats-nomcv', 'nomcv-nd'],
+        },
+        {
+          title: 'Estimate: 1 row (actual 300,000)',
+          note: 'The planner clamps to a minimum of 1. In a join with orders on customer_id, it chose a Nested Loop that ran 300,000 index lookups. After ANALYZE: estimate 301,080, Hash Join. On the warm lab cache the nested loop happened to finish first (388 ms vs 515 ms); on cold data, 300,000 random lookups would cost far more. The estimate was wrong by 300,000×, whichever plan won.',
+          active: ['nd', 'est'],
+          edges: ['nd-est'],
+          subs: { est: '1 row (actual 300,000)' },
+        },
+      ],
+    },
+  ]}
+/>
+
+### When the summary is not enough
+
+| Problem | Symptom | Fix |
+|---|---|---|
+| Skewed column (a few huge values among many small ones) | Estimates for big values far too low | `ALTER TABLE orders ALTER COLUMN customer_id SET STATISTICS 1000; ANALYZE orders;` (bigger MCV list and histogram) |
+| Correlated columns | Combined conditions underestimated (9.4× in Concept 1) | `CREATE STATISTICS orders_dep (dependencies, mcv) ON status, channel FROM orders; ANALYZE orders;` (helps equality conditions) |
+| Bulk load or big delete | Estimates from the old data | Run `ANALYZE` right after the load; autovacuum waits for 50 + 10% of the rows to change (100,050 for `orders`) |
+| Expression in WHERE | No statistics on `lower(email)` | An expression index gathers statistics on the expression (Session 5) |
+
+## MySQL InnoDB: index statistics, dives and histograms
+
+```sql
+SELECT index_name, stat_name, stat_value, sample_size FROM mysql.innodb_index_stats
+WHERE table_name = 'orders' AND stat_name LIKE 'n_diff%';
+```
+
+| Index | `n_diff_pfx01` (distinct first column) | Sample pages | Reality |
+|---|---|---|---|
+| `orders_customer_idx` | 99,661 | 20 | 100,000 |
+| `orders_status_idx` | 4 | 6 | 5 |
+| `orders_sku_idx` | 4,979 | 20 | 5,000 |
+
+| Term | Meaning |
+|---|---|
+| Index statistics | Distinct values per key prefix, from sampled leaf pages; used for equality (`ref`) estimates: rows ≈ table rows / distinct values |
+| Index dive | For a range or a short `IN` list (≤ `eq_range_index_dive_limit` = 200 values) on an indexed column, descend the index to the range ends and estimate the entries between |
+| Histogram | Bucket statistics for a column, created explicitly; used for conditions on **unindexed** columns |
+| **✓ Indexed column / ✗ Not indexed** | Indexed: statistics or dives. Not indexed: histogram if present, otherwise a fixed guess |
+
+<Flow
+  title="MySQL: where row estimates come from"
+  height={340}
+  nodes={[
+    { id: 'q', label: 'Condition', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'yes', label: '✓ Indexed column', sub: '', x: 20, y: 150, w: 220 },
+    { id: 'no', label: '✗ Not indexed', sub: '', x: 560, y: 20, w: 220 },
+    { id: 'dive', label: 'Index dive', sub: 'ranges, short IN lists', x: 20, y: 270, w: 220 },
+    { id: 'ndiff', label: 'Index statistics', sub: 'n_diff, 20 sampled pages', x: 290, y: 270, w: 220 },
+    { id: 'guess', label: 'Fixed guess', sub: '10% for =, 33.33% for ranges', x: 560, y: 150, w: 220 },
+    { id: 'hist', label: 'Histogram', sub: 'if created', x: 560, y: 270, w: 220 },
+    { id: 'est', label: 'rows / filtered', sub: '', x: 290, y: 150, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-yes', from: 'q', to: 'yes' },
+    { id: 'q-no', from: 'q', to: 'no' },
+    { id: 'yes-dive', from: 'yes', to: 'dive' },
+    { id: 'yes-ndiff', from: 'yes', to: 'ndiff' },
+    { id: 'no-guess', from: 'no', to: 'guess' },
+    { id: 'guess-hist', from: 'guess', to: 'hist', quiet: true },
+    { id: 'dive-est', from: 'dive', to: 'est', quiet: true },
+    { id: 'ndiff-est', from: 'ndiff', to: 'est', quiet: true },
+    { id: 'guess-est', from: 'guess', to: 'est', quiet: true },
+    { id: 'hist-est', from: 'hist', to: 'est', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'Range on an indexed column',
+      path: '✓ indexed → index dive into orders_customer_idx → rows 18,000',
+      summary: 'customer_id <= 1000: estimate 18,000, actual 10,000.',
+      subs: { q: 'customer_id <= 1000' },
+      steps: [
+        {
+          title: '✓ Indexed: dive',
+          note: 'For a range, MySQL dives into the index at both ends and estimates how many entries lie between.',
+          code: 'EXPLAIN SELECT * FROM orders WHERE customer_id <= 1000;',
+          active: ['q', 'yes', 'dive'],
+          edges: ['q-yes', 'yes-dive'],
+        },
+        {
+          title: 'Estimate: 18,000',
+          note: 'Dives are usually closer than this; here the estimate is 1.8× the truth. EXPLAIN FORMAT=JSON shows the cost it fed: read_cost 6,300 + eval_cost 1,800 (18,000 rows × 0.1).',
+          active: ['dive', 'est'],
+          edges: ['dive-est'],
+          subs: { est: 'rows=18,000' },
+        },
+      ],
+    },
+    {
+      title: 'Equality on an indexed column',
+      path: '✓ indexed → index statistics: n_diff = 4 for status → rows ≈ table / distinct',
+      summary: "status = 'delivered': estimate 498,055, actual 350,000.",
+      subs: { q: "status = 'delivered'" },
+      steps: [
+        {
+          title: '✓ Indexed: use statistics',
+          note: 'For ref access, InnoDB\'s sampled distinct count gives the average rows per value. status was sampled from only 6 pages and shows 4 distinct values (there are 5).',
+          code: "EXPLAIN SELECT * FROM orders WHERE status = 'delivered';",
+          active: ['q', 'yes', 'ndiff'],
+          edges: ['q-yes', 'yes-ndiff'],
+          subs: { ndiff: 'status: 4 distinct' },
+        },
+        {
+          title: 'An average, not this value',
+          note: 'The estimate is the same for every status value: rare and common alike. rows=498,055 for delivered; the truth is 350,000, and for a rare value it would be far too high.',
+          active: ['ndiff', 'est'],
+          edges: ['ndiff-est'],
+          subs: { est: 'rows=498,055' },
+        },
+      ],
+    },
+    {
+      title: 'Unindexed column, before and after a histogram',
+      path: '✗ not indexed → fixed guess 33.33% → after UPDATE HISTOGRAM: 20.01%',
+      summary: 'amount > 400: actual 20.0%.',
+      subs: { q: 'amount > 400' },
+      steps: [
+        {
+          title: '✗ Not indexed: a fixed guess',
+          note: 'No index, no histogram: MySQL assumes a range keeps 33.33% of the rows (filtered=33.33).',
+          code: 'EXPLAIN SELECT * FROM orders WHERE amount > 400;',
+          active: ['q', 'no', 'guess', 'est'],
+          edges: ['q-no', 'no-guess', 'guess-est'],
+          subs: { est: 'filtered=33.33' },
+        },
+        {
+          title: 'Create a histogram',
+          note: 'A 100-bucket equi-height histogram describes amount without the cost of an index.',
+          code: 'ANALYZE TABLE orders UPDATE HISTOGRAM ON amount WITH 100 BUCKETS;',
+          active: ['guess', 'hist'],
+          edges: ['guess-hist'],
+        },
+        {
+          title: 'Estimate: 20.01%',
+          note: 'filtered=20.01; the real share is 199,980 / 1,000,000 = 20.0%. Histograms improve join order and filtering estimates; they do not create an access path.',
+          active: ['hist', 'est'],
+          edges: ['hist-est'],
+          subs: { est: 'filtered=20.01' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: the plan cache instead of statistics
+
+| Term | Meaning |
+|---|---|
+| Query shape | The filter, sort and projection with values removed: `{ status: ?, customer_id: { $lte: ? } }` |
+| Plan cache entry | The winning plan for a shape, with the work it took (`works`) |
+| Inactive → active | A new entry starts inactive; when the shape runs again within that work, it becomes active and is reused |
+| Replanning | If an active plan needs more than 10× its recorded work, MongoDB races the candidates again |
+| **✓ Active entry / ✗ No usable entry** | Reuse the cached plan, or run a trial |
+
+<Flow
+  title="MongoDB: plan cache"
+  height={330}
+  nodes={[
+    { id: 'q', label: 'Query shape', sub: '{ status, customer_id }', x: 20, y: 20, w: 230 },
+    { id: 'cache', label: 'Plan cache', sub: '', x: 330, y: 20, w: 190 },
+    { id: 'hit', label: '✓ Active entry', sub: 'reuse the plan', x: 590, y: 20, w: 190 },
+    { id: 'miss', label: '✗ No usable entry', sub: '', x: 330, y: 140, w: 190 },
+    { id: 'trial', label: 'Trial run', sub: 'race candidates', x: 20, y: 140, w: 230 },
+    { id: 'exec', label: 'Execute', sub: '', x: 590, y: 140, w: 190 },
+    { id: 'replan', label: 'Replan', sub: 'works > 10× cached', x: 590, y: 260, w: 190 },
+  ]}
+  edges={[
+    { id: 'q-cache', from: 'q', to: 'cache' },
+    { id: 'cache-hit', from: 'cache', to: 'hit' },
+    { id: 'cache-miss', from: 'cache', to: 'miss' },
+    { id: 'miss-trial', from: 'miss', to: 'trial' },
+    { id: 'trial-cache', from: 'trial', to: 'cache', quiet: true },
+    { id: 'hit-exec', from: 'hit', to: 'exec' },
+    { id: 'exec-replan', from: 'exec', to: 'replan' },
+    { id: 'replan-miss', from: 'replan', to: 'miss', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'First run of a shape',
+      path: 'plan cache ✗ no entry → trial → winner stored as an inactive entry',
+      summary: '$planCacheStats after one run: plan customer_id_1, works 2,001, isActive false.',
+      steps: [
+        {
+          title: 'Look up the shape',
+          note: 'Values are stripped: any status and any customer_id bound share the shape.',
+          code: 'db.orders.find({ status: "shipped", customer_id: { $lte: 1000 } })',
+          active: ['q', 'cache'],
+          edges: ['q-cache'],
+        },
+        {
+          title: '✗ No entry: trial',
+          note: 'The two candidate plans race (Concept 1): customer_id_1 wins after 2,001 works.',
+          active: ['cache', 'miss', 'trial'],
+          edges: ['cache-miss', 'miss-trial'],
+        },
+        {
+          title: 'Stored inactive',
+          note: 'The winner is cached with works = 2,001, marked inactive. db.orders.aggregate([{ $planCacheStats: {} }]) shows it.',
+          active: ['trial', 'cache'],
+          edges: ['trial-cache'],
+          subs: { cache: 'customer_id_1, inactive' },
+        },
+      ],
+    },
+    {
+      title: 'Repeated run',
+      path: 'plan cache ✓ active entry → execute without a trial',
+      summary: 'The shape runs again within the recorded work: the entry becomes active and is reused.',
+      subs: { cache: 'customer_id_1' },
+      steps: [
+        {
+          title: '✓ Reuse the cached plan',
+          note: 'A second run that needs no more work than recorded activates the entry; from then on the shape skips planning.',
+          code: 'db.orders.find({ status: "paid", customer_id: { $lte: 500 } })',
+          active: ['q', 'cache', 'hit', 'exec'],
+          edges: ['q-cache', 'cache-hit', 'hit-exec'],
+        },
+      ],
+    },
+    {
+      title: 'Cached plan goes bad',
+      path: '✓ active entry → execution needs > 10× the cached works → replan',
+      summary: 'Different values can make the cached plan a poor fit for the same shape.',
+      subs: { cache: 'customer_id_1' },
+      steps: [
+        {
+          title: 'Same shape, very different values',
+          note: 'With customer_id ≤ 100,000 (every customer), the customer_id plan scans the whole index while status = cancelled would have been far more selective.',
+          code: 'db.orders.find({ status: "cancelled", customer_id: { $lte: 100000 } })',
+          active: ['q', 'cache', 'hit', 'exec'],
+          edges: ['q-cache', 'cache-hit', 'hit-exec'],
+        },
+        {
+          title: 'Replan',
+          note: 'Once the work exceeds 10× the cached 2,001, MongoDB evicts the entry and races the candidates again for this run. Index builds, drops and restarts also clear the cache; db.orders.getPlanCache().clear() does it by hand.',
+          active: ['exec', 'replan', 'miss'],
+          edges: ['exec-replan', 'replan-miss'],
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+After a bulk load, an `ANALYZE` (PostgreSQL) or `ANALYZE TABLE` (MySQL) is part of the load, not an optional extra. Automatic re-analysis only happens after enough changes **and** some time, and the first queries on the new data run with the old statistics.
+</Pitfall>
+
+## Real-world scenario: the nightly import
+
+Every night a job truncates `daily_sales` and loads 5M rows, then dashboards query it. On the first morning query the plan is a nested loop estimated at 1 row; by 9 am it is a hash join and fast.
+
+| Time | What happened |
+|---|---|
+| 02:00 | `TRUNCATE` + `COPY` of 5M rows: statistics still describe yesterday's data, or an empty table |
+| 08:00 | First dashboard query: estimates from stale statistics → nested loop |
+| 08:05 | Autovacuum notices the changes and runs `ANALYZE` |
+| 09:00 | Same query: correct estimates → hash join |
+
+**Fix:** end the import job with `ANALYZE daily_sales;` (seconds for 5M rows). In MySQL, `ANALYZE TABLE daily_sales`.
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 3: cost model | Turns these estimates into costs |
+| Concept 5: ignored indexes | Stale or missing statistics are a top reason |
+| Session 5: expression indexes | Bring statistics for expressions |
+| Session 8: index checklist | "Did you ANALYZE?" comes first |
+
+## Key takeaways
+
+1. Planners estimate rows from summaries, not counts.
+2. PostgreSQL keeps most common values, a 100-bucket histogram, `n_distinct` and correlation per column, from a 30,000-row sample.
+3. A value in the MCV list gets its own frequency; others get an average; ranges interpolate in the histogram.
+4. InnoDB keeps distinct counts per index prefix from 20 sampled pages, dives into indexes for ranges, and can use histograms for unindexed columns.
+5. MongoDB keeps no statistics; it caches the winning plan per query shape and replans when it degrades.
+6. Stale statistics after bulk changes give wild estimates (1 vs 300,000); run `ANALYZE` after loads.
+7. Extended statistics and higher statistics targets fix correlated and skewed columns.
+
+## Check questions
+
+1. Where does PostgreSQL get the estimate 51,000 for `status = 'shipped'`? Show the calculation.
+2. Why is the estimate for `customer_id = 7` the same as for any other customer, and when does that become a problem?
+3. How did the planner estimate 8,314 rows for `customer_id BETWEEN 1 AND 1000` from the histogram?
+4. After inserting 300,000 `refunded` rows without `ANALYZE`, the estimate was 1. Why exactly 1, and what would autovacuum have needed before re-analyzing?
+5. MySQL estimated the same rows for every `status` value. Which statistic did it use, and why is that weak for skewed columns?
+6. What did a MySQL histogram on `amount` change, and what did it not change?
+7. MongoDB has no statistics. How does it avoid re-planning every query, and when does it plan again?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-3-query-planner/concept-2-statistics/answers">Worked answers to Q1–Q7</DeepDive>

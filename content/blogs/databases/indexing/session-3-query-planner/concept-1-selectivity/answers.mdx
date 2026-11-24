@@ -1,0 +1,74 @@
+---
+title: "Answers: Selectivity and cardinality"
+description: "Worked answers to the Session 3 Concept 1 check questions."
+companion: "answers"
+tags: ["indexing", "query-planner", "selectivity", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/row-estimation-examples.html"
+  - "https://www.mongodb.com/docs/manual/core/query-plans/"
+---
+
+<Tldr>
+Selectivity × rows = cardinality. Low selectivity → index; high selectivity → full scan; physical order moves the line. Estimates are usually close, except when conditions are correlated.
+</Tldr>
+
+## Q1. status = 'pending'
+
+**Question:** define selectivity and cardinality, and give both for `status = 'pending'` on the lab table.
+
+| | Definition | `status = 'pending'` |
+|---|---|---|
+| Selectivity | Fraction of rows the condition keeps | 200,000 / 1,000,000 = **0.20** |
+| Cardinality of the step | Rows it returns | **200,000** (estimated 199,267) |
+| Cardinality of the column | Distinct values | `status`: **5** |
+
+> **Common mistake:** calling 0.20 "high selectivity". Selectivity numbers near 0 mean highly selective; 0.20 is weakly selective.
+
+## Q2. customer_id = 7 vs status = 'paid'
+
+**Question:** why is `customer_id = 7` highly selective while `status = 'paid'` is not, even though both are equalities?
+
+An equality keeps about 1 / (number of distinct values) of the rows, adjusted for skew. `customer_id` has ≈ 100,000 values, so one value keeps ≈ 0.001% (7 rows). `status` has 5 values and `paid` alone is 35%. Selectivity is a property of the value distribution, not of the operator.
+
+> **Common mistake:** "equality conditions always use an index". Only selective ones should.
+
+## Q3. The 9.4× underestimate
+
+**Question:** the planner estimated 10,654 rows for `id <= 100000 AND created_at < '2025-02-07'`; the truth is 100,000. What assumption caused this?
+
+**Independence.** The planner estimates each condition separately (≈ 10% each) and multiplies: 10% × 10% ≈ 1% → ≈ 10,000 rows. But `created_at` rises with `id`, so the second condition removes nothing from the first: the combined selectivity is 10%, not 1%. PostgreSQL's extended statistics (`CREATE STATISTICS`, Concept 2) can capture dependencies between columns, mainly for equality conditions.
+
+> **Common mistake:** "the statistics are stale". They were fresh; each single-column estimate was right, only the combination was wrong.
+
+## Q4. 20% vs 49%
+
+**Question:** PostgreSQL switched from Bitmap Heap Scan to Seq Scan between 20% and 50% for `customer_id`, but kept an Index Scan at 49% for `created_at`. Why?
+
+The cost of the index route depends on **which heap pages** it reads and **in what order**. `customer_id` rows are scattered (correlation ≈ 0): at 20% they already cover nearly every page, and beyond that the index only adds work. `created_at` rows are in physical order (correlation 1.0): 49% of the rows are the first 49% of the pages, read front to back, so the index route reads half the table sequentially, cheaper than all of it.
+
+> **Common mistake:** "the created_at index is a better index". Same structure; the data layout differs.
+
+## Q5. MySQL and status = 'delivered'
+
+**Question:** MySQL used the `status` index for `status = 'delivered'` and was 40% slower than a full scan. Why is a low-selectivity condition risky for its optimizer?
+
+Through a secondary index, every matching row costs a clustered-index lookup. At 35% that is 350,000 lookups, against one sequential pass over 4,203 leaves for the full scan. The optimizer's estimate (498,055 rows) and cost model did not capture how expensive those lookups are compared with a sequential scan, and InnoDB has no bitmap scan to read the rows in order. The measured result: 144 ms vs 103 ms.
+
+> **Common mistake:** trusting that "the optimizer chose it, so it is fastest". Measure with `IGNORE INDEX` when a low-selectivity index is used.
+
+## Q6. MongoDB's choice
+
+**Question:** how does MongoDB decide between two applicable indexes, and what does it do when only one applies?
+
+With **several** candidates it runs a **trial**: the plans execute in turns until one returns 101 documents or a work limit is reached; the plan with the best results-per-work score wins and is cached for that query shape. With **one** applicable index there is nothing to compare: it is used directly, without considering a collection scan, whatever the selectivity.
+
+> **Common mistake:** "MongoDB estimates costs like SQL planners". It measures candidates by running them, and never weighs an index against a COLLSCAN.
+
+## Q7. Where a full scan wins
+
+**Question:** give a selectivity at which you would expect a full scan to beat an index on scattered rows, and explain using pages.
+
+Around **5–20%** and above, depending on rows per page and storage. With 99 rows per page, 5% of the rows spread at random touch 1 − 0.95⁹⁹ ≈ 99% of the pages (Session 1, Concept 4): the index route reads nearly every page anyway, out of order and some more than once, plus the index pages. A full scan reads each page once, in order. PostgreSQL's bitmap scans push the crossover up (≈ 20% in the lab); MySQL, without them, switched earlier.
+
+> **Common mistake:** "50%": that is the crossover for ordered rows, not scattered ones.

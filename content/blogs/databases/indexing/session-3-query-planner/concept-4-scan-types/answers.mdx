@@ -1,0 +1,74 @@
+---
+title: "Answers: Index Scan vs Bitmap Scan vs Seq Scan"
+description: "Worked answers to the Session 3 Concept 4 check questions."
+companion: "answers"
+tags: ["indexing", "query-planner", "bitmap-scan", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/indexes-bitmap-scans.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/mrr-optimization.html"
+---
+
+<Tldr>
+Index Scan: index order. Bitmap: file order, once per page, combinable, unordered output. Seq Scan: everything. The right one depends on how many pages hold matches and whether the output must be ordered.
+</Tldr>
+
+## Q1. Order of heap pages
+
+**Question:** for each of Index Scan, Bitmap Heap Scan and Seq Scan, describe the order in which heap pages are read.
+
+| Scan | Heap page order |
+|---|---|
+| Index Scan | The order of the index entries: random for an uncorrelated column, almost sequential for a correlated one; a page can be read more than once |
+| Bitmap Heap Scan | Increasing page number, only pages with matches, each exactly once |
+| Seq Scan | Every page, from first to last |
+
+> **Common mistake:** "a bitmap scan reads pages randomly because it comes from an index". The bitmap exists precisely to sort the pages.
+
+## Q2. Bitmap for customer_id, Index Scan for created_at
+
+**Question:** why did PostgreSQL choose a Bitmap Heap Scan for `customer_id <= 1000` but an Index Scan for `created_at < '2025-02-01'`?
+
+`customer_id` rows are scattered (correlation −0.01): 9,956 rows on 6,376 pages. Reading them in index order would jump around and revisit pages; the bitmap reads each page once in file order, so it is cheaper. `created_at` rows are already in file order (correlation 1.0): index order **is** file order, so an Index Scan reads the first ≈ 860 pages sequentially and skips the cost of building a bitmap; it also returns rows sorted by `created_at`.
+
+> **Common mistake:** "Index Scan is for small results, Bitmap for large". Order matters as much as size.
+
+## Q3. exact=791 lossy=9310
+
+**Question:** what does `Heap Blocks: exact=791 lossy=9310` mean, and what would you change?
+
+The bitmap did not fit in `work_mem` (set to 64 kB), so for 9,310 pages Postgres only remembered "this page has at least one match". It had to recheck every row on those pages against the condition (`Rows Removed by Index Recheck: 736,036`). Only 791 pages kept exact row bits. Raise `work_mem` for the query (for example `SET LOCAL work_mem = '16MB'` in the transaction): with 4 MB the same query had `exact=10101`, no recheck.
+
+> **Common mistake:** "lossy means wrong results". Lossy pages are rechecked, so results are correct; only CPU is wasted.
+
+## Q4. Two indexes at once
+
+**Question:** how did `customer_id <= 5000 AND status = 'shipped'` use two indexes at once, and why can an Index Scan not do that?
+
+Each index produced a bitmap of matching rows (50,090 and 50,000); **BitmapAnd** intersected them to 2,580 rows on 2,304 pages before any heap access; the heap was then read once. An Index Scan walks one index and fetches each row as it goes: there is no step where two lists of ctids can be combined before fetching, so it can use only one index and must filter the other condition on the fetched rows.
+
+> **Common mistake:** "PostgreSQL merges the two indexes into one". It merges two temporary bitmaps for this query only.
+
+## Q5. MySQL MRR
+
+**Question:** what does MySQL's MRR do, and why was it 28% faster here?
+
+Multi-Range Read buffers the primary keys found in the secondary range, **sorts them**, and then fetches the rows in primary-key order. Since the clustered index is ordered by primary key, consecutive lookups land on the same or neighbouring leaves: fewer leaf visits, more sequential I/O. Without MRR, lookups follow `customer_id` order, which jumps across the table. 50,090 rows: 29.4 ms with MRR vs 40.6 ms without.
+
+> **Common mistake:** assuming MRR is on by default. It is enabled, but `mrr_cost_based=on` means the optimizer uses it only when it estimates a gain, which it often does not.
+
+## Q6. Bitmap and ORDER BY … LIMIT
+
+**Question:** why can a Bitmap Heap Scan not serve `ORDER BY created_at LIMIT 20` efficiently?
+
+The bitmap must be complete before any heap page is read, so the scan cannot stop after 20 rows, and it returns rows in page order, not `created_at` order. The plan would collect **all** matching rows, sort them, and keep 20. An Index Scan on `created_at` returns rows already sorted and can stop after the 20th.
+
+> **Common mistake:** "the bitmap is built from the created_at index, so the order is kept". The bitmap records pages, not order.
+
+## Q7. status = 'delivered' in PostgreSQL
+
+**Question:** MongoDB used `status_1` for `status = 'delivered'` (35% of documents). Would PostgreSQL have used an index for the same query? What did it actually choose?
+
+Yes, in the form of a **Bitmap Heap Scan** on `orders_status_idx` (cost 18,311 < Seq Scan 22,602). With 35% of the rows matching, every heap page holds matches, so the bitmap reads essentially the whole table in file order, but it skips evaluating the condition on the 65% of rows it knows do not match. Measured (warm): Bitmap 19.7 ms, Seq Scan 30.0 ms, forced Index Scan 22.1 ms. An Index Scan in status order would not have been chosen.
+
+> **Common mistake:** "PostgreSQL never uses an index above ≈ 20%". With a bitmap and a cheap per-page cost when nearly all pages are read, it sometimes does, and correctly.

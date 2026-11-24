@@ -1,0 +1,342 @@
+---
+title: "Concept 3: The cost model"
+description: "How a planner turns estimated rows into a number per plan and picks the smallest: PostgreSQL's page and CPU cost constants, MySQL's read and evaluate costs, and MongoDB's trial score. Every formula checked against EXPLAIN on the lab."
+type: "concept"
+tags: ["indexing", "postgresql", "mysql", "mongodb", "query-planner", "cost-model"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/runtime-config-query.html#RUNTIME-CONFIG-QUERY-CONSTANTS"
+  - "https://www.postgresql.org/docs/current/using-explain.html"
+  - "https://github.com/postgres/postgres/blob/master/src/backend/optimizer/path/costsize.c"
+  - "https://dev.mysql.com/doc/refman/8.4/en/cost-model.html"
+  - "https://www.mongodb.com/docs/manual/core/query-plans/"
+---
+
+<Tldr>
+A cost-based planner prices every candidate plan in **abstract units** (pages read × a cost per page + rows processed × a cost per row) and runs the cheapest. PostgreSQL's Seq Scan of `orders` costs 10,102 + 10,000 + 2,500 = **22,602**; an Index Scan for `customer_id = 7` costs **48.62**, and both numbers can be recomputed by hand from the documented constants. The constants are assumptions about your hardware: lowering `random_page_cost` from 4 to 1.1 made PostgreSQL pick an Index Scan that ran **3–4× slower** than the Seq Scan it replaced. MySQL prices plans the same way with different constants; MongoDB does not price plans at all, it scores them after a trial run.
+</Tldr>
+
+## PostgreSQL: the constants
+
+| Setting | Default | Charged for |
+|---|---|---|
+| `seq_page_cost` | 1.0 | A page read in file order (the unit) |
+| `random_page_cost` | 4.0 | A page read out of order |
+| `cpu_tuple_cost` | 0.01 | Each row produced by a scan |
+| `cpu_index_tuple_cost` | 0.005 | Each index entry processed |
+| `cpu_operator_cost` | 0.0025 | Each operator or function evaluation (a `WHERE` comparison) |
+| `effective_cache_size` | 4 GB | Not a cost: a hint of how much data is likely cached, which lowers the cost of repeated page reads in index scans |
+| `parallel_setup_cost` / `parallel_tuple_cost` | 1,000 / 0.1 | Starting workers / passing each row to the leader |
+
+`EXPLAIN` prints two numbers per node, `cost=startup..total`: the cost before the first row and the cost to produce all rows.
+
+## Three plans priced by hand
+
+| Plan | Pages | CPU | Total (EXPLAIN) |
+|---|---|---|---|
+| Seq Scan, any filter | 10,102 pages × 1.0 = 10,102 | 1M rows × (0.01 + 0.0025) = 12,500 | **22,602** |
+| Index Scan, `customer_id = 7` (11 rows) | 1 index page × 4.0 + 11 heap pages × 4.0 = 48 | 11 × (0.005 + 0.0025 + 0.01) ≈ 0.19; descent 0.42 | **48.62** |
+| Index Scan, `created_at < '2025-07-01'` (494,454 rows, correlation 1.0) | ≈ 1,350 index pages × 4.0 + ≈ 4,991 heap pages read **in order**: 4.0 + 4,990 × 1.0 | ≈ 494,454 × 0.0175 ≈ 8,650 | ≈ 19,050 (**19,083**) |
+
+The heap part of an Index Scan is priced between two extremes using the column's correlation c: **max** = every heap page a random read (uncorrelated), **min** = one random read then sequential pages (perfectly ordered), and **cost = max + c² × (min − max)**. With c = 1.0 for `created_at`, it is the cheap end; with c ≈ 0 for `customer_id`, the expensive end.
+
+| Term | Meaning |
+|---|---|
+| Startup cost | Work before the first row (an index descent, building a bitmap or hash) |
+| Total cost | Work for all rows; what the planner compares (unless a `LIMIT` makes startup matter) |
+| **✓ Cheapest** | The plan with the lowest total cost is executed |
+| **✗ Rejected** | Every other candidate |
+
+<Flow
+  title="PostgreSQL: pricing and choosing a plan"
+  height={340}
+  nodes={[
+    { id: 'q', label: 'Query', sub: '', x: 20, y: 20, w: 220 },
+    { id: 'seq', label: 'Seq Scan', sub: '22,602', x: 310, y: 20, w: 200 },
+    { id: 'idx', label: 'Index Scan', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'pages', label: 'Page costs', sub: 'pages × 1.0 or 4.0', x: 20, y: 150, w: 220 },
+    { id: 'cpu', label: 'CPU costs', sub: 'rows × 0.01, entries × 0.005', x: 310, y: 150, w: 200 },
+    { id: 'bmp', label: 'Bitmap Heap Scan', sub: '', x: 580, y: 150, w: 200 },
+    { id: 'win', label: '✓ Cheapest', sub: 'executed', x: 120, y: 270, w: 220 },
+    { id: 'lose', label: '✗ Rejected', sub: '', x: 460, y: 270, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-pages', from: 'q', to: 'pages' },
+    { id: 'pages-cpu', from: 'pages', to: 'cpu' },
+    { id: 'cpu-seq', from: 'cpu', to: 'seq', quiet: true },
+    { id: 'cpu-idx', from: 'cpu', to: 'idx', quiet: true },
+    { id: 'cpu-bmp', from: 'cpu', to: 'bmp', quiet: true },
+    { id: 'pages-win', from: 'pages', to: 'win', quiet: true },
+    { id: 'cpu-win', from: 'cpu', to: 'win', quiet: true },
+    { id: 'cpu-lose', from: 'cpu', to: 'lose', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'customer_id = 7',
+      path: 'Seq 22,602 vs Index 48.62 vs Bitmap 47.56 → ✓ Bitmap Heap Scan',
+      summary: 'Three candidates, a 470× cost gap.',
+      subs: { q: 'customer_id = 7 (11 rows)', idx: '48.62', bmp: '47.56' },
+      steps: [
+        {
+          title: 'Price the page reads',
+          note: 'Seq Scan: 10,102 pages × 1.0. Index Scan: 1 index leaf + 11 heap pages, each a random read × 4.0 = 48. Bitmap: almost the same pages, sorted.',
+          code: 'EXPLAIN SELECT * FROM orders WHERE customer_id = 7;',
+          active: ['q', 'pages'],
+          edges: ['q-pages'],
+        },
+        {
+          title: 'Add CPU per row',
+          note: 'Seq Scan: 1M rows × (0.01 + 0.0025) = 12,500. Index Scan: 11 rows and entries ≈ 0.19, plus 0.42 startup for the descent.',
+          active: ['pages', 'cpu'],
+          edges: ['pages-cpu'],
+        },
+        {
+          title: 'Totals',
+          note: 'Seq 22,602; Index 48.62 (shown when bitmap scans are disabled); Bitmap 47.56.',
+          active: ['cpu', 'seq', 'idx', 'bmp'],
+          edges: ['cpu-seq', 'cpu-idx', 'cpu-bmp'],
+        },
+        {
+          title: '✓ Bitmap wins by a hair',
+          note: 'The cheapest total is executed. Bitmap and Index are within 2%; either is fine. The Seq Scan is rejected by a factor of 470.',
+          active: ['bmp', 'win', 'seq', 'lose'],
+          edges: ['cpu-win', 'cpu-lose'],
+          subs: { win: 'Bitmap 47.56', lose: 'Seq 22,602' },
+        },
+      ],
+    },
+    {
+      title: 'created_at < 1 July',
+      path: 'correlation 1.0 → heap pages priced as sequential → Index 19,083 < Seq 22,602 ✓',
+      summary: 'Half the table, still an index plan, because the rows are in order.',
+      subs: { q: 'created_at < 1 July (49%)', idx: '19,083', bmp: '(more)' },
+      steps: [
+        {
+          title: 'Pages: in order, so mostly 1.0 each',
+          note: '≈ 4,991 heap pages. With correlation 1.0, the formula uses the minimum: one random read, then sequential pages. Plus ≈ 1,350 index leaves at 4.0.',
+          code: "EXPLAIN SELECT * FROM orders WHERE created_at < '2025-07-01';",
+          active: ['q', 'pages'],
+          edges: ['q-pages'],
+        },
+        {
+          title: 'CPU for half a million rows',
+          note: '494,454 rows × (0.01 + 0.005 + 0.0025) ≈ 8,650.',
+          active: ['pages', 'cpu', 'idx', 'seq'],
+          edges: ['pages-cpu', 'cpu-idx', 'cpu-seq'],
+        },
+        {
+          title: '✓ Index Scan, 19,083',
+          note: 'Cheaper than the Seq Scan\'s 22,602. Measured (warm): Index 29.8 ms, Seq 33.1 ms: the model was right.',
+          active: ['idx', 'win', 'seq', 'lose'],
+          edges: ['pages-win', 'cpu-lose'],
+          subs: { win: 'Index 19,083', lose: 'Seq 22,602' },
+        },
+      ],
+    },
+    {
+      title: 'random_page_cost = 1.1',
+      path: 'random pages priced like sequential → Index 20,537 < Seq 22,602 ✓ chosen → 3–4× slower in reality',
+      summary: 'customer_id <= 50000: a "cheaper" plan that ran 117 ms instead of 31 ms.',
+      subs: { q: 'customer_id <= 50000 (50%)', idx: '20,537', bmp: '(more)' },
+      steps: [
+        {
+          title: 'A common tuning: random_page_cost = 1.1',
+          note: 'On SSDs many guides recommend 1.1–1.5, so random reads are priced almost like sequential ones.',
+          code: 'SET random_page_cost = 1.1;\nEXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id <= 50000;',
+          active: ['q', 'pages'],
+          edges: ['q-pages'],
+          subs: { pages: 'random pages × 1.1' },
+        },
+        {
+          title: 'The Index Scan now looks cheaper',
+          note: '500,000 rows, scattered: the Index Scan\'s cost drops to 20,537, below the Seq Scan\'s 22,602.',
+          active: ['pages', 'cpu', 'idx', 'seq'],
+          edges: ['pages-cpu', 'cpu-idx', 'cpu-seq'],
+        },
+        {
+          title: '✓ Chosen, and 3–4× slower',
+          note: 'Measured: Index Scan 117 ms warm (185 ms cold) vs Seq Scan 31 ms (42 ms cold). Even with every page in memory, visiting heap pages in random order, many of them again and again, costs more per row than one pass. The constant should reflect the real cost of an out-of-order page visit, not only the disk.',
+          active: ['idx', 'win', 'seq', 'lose'],
+          edges: ['pages-win', 'cpu-lose'],
+          subs: { win: 'Index: 117 ms', lose: 'Seq: 31 ms' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MySQL: read cost + evaluate cost
+
+| Constant (`mysql.server_cost`, `mysql.engine_cost`) | Default | Charged for |
+|---|---|---|
+| `io_block_read_cost` | 1.0 | A page read from disk |
+| `memory_block_read_cost` | 0.25 | A page already in the buffer pool |
+| `row_evaluate_cost` | 0.1 | Evaluating each row against the conditions |
+| `key_compare_cost` | 0.05 | Comparing keys (sorting, index lookups) |
+
+`EXPLAIN FORMAT=JSON` shows `read_cost`, `eval_cost` and `query_cost`; `EXPLAIN FORMAT=TREE` shows `cost=` per step.
+
+| Term | Meaning |
+|---|---|
+| `read_cost` | Pages to read × block cost (memory or disk, from how much of the index InnoDB reports as cached) |
+| `eval_cost` | Rows × `row_evaluate_cost` |
+| **✓ Cheapest / ✗ Rejected** | As in PostgreSQL |
+
+<Flow
+  title="MySQL: pricing and choosing a plan"
+  height={320}
+  nodes={[
+    { id: 'q', label: 'Query', sub: 'customer_id <= 1000', x: 20, y: 20, w: 220 },
+    { id: 'full', label: 'Table scan', sub: '', x: 310, y: 20, w: 200 },
+    { id: 'range', label: 'Range scan', sub: '', x: 580, y: 20, w: 200 },
+    { id: 'read', label: 'read_cost', sub: 'pages × 0.25 or 1.0', x: 20, y: 150, w: 220 },
+    { id: 'eval', label: 'eval_cost', sub: 'rows × 0.1', x: 310, y: 150, w: 200 },
+    { id: 'win', label: '✓ Cheapest', sub: '', x: 120, y: 260, w: 220 },
+    { id: 'lose', label: '✗ Rejected', sub: '', x: 460, y: 260, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-read', from: 'q', to: 'read' },
+    { id: 'read-eval', from: 'read', to: 'eval' },
+    { id: 'eval-full', from: 'eval', to: 'full', quiet: true },
+    { id: 'eval-range', from: 'eval', to: 'range', quiet: true },
+    { id: 'eval-win', from: 'eval', to: 'win', quiet: true },
+    { id: 'eval-lose', from: 'eval', to: 'lose', quiet: true },
+  ]}
+  cases={[
+    {
+      title: 'customer_id <= 1000',
+      path: 'table scan 100,677 vs range 8,100 → ✓ range',
+      summary: 'Both costs recomputed from the constants.',
+      steps: [
+        {
+          title: 'Table scan',
+          note: 'eval_cost = 996,111 estimated rows × 0.1 = 99,611. read_cost = 4,263 pages × 0.25 (all cached) = 1,066. Total 100,677, as EXPLAIN FORMAT=TREE shows. On a cold buffer pool the pages are priced at 1.0: 103,874.',
+          code: 'EXPLAIN FORMAT=TREE SELECT * FROM orders IGNORE INDEX (orders_customer_idx) WHERE customer_id <= 1000;',
+          active: ['q', 'read', 'eval', 'full'],
+          edges: ['q-read', 'read-eval', 'eval-full'],
+          subs: { full: '100,677' },
+        },
+        {
+          title: 'Range scan',
+          note: 'EXPLAIN FORMAT=JSON: rows_examined 18,000; read_cost 6,300 (index range plus a clustered lookup per row); eval_cost 18,000 × 0.1 = 1,800. query_cost 8,100.',
+          active: ['read', 'eval', 'range'],
+          edges: ['read-eval', 'eval-range'],
+          subs: { range: '8,100' },
+        },
+        {
+          title: '✓ Range scan',
+          note: '8,100 < 100,677. Note how much of MySQL\'s full-scan cost is per-row evaluation (99%): its model, like its measured CPU time, says InnoDB full scans are CPU-bound.',
+          active: ['range', 'win', 'full', 'lose'],
+          edges: ['eval-win', 'eval-lose'],
+          subs: { win: 'range 8,100', lose: 'scan 100,677' },
+        },
+      ],
+    },
+  ]}
+/>
+
+## MongoDB: a score, not a cost
+
+| Term | Meaning |
+|---|---|
+| `works` | Units of work a plan did in the trial (roughly one index key or document per unit) |
+| `advanced` | Results the plan returned in the trial |
+| Score | 1 (base) + advanced / works (productivity) + small bonuses (no FETCH needed, no in-memory SORT, finished early) |
+| **✓ Highest score / ✗ Lower score** | The winner is cached; the others are listed as `rejectedPlans` |
+
+<Flow
+  title="MongoDB: scoring trial runs"
+  height={320}
+  nodes={[
+    { id: 'q', label: 'Query', sub: '{ status, customer_id }', x: 20, y: 20, w: 230 },
+    { id: 'a', label: 'Plan A', sub: 'IXSCAN customer_id_1', x: 320, y: 20, w: 220 },
+    { id: 'b', label: 'Plan B', sub: 'IXSCAN status_1', x: 580, y: 20, w: 200 },
+    { id: 'score', label: 'Score', sub: '1 + advanced / works', x: 320, y: 150, w: 220 },
+    { id: 'win', label: '✓ Highest score', sub: 'cached', x: 120, y: 260, w: 220 },
+    { id: 'lose', label: '✗ Lower score', sub: 'rejectedPlans', x: 460, y: 260, w: 220 },
+  ]}
+  edges={[
+    { id: 'q-a', from: 'q', to: 'a' },
+    { id: 'a-score', from: 'a', to: 'score' },
+    { id: 'b-score', from: 'b', to: 'score' },
+    { id: 'score-win', from: 'score', to: 'win' },
+    { id: 'score-lose', from: 'score', to: 'lose' },
+  ]}
+  cases={[
+    {
+      title: 'Two candidates',
+      path: 'A: 101 / 2,001 → 1.0507 ✓; B: 24 / 2,001 → 1.0122 ✗',
+      summary: 'explain("allPlansExecution") shows works, advanced and score for each plan.',
+      steps: [
+        {
+          title: 'Run both for the trial',
+          note: 'Both plans get the same number of work units, in turns, until one returns 101 documents.',
+          code: 'db.orders.find({ status: "shipped", customer_id: { $lte: 1000 } }).explain("allPlansExecution")',
+          active: ['q', 'a', 'b'],
+          edges: ['q-a'],
+          subs: { a: '101 docs / 2,001 works', b: '24 docs / 2,001 works' },
+        },
+        {
+          title: 'Score each',
+          note: 'A: 1 + 101 / 2,001 = 1.0505, plus tiny bonuses → 1.0507. B: 1 + 24 / 2,001 = 1.0120 → 1.0122.',
+          active: ['a', 'b', 'score'],
+          edges: ['a-score', 'b-score'],
+        },
+        {
+          title: '✓ A wins',
+          note: 'No page counts, no constants: the measurement is "results per unit of work in the first moments". That is robust to bad statistics (there are none) but sensitive to where matching documents happen to sit early in each index.',
+          active: ['score', 'win', 'lose'],
+          edges: ['score-win', 'score-lose'],
+          subs: { win: 'A: 1.0507', lose: 'B: 1.0122' },
+        },
+      ],
+    },
+  ]}
+/>
+
+<Pitfall>
+Do not tune cost constants to fix one query. `random_page_cost = 1.1` is reasonable when most data is cached **and** you have checked that index plans really are cheap on your workload; in the lab it made a 50%-selectivity query 3–4× slower. Change constants with `SET` in a session, compare `EXPLAIN ANALYZE` across representative queries, then decide.
+</Pitfall>
+
+## Real-world scenario: the plan that flips at month end
+
+A report query `WHERE created_at >= :start` uses an Index Scan for a one-week window and a Seq Scan for a month. It is fast in both cases. A team member forces the index with `SET enable_seqscan = off` "because indexes are faster", and month-end reports slow down.
+
+| Window | Rows | Planner's choice | Forced index |
+|---|---|---|---|
+| 1 week | ≈ 2% | Index Scan (cheap) | Same |
+| 1 month | ≈ 8% | Index Scan or Bitmap (correlated data) | Same |
+| 9 months | ≈ 75% | Seq Scan (22,602 < index cost) | Index Scan of 75% of the table |
+
+**Lesson:** the cost model's job is exactly this switch. `enable_*` settings are for experiments, never for production queries.
+
+## Why this matters for indexes
+
+| Later topic | Why this concept matters |
+|---|---|
+| Concept 4: scan types | Each scan's formula explains where it wins |
+| Concept 5: ignored indexes | "Too expensive" is a cost-model verdict, often correct |
+| Session 4: ORDER BY + LIMIT | Startup cost decides when an index avoids a sort |
+| Session 5: covering indexes | Removing heap pages removes the expensive part of the formula |
+
+## Key takeaways
+
+1. A cost-based planner prices each candidate in abstract units and runs the cheapest.
+2. PostgreSQL: pages × `seq_page_cost` (1.0) or `random_page_cost` (4.0), plus rows × `cpu_tuple_cost` (0.01), entries × `cpu_index_tuple_cost` (0.005), operators × `cpu_operator_cost` (0.0025).
+3. Seq Scan of `orders` = 22,602; Index Scan for `customer_id = 7` = 48.62; both reproducible by hand.
+4. Correlation moves an Index Scan's heap cost between all-random and almost-all-sequential.
+5. MySQL prices `read_cost` (pages × 0.25 cached or 1.0 disk) + `eval_cost` (rows × 0.1).
+6. MongoDB scores trial runs by results per unit of work instead of estimating costs.
+7. Cost constants are assumptions; changing them changes plans, not always for the better.
+
+## Check questions
+
+1. Recompute the Seq Scan cost of `orders` (10,102 pages, 1M rows, one `WHERE` condition) from the constants.
+2. Break the Index Scan cost of 48.62 for `customer_id = 7` into its parts.
+3. Why does an Index Scan on `created_at` returning 49% of the rows cost less than the Seq Scan, while one on `customer_id` returning 50% costs more?
+4. What happened when `random_page_cost` was lowered to 1.1, and why was the planner's new choice slower?
+5. MySQL's table-scan cost was 100,677 in one run and 103,874 in another. Explain the difference.
+6. How did MongoDB arrive at the scores 1.0507 and 1.0122?
+7. Why are `enable_seqscan = off` and similar settings dangerous outside experiments?
+
+<DeepDive label="ANSWERS" href="/blogs/databases/indexing/session-3-query-planner/concept-3-cost-model/answers">Worked answers to Q1–Q7</DeepDive>

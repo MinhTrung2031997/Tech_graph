@@ -1,0 +1,75 @@
+---
+title: "Answers: Statistics and ANALYZE"
+description: "Worked answers to the Session 3 Concept 2 check questions: MCV, n_distinct and histogram estimates, stale statistics, InnoDB index statistics, histograms and MongoDB's plan cache."
+companion: "answers"
+tags: ["indexing", "query-planner", "statistics", "answers"]
+status: "draft"
+sources:
+  - "https://www.postgresql.org/docs/current/row-estimation-examples.html"
+  - "https://dev.mysql.com/doc/refman/8.4/en/optimizer-statistics.html"
+  - "https://www.mongodb.com/docs/manual/core/query-plans/"
+---
+
+<Tldr>
+Common values: their own frequency. Other values: an average. Ranges: histogram interpolation. Changed data: wrong numbers until the next ANALYZE. MongoDB swaps all of this for a cache of plans that won a race.
+</Tldr>
+
+## Q1. 51,000 for shipped
+
+**Question:** where does PostgreSQL get the estimate 51,000 for `status = 'shipped'`? Show the calculation.
+
+`shipped` is in `pg_stats.most_common_vals` for `status` with frequency 0.051 (5.1% of the 30,000 sampled rows). Estimate = `pg_class.reltuples` × frequency = 1,000,000 × 0.051 = **51,000**. The real share is 5.0%; the 0.1% difference is sampling noise.
+
+> **Common mistake:** dividing by `n_distinct` (1,000,000 / 5 = 200,000). That rule is only for values not in the MCV list.
+
+## Q2. Every customer gets 11
+
+**Question:** why is the estimate for `customer_id = 7` the same as for any other customer, and when does that become a problem?
+
+No customer appears often enough in the 30,000-row sample to enter the MCV list, so every value is estimated with the same rule: 1 / `n_distinct` = 1 / 91,474 → 11 rows. That is fine while customers are similar. It becomes a problem with **skew**: a marketplace account with 200,000 orders also gets "11 rows", and the planner may pick a nested loop or an index scan that is wrong for it. A larger statistics target (`SET STATISTICS 1000`) lets the big customers into the MCV list.
+
+> **Common mistake:** "the planner knows each customer's count". It only knows the values it saw often in the sample.
+
+## Q3. 8,314 from the histogram
+
+**Question:** how did the planner estimate 8,314 rows for `customer_id BETWEEN 1 AND 1000` from the histogram?
+
+The histogram has 101 bounds = 100 buckets of ≈ 1% of the rows. The first bucket spans 4 to 1,188. The range ends at 1,000, which is (1,000 − 4) / (1,188 − 4) ≈ 0.84 of the way through bucket 1 (values below 4 are outside the histogram's range and count as ≈ 0). So selectivity ≈ 0.84 × 1% ≈ 0.84%, giving ≈ 8,300 rows; the planner's small corrections give 8,314. The truth is 9,956: values are not perfectly even inside a bucket.
+
+> **Common mistake:** "1,000 / 100,000 = 1%". That is the answer from knowing the data; the planner only has the bucket bounds.
+
+## Q4. Why exactly 1
+
+**Question:** after inserting 300,000 `refunded` rows without `ANALYZE`, the estimate was 1. Why exactly 1, and what would autovacuum have needed before re-analyzing?
+
+The five MCVs covered 100% of the sampled rows, so the selectivity left for any other value was 0. The planner never estimates fewer than **1** row (it clamps), hence 1.
+
+Autovacuum re-analyzes a table after `autovacuum_analyze_threshold + autovacuum_analyze_scale_factor × reltuples` = 50 + 0.1 × 1,000,000 = **100,050** changed rows. The insert exceeded that, so with autovacuum enabled (it was disabled on the copy) the next autovacuum cycle, within about a minute, would have fixed it. Running `ANALYZE` right after the insert avoids even that window.
+
+> **Common mistake:** "estimate 0". PostgreSQL never plans for zero rows.
+
+## Q5. MySQL's equal estimates
+
+**Question:** MySQL estimated the same rows for every `status` value. Which statistic did it use, and why is that weak for skewed columns?
+
+For an equality on an indexed column (ref access) it used the **index statistics**: the sampled number of distinct values in `orders_status_idx` (`n_diff_pfx01` = 4, from only 6 pages), giving rows ≈ table rows / distinct values. It is an **average per value**, so it is equally wrong for a value with 35% of the rows and for one with 0.1%. For skewed columns that can mean an index plan for a common value (slow) or a scan for a rare one.
+
+> **Common mistake:** "MySQL uses the histogram here". Histograms are used for unindexed columns; for an indexed column, index dives or index statistics take precedence.
+
+## Q6. The amount histogram
+
+**Question:** what did a MySQL histogram on `amount` change, and what did it not change?
+
+It changed the **estimate**: `filtered` for `amount > 400` went from the default guess 33.33% to 20.01%, matching the real 20.0%. Better estimates improve join order and the choice between plans that filter on that column.
+
+It did **not** create an access path: the plan was still `type: ALL`, because a histogram is statistics, not an index.
+
+> **Common mistake:** expecting a histogram to speed up the query by itself.
+
+## Q7. MongoDB without statistics
+
+**Question:** MongoDB has no statistics. How does it avoid re-planning every query, and when does it plan again?
+
+It caches the winning plan per **query shape** (the query with values removed). A new entry starts inactive, becomes active when the shape runs again within the recorded work, and is then reused without a trial. It plans again when the cached plan needs more than **10×** the work recorded for it (the values have made it a poor fit), and whenever the cache is cleared: index created or dropped, collection dropped, server restart, or `getPlanCache().clear()`.
+
+> **Common mistake:** "MongoDB plans each query from scratch". Only new or evicted shapes go through a trial.
