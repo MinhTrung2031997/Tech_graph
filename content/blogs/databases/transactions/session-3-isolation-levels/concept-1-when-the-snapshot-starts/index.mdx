@@ -16,7 +16,7 @@ sources:
 All three engines use MVCC, so an isolation level is mostly a rule about **which snapshot a read uses**. In **READ COMMITTED** every statement takes a fresh snapshot: T1 read balance 1000, T2 committed −100, T1's next read returned **900**. In **REPEATABLE READ** (PostgreSQL, MySQL) and in a **MongoDB transaction**, the whole transaction reads one snapshot: the second read returned **1000** again, and a new row inserted by T2 stayed invisible (count 1000, not 1001). The snapshot starts at the transaction's **first read**, not at `BEGIN`: a transaction that waited 2 s before its first `SELECT` saw T2's change (900) in all three engines, unless MySQL is told `START TRANSACTION WITH CONSISTENT SNAPSHOT` (1000).
 </Tldr>
 
-[Session 2](/blogs/databases/transactions/session-2-anomalies) reproduced the anomalies. This session asks which **level** prevents each one, engine by engine. The first rule to learn is when the snapshot is taken.
+[Session 2](/blogs/databases/transactions/session-2-anomalies/concept-1-dirty-reads) reproduced the anomalies. This session asks which **level** prevents each one, engine by engine. The first rule to learn is when the snapshot is taken.
 
 ## The levels each engine really has
 
@@ -326,7 +326,7 @@ The test in every engine: T1 reads account 1 (balance 1000), sleeps 2 s and read
 
 ## What each level prevents (measured)
 
-| Anomaly ([Session 2](/blogs/databases/transactions/session-2-anomalies)) | PG RC | PG RR | PG SERIALIZABLE | MySQL RC | MySQL RR | MySQL SERIALIZABLE | MongoDB transaction |
+| Anomaly ([Session 2](/blogs/databases/transactions/session-2-anomalies/concept-1-dirty-reads)) | PG RC | PG RR | PG SERIALIZABLE | MySQL RC | MySQL RR | MySQL SERIALIZABLE | MongoDB transaction |
 |---|---|---|---|---|---|---|---|
 | Dirty read | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Non-repeatable read | ✗ (900) | ✓ (1000) | ✓ | ✗ (900) | ✓ for plain reads (1000); ✗ for locking reads (900) | ✓ | ✓ (1000) |
